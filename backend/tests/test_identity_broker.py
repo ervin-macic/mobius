@@ -54,7 +54,7 @@ def test_served_tree_loses_group_write_after_boot_writers_before_validation():
   normalize = source.index("find /data/platform ! -type l -perm /022 -exec chmod go-w {} +")
   # The image's boot transaction (activate, guard, revert) is every writer.
   assert source.index("if ! _platform_boot activate 2>&1; then") < normalize
-  assert source.index("  _platform_boot revert 2>&1\n") < normalize
+  assert source.index("elif _platform_boot revert 2>&1") < normalize
   assert source.rindex("_platform_boot guard") < normalize
   assert normalize < source.index("served_runtime_launcher.py \\\n       --check identity_broker")
 

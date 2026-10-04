@@ -204,7 +204,6 @@ def clone_env(tmp_path, monkeypatch):
   # This boot's image runs the boot transaction; tests of images before it
   # remove the marker. ``_boot_image`` chooses the running image's revision.
   monkeypatch.setattr(pu, "BOOT_TRANSACTION_MARKER", tmp_path / ".boot-transaction")
-  monkeypatch.setattr(pu, "BOOT_UNSETTLED_MARKER", tmp_path / ".boot-unsettled")
   monkeypatch.setattr(platform_boot, "BOOT_LOG", tmp_path / "platform-boot.jsonl")
   pu.BOOT_TRANSACTION_MARKER.write_text("1\n")
   monkeypatch.setenv("MOBIUS_BUILD_INFO_PATH", str(tmp_path / "build-info.json"))
@@ -1025,34 +1024,6 @@ def test_boot_merge_back_survives_a_metadata_only_repair_of_every_file(clone_env
   assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
     "?? backend/app/wip.py",
   ]
-
-
-def test_a_fallback_boot_leaves_an_unsettled_update_to_the_next_boot(clone_env):
-  """When the boot transaction fails, the entrypoint serves the baked platform
-  instead of restarting forever. That server must not finish, confirm, bind,
-  cancel or retire the update the failed transaction left: those records are
-  the next boot's, which can still return to the saved previous state."""
-  origin, platform = clone_env
-  _target, _late = _swapped_with_late_commit(platform, origin)
-  record = pu.read_prepared_update()
-  head = _served_sha(platform)
-  pu.BOOT_UNSETTLED_MARKER.write_text("activate\n")
-  _boot_started_server(platform, source="baked")
-
-  assert pu.boot_transaction_unsettled() == "activate"
-  assert pu.complete_platform_swap(platform) is None
-  assert pu.confirm_platform_swap_loaded(platform) is False
-  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
-  assert pu.reconcile_bound_operation({"state": "succeeded"}, platform) is None
-  for owner_action in (pu.cancel_unfinished_update, pu.check_for_updates):
-    with pytest.raises(pu.PlatformUpdateError, match="boot_transaction_unsettled"):
-      owner_action(platform)
-  assert pu.read_prepared_update() == record
-  assert _served_sha(platform) == head
-
-  # Every boot clears the marker first; the next transaction settles the update.
-  pu.BOOT_UNSETTLED_MARKER.unlink()
-  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
 
 
 def test_a_merged_back_tree_that_cannot_start_returns_to_the_previous_state(
@@ -6051,7 +6022,7 @@ def test_entrypoint_settles_guards_and_probes_before_any_served_code_runs():
     0,
     branch.index("if ! _platform_boot guard 2>&1; then"),
     branch.index("if _platform_import_probe; then"),
-    branch.index("  _platform_boot revert 2>&1\n"),
+    branch.index("elif _platform_boot revert"),
   ]
   assert order == sorted(order)
   assert "reconcile_clone_sync" not in body

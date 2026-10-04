@@ -510,9 +510,8 @@ _platform_use_baked() {
 }
 
 # `_platform_boot activate` publishes this marker (its protocol) only once
-# this boot's transaction succeeded, and `_platform_boot_unsettled` writes the
-# second when it failed; never trust either from an earlier boot.
-rm -f /tmp/platform-boot-transaction /tmp/platform-boot-unsettled
+# this boot's transaction succeeded; never trust one from an earlier boot.
+rm -f /tmp/platform-boot-transaction
 
 if [ "${MOBIUS_TEST_RUNTIME:-0}" = "1" ]; then
   _platform_seed_test_checkout || exit 1
@@ -529,54 +528,26 @@ _own_as_mobius /data/platform 2>/dev/null || true
 # guard, then the decisive probe. A probe failure returns a swapped-in update
 # to its saved previous state and checks that tree the same way. A fresh seed
 # takes the same path, so every served boot publishes the transaction.
-#
-# A failed transaction step never serves /data/platform, and never retries:
-# the image's own baked platform serves instead, so the owner sees what
-# happened (the shell's baked-source warning and a push) rather than an
-# instance that restarts forever. /data/platform and every update record and
-# journal stay exactly as the failure left them; the next boot's transaction
-# resumes from there. The root-owned marker makes the fallback server refuse
-# update work meanwhile (platform_update.BOOT_UNSETTLED_MARKER).
-_platform_boot_unsettled() {
-  printf '%s\n' "$1" > /tmp/platform-boot-unsettled
-  chmod 644 /tmp/platform-boot-unsettled 2>/dev/null || true
-  echo "PLATFORM LAYER WARNING: boot $1 could not settle /data/platform; it is left as it is for the next boot." >&2
-  echo "  Why: /data/logs/platform-boot.jsonl. Updates stay paused until a boot settles it." >&2
-}
-
 _platform_serve_checkout() {
   if ! _platform_boot activate 2>&1; then
-    _platform_boot_unsettled activate
-    _platform_use_baked
-    return
+    echo "Platform layer: this image could not establish a platform state it may run; refusing to start." >&2
+    exit 1
   fi
   if ! _platform_boot guard 2>&1; then
-    _platform_boot_unsettled guard
-    _platform_use_baked
-    return
+    echo "Platform layer: boot guard failed; refusing to serve the platform tree." >&2
+    exit 1
   fi
   if _platform_import_probe; then
     echo "Platform layer: import probe OK; serving /data/platform/backend."
     _platform_use_direct
-    return
+  elif _platform_boot revert 2>&1 && _platform_boot guard 2>&1 &&
+       _platform_import_probe; then
+    echo "Platform layer: returned to the previous version; serving /data/platform/backend."
+    _platform_use_direct
+  else
+    echo "PLATFORM LAYER WARNING: import probe failed for /data/platform." >&2
+    _platform_use_baked
   fi
-  # Exit 3 is revert's answer that no swapped-in update exists (the checkout
-  # simply does not import); any other failure is an unsettled transaction.
-  _platform_boot revert 2>&1
-  _revert_status=$?
-  if [ "$_revert_status" -eq 0 ]; then
-    if ! _platform_boot guard 2>&1; then
-      _platform_boot_unsettled guard
-    elif _platform_import_probe; then
-      echo "Platform layer: returned to the previous version; serving /data/platform/backend."
-      _platform_use_direct
-      return
-    fi
-  elif [ "$_revert_status" -ne 3 ]; then
-    _platform_boot_unsettled revert
-  fi
-  echo "PLATFORM LAYER WARNING: import probe failed for /data/platform." >&2
-  _platform_use_baked
 }
 
 if [ ! -d "$_platform_app" ]; then

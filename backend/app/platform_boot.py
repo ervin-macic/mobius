@@ -14,17 +14,13 @@ decides whether served source may run on it:
   ``BOOT_PROTOCOL`` for the running server.
 ``revert``
   After the served tree failed its import probe. Returns a swapped-in update
-  to its saved previous state; exits ``NOTHING_TO_REVERT`` when there is none.
+  to its saved previous state; exits nonzero when there is none.
 ``guard``
   The fail-closed boot guard: prove the served tree is a clean committed
   state, or refuse to serve it.
 
-Exit 1 means the transaction failed: this image cannot establish a state it
-may serve from ``/data/platform``. The entrypoint then serves the baked
-platform instead, leaves ``/data/platform`` and its update records exactly as
-they are for the next boot, and marks the boot unsettled
-(``platform_update.BOOT_UNSETTLED_MARKER``) so the fallback server pauses
-update work and tells the owner.
+A nonzero exit means this image cannot establish a state it may serve from
+``/data/platform``; the entrypoint then refuses to serve that tree.
 
 Every run is also appended to ``BOOT_LOG``. The container's console is outside
 the app container, so this durable record is the only place an agent repairing
@@ -44,8 +40,6 @@ from pathlib import Path
 BOOT_LOG = Path("/data/logs/platform-boot.jsonl")
 _BOOT_LOG_RECORDS = 200
 _STDERR_CHARS = 2000
-# ``revert`` found no swapped-in update: an answer, not a failed transaction.
-NOTHING_TO_REVERT = 3
 
 
 def failure_detail(exc: BaseException) -> str:
@@ -113,8 +107,8 @@ def main(argv: list[str]) -> int:
     elif command == "revert":
       if not platform_update.revert_failed_update(repo):
         print("platform boot revert: no swapped-in update to revert", file=sys.stderr)
-        record_boot_run(command, ok=True, detail="no swapped-in update to revert")
-        return NOTHING_TO_REVERT
+        record_boot_run(command, ok=False, detail="no swapped-in update to revert")
+        return 1
       outcome = "reverted"
     else:
       outcome = platform_update.boot_guard_sync()
