@@ -5880,6 +5880,102 @@ MANIFEST_MULTI_INCOMPLETE = {
 }
 
 
+def _install_package(client, auth, base, manifest, files):
+  responses = {base + "mobius.json": (200, json.dumps(manifest).encode())}
+  responses.update({base + rel: (200, body) for rel, body in files.items()})
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client(responses),
+  ):
+    return client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+
+
+def test_install_accepts_a_bundled_dataset_larger_than_the_old_per_file_cap(
+  client, auth, bypass_url_validation,
+):
+  """An entry that imports a multi-megabyte JSON dataset, which a copied
+  1 MiB per-file cap used to refuse. Only the whole package is bounded."""
+  dataset = json.dumps([{"case": i, "note": "x" * 40} for i in range(30_000)])
+  assert len(dataset) > 1024 * 1024
+  jsx = (
+    "import cases from './data/cases.json'\n"
+    "export default function App() { return <div>{cases.length}</div> }\n"
+  )
+  manifest = {
+    **MANIFEST_MULTI,
+    "id": "bundled-dataset",
+    "source_files": ["data/cases.json"],
+  }
+
+  r = _install_package(
+    client, auth, "https://bundled-dataset.test/", manifest,
+    {"index.jsx": jsx.encode(), "data/cases.json": dataset.encode()},
+  )
+
+  assert r.status_code == 201, r.text
+  src = Path(get_settings().data_dir) / "apps" / "bundled-dataset"
+  assert (src / "data" / "cases.json").read_text() == dataset
+
+
+def test_install_package_budget_spans_every_declared_file_kind(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  from app import install
+
+  files = {
+    "index.jsx": JSX.encode(),
+    "cards.js": b"export const CARD = 1\n",
+    "extra.txt": b"served as a static asset",
+  }
+  manifest = {
+    **MANIFEST_MULTI,
+    "id": "package-budget",
+    "source_files": ["cards.js"],
+    "static_assets": {"extra.txt": "extra.txt"},
+  }
+  monkeypatch.setattr(
+    install, "_PACKAGE_MAX_BYTES", sum(map(len, files.values())) - 1,
+  )
+
+  r = _install_package(
+    client, auth, "https://package-budget.test/", manifest, files,
+  )
+
+  assert r.status_code == 413, r.text
+  assert "app package limit (reached while downloading cards.js)" in (
+    r.json()["detail"]
+  )
+
+
+def test_install_counts_a_path_declared_twice_once(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  """Install reads a subset of the tree Store publication bounded. A file
+  declared as both a source file and a static asset must not count twice,
+  or an accepted Store release could still fail to install."""
+  from app import install
+
+  shared = b'{"rows": [1, 2, 3]}'
+  files = {"index.jsx": JSX.encode(), "data.json": shared}
+  manifest = {
+    **MANIFEST_MULTI,
+    "id": "shared-path",
+    "source_files": ["data.json"],
+    "static_assets": {"data.json": "data.json"},
+  }
+  monkeypatch.setattr(
+    install, "_PACKAGE_MAX_BYTES", sum(map(len, files.values())),
+  )
+
+  r = _install_package(
+    client, auth, "https://shared-path.test/", manifest, files,
+  )
+
+  assert r.status_code == 201, r.text
+
+
 def test_multifile_install_rejects_incomplete_source_files(
   client, auth, bypass_url_validation,
 ):
@@ -6661,7 +6757,9 @@ def test_update_check_malformed_candidate_degrades_to_unknown(
   assert response.json()["upstream_version"] is None
 
 
-def test_discovery_retains_source_byte_budget(bypass_url_validation, monkeypatch):
+def test_discovery_retains_the_package_byte_budget(
+  bypass_url_validation, monkeypatch,
+):
   from fastapi import HTTPException
   from app import install
 
@@ -6670,14 +6768,14 @@ def test_discovery_retains_source_byte_budget(bypass_url_validation, monkeypatch
   responses = _check_responses(
     base, manifest, JSX, sources={"one.js": b"123", "two.js": b"456"},
   )
-  monkeypatch.setattr(install, "_SOURCE_FILES_TOTAL_MAX", 5)
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 5)
   with patch(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ):
     with pytest.raises(HTTPException) as exc:
       asyncio.run(install.fetch_upstream_source(base + "mobius.json", strict=False))
-  assert exc.value.status_code == 400
-  assert "source_files exceed" in exc.value.detail
+  assert exc.value.status_code == 413
+  assert "reached while downloading two.js" in exc.value.detail
 
 
 def test_update_check_changed_file_is_true(

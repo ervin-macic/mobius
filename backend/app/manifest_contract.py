@@ -21,15 +21,14 @@ RECOGNIZED_CAPABILITIES = (
 )
 SKILLS_COUNT_MAX = 5
 MANIFEST_MAX_BYTES = 64 * 1024
-ENTRY_MAX_BYTES = 1024 * 1024
-SEED_MAX_BYTES = 4 * 1024 * 1024
-SEEDS_COUNT_MAX = 64
-SEEDS_TOTAL_MAX = 32 * 1024 * 1024
-STATIC_ASSET_MAX_BYTES = 16 * 1024 * 1024
-STATIC_ASSETS_COUNT_MAX = 256
-STATIC_ASSETS_TOTAL_MAX = 64 * 1024 * 1024
-SOURCE_FILES_TOTAL_MAX = 8 * 1024 * 1024
-ICON_MAX_BYTES = 12 * 1024 * 1024
+# The one size bound for an app package: every file its manifest declares
+# (entry, job, source files, static assets, storage seeds, icon). Install holds
+# a whole package from an untrusted host in memory to review and digest it, so
+# the total is the real safety bound. No single file or file kind has its own
+# cap: a large dataset is as valid as many small modules. Store publication
+# bounds the whole accepted tree by the same number, so every app the Store
+# accepts is installable. The Store host preserves releases up to 64 MiB too.
+PACKAGE_MAX_BYTES = 64 * 1024 * 1024
 SKILL_MAX_BYTES = 256 * 1024
 SYSTEM_PROMPT_MAX_BYTES = 256 * 1024
 PROJECT_TEMPLATES_COUNT_MAX = 12
@@ -804,12 +803,10 @@ def validate_manifest_contract(manifest) -> None:
       validate_repo_relative_path(value, f"storage_seeds.{sub}")
 
   static_assets = manifest.get("static_assets", {})
+  # No file-count caps for static assets, seeds, or source files: the manifest
+  # byte cap bounds how many paths can be listed, and PACKAGE_MAX_BYTES bounds
+  # what they add up to.
   static_assets_entries = static_asset_entries(static_assets)
-  if len(static_assets_entries) > STATIC_ASSETS_COUNT_MAX:
-    _fail(
-      "Manifest has too many static_assets "
-      f"(max {STATIC_ASSETS_COUNT_MAX})."
-    )
   for dest, src in static_assets_entries.items():
     validate_repo_relative_path(dest, f"static_assets.{dest}")
     validate_repo_relative_path(src, f"static_assets.{dest}")
@@ -823,8 +820,6 @@ def validate_manifest_contract(manifest) -> None:
   if source_files is not None:
     if not isinstance(source_files, list):
       _fail("Manifest `source_files` must be an array.")
-    # No file-count cap: the manifest byte cap bounds how many paths can be
-    # listed, and fetch enforces the per-file and total source byte caps.
     schedule = manifest.get("schedule")
     declared_job = schedule.get("job") if isinstance(schedule, Mapping) else None
     seen_sources: set[str] = set()

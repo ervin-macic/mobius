@@ -13,11 +13,11 @@ from pathlib import Path, PurePosixPath
 
 from app import app_git, models
 from app.config import get_settings
+from app.manifest_contract import PACKAGE_MAX_BYTES
 from app.storage_io import atomic_write
 
 
 MAX_SOURCE_FILES = 250
-MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_PATH_BYTES = 512
 MAX_JOURNAL_BYTES = 16 * 1024
 MAX_STORE_SCREENSHOTS = 5
@@ -521,7 +521,7 @@ def read_public_store_asset(
     )
   content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
   assert isinstance(content, bytes)
-  if len(content) > MAX_SOURCE_BYTES:
+  if len(content) > PACKAGE_MAX_BYTES:
     raise CommunityPublicationError(
       "The Store listing asset is too large.", "payload_too_large", 413,
     )
@@ -551,9 +551,12 @@ def build_public_snapshot(app: models.App) -> tuple[str, list[dict[str, str]]]:
     content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
     assert isinstance(content, bytes)
     total += len(content)
-    if total > MAX_SOURCE_BYTES:
+    # The same bound install applies, over a superset of what install reads,
+    # so an accepted snapshot is always installable.
+    if total > PACKAGE_MAX_BYTES:
       raise CommunityPublicationError(
-        "The public app snapshot is larger than 64 MiB.",
+        "The public app snapshot is larger than the "
+        f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit.",
         "payload_too_large",
         413,
       )

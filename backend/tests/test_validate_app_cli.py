@@ -354,17 +354,44 @@ def test_validator_rejects_symlinked_manifest(tmp_path):
   assert "manifest must not be a symlink" in result.stderr
 
 
-def test_validator_rejects_oversized_local_icon(tmp_path):
-  _write_app(tmp_path, "export default function App(){ return null }")
-  icon = tmp_path / "icon.png"
-  icon.write_bytes(b"x" * (12 * 1024 * 1024 + 1))
+def _declare(tmp_path: Path, field: str, value) -> None:
   manifest = json.loads((tmp_path / "mobius.json").read_text())
-  manifest["icon"] = "icon.png"
+  manifest[field] = value
   (tmp_path / "mobius.json").write_text(json.dumps(manifest))
+
+
+def test_validator_accepts_a_data_file_larger_than_any_former_per_file_cap(
+  tmp_path,
+):
+  """A bundled dataset is as valid as many small modules."""
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  (tmp_path / "data").mkdir()
+  with open(tmp_path / "data" / "cases.bin", "wb") as data:
+    data.truncate(16 * 1024 * 1024 + 1)
+  _declare(tmp_path, "source_files", ["data/cases.bin"])
+
+  result = _run(tmp_path)
+  assert result.returncode == 0, result.stderr
+
+
+def test_validator_rejects_a_package_over_the_limit_install_and_store_share(
+  tmp_path,
+):
+  from app.manifest_contract import PACKAGE_MAX_BYTES
+
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  half = PACKAGE_MAX_BYTES // 2 + 1
+  for name in ("a.bin", "b.bin"):
+    with open(tmp_path / name, "wb") as data:
+      data.truncate(half)
+  _declare(tmp_path, "source_files", ["a.bin"])
+  _declare(tmp_path, "static_assets", {"b.bin": "b.bin"})
 
   result = _run(tmp_path)
   assert result.returncode == 1
-  assert "local apply rejects the revision" in result.stderr
+  assert f"installs and the Store accept at most {PACKAGE_MAX_BYTES}" in (
+    result.stderr
+  )
 
 
 def test_validator_rejects_missing_declared_local_icon(tmp_path):

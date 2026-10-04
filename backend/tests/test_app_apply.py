@@ -10,7 +10,6 @@ import pytest
 from app import app_apply, app_git, icon_assets, models
 from app.config import get_settings
 from app.database import SessionLocal
-from app.manifest_contract import STATIC_ASSETS_COUNT_MAX
 
 
 def _source(slug: str = "demo") -> Path:
@@ -307,15 +306,16 @@ def test_local_apply_materializes_versioned_static_assets(client, auth):
   assert not served.exists()
 
 
-def test_local_apply_enforces_static_asset_count_before_materialization(
-  client, auth,
-):
+def test_local_apply_has_no_static_asset_count_cap(client, auth):
+  """Static assets were once capped at 256 files. The manifest's byte cap
+  already bounds how many can be listed, and the package byte bound limits
+  their size, so a count is never a reason to refuse an app."""
   source = _source()
   asset_sources = source / "listing-assets"
   asset_sources.mkdir()
   manifest = json.loads((source / "mobius.json").read_text())
   manifest["static_assets"] = {}
-  for index in range(STATIC_ASSETS_COUNT_MAX):
+  for index in range(300):
     name = f"item-{index}.txt"
     (asset_sources / name).write_text(str(index))
     manifest["static_assets"][f"listing/{name}"] = f"listing-assets/{name}"
@@ -324,30 +324,7 @@ def test_local_apply_enforces_static_asset_count_before_materialization(
   accepted = _apply(client, auth, source)
 
   assert accepted.status_code == 200, accepted.text
-  served = source / "static" / "listing"
-  assert len(list(served.iterdir())) == STATIC_ASSETS_COUNT_MAX
-  accepted_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
-
-  extra_name = "item-over-limit.txt"
-  (asset_sources / extra_name).write_text("must not publish")
-  manifest["static_assets"][f"listing/{extra_name}"] = (
-    f"listing-assets/{extra_name}"
-  )
-  (source / "mobius.json").write_text(json.dumps(manifest))
-
-  rejected = _apply(client, auth, source)
-
-  assert rejected.status_code == 422, rejected.text
-  assert rejected.json()["detail"] == {
-    "code": "manifest_invalid",
-    "message": (
-      "Manifest has too many static_assets "
-      f"(max {STATIC_ASSETS_COUNT_MAX})."
-    ),
-  }
-  assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == accepted_head
-  assert len(list(served.iterdir())) == STATIC_ASSETS_COUNT_MAX
-  assert not (served / extra_name).exists()
+  assert len(list((source / "static" / "listing").iterdir())) == 300
 
 
 @pytest.mark.parametrize("symlink_component", ["source", "parent"])

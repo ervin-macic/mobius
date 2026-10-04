@@ -69,17 +69,9 @@ from app.compiler import (
 )
 from app.config import get_settings
 from app.manifest_contract import (
-  ENTRY_MAX_BYTES as _CONTRACT_ENTRY_MAX_BYTES,
-  ICON_MAX_BYTES as _CONTRACT_ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
-  SEED_MAX_BYTES as _CONTRACT_SEED_MAX_BYTES,
-  SEEDS_COUNT_MAX as _CONTRACT_SEEDS_COUNT_MAX,
-  SEEDS_TOTAL_MAX as _CONTRACT_SEEDS_TOTAL_MAX,
+  PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
   SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
-  SOURCE_FILES_TOTAL_MAX as _CONTRACT_SOURCE_FILES_TOTAL_MAX,
-  STATIC_ASSET_MAX_BYTES as _CONTRACT_STATIC_ASSET_MAX_BYTES,
-  STATIC_ASSETS_COUNT_MAX as _CONTRACT_STATIC_ASSETS_COUNT_MAX,
-  STATIC_ASSETS_TOTAL_MAX as _CONTRACT_STATIC_ASSETS_TOTAL_MAX,
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
@@ -138,13 +130,9 @@ def _publish_install_bundle(
 # the safety net against malicious URLs streaming GB of data.
 _MANIFEST_MAX_BYTES = _CONTRACT_MANIFEST_MAX_BYTES
 
-# Entry JSX cap. Real apps run 5-50 KB; 1 MB is enough headroom for
-# anything reasonable while bounding worst-case install cost.
-_ENTRY_MAX_BYTES = _CONTRACT_ENTRY_MAX_BYTES
-
-# Seed file cap (per file). Storage seeds are prompts, default
-# configs, sample images — never huge.
-_SEED_MAX_BYTES = _CONTRACT_SEED_MAX_BYTES
+# Total bytes one install may download for every file the manifest declares.
+# See `manifest_contract.PACKAGE_MAX_BYTES`; `_PackageDownload` enforces it.
+_PACKAGE_MAX_BYTES = _CONTRACT_PACKAGE_MAX_BYTES
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -190,28 +178,13 @@ def _compile_error_detail(app_name: str, exc: CompileError) -> str:
   return f"{app_name} failed to compile: {detail}"
 
 
-# Aggregate caps across ALL seeds in one manifest. The per-file cap alone
-# leaves the total unbounded (a manifest can list many seeds), so a small
-# manifest could still force large memory growth holding them all (Codex
-# review round-10 #6). These bound the count and the summed bytes.
-_SEEDS_COUNT_MAX = _CONTRACT_SEEDS_COUNT_MAX
-_SEEDS_TOTAL_MAX = _CONTRACT_SEEDS_TOTAL_MAX
-
 # Static site assets declared by a manifest. These are for prebuilt apps that
 # need durable files below /data/apps/<slug>/static (served at /app-assets/...),
 # not one-off files dropped into the platform frontend.
-_STATIC_ASSET_MAX_BYTES = _CONTRACT_STATIC_ASSET_MAX_BYTES
-_STATIC_ASSETS_COUNT_MAX = _CONTRACT_STATIC_ASSETS_COUNT_MAX
-_STATIC_ASSETS_TOTAL_MAX = _CONTRACT_STATIC_ASSETS_TOTAL_MAX
 _STATIC_ASSETS_MANIFEST = managed_paths.STATIC_ASSETS_MANIFEST
 _STATIC_ASSETS_BACKUP_ASSET_PREFIX = "assets"
 _STATIC_ASSETS_BACKUP_METADATA_PREFIX = "metadata"
 _PENDING_UPDATE_DIR = "mobius-pending-update"
-
-# Sibling source modules a multi-file mini-app declares alongside `entry`
-# (`cards.js`, `utils.js`, …) so Rolldown can bundle the import graph. The shared
-# manifest contract bounds the list by bytes; fetch caps per-file and summed bytes.
-_SOURCE_FILES_TOTAL_MAX = _CONTRACT_SOURCE_FILES_TOTAL_MAX
 
 # Shared skill files an app declares via manifest `skills`: a root-level
 # `<id>.md` or a `<id>/` folder (SKILL.md + sibling markdown) whose
@@ -260,9 +233,6 @@ def _prune_empty_skill_folder(root: Path, rel: str) -> None:
 # time). Excluding these keeps the source-write loop from rewriting an
 # install-managed artifact a clean merge happened to carry on `main`.
 _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
-
-# Icon cap matches the icon-upload route's 12 MB ceiling.
-_ICON_MAX_BYTES = _CONTRACT_ICON_MAX_BYTES
 
 _HTTP_TIMEOUT = 15.0
 
@@ -866,6 +836,41 @@ async def _http_get(
   # Recurse outside the stream context so the previous connection is
   # already released by the time we open the next one.
   return await _http_get(client, next_url, max_bytes, _hops + 1)
+
+
+class _PackageDownload:
+  """Download one app package's declared files under `_PACKAGE_MAX_BYTES`.
+
+  Each read may use only what the package has left, so the stream stops the
+  moment the running total would cross the bound. A path declared more than
+  once (say, as a source file and a static asset) is fetched and counted once.
+  So an install never downloads more than the published tree it reads from.
+  """
+
+  def __init__(self, client: httpx.AsyncClient, raw_base: str) -> None:
+    self._client = client
+    self._raw_base = raw_base
+    self._files: dict[str, bytes] = {}
+    self._total = 0
+
+  async def read(self, rel: str) -> bytes:
+    if rel in self._files:
+      return self._files[rel]
+    try:
+      data = await _http_get(
+        self._client, self._raw_base + rel, _PACKAGE_MAX_BYTES - self._total,
+      )
+    except HTTPException as exc:
+      if exc.status_code != 413:
+        raise
+      raise HTTPException(
+        413,
+        f"This app is larger than the {_PACKAGE_MAX_BYTES // (1024 * 1024)} "
+        f"MiB app package limit (reached while downloading {rel}).",
+      ) from exc
+    self._total += len(data)
+    self._files[rel] = data
+    return data
 
 
 async def _resolve_source_identity(
@@ -2330,28 +2335,19 @@ async def fetch_upstream_source(
     else:
       _validate_discovery_manifest(manifest)
     raw_base = _normalize_raw_base(_derive_raw_base(manifest_url))
+    package = _PackageDownload(cli, raw_base)
 
-    entry_bytes = await _http_get(
-      cli, raw_base + manifest["entry"], _ENTRY_MAX_BYTES,
-    )
-
-    source_files: dict[str, bytes] = {}
-    source_files_total = 0
-    for rel in manifest.get("source_files") or []:
-      data = await _http_get(cli, raw_base + rel, _ENTRY_MAX_BYTES)
-      source_files_total += len(data)
-      if source_files_total > _SOURCE_FILES_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest source_files exceed {_SOURCE_FILES_TOTAL_MAX} bytes total.",
-        )
-      source_files[rel] = data
+    entry_bytes = await package.read(manifest["entry"])
+    source_files = {
+      rel: await package.read(rel)
+      for rel in manifest.get("source_files") or []
+    }
 
     sched = manifest.get("schedule")
     job_name = sched.get("job") if isinstance(sched, dict) else None
     job_bytes: bytes | None = None
     if job_name:
-      job_bytes = await _http_get(cli, raw_base + job_name, _ENTRY_MAX_BYTES)
+      job_bytes = await package.read(job_name)
 
   return FetchedUpstream(
     manifest=manifest,
@@ -2869,17 +2865,14 @@ async def _fetch_install_candidate(
         },
       )
 
-    entry_bytes = await _http_get(
-      cli, raw_base + manifest["entry"], _ENTRY_MAX_BYTES,
-    )
+    package = _PackageDownload(cli, raw_base)
+    entry_bytes = await package.read(manifest["entry"])
 
     icon_processed: bytes | None = None
     icon_warning: str | None = None
     if manifest.get("icon"):
       try:
-        icon_raw = await _http_get(
-          cli, raw_base + manifest["icon"], _ICON_MAX_BYTES,
-        )
+        icon_raw = await package.read(manifest["icon"])
         icon_processed = icon_assets.normalize_icon(icon_raw)
       except icon_assets.InvalidIcon as exc:
         icon_warning = f"icon: {exc}"
@@ -2892,70 +2885,32 @@ async def _fetch_install_candidate(
     schedule = manifest.get("schedule")
     bundled_job = None
     if schedule and schedule.get("job"):
-      bundled_job = await _http_get(
-        cli, raw_base + schedule["job"], _ENTRY_MAX_BYTES,
-      )
+      bundled_job = await package.read(schedule["job"])
       try:
         validate_schedule_job(manifest, bundled_job)
       except ManifestContractError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    static_assets: dict[str, bytes] = {}
-    static_assets_total = 0
-    for dest, src in static_asset_entries(
-      manifest.get("static_assets") or {},
-    ).items():
-      if len(static_assets) >= _STATIC_ASSETS_COUNT_MAX:
-        raise HTTPException(
-          400,
-          "Manifest has too many static_assets "
-          f"(max {_STATIC_ASSETS_COUNT_MAX}).",
-        )
-      data = await _http_get(
-        cli, raw_base + src, _STATIC_ASSET_MAX_BYTES,
-      )
-      static_assets_total += len(data)
-      if static_assets_total > _STATIC_ASSETS_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          "Manifest static_assets exceed "
-          f"{_STATIC_ASSETS_TOTAL_MAX} bytes total.",
-        )
-      static_assets[dest] = data
+    static_assets = {
+      dest: await package.read(src)
+      for dest, src in static_asset_entries(
+        manifest.get("static_assets") or {},
+      ).items()
+    }
+    source_files = {
+      rel: await package.read(rel)
+      for rel in manifest.get("source_files") or []
+    }
 
-    source_files: dict[str, bytes] = {}
-    source_files_total = 0
-    for rel in manifest.get("source_files") or []:
-      data = await _http_get(cli, raw_base + rel, _ENTRY_MAX_BYTES)
-      source_files_total += len(data)
-      if source_files_total > _SOURCE_FILES_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest source_files exceed {_SOURCE_FILES_TOTAL_MAX} bytes total.",
-        )
-      source_files[rel] = data
-
+    # Inline seeds are part of the manifest, which its own cap already bounds.
     seeds: dict[str, bytes] = {}
-    seeds_total = 0
     for sub, value in (manifest.get("storage_seeds") or {}).items():
-      if len(seeds) >= _SEEDS_COUNT_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest has too many storage_seeds (max {_SEEDS_COUNT_MAX}).",
-        )
       if _seed_value_is_inline(value):
-        data = json.dumps(
+        seeds[sub] = json.dumps(
           value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
       else:
-        data = await _http_get(cli, raw_base + value, _SEED_MAX_BYTES)
-      seeds_total += len(data)
-      if seeds_total > _SEEDS_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest storage_seeds exceed {_SEEDS_TOTAL_MAX} bytes total.",
-        )
-      seeds[sub] = data
+        seeds[sub] = await package.read(value)
 
   candidate_digest = _install_candidate_digest(
     manifest=manifest,

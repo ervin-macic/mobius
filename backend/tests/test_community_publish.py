@@ -252,12 +252,24 @@ def test_snapshot_rejects_tracked_environment_files(tmp_path):
 
 def test_snapshot_enforces_the_host_release_size_limit(tmp_path, monkeypatch):
   repo, app, _ = _app_repo(tmp_path, source="export default 1")
-  monkeypatch.setattr("app.community_publish.MAX_SOURCE_BYTES", 1)
+  monkeypatch.setattr("app.community_publish.PACKAGE_MAX_BYTES", 1)
 
   with pytest.raises(CommunityPublicationError) as raised:
     build_public_snapshot(app)
 
   assert raised.value.code == "payload_too_large"
+
+
+def test_store_publication_and_install_share_one_package_bound():
+  """Publication bounds the whole accepted tree and install reads a subset of
+  it, so the two must use the same number for every accepted app to install."""
+  from app import community_publish, install, manifest_contract
+
+  assert (
+    community_publish.PACKAGE_MAX_BYTES
+    == install._PACKAGE_MAX_BYTES
+    == manifest_contract.PACKAGE_MAX_BYTES
+  )
 
 
 def test_snapshot_rejects_symlink_instead_of_following_it(tmp_path):
