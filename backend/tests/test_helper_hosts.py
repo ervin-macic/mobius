@@ -8,6 +8,7 @@ import pytest
 
 from app import claude_helper_host as claude_host
 from app import helper_hosts
+from app.provider_errors import ProviderErrorKind, classify_provider_error
 
 
 # ----------------------------------------------------------------- identity
@@ -486,7 +487,6 @@ def test_a_usage_limit_inside_a_host_parks_like_the_private_runner(
   and never resumed: in a host the limit arrives only as the helper's own
   API-error message. It must reach the turn's result as a limit."""
   from claude_agent_sdk.types import AssistantMessage, TextBlock
-  from app import chat as chat_mod
 
   limit_text = "You've hit your session limit · resets 12:50am (UTC)"
   host = claude_host.ClaudeHelperHost(
@@ -514,7 +514,9 @@ def test_a_usage_limit_inside_a_host_parks_like_the_private_runner(
   result = turn("task")
 
   assert result["error"] == limit_text
-  assert chat_mod._is_limit_terminal(result)
+  assert classify_provider_error(
+    result["error"], status=result.get("api_error_status"),
+  ) is ProviderErrorKind.USAGE_LIMIT
 
 
 def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
@@ -560,7 +562,7 @@ def test_host_helper_sessions_round_trip():
   assert claude_host.agent_type_for(None) == "mobius-helper"
 
 
-def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch):
+def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch, real_end_orphaned_hosts):
   import subprocess
   gone = subprocess.Popen(["true"])
   gone.wait()
@@ -584,7 +586,7 @@ def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch):
     lambda path: [str(p.pid) for p in procs] if path == "/proc" else real_listdir(path),
   )
   try:
-    assert helper_hosts.end_orphaned_hosts() == 2
+    assert real_end_orphaned_hosts() == 2
     orphan.wait(timeout=2)
     unowned.wait(timeout=2)
     assert owned.poll() is None

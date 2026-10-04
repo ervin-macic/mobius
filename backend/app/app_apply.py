@@ -851,16 +851,6 @@ async def apply_source_revision(
         install._assert_service_transition_safe(
           app, service_id=service_id, aliases=service_aliases,
         )
-        if store_managed and accept_local_package:
-          _apply_explicit_package_runtime(
-            db, app, manifest, package_icon=package_icon,
-          )
-        else:
-          _apply_local_manifest_runtime(
-            db, app, manifest, package_icon=package_icon,
-          )
-      if chat_id is not None:
-        app.chat_id = chat_id
 
       committed = await _git_operation(
         "commit",
@@ -935,15 +925,27 @@ async def apply_source_revision(
           f"Could not build the app's Python environment. {exc}",
           status_code=422,
         ) from exc
+      # Begin the SQLite write transaction only now, after the last await.
+      # Holding it across the build, Git commit or environment preparation
+      # let a writer that waits on SQLite inside the event loop (any async
+      # route committing) stall this apply until its busy timeout expired,
+      # failing that unrelated request. Everything slow or failure-prone above
+      # is independent of the durable row, and nothing below awaits before
+      # the commit or rollback that ends the transaction.
       if created:
-        # A new App has no numeric id until SQLite inserts it. Compiling after
-        # that insert used to hold the database write lock for the entire
-        # build, so an unrelated chat creation could exhaust SQLite's busy
-        # timeout. Everything slow or failure-prone above this point is
-        # independent of the durable identity; begin the write transaction
-        # only when the accepted Git tree and compiled bytes are ready.
         db.add(app)
         db.flush()
+      if manifest is not None:
+        if store_managed and accept_local_package:
+          _apply_explicit_package_runtime(
+            db, app, manifest, package_icon=package_icon,
+          )
+        else:
+          _apply_local_manifest_runtime(
+            db, app, manifest, package_icon=package_icon,
+          )
+      if chat_id is not None:
+        app.chat_id = chat_id
       if python_env is not None:
         published_env = app_python_env.publish_env(
           get_settings().data_dir, app.id, python_env,

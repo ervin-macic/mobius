@@ -1,12 +1,13 @@
 import { test, expect } from '@playwright/test'
 import { attachCleanup, createTaggedChat } from './_chatTracker.mjs'
-import { mockAcceptedMessages } from './_mockAcceptedMessages.mjs'
+import { mockAcceptedMessages, releaseMockRoutesAfterEach } from './_mockAcceptedMessages.mjs'
 import { waitForComposerSendable } from './_chatSession.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
 
 test.use({ serviceWorkers: 'block' })
 attachCleanup()
+releaseMockRoutesAfterEach()
 
 test('an uploaded attachment survives a chat switch and remains sendable', async ({ page }) => {
   await page.setViewportSize({ width: 412, height: 915 })

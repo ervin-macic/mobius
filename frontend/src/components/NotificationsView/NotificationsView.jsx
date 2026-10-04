@@ -5,7 +5,6 @@ import { notificationQueries } from '../../hooks/queries.js'
 import { formatDateTime } from '../../lib/dateTimeFormat.js'
 import {
   completeNotificationRecovery,
-  hasRecoveryReceipt,
   notificationRecoveryAction,
   recoveryFailure,
   recoveryUnavailableLabel,
@@ -255,7 +254,6 @@ export default function NotificationsView({
           {rows.map((n) => {
             const nav = parseNotificationTarget(n.target)
             const recovery = notificationRecoveryAction(n)
-            const protectsDismissal = hasRecoveryReceipt(n)
             const recoveryStatus = recoveryState[n.id]
             const unavailableLabel = recovery && (
               recoveryStatus === 'done' ? 'Restored' : (
@@ -362,18 +360,16 @@ export default function NotificationsView({
                   ) : (
                     <div className={`notifications__row${n.variant === 'error' ? ' notifications__row--error' : ''}`}>{body}</div>
                   )}
-                  {!protectsDismissal && (
-                    <button
-                      type="button"
-                      className="notifications__dismiss"
-                      aria-label={`Dismiss ${n.title}`}
-                      title="Dismiss notification"
-                      disabled={!onDismiss || dismissState[n.id] === 'working'}
-                      onClick={() => handleDismiss(n.id)}
-                    >
-                      <X width={16} height={16} aria-hidden="true" />
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    className="notifications__dismiss"
+                    aria-label={`Dismiss ${n.title}`}
+                    title="Dismiss notification"
+                    disabled={!onDismiss || dismissState[n.id] === 'working'}
+                    onClick={() => handleDismiss(n.id)}
+                  >
+                    <X width={16} height={16} aria-hidden="true" />
+                  </button>
                 </div>
                 {dismissState[n.id] === 'error' && (
                   <p className="notifications__dismiss-error" role="alert">

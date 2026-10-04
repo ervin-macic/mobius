@@ -1,6 +1,16 @@
 /** Shared layout-geometry helpers for browser specs. */
+import { expect } from '@playwright/test'
 
-/** Measure an element only once its geometry has stopped moving.
+/** Measure an element only once its geometry has stopped moving and nothing
+ *  covers it.
+ *
+ *  The launch cover (#splash in index.html) spans the whole viewport until the
+ *  shell's first chat frame paints and the owned fonts settle; App's
+ *  removeSplash then drops its pointer events and removes it. The shell lays
+ *  out underneath, so a box can be settled and correct while a raw
+ *  page.mouse / touch press at it still lands on the cover and starts nothing.
+ *  Locator actions wait for that themselves (Playwright's hit-target check);
+ *  the raw gestures these boxes feed do not, so wait for the cover here.
  *
  *  Tab strips reflow after the panes are up: a tab is laid out at an empty
  *  ~36px width and grows to its full ~120px once the chat title resolves,
@@ -14,6 +24,7 @@
  *  cap keeps a genuinely animating element from hanging the case; it returns
  *  the last reading so the caller still fails on its own assertion. */
 export async function settledBox(locator, { frames = 3, maxFrames = 180 } = {}) {
+  await expect(locator.page().locator('#splash')).toHaveCount(0, { timeout: 8000 })
   await locator.scrollIntoViewIfNeeded()
   const box = await locator.evaluate((element, settings) => (
     new Promise((resolve) => {

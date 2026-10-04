@@ -2255,3 +2255,92 @@ def test_wait_resume_existence_gate_does_not_load_chat_payloads(
   assert starts == []
   db.expire_all()
   assert db.get(models.ChatWait, wait_id).status == ("cancelled" if deleted else "met")
+
+
+@pytest.mark.parametrize('state,total,completed,expected', [
+  ('pending', 4, 3, 'armed'), ('pending', 0, 0, 'armed'), ('met', 4, 4, 'met'), ('failed', 0, 0, 'failed'),
+])
+def test_typed_check_observations_keep_progress_separate_from_monitor_failure(
+  client, owner_token, db, monkeypatch, state, total, completed, expected,
+):
+  import json
+  chat_id = _owner_chat(client, owner_token)
+  row = declare_wait(db, chat_id=chat_id, description='Checks finish', kind='github_checks',
+    github_checks={'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40},
+    deadline_secs=600)
+  payload = {'state': state, 'summary': 'Observed check progress', 'completed': completed, 'total': total}
+  async def check(command, **kwargs):
+    assert 'pr-checks.py' in command and '--json' in command
+    return 0, json.dumps(payload)
+  monkeypatch.setattr(chat_waits_mod, '_run_check', check)
+  asyncio.run(chat_waits_mod._check_one(row.id))
+  db.expire_all()
+  row = db.get(models.ChatWait, row.id)
+  assert row.status == expected
+  assert 'Observed check progress' in chat_waits_mod._compose_resume_notice(row, 'met')
+
+
+def test_armed_github_wait_builds_checker_command_at_check_time(
+  client, owner_token, db, monkeypatch, tmp_path,
+):
+  from pathlib import Path
+  import sys
+  chat_id = _owner_chat(client, owner_token)
+  row = declare_wait(db, chat_id=chat_id, description='Checks finish', kind='github_checks',
+    github_checks={'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40},
+    deadline_secs=600)
+  assert row.command is None
+  assert row.condition_json == {'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40}
+  # An image update replaces the interpreter after the wait was armed.
+  argv_log = tmp_path / 'argv.json'
+  python = tmp_path / 'python3.99'
+  python.write_text(
+    '#!/bin/bash\n'
+    f'printf "%s\\n" "$@" > {argv_log}\n'
+    'echo \'{"state":"met","summary":"All 2 checks finished.","completed":2,"total":2}\'\n'
+  )
+  python.chmod(0o755)
+  monkeypatch.setattr(sys, 'executable', str(python))
+  asyncio.run(chat_waits_mod._check_one(row.id))
+  db.expire_all()
+  row = db.get(models.ChatWait, row.id)
+  assert row.status == 'met', row.last_output
+  argv = argv_log.read_text().split()
+  assert argv[0].endswith('/scripts/pr-checks.py') and Path(argv[0]).is_file()
+  assert argv[1:] == ['--json', 'owner/repo', '7', 'a' * 40]
+  notice = chat_waits_mod._compose_resume_notice(row, 'met')
+  assert '"github_checks":{"repository":"owner/repo","pull_request":7,' in notice
+
+
+@pytest.mark.parametrize('exit_code,output', [(0, 'not json'), (0, '{"state":"pending","summary":"waiting","completed":4,"total":4}'), (0, '{"state":"met","summary":"ready","completed":1,"total":4}'), (-1, 'timeout')])
+def test_broken_typed_observation_never_becomes_success_or_endless_pending(client, owner_token, db, monkeypatch, exit_code, output):
+  chat_id = _owner_chat(client, owner_token)
+  row = declare_wait(db, chat_id=chat_id, description='Checks finish', kind='github_checks',
+    github_checks={'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40}, deadline_secs=600)
+  async def check(*args, **kwargs):
+    return exit_code, output
+  monkeypatch.setattr(chat_waits_mod, '_run_check', check)
+  asyncio.run(chat_waits_mod._check_one(row.id))
+  db.expire_all()
+  row = db.get(models.ChatWait, row.id)
+  assert row.status == 'failed'
+  if exit_code:
+    assert 'timeout' in row.last_output
+
+
+def test_wait_route_accepts_typed_check_but_rejects_mixed_execution(client, owner_token, db):
+  chat_id = _owner_chat(client, owner_token)
+  run_id = _seed_declaring_run(db, chat_id)
+  db.get(models.ChatRun, run_id).status = "running"
+  db.commit()
+  auth = _agent_run_auth(db, chat_id, run_id)
+  payload = {'description': 'Checks finish', 'kind': 'github_checks',
+    'github_checks': {'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40},
+    'deadline_secs': 600}
+  response = client.post('/api/chat-waits', json=payload, headers=auth)
+  assert response.status_code == 200, response.text
+  assert response.json()['kind'] == 'github_checks'
+  assert response.json()['condition_owner'] == 'GitHub'
+  for extra in ({'command': 'true'}, {'delay_secs': 60}, {'deadline_secs': None},
+                {'github_checks': {'repository': 'owner/repo', 'pull_request': 7}}):
+    assert client.post('/api/chat-waits', json={**payload, **extra}, headers=auth).status_code == 422

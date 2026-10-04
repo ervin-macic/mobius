@@ -1,13 +1,24 @@
 import { isDistinctiveActivityTool } from './toolActivityLabel.js'
 
-// One boundary rule for transcript-level agent activity. Helper completions are
-// incoming agent activity just like peer messages are outgoing agent activity;
-// neither should split thinking/tools into repeated top-level disclosures.
+/** The one display rule for agent work. Everything the agent does or receives
+ * while working (tools, including peer messages; thinking; compact activity;
+ * helper results) belongs to the activity stretch, within a message and across
+ * hidden interruptions of one reply. Everything else keeps its own decided
+ * visual block and is a boundary: prose, owner-input cards (questions, secure
+ * input), errors and recovery, generated files, and the message-level Goal,
+ * Wait, and continuation-cause cards. */
+export function isAgentWorkBlock(item) {
+  return item?.type === 'tool'
+    || item?.type === 'thinking'
+    || item?.type === 'activity'
+    || item?.type === 'helper_result'
+}
+
+// Within one stretch, compact activity is merged separately and distinctive
+// tools keep their own line; the rest folds into one disclosure.
 export function isActivityRunEntry(entry) {
   const item = entry?.item
-  return item?.type === 'thinking'
-    || item?.type === 'helper_result'
-    || (item?.type === 'tool' && !isDistinctiveActivityTool(item))
+  return isAgentWorkBlock(item) && item.type !== 'activity' && !isDistinctiveActivityTool(item)
 }
 
 const MAX_OPERATION_RESOURCES = 128

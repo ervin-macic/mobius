@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -33,7 +34,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +49,7 @@ from app import (
   activity,
   app_git,
   app_python_env,
+  applied_app_runtime,
   data_git,
   drawer_pins,
   fs_locks,
@@ -2784,11 +2785,13 @@ class InstallJournal:
     self.created_paths.clear()
 
   def rollback_materialization(self) -> None:
-    """Undo pre-commit filesystem work; never undo a durable install."""
+    """Undo pre-commit filesystem work once; never undo a durable install."""
     if self.durable:
       return
     _run_rollback_actions(self.rollback_actions)
     _cleanup(self.created_paths)
+    self.rollback_actions.clear()
+    self.created_paths.clear()
 
   def cleanup_superseded(self) -> None:
     """Remove backups/artifacts made obsolete by a successful commit."""
@@ -3681,74 +3684,85 @@ class ActivationPlan:
   capability_contract: dict
   package_id: str | None
   source_identity: str | None
-  # Built from the fetched package before the row's write transaction.
-  python_env: app_python_env.StagedEnv | None = None
+  # Set on the second pass of an install whose manifest declares a Python lock.
+  python_check: CheckedPythonTree | None = None
 
 
-async def _stage_install_python_env(
-  data_dir: Path,
-  manifest: dict,
-  package_tree: dict[str, bytes],
-  app_id: int | None,
-  journal: InstallJournal,
-) -> app_python_env.StagedEnv | None:
-  """Build the package's declared Python env before any row is written.
+@dataclass(frozen=True)
+class CheckedPythonTree:
+  """A reconciled source tree whose Python entries passed outside the locks."""
 
-  A build takes minutes at worst, so it must not run inside the install's
-  SQLite write transaction. The reconciled tree exists only inside that
-  transaction, so this builds from the fetched package (its lock and service)
-  and ``_publish_install_python_env`` requires the reconciled lock to match.
+  # The source-dir tree both passes snapshot at the same point, before compile
+  # and commit; with the same candidate's assets and manifest it fixes every
+  # served byte.
+  tree_oid: str
+  env: app_python_env.StagedEnv
+
+
+class _UncheckedPythonTree(Exception):
+  """The first pass's reconciled tree, handed out once its locks are released.
+
+  Building and smoke-running an env takes minutes at worst, so it must not run
+  inside the install's SQLite write transaction or source-dir lock. The first
+  pass therefore stops before anything durable: the install rolls its source
+  writes back under the source-dir lock, checks this tree, and reconciles again.
   """
-  if python_lock(manifest) is None:
-    return None
 
-  def build():
-    with tempfile.TemporaryDirectory(prefix="mobius-install-env-") as tmp:
-      root = Path(tmp)
-      for relative, content in package_tree.items():
-        (root / relative).parent.mkdir(parents=True, exist_ok=True)
-        (root / relative).write_bytes(content)
-      (root / "mobius.json").write_text(json.dumps(manifest, sort_keys=True))
-      return app_python_env.prepare_env(data_dir, app_id, root)
+  def __init__(
+    self,
+    tree_oid: str,
+    runtime: applied_app_runtime.PreparedRuntime,
+    app_id: int | None,
+  ) -> None:
+    super().__init__("reconciled Python tree needs checking")
+    self.tree_oid = tree_oid
+    self.runtime = runtime
+    self.app_id = app_id
 
+
+async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPythonTree:
+  """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
+  data_dir = Path(get_settings().data_dir)
   try:
-    staged = await asyncio.to_thread(build)
+    env = await asyncio.to_thread(
+      app_python_env.prepare_env, data_dir, pending.app_id, pending.runtime.root,
+    )
   except app_python_env.PythonEnvBuildError as exc:
     raise HTTPException(422, detail={
       "code": "python_env_failed",
       "message": f"Could not build the app's Python environment. {exc}",
     }) from exc
-  journal.rollback_actions.append(lambda: app_python_env.discard_env(staged))
-  return staged
+  except Exception as exc:
+    log.exception("install: unexpected failure while checking the Python environment")
+    raise HTTPException(
+      500, "Install failed due to an unexpected server error.",
+    ) from exc
+  finally:
+    shutil.rmtree(pending.runtime.root, ignore_errors=True)
+  return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
-def _publish_install_python_env(
-  app: models.App,
-  staged: app_python_env.StagedEnv | None,
-  runtime_root: Path,
-  journal: InstallJournal,
-  data_dir: Path,
+def _require_package_python_lock(
+  manifest: dict, package_tree: dict[str, bytes], runtime_root: Path,
 ) -> None:
-  """Link the staged env for the reconciled tree, before its pointer is published."""
+  """Refuse a reconciled tree whose Python lock is not the reviewed package's."""
   try:
     key = app_python_env.declared_key(runtime_root)
   except app_python_env.PythonEnvUnavailable as exc:
     raise HTTPException(422, detail={
       "code": "python_env_failed", "message": str(exc),
     }) from exc
-  if key != (staged.key if staged is not None else None):
+  package_lock = package_tree.get(python_lock(manifest))
+  if package_lock is None or key != app_python_env.env_key(package_lock):
     # Only a local edit to the lock merged into the update can differ here.
     raise HTTPException(409, detail={
       "code": "python_lock_diverged",
       "message": (
-        "This app's local source changes its Python lock, so the environment "
-        "built for the update does not match it. The update was not "
-        "installed; reconcile the lock in the app source, Apply it, and retry."
+        "This app's local source changes its Python lock, so it no longer "
+        "matches the update's. The update was not installed; reconcile the "
+        "lock in the app source, Apply it, and retry."
       ),
     })
-  if staged is not None:
-    published = app_python_env.publish_env(data_dir, app.id, staged)
-    journal.rollback_actions.append(lambda: app_python_env.unpublish_env(published))
 
 
 def _apply_manifest_metadata(
@@ -3837,6 +3851,10 @@ async def _activate_install_source(
   the caller commits the row. Every filesystem mutation is registered with the
   journal before this function returns, so the outer transaction retains one
   rollback boundary.
+
+  A tree that declares a Python lock is published only on a second pass: the
+  first pass writes the reconciled source, freezes its exact runtime tree, and
+  raises ``_UncheckedPythonTree`` so the install can roll back and check it.
   """
   entry_source = plan.source_tree[plan.entry_key].decode("utf-8")
   _apply_manifest_metadata(
@@ -3855,6 +3873,7 @@ async def _activate_install_source(
 
   _reject_if_source_dir_taken(db, str(source_dir), exclude_id=app.id)
   source_dir.mkdir(parents=True, exist_ok=True)
+  python_declared = python_lock(manifest) is not None
   jsx_file = source_dir / "index.jsx"
   if not plan.cloned_install:
     for rel, content in plan.source_tree.items():
@@ -3904,6 +3923,36 @@ async def _activate_install_source(
     journal.rollback_actions,
     journal.commit_actions,
   )
+  # The source dir now holds exactly what the commit below records.
+  runtime_manifest = json.dumps(manifest, sort_keys=True).encode()
+  if python_declared:
+    # Both passes snapshot here, before anything is compiled or committed, so
+    # a stale second pass is refused while it has nothing durable to undo.
+    snapshot = await asyncio.to_thread(app_git.snapshot_worktree, source_dir)
+    if plan.python_check is None:
+      runtime = await asyncio.to_thread(
+        applied_app_runtime.prepare_runtime, source_dir, snapshot.tree_oid,
+        static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
+      )
+      try:
+        _require_package_python_lock(
+          manifest, plan.published_source_tree, runtime.root,
+        )
+      except BaseException:
+        shutil.rmtree(runtime.root)
+        raise
+      raise _UncheckedPythonTree(
+        snapshot.tree_oid, runtime, app.id if plan.updating else None,
+      )
+    if snapshot.tree_oid != plan.python_check.tree_oid:
+      raise HTTPException(409, detail={
+        "code": "python_check_stale",
+        "message": (
+          "The app's source changed while its Python code was being checked. "
+          "The update was not installed; try again."
+        ),
+      })
+
   await compile_jsx(
     entry_source,
     out_path=staged_bundle,
@@ -3931,19 +3980,21 @@ async def _activate_install_source(
   app.source_commit = await asyncio.to_thread(
     app_git.head_sha, source_dir, app_git.LOCAL_BRANCH,
   )
-  from app import applied_app_runtime
   runtime_staged = await asyncio.to_thread(
     applied_app_runtime.prepare_runtime, source_dir, app.source_commit,
-    static_assets=plan.static_assets,
-    runtime_manifest=json.dumps(manifest, sort_keys=True).encode(),
+    static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
   )
-  try:
-    _publish_install_python_env(
-      app, plan.python_env, runtime_staged.root, journal, data_dir,
+  if plan.python_check is not None:
+    try:
+      published_env = app_python_env.publish_env(
+        data_dir, app.id, plan.python_check.env,
+      )
+    except BaseException:
+      shutil.rmtree(runtime_staged.root)
+      raise
+    journal.rollback_actions.append(
+      lambda: app_python_env.unpublish_env(published_env)
     )
-  except BaseException:
-    shutil.rmtree(runtime_staged.root)
-    raise
   applied_app_runtime.publish_runtime(app, runtime_staged)
   return equivalence_target
 
@@ -4001,6 +4052,9 @@ async def install_from_manifest(
       still hidden, then revives it in one short drawer-serialized commit. If
       revival fails, the durable prepared source remains hidden and a retry can
       recover it without exposing a half-installed pinned item.
+    - A declared Python lock is checked against the exact reconciled tree
+      between two passes, outside the transaction. A failed check (422) or a
+      tree that changed meanwhile (409) leaves the previous revision live.
     - FastAPI surfaces each HTTPException with its proper status code;
       we never catch + swallow anything that would land the DB or
       filesystem in a half state.
@@ -4139,6 +4193,58 @@ async def install_from_manifest(
       expected_upstream_commit=expected_upstream_commit,
       expected_candidate_digest=expected_candidate_digest,
     )
+
+  # Phase 2: immutable identity/update decision. No writes occur here.
+  target = _select_install_target(
+    db,
+    candidate=candidate,
+    manifest_url=manifest_url,
+    source=source,
+    expected_app_id=reviewed_app_id or expected_app_id,
+    publication_handoff_app_id=publication_handoff_app_id,
+  )
+  await _authorize_source_handoff(target, candidate)
+
+  # Phases 3 and 4. A declared Python lock takes two passes: the first stops
+  # with the exact reconciled runtime tree and rolls back, that tree's env is
+  # built and smoke-run holding no lock, and the second publishes only if it
+  # reconciles the same source tree.
+  install_candidate = functools.partial(
+    _install_candidate,
+    db,
+    candidate=candidate,
+    target=target,
+    manifest_url=manifest_url,
+    source=source,
+    reviewed_upstream_commit=reviewed_upstream_commit,
+    expected_upstream_commit=expected_upstream_commit,
+    publication_handoff_app_id=publication_handoff_app_id,
+  )
+  try:
+    return await install_candidate(python_check=None)
+  except _UncheckedPythonTree as unchecked:
+    pending = unchecked
+  python_check = await _check_reconciled_python(pending)
+  return await install_candidate(python_check=python_check)
+
+
+async def _install_candidate(
+  db: Session,
+  *,
+  candidate: InstallCandidate,
+  target: InstallTarget,
+  manifest_url: str | None,
+  source: str,
+  reviewed_upstream_commit: str | None,
+  expected_upstream_commit: str | None,
+  publication_handoff_app_id: int | None,
+  python_check: CheckedPythonTree | None,
+) -> InstallResult:
+  """Reconcile and activate one selected candidate in one transaction.
+
+  ``python_check`` is the second pass's checked tree. It owns that env until
+  publication links it, discarding it on rollback or conflict.
+  """
   manifest = candidate.manifest
   raw_base = candidate.raw_base
   entry_bytes = candidate.entry_bytes
@@ -4152,17 +4258,7 @@ async def install_from_manifest(
   fetched_capability_digest = candidate.capability_digest
   candidate_digest = candidate.candidate_digest
   sched = manifest.get("schedule")
-
-  # Phase 2: immutable identity/update decision. No writes occur here.
-  target = _select_install_target(
-    db,
-    candidate=candidate,
-    manifest_url=manifest_url,
-    source=source,
-    expected_app_id=reviewed_app_id or expected_app_id,
-    publication_handoff_app_id=publication_handoff_app_id,
-  )
-  await _authorize_source_handoff(target, candidate)
+  python_env = python_check.env if python_check is not None else None
   existing = target.existing
   revive_after_commit = bool(existing and existing.deleted_at is not None)
   mode = target.mode
@@ -4259,11 +4355,10 @@ async def install_from_manifest(
   journal = InstallJournal()
   data_dir = Path(get_settings().data_dir)
 
+  if python_env is not None:
+    journal.rollback_actions.append(lambda: app_python_env.discard_env(python_env))
+
   try:
-    python_env = await _stage_install_python_env(
-      data_dir, manifest, published_source_tree,
-      existing.id if existing is not None else None, journal,
-    )
     app = await _prepare_app_row(
       db,
       candidate=candidate,
@@ -4334,6 +4429,12 @@ async def install_from_manifest(
             "install: restored %s upstream ref to DB-recorded commit %s",
             git_source_dir, prev_upstream_commit,
           )
+        # A rolled-back pass, including the first pass of a Python check,
+        # leaves `upstream` where it found it for the next reconciliation.
+        journal.rollback_actions.append(
+          lambda d=git_source_dir, c=prev_upstream_commit:
+            app_git.restore_upstream_ref(d, c)
+        )
         previous_upstream_paths = await asyncio.to_thread(
           _read_upstream_source_paths, git_source_dir, prev_upstream_commit,
         )
@@ -4824,7 +4925,7 @@ async def install_from_manifest(
             capability_contract=capability_contract,
             package_id=target.package_id,
             source_identity=target.source_identity,
-            python_env=python_env,
+            python_check=python_check,
           ),
           journal=journal,
           data_dir=data_dir,
@@ -4832,6 +4933,14 @@ async def install_from_manifest(
       else:
         # A conflict activates nothing, so its build is never linked.
         journal.commit_actions.append(lambda: app_python_env.discard_env(python_env))
+    except Exception:
+      # Undo this pass's source writes and upstream ref while the lock still
+      # excludes other writers, so a commit cannot land in between and then be
+      # overwritten. This includes the first pass of a Python check. The outer
+      # handlers still shape the response; their rollback then has nothing left.
+      db.rollback()
+      journal.rollback_materialization()
+      raise
     finally:
       # Release the per-source-dir lock (held across the merge + write for the
       # git path) BEFORE the seeds block takes app_storage_lock, preserving the
@@ -4951,7 +5060,7 @@ async def install_from_manifest(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
-  except HTTPException:
+  except (HTTPException, _UncheckedPythonTree):
     db.rollback()
     journal.rollback_materialization()
     raise
@@ -5022,5 +5131,5 @@ def _run_rollback_actions(actions: list[Callable[[], None]]) -> None:
   for action in reversed(actions):
     try:
       action()
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
       log.warning("install rollback: %s", exc)

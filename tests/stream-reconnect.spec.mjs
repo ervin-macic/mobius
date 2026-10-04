@@ -1100,9 +1100,20 @@ test.describe('Stream reconnection', () => {
         output: 'source-rich output that is still only an older prefix',
       },
     ]
+    // The server projects who moves next only through the exact Goal's
+    // handoff: its saved card makes this Goal wait on the owner.
+    const goal = {
+      id: 'goal-frozen-1',
+      revision: 0,
+      objective: GOAL,
+      status: 'active',
+      resumable: false,
+      handoff: { kind: 'owner_input', reason: 'saved_card' },
+    }
     const runtimeState = {
       ...runtimeSnapshot({ running: true, pending_question_id: QUESTION_ID }),
       active_goal_objective: GOAL,
+      goal,
       updated_at: updatedAt,
     }
     const detail = {
@@ -1186,6 +1197,7 @@ test.describe('Stream reconnection', () => {
       // Answering unfreezes the turn: clear the parked question (the stream
       // attaches only without one) and advance the revision so it is adopted.
       runtimeState.pending_question_id = null
+      runtimeState.goal = { ...goal, handoff: { kind: 'working', reason: null } }
       runtimeState.runtime_revision += 1
       route.fulfill({
         status: 202,
@@ -1218,7 +1230,7 @@ test.describe('Stream reconnection', () => {
       .toContainText('A couple of choices:')
     const goalRail = page.getByRole('group', { name: 'Goal progress' })
     // An open card makes the goal wait on the owner.
-    await expect(goalRail).toContainText(`Goal · Needs your answer · ${GOAL}`)
+    await expect(goalRail).toContainText(`Goal · Waiting for you · ${GOAL}`)
 
     // A preserved draft remains editable, but the question barrier owns the
     // action slot: offer Stop rather than a Send that can only receive 409.
@@ -1241,10 +1253,12 @@ test.describe('Stream reconnection', () => {
     // The answer stays inside this same durable goal run. Even after this
     // browser exhausts its reconnects, connection loss must not retire
     // the goal while the authoritative runtime still reports `running:true`.
-    await expect(goalRail).toContainText(`Goal · ${GOAL}`)
+    await expect(goalRail).toContainText(GOAL)
     // Reconnecting is silent in the chat (the shell badge owns it); wait until
     // the stream's retries have run out: the first attach plus three retries.
     await expect.poll(() => streamRequestCount, { timeout: 25000 }).toBeGreaterThanOrEqual(4)
+    // By then the active-turn runtime poll has adopted the answered revision:
+    // the Goal is back with the agent, so it no longer waits on the owner.
     await expect(goalRail).toContainText(`Goal · ${GOAL}`)
 
     // Answering MUST POST the answer payload (the turn unfreezes).

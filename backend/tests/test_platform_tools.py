@@ -457,11 +457,15 @@ def test_control_protocol_advertises_every_run_bound_tool(monkeypatch):
     "delay_secs",
     "interval_secs",
     "deadline_secs",
+    "github_checks",
   }
   assert "question card" in (
     wait_schema["properties"]["condition_owner"]["description"]
   )
   assert wait_schema["additionalProperties"] is False
+  assert wait_schema["properties"]["github_checks"]["required"] == [
+    "repository", "pull_request", "head_sha",
+  ]
   # Expose the owning route's existing limits before an agent spends a call
   # discovering them in a 422 (condition_owner was previously unbounded here).
   for name, length in (("description", 500), ("condition_owner", 160), ("command", 4000)):
@@ -722,6 +726,7 @@ def test_control_protocol_declares_wait_through_the_canonical_client(monkeypatch
     "description": "CI becomes green",
     "condition_owner": "GitHub checks",
     "kind": "command",
+    "github_checks": None,
     "command": "gh pr checks 123 --watch=false >/dev/null",
     "delay_secs": None,
     "interval_secs": 120,
@@ -863,6 +868,27 @@ def test_coordination_tools_validate_discovery_and_send(monkeypatch):
   })
   assert invalid_broadcast["isError"] is True
   assert "cannot interrupt" in invalid_broadcast["content"][0]["text"]
+
+
+def test_send_agent_message_reports_wrong_keys_and_target_shape_without_echoing_values():
+  control = _control_module()
+  with pytest.raises(ValueError) as wrong:
+    control._call_send_agent_message({"helper": "secret-helper", "message": "secret-body"})
+  assert "invalid keys: helper, message" in str(wrong.value)
+  assert "recipients (agent/chat ids), body" in str(wrong.value)
+  assert "message_agent(helper, message)" in str(wrong.value)
+  assert "secret-helper" not in str(wrong.value)
+  assert "secret-body" not in str(wrong.value)
+
+  with pytest.raises(ValueError) as target:
+    control._call_send_agent_message({"recipients": "secret-peer", "body": "note"})
+  assert "list of at most 24 agent/chat ids" in str(target.value)
+  assert "secret-peer" not in str(target.value)
+
+  send = control._TOOL_DEFINITIONS["send_agent_message"]
+  followup = control._TOOL_DEFINITIONS["message_agent"]
+  assert "finished helper's follow-up" in send["description"]
+  assert "live helper" in followup["description"]
 
 
 def test_mcp_send_passes_through_backend_compact_receipt(monkeypatch):

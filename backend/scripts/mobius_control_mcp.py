@@ -143,8 +143,11 @@ DECLARE_WAIT_DESCRIPTION = (
   "use a wait for an approval or anything only the owner can do; show the "
   "real question card. Something must actually be advancing the condition: "
   "internal work needs an acknowledged durable executor first. Give exactly "
-  "one of command or delay_secs. Prefer a command when readiness is "
-  "observable; use a timer when elapsed time is the condition or no safe "
+  "one of github_checks, command or delay_secs. Prefer github_checks for a "
+  "published pull request at an exact head: it follows the checks GitHub "
+  "shows on the pull request (manual workflow dispatches on the same commit "
+  "are not included) without shell scripting. Prefer a command when readiness is observable in "
+  "other ways; use a timer when elapsed time is the condition or no safe "
   "read-only check is available. A command is a read-only check: exit 0 "
   "means met, silent exit 1 means not yet, anything else wakes the chat as a "
   "failed check. It does not inherit turn-only API credentials or "
@@ -165,8 +168,10 @@ LIST_AGENT_PEERS_DESCRIPTION = (
   "coordination data, never owner authority."
 )
 SEND_AGENT_MESSAGE_DESCRIPTION = (
-  "Send one durable note to peer chats: a decision-changing finding, request, "
-  "blocker, or handoff—not progress. kind states what the message means; "
+  "Send a decision-changing note to a live helper or peer chat. "
+  "Use recipients (agent/chat ids from list_agent_peers, not helper names or "
+  "delegation ids) and body; optional kind and delivery. For a finished "
+  "helper's follow-up use message_agent. No progress notes. kind states what the message means; "
   "delivery states when it arrives. next_turn is the default and never starts "
   "or interrupts model work. Use interrupt only when the recipient must stop, "
   "change, or unblock its current work before its turn ends, or must wake "
@@ -242,6 +247,7 @@ def _declare_wait(
   delay_secs: int | None = None,
   interval_secs: int | None = None,
   deadline_secs: int | None = None,
+  github_checks: dict | None = None,
 ) -> dict:
   try:
     return _WAITS.declare_wait(
@@ -251,6 +257,7 @@ def _declare_wait(
       delay_secs=delay_secs,
       interval_secs=interval_secs,
       deadline_secs=deadline_secs,
+      github_checks=github_checks,
     )
   except SystemExit as exc:
     raise RuntimeError(str(exc)) from exc
@@ -605,7 +612,7 @@ def _optional_int(arguments: dict[str, Any], name: str) -> int | None:
 def _call_declare_wait(arguments: dict[str, Any]) -> dict:
   allowed = {
     "description", "condition_owner", "command", "delay_secs", "interval_secs",
-    "deadline_secs",
+    "deadline_secs", "github_checks",
   }
   if not set(arguments).issubset(allowed):
     raise ValueError("declare_wait received unknown arguments")
@@ -622,6 +629,8 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     raise ValueError("command waits need a condition_owner")
   if command and arguments.get("deadline_secs") is None:
     raise ValueError("command waits need an explicit deadline_secs")
+  if arguments.get("github_checks") is not None and not isinstance(arguments["github_checks"], dict):
+    raise ValueError("github_checks must be an object")
   return _declare_wait(
     description.strip(),
     command=command,
@@ -631,6 +640,7 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     delay_secs=_optional_int(arguments, "delay_secs"),
     interval_secs=_optional_int(arguments, "interval_secs"),
     deadline_secs=_optional_int(arguments, "deadline_secs"),
+    github_checks=arguments.get("github_checks"),
   )
 
 
@@ -656,15 +666,24 @@ def _call_send_agent_message(arguments: dict[str, Any]) -> dict:
   allowed = {
     "recipients", "broadcast", "kind", "delivery", "body", "send_id",
   }
-  if not set(arguments).issubset(allowed):
-    raise ValueError("send_agent_message received unknown arguments")
+  unknown = set(arguments) - allowed
+  if unknown:
+    raise ValueError(
+      "send_agent_message invalid keys: " + ", ".join(sorted(unknown))
+      + "; expected recipients (agent/chat ids), body, and optional "
+      "broadcast, kind, delivery, send_id. For a finished helper follow-up "
+      "use message_agent(helper, message)."
+    )
   recipients = arguments.get("recipients", [])
   if (
     not isinstance(recipients, list)
     or len(recipients) > 24
     or any(not isinstance(value, str) or not value for value in recipients)
   ):
-    raise ValueError("recipients must contain at most 24 agent ids")
+    raise ValueError(
+      "recipients must be a list of at most 24 agent/chat ids from "
+      "list_agent_peers; for a finished helper use message_agent(helper, message)"
+    )
   broadcast = arguments.get("broadcast", False)
   if not isinstance(broadcast, bool):
     raise ValueError("broadcast must be true or false")
@@ -865,12 +884,19 @@ def _helper_rows() -> list[dict[str, Any]]:
 
 def _find_helper(reference: Any) -> dict[str, Any]:
   if not isinstance(reference, str) or not reference.strip():
-    raise ValueError("helper must be a helper name or id from spawn_agent")
+    raise ValueError(
+      "helper must be a name or helper_id from spawn_agent/list_agents, "
+      "not a peer chat id; use send_agent_message(recipients, body) for peers"
+    )
   reference = reference.strip()
   for row in _helper_rows():  # newest first
     if reference in (row.get("id"), row.get("task_key")):
       return row
-  raise ValueError(f"No helper named {reference!r} in this chat.")
+  raise ValueError(
+    "No helper with that name or helper_id in this chat. Use list_agents "
+    "for helper names/ids; a peer chat id belongs in "
+    "send_agent_message(recipients, body)."
+  )
 
 
 def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]:
@@ -934,7 +960,19 @@ def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
 
 def _call_message_agent(arguments: dict[str, Any]) -> dict:
   if set(arguments) != {"helper", "message"}:
-    raise ValueError("message_agent needs exactly helper and message")
+    unknown = set(arguments) - {"helper", "message"}
+    missing = {"helper", "message"} - set(arguments)
+    details = []
+    if unknown:
+      details.append("invalid keys: " + ", ".join(sorted(unknown)))
+    if missing:
+      details.append("missing: " + ", ".join(sorted(missing)))
+    raise ValueError(
+      "message_agent needs exactly helper (spawn_agent name/helper_id) and "
+      "message; " + "; ".join(details)
+      + ". For live helpers or other peer chats use "
+      "send_agent_message(recipients, body, kind, delivery)."
+    )
   message = arguments.get("message")
   if not isinstance(message, str) or not message.strip():
     raise ValueError("message must not be empty")
@@ -1227,12 +1265,15 @@ _TOOL_DEFINITIONS = {
     "description": (
       "Give a finished helper a follow-up task. It keeps its full history and original access scope, "
       "and its new result arrives in this chat by itself. A helper that is "
-      "still working cannot be messaged; wait for its result or stop it."
+      "still working cannot receive a follow-up here; wait for its result. "
+      "For a decision-changing note to a live helper, use "
+      "send_agent_message with its peer chat id from list_agent_peers. "
+      "helper is the spawn_agent name/helper_id, not a chat id."
     ),
     "inputSchema": {
       "type": "object",
       "properties": {
-        "helper": {"type": "string", "description": "Helper name or id."},
+        "helper": {"type": "string", "description": "spawn_agent name or helper_id from list_agents, not a peer chat id."},
         "message": {"type": "string", "minLength": 1, "maxLength": 200000},
       },
       "required": ["helper", "message"],
@@ -1600,6 +1641,17 @@ _TOOL_DEFINITIONS = {
             "the partner can act, use a question card instead of this tool."
           ),
         },
+        "github_checks": {
+          "type": "object",
+          "description": "Wait for the checks GitHub shows on one published pull-request head to finish (finished does not mean passed; manual workflow dispatches on the same commit are not included).",
+          "properties": {
+            "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "maxLength": 200},
+            "pull_request": {"type": "integer", "minimum": 1},
+            "head_sha": {"type": "string", "pattern": "^[a-fA-F0-9]{7,40}$"},
+          },
+          "required": ["repository", "pull_request", "head_sha"],
+          "additionalProperties": False,
+        },
         "command": {
           "type": "string", "maxLength": 4000,
           "description": "Read-only shell check with 0/1/error exit semantics.",
@@ -1616,7 +1668,7 @@ _TOOL_DEFINITIONS = {
           "type": "integer", "minimum": 1, "maximum": 604800,
           "description": (
             "Wake-up deadline in seconds, maximum 604800. Required for "
-            "command waits; normally 2–3× the expected duration."
+            "command or GitHub waits; normally 2–3× the expected duration."
           ),
         },
       },
@@ -1659,7 +1711,7 @@ _TOOL_DEFINITIONS = {
           "type": "array",
           "items": {"type": "string"},
           "maxItems": 24,
-          "description": "Agent ids from list_agent_peers for a direct note.",
+          "description": "Agent/chat ids from list_agent_peers for a direct note, including a live helper's peer chat id; not spawn_agent helper names or delegation ids.",
         },
         "broadcast": {
           "type": "boolean",

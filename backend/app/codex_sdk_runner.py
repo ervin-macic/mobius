@@ -2252,7 +2252,7 @@ async def _run_codex_sdk_turn(
             })
           # When a preceding AccountRateLimitsUpdatedNotification told us a quota
           # window actually reached its cap, surface a STRUCTURED limit terminal
-          # rather than raising: api_error_status=429 lets chat._is_limit_terminal
+          # rather than raising: api_error_status=429 lets classify_provider_error
           # detect the kill without string-matching, and the captured reset epoch
           # gives an exact park/resume time. This is the Codex analog of Claude's
           # api_error_status/resets_at terminal. Absent that structured signal we

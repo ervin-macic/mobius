@@ -81,6 +81,11 @@ from app.chat_logging import (
   safe_commit as _safe_commit,
 )
 from app.goal_commands import goal_request_for_agent, is_goal_continue
+from app.provider_errors import (
+  ProviderErrorKind,
+  classify_provider_error,
+  is_workspace_credits_exhausted,
+)
 from app.chat_writer import (
   AcknowledgeProviderSuccess,
   AdmitProviderExecution,
@@ -3671,19 +3676,6 @@ async def _terminal_setup_error_cleanup(
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
 
 
-_LIMIT_ERROR_MARKERS = (
-  "rate limit",
-  "rate_limit",
-  "usage limit",
-  "usage_limit",
-  "weekly limit",
-  "session limit",
-  "overloaded",
-  "quota",
-  "too many requests",
-  "429",
-)
-
 # A model-capacity response is not an account quota: it means the selected
 # model is temporarily saturated. Keep this deliberately narrow so an
 # unrelated "capacity" error (for example storage capacity) is never retried
@@ -3695,60 +3687,12 @@ _MODEL_CAPACITY_ERROR_MARKERS = (
 )
 
 
-# The provider's exhausted-workspace-credits rejection as plain error text, for
-# failures without the runner's structured ``credits_depleted`` flag. It is not
-# a timed limit: nothing resets on its own, so it is a manual pause the owner
-# continues after adding credits. Matched exactly so unrelated payment failures
-# keep the error card.
-_WORKSPACE_CREDITS_ERROR = "your workspace is out of credits. add credits to continue."
-
-
-def _is_workspace_credits_error_text(text: str | None) -> bool:
-  """Whether a provider rejected the turn because workspace credits ran out."""
-  return (text or "").strip().lower() == _WORKSPACE_CREDITS_ERROR
-
-
-def _is_limit_error_text(text: str | None) -> bool:
-  """Whether an error string names a provider rate/usage-limit exhaustion.
-
-  Substring match on the display error. A false positive only parks the queue
-  for manual resend; a false negative reinstates the limit storm. A transient
-  one-off error does not match, so the queue flows through a blip.
-
-  The marker list is grounded in the ACTUAL Anthropic limit strings seen in
-  prod chat.log: "You've hit your weekly limit · resets ...", "... session
-  limit ...", "Server is temporarily limiting requests ... Rate limited". The
-  `limit`+`resets` compound catches the whole "hit your <period> limit · resets
-  <time>" family (weekly / session / usage / 5-hour) without matching a random
-  error that merely contains the word "limit".
-  """
-  if not text:
-    return False
-  low = text.lower()
-  if any(marker in low for marker in _LIMIT_ERROR_MARKERS):
-    return True
-  return "limit" in low and "resets" in low
-
-
 def _is_model_capacity_error_text(text: str | None) -> bool:
   """Whether a provider says the specifically selected model is busy."""
   if not text:
     return False
   low = text.lower()
   return any(marker in low for marker in _MODEL_CAPACITY_ERROR_MARKERS)
-
-
-def _is_limit_terminal(runner_result: dict) -> bool:
-  """Whether a success-path terminal result was a rate/usage-limit kill.
-
-  Keys on the structured `api_error_status` (Claude surfaces 429 there — see
-  claude_sdk_runner ResultMessage handling) first, then the display error
-  string. Codex results carry no `api_error_status`, so they fall back to the
-  string check.
-  """
-  if runner_result.get("api_error_status") == 429:
-    return True
-  return _is_limit_error_text(runner_result.get("error"))
 
 
 # Provider-limit parking (design §2.4). When the reset time can't be parsed
@@ -4052,13 +3996,15 @@ def _park_exit(
   """
   if getattr(sink, "chat_id", None) in _restart_draining_chats:
     return {"parked": False}
+  # Claude reports 413 and 429 as `api_error_status`, and the Codex runner
+  # turns a reached rate-limit window into 429. Results without a status, and
+  # exception exits, classify by the error text.
+  error_kind = classify_provider_error(
+    error_text, status=(runner_result or {}).get("api_error_status"),
+  )
   if (
-    (runner_result or {}).get("api_error_status") == 413
+    error_kind is ProviderErrorKind.TOO_LARGE
     or (runner_result or {}).get("context_window_exceeded") is True
-    or any(marker in (error_text or "").lower() for marker in (
-      "request body is too large", "request body too large",
-      "request entity too large", "payload too large",
-    ))
   ):
     size_message = (
       "This conversation exceeds the model's context window."
@@ -4076,17 +4022,18 @@ def _park_exit(
     })
     return {"parked": False, "oversized": True}
   # Checked before the limit branch: Codex reports depleted credits as a
-  # reached rate limit (429), but no reset time will refill them.
+  # reached rate limit (429), but no reset time will refill them, so it is a
+  # manual pause the owner resumes after adding credits. Other credit
+  # failures are shown as plain errors.
   if (
     (runner_result or {}).get("credits_depleted") is True
-    or _is_workspace_credits_error_text(error_text)
+    or is_workspace_credits_exhausted(error_text)
   ):
     sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
     return {"parked": False}
-  if runner_result is not None:
-    limit = _is_limit_terminal(runner_result)
-  else:
-    limit = _is_limit_error_text(error_text)
+  # A false positive only parks the queue for manual resend; a false negative
+  # reinstates the limit storm.
+  limit = error_kind is ProviderErrorKind.USAGE_LIMIT
   model_capacity = _is_model_capacity_error_text(error_text)
   failed = bool(error_text) or runner_result is None
   if model_capacity:

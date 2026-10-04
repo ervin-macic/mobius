@@ -29,9 +29,8 @@ test('notification header confirms clearing without a blocking modal', () => {
   assert.match(clearRule, /color:\s*var\(--text\)/)
 })
 
-test('ordinary notifications can be dismissed individually without nesting controls', () => {
+test('notifications can be dismissed individually without nesting controls', () => {
   assert.match(component, /onDismiss/)
-  assert.match(component, /!protectsDismissal && \(/)
   assert.match(component, /aria-label=\{`Dismiss \$\{n\.title\}`\}/)
   assert.match(component, /await onDismiss\(notificationId\)/)
   assert.match(center, /onDismiss=\{dismiss\}/)

@@ -150,6 +150,56 @@ def test_new_app_compile_does_not_hold_sqlite_write_lock(
     verify.close()
 
 
+@pytest.mark.parametrize("mode", ["created", "updated"])
+def test_apply_holds_no_sqlite_write_lock_across_its_awaits(
+  client, auth, monkeypatch, mode,
+):
+  """No awaited apply phase may run inside the row's write transaction.
+
+  An async route that commits waits on SQLite inside the event loop, so a
+  write lock held across an await stalls both requests until the busy timeout
+  fails the unrelated one. Environment preparation is the last awaited phase,
+  after compilation, the Git commit and runtime staging.
+  """
+  source = _source()
+  if mode == "updated":
+    assert _apply(client, auth, source).status_code == 200
+    (source / "index.jsx").write_text(
+      "export default function App() { return <div>second</div> }\n"
+    )
+  concurrent_chat_id = f"chat-created-during-app-{mode}"
+  prepare_env = app_apply.app_python_env.prepare_env
+  write_errors = []
+
+  def prepare_env_while_chat_is_created(*args, **kwargs):
+    concurrent = SessionLocal()
+    try:
+      # Fail promptly instead of waiting out the live five-second timeout.
+      concurrent.connection().exec_driver_sql("PRAGMA busy_timeout=50")
+      concurrent.add(models.Chat(
+        id=concurrent_chat_id,
+        title="Concurrent chat",
+        messages=[],
+        pending_messages=[],
+      ))
+      concurrent.commit()
+    except Exception as exc:  # recorded so the assertion names the lock
+      write_errors.append(repr(exc))
+    finally:
+      concurrent.close()
+    return prepare_env(*args, **kwargs)
+
+  monkeypatch.setattr(
+    app_apply.app_python_env, "prepare_env", prepare_env_while_chat_is_created,
+  )
+
+  response = _apply(client, auth, source)
+
+  assert response.status_code == 200, response.text
+  assert response.json()["mode"] == mode
+  assert write_errors == []
+
+
 def test_apply_updates_multifile_revision_once(client, auth, db):
   source = _source()
   created = _apply(client, auth, source)
