@@ -67,7 +67,9 @@ class RunPolicy:
     return (
       "You are a delegated subagent running as a durable child task inside "
       "Möbius. Complete only the bounded user task in this child conversation "
-      "and return a clear result to the parent. When parallelism or local "
+      "and return a clear result to the parent. The parent receives only your "
+      "final message, so write your complete report last, after any tool "
+      "calls. When parallelism or local "
       "decomposition materially helps, start your own helpers with the Möbius "
       "spawn_agent tool with stable names; you remain responsible for checking your own "
       "completion condition after they settle, and their results reach you by "

@@ -1304,7 +1304,8 @@ plus that message's latest error so a failed or stopped helper stays actionable.
 Earlier text blocks in the same message are progress narration, split off by
 tool calls or by separate provider items; they stay in the child transcript as
 evidence but are not replayed to the parent. As with Claude Code and Codex
-subagents, a helper's final message is its report. One status still reads
+subagents, a helper's final message is its report, and the helper system
+prompt tells it to write that report last, after any tool calls. One status still reads
 report content: a failed run whose text carries the write-review marker
 projects as `needs_review`.
 
