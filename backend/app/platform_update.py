@@ -68,8 +68,8 @@ from typing import Callable, Literal, NotRequired, TypedDict
 from sqlalchemy.orm import Session
 
 from app import app_git, platform_activation, runtime_provenance
-from app.config import import_probe_env
 from app.platform_activation import PlatformActivationImpact
+from app.restart_util import run_candidate_startup_check
 
 
 log = logging.getLogger(__name__)
@@ -179,10 +179,6 @@ _FETCH_TIMEOUT = 120
 # the platform tree ever sees it as content, and a conflicting merge can stay
 # parked there for a resolver without touching the served checkout.
 _OVERLAY_CANDIDATE_DIRNAME = "mobius-overlay-candidate"
-# The post-merge import probe. A module-level infinite loop or a blocking call
-# in agent-edited code would otherwise wedge boot forever; a timeout-kill counts
-# as probe-fail -> roll back.
-_PROBE_TIMEOUT = 60
 # Hook installation only copies a handful of local files and updates one
 # repo-local config value. A long run is a wedged filesystem/process, not work.
 _HOOK_INSTALL_TIMEOUT = 15
@@ -1207,38 +1203,16 @@ def _clear_upstream(repo: Path) -> None:
   )
 
 
-def _import_probe(repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT):
-  """Run ``import app.main`` as a fresh subprocess with cwd the served backend.
+def _import_probe(repo: Path = PLATFORM_REPO) -> tuple[bool, str]:
+  """Run ``run_candidate_startup_check`` on ``repo``'s backend.
 
-  Single-source probe for both boot and post-merge: it MUST be a subprocess (not
-  an in-process import) so the reconcile process — which already imported the OLD
-  ``app.platform_update`` — validates the NEW on-disk tree without corrupting its
-  own interpreter, and so cwd/env exactly mirror the uvicorn exec. The env scrubs
-  ``PYTHONPATH`` (no stray path may shadow ``app``) and the ``GIT_*`` pointers,
-  and keeps ``DATABASE_URL`` / ``DATA_DIR`` so settings resolve as the served
-  process does; the withheld signing key is replaced by an import-only
-  placeholder. Returns ``(ok, error)``.
+  The fresh interpreter validates the new on-disk tree, not this updater's
+  already-imported modules. Returns ``(ok, error)``.
   """
-  backend = repo / "backend"
-  env = dict(os.environ)
-  for var in (
-    "PYTHONPATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-  ):
-    env.pop(var, None)
-  import_probe_env(env)
-  try:
-    proc = subprocess.run(
-      [sys.executable or "python3", "-c", "import app.main"],
-      cwd=str(backend), capture_output=True, text=True, timeout=timeout, env=env,
-    )
-  except subprocess.TimeoutExpired:
-    return False, f"import probe timed out after {timeout}s"
-  except OSError as exc:
-    return False, f"import probe could not run: {exc!r}"
-  if proc.returncode == 0:
+  failure = run_candidate_startup_check(repo / "backend")
+  if failure is None:
     return True, ""
-  return False, (proc.stderr or proc.stdout or "").strip()[-_ERROR_EXCERPT_CHARS:]
+  return False, failure[-_ERROR_EXCERPT_CHARS:]
 
 
 @contextlib.contextmanager
@@ -2812,12 +2786,9 @@ def _finalize_update(
   _activate_candidate(repo, local, pre, tip)
   app_git.remove_overlay_worktree(repo, _overlay_candidate_path(repo))
 
-  # Post-reconcile import probe: a text-clean merge can still produce a tree
-  # that fails to import (upstream dropped a module a local edit imports; a bad
-  # deploy). Roll back to the previous served commit rather than serve it
-  # broken. Skip the ~60s throwaway boot when the reconcile touched NO served
-  # backend code (frontend/tests/docs/scripts only): the backend tree is then
-  # byte-identical, so the probe would only re-prove an unchanged import.
+  # A text-clean merge can fail at import or the candidate startup smoke. Roll it
+  # back before accepting the update. Skip the probe when no served backend
+  # code changed: that tree is byte-identical to the already-running version.
   if platform_activation.backend_import_probe_required(changed):
     if progress:
       progress(PlatformUpdatePhase.VALIDATING)

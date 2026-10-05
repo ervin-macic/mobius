@@ -1,41 +1,7 @@
 import { test, expect } from '@playwright/test'
-import { randomUUID } from 'node:crypto'
-import { applyApp } from './app-source.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
-
-// A disposable Store-compatible frame owns the same host navigation seam as
-// the real Store. E2E disables first-boot apps, so discovery cannot assume a
-// bootstrapped Store. Keep the catalog deterministic and exercise real shell
-// app routing, intent delivery and reversible host history instead.
-const STORE_FIXTURE = `
-import React, { useEffect, useRef, useState } from 'react'
-
-export default function StoreFixture() {
-  const [detail, setDetail] = useState(null)
-  const entry = useRef(null)
-  useEffect(() => {
-    function onIntent(event) {
-      if (event.origin !== window.location.origin || event.source !== window.parent) return
-      if (event.data?.type !== 'moebius:app-intent') return
-      const match = /^app:([a-z0-9-]+)$/.exec(event.data.intent || '')
-      if (!match || match[1] !== 'notes') return
-      const handle = window.mobius.nav.open('app-store-detail', {
-        onBack: () => { entry.current = null; setDetail(null) },
-        onForward: () => { entry.current = handle; setDetail('Notes') },
-      })
-      entry.current = handle
-      handle.outcome.then(({ status }) => {
-        if (entry.current === handle && status === 'owned') setDetail('Notes')
-      })
-    }
-    window.addEventListener('message', onIntent)
-    return () => window.removeEventListener('message', onIntent)
-  }, [])
-  return detail ? <main><h1>{detail}</h1><details><summary>Privacy, access & technical details</summary><p>Privacy & access</p></details></main>
-    : <main><h1>App Store</h1></main>
-}
-`
+const SCREEN_COUNT = 11
 
 // Keep the browser's first-run requests inside this isolated test case.
 test.use({ serviceWorkers: 'block' })
@@ -70,162 +36,146 @@ async function openGuide(page) {
   }))
 
   await page.goto(`${BASE}/shell/`)
-  const guide = page.locator('aside.wt__card')
+  const guide = page.getByRole('dialog', { name: /./ }).filter({ has: page.locator('.wt__bars') })
   await expect(guide).toBeVisible()
   return { guide, completionCount: () => completions }
 }
 
+const CATALOG = { schema: 1, apps: [
+  { id: 'memory', name: 'Memory', description: 'Remember things.', manifest_url: 'https://example.com/memory/mobius.json', raw_base: 'https://example.com/memory/' },
+  { id: 'reflection', name: 'Reflection', description: 'Learn from mistakes.', manifest_url: 'https://example.com/reflection/mobius.json', raw_base: 'https://example.com/reflection/' },
+] }
+
+async function stubCatalog(page) {
+  await page.route(/\/api\/proxy\?/, route => {
+    const source = new URL(route.request().url()).searchParams.get('url')
+    if (source?.endsWith('/catalog.json')) return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(CATALOG) })
+    return route.fulfill({ status: 404, body: '' })
+  })
+}
+
+async function goToScreen(guide, name) {
+  await guide.getByRole('button', { name: `Go to ${name}` }).click()
+}
+
 test('a new owner can move through the guide and finish it', async ({ page }) => {
   const { guide, completionCount } = await openGuide(page)
-  await expect(guide.getByRole('heading', { name: 'Welcome to Möbius' })).toBeVisible()
-  await expect(guide).toHaveAttribute('role', 'region')
-  await expect(guide).not.toHaveAttribute('aria-modal', 'true')
+  await expect(guide).toHaveAttribute('aria-modal', 'true')
+  await expect(guide.getByRole('heading', { name: /Welcome to Möbius/ })).toBeFocused()
+  await expect(guide.getByRole('button', { name: /^Go to / })).toHaveCount(SCREEN_COUNT)
 
-  await guide.getByRole('button', { name: 'Next' }).click()
-  await expect(guide.getByRole('heading', { name: 'Connect an agent' })).toBeFocused()
-  await expect(guide.getByRole('button', { name: 'OpenAI Codex' })).toBeVisible()
-  // The shell stays keyboard reachable; the guide never traps focus.
-  await expect(guide.getByRole('button', { name: 'Dismiss welcome' })).toBeVisible()
-
+  await guide.getByRole('button', { name: 'Continue' }).click()
+  await expect(guide.getByRole('heading', { name: /Say what you need/ })).toBeFocused()
   await guide.getByRole('button', { name: 'Back' }).click()
-  await expect(guide.getByRole('heading', { name: 'Welcome to Möbius' })).toBeVisible()
+  await expect(guide.getByRole('heading', { name: /Welcome to Möbius/ })).toBeVisible()
 
-  for (const title of ['Connect an agent', 'Chat and Projects', 'Explore apps', 'Your settings', 'Choose a handle']) {
-    await guide.getByRole('button', { name: 'Next' }).click()
-    await expect(guide.getByRole('heading', { name: title })).toBeVisible()
-  }
-
+  for (let step = 1; step < SCREEN_COUNT; step += 1) await guide.getByRole('button', { name: 'Continue' }).click()
+  await expect(guide.getByRole('heading', { name: /Good luck/ })).toBeVisible()
   await guide.getByRole('button', { name: 'Finish guide' }).click()
   await expect(guide).toHaveCount(0)
   await expect.poll(completionCount).toBe(1)
 
-  const refreshedStatus = page.waitForResponse(response =>
-    new URL(response.url()).pathname === '/api/owner/walkthrough',
-  )
+  const refreshedStatus = page.waitForResponse(response => new URL(response.url()).pathname === '/api/owner/walkthrough')
   await page.reload()
   await refreshedStatus
   await expect(page.locator('.shell')).toBeVisible()
   await expect(guide).toHaveCount(0)
 })
 
-test('mobile guide content scrolls while its Next action remains usable', async ({ page }) => {
+test('the guide is a modal: Tab stays inside, and Escape dismisses it like the close button', async ({ page }) => {
+  const { guide, completionCount } = await openGuide(page)
+  for (let press = 0; press < 30; press += 1) {
+    await page.keyboard.press('Tab')
+    expect(await guide.evaluate(card => card.contains(document.activeElement))).toBe(true)
+  }
+  await page.keyboard.press('Escape')
+  await expect(guide).toHaveCount(0)
+  await expect.poll(completionCount).toBe(1)
+})
+
+test('Escape in the access review cancels only the review, not the guide', async ({ page }) => {
+  await stubCatalog(page)
+  await page.route(/\/api\/apps\/preview$/, route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ manifest: { id: 'memory' }, capability_contract: {}, capability_digest: 'd1' }) }))
+  const { guide, completionCount } = await openGuide(page)
+  await goToScreen(guide, 'Make it yours')
+  await guide.getByRole('button', { name: 'Install Memory' }).click()
+  await expect(page.getByRole('alertdialog', { name: 'Memory asks for access' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
+  await expect(guide).toBeVisible()
+  expect(completionCount()).toBe(0)
+})
+
+test('mobile guide fills the screen and keeps Continue reachable', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 700 })
   const { guide } = await openGuide(page)
-  for (let step = 0; step < 3; step += 1) {
-    await guide.getByRole('button', { name: 'Next' }).click()
-  }
-  await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeVisible()
-
-  await expect.poll(() => guide.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true)
-  await guide.evaluate(element => { element.scrollTop = element.scrollHeight })
-  await expect(guide.getByRole('button', { name: 'Next' })).toBeInViewport()
-
-  await guide.getByRole('button', { name: 'Next' }).click()
-  await expect(guide.getByRole('heading', { name: 'Your settings' })).toBeVisible()
+  await goToScreen(guide, 'Meet your agent')
+  await goToScreen(guide, 'App Store')
+  await expect(guide.getByRole('button', { name: 'Continue' })).toBeInViewport()
+  await expect(guide.getByRole('button', { name: 'Dismiss welcome' })).toBeInViewport()
+  await guide.getByRole('button', { name: 'Continue' }).click()
+  await expect(guide.getByRole('heading', { name: /Collaboration apps/ })).toBeVisible()
 })
 
 test('short landscape keeps guide actions and dismissal reachable', async ({ page }) => {
   await page.setViewportSize({ width: 700, height: 360 })
   const { guide, completionCount } = await openGuide(page)
-  for (let step = 0; step < 3; step += 1) await guide.getByRole('button', { name: 'Next' }).click()
-  await expect.poll(() => guide.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true)
-  await expect(guide.getByRole('button', { name: 'Next' })).toBeInViewport()
+  await expect(guide.getByRole('button', { name: 'Continue' })).toBeInViewport()
   await expect(guide.getByRole('button', { name: 'Dismiss welcome' })).toBeInViewport()
   await guide.getByRole('button', { name: 'Dismiss welcome' }).click()
   await expect(guide).toHaveCount(0)
   await expect.poll(completionCount).toBe(1)
 })
 
-test('app discovery hands access review to Store and preserves the guide through history', async ({ page, request }) => {
-  // The disposable E2E server skips default-app bootstrap. Install this test's
-  // Store explicitly instead of making the test depend on host app inventory.
-  await page.goto(BASE, { waitUntil: 'domcontentloaded' })
-  const token = await page.evaluate(() => localStorage.getItem('token'))
-  const { app: storeApp } = await applyApp(request, token, {
-    slug: `store-onboarding-${randomUUID()}`, name: 'App Store',
-    jsxSource: STORE_FIXTURE,
-  })
-  try {
-    await page.route(/\/api\/proxy\?/, route => {
-      const source = new URL(route.request().url()).searchParams.get('url')
-      if (source?.endsWith('/catalog.json')) return route.fulfill({
-        status: 200, contentType: 'application/json',
-        body: JSON.stringify({ schema: 1, apps: [{
-          id: 'notes', name: 'Notes', description: 'Write notes.',
-          manifest_url: 'https://example.com/notes/mobius.json', raw_base: 'https://example.com/notes/',
-        }] }),
-      })
-      return route.continue()
-    })
-    const { guide, completionCount } = await openGuide(page)
-    const storeSelector = `iframe[data-app-id="${storeApp.id}"]`
-    for (let step = 0; step < 3; step += 1) {
-      await guide.getByRole('button', { name: 'Next', exact: true }).click()
+test('installing an app asks for access first and installs exactly what was reviewed', async ({ page }) => {
+  await stubCatalog(page)
+  const requests = []
+  await page.route(/\/api\/apps\/(preview|install)$/, route => {
+    const request = route.request()
+    requests.push({ path: new URL(request.url()).pathname.split('/').pop(), body: request.postDataJSON() })
+    if (request.url().endsWith('/preview')) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ manifest: { id: 'memory' }, capability_contract: { data: { shared_memory: 'write' } }, capability_digest: 'digest-1' }) })
     }
-    const review = guide.getByRole('button', { name: 'Review Notes in App Store' })
-    await expect(review).toBeEnabled()
-    let installs = 0
-    await page.route(/\/api\/apps\/install$/, route => {
-      installs += 1
-      return route.abort('blockedbyclient')
-    })
-    await review.click()
-    await expect(guide).not.toBeVisible()
-    await expect(page.locator(storeSelector)).toBeVisible()
-    const store = page.frameLocator(storeSelector)
-    await expect(store.getByRole('heading', { name: 'Notes', exact: true })).toBeVisible()
-    await store.locator('summary').filter({ hasText: 'Privacy, access & technical details' }).click()
-    await expect(store.getByText('Privacy & access', { exact: true })).toBeVisible()
-    expect(installs).toBe(0)
-    expect(completionCount()).toBe(0)
-    await page.goBack() // Store detail -> Store browse.
-    await page.goBack() // Store route -> previous workspace and guide.
-    await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeVisible()
-    await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeFocused()
-    await page.goForward()
-    await expect(guide).not.toBeVisible()
-    await page.goBack()
-    await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeFocused()
-    expect(installs).toBe(0)
-    expect(completionCount()).toBe(0)
-  } finally {
-    await request.delete(`${BASE}/api/apps/${storeApp.id}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-  }
+    return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ warnings: [] }) })
+  })
+  const { guide } = await openGuide(page)
+  await goToScreen(guide, 'Make it yours')
+  const install = guide.getByRole('button', { name: 'Install Memory' })
+  await install.click()
+
+  const access = page.getByRole('alertdialog', { name: 'Memory asks for access' })
+  await expect(access).toBeVisible()
+  await expect(access.getByText('Shared memory')).toBeVisible()
+  await expect(access.getByRole('button', { name: 'Confirm and install' })).toBeFocused()
+  // Nothing is installed while the access is being read.
+  expect(requests.map(request => request.path)).toEqual(['preview'])
+  // The other app cannot be started while this review is open.
+  await expect(guide.getByRole('button', { name: 'Install Reflection' })).toHaveAttribute('aria-disabled', 'true')
+
+  await access.getByRole('button', { name: 'Cancel' }).click()
+  await expect(access).toHaveCount(0)
+  await expect(install).toBeFocused()
+  expect(requests.map(request => request.path)).toEqual(['preview'])
+
+  await install.click()
+  await page.getByRole('button', { name: 'Confirm and install' }).click()
+  await expect.poll(() => requests.filter(request => request.path === 'install').length).toBe(1)
+  expect(requests.at(-1).body.reviewed_capability_digest).toBe('digest-1')
 })
 
-test('missing App Store does not block the guide or install from discovery', async ({ page }) => {
-  await page.route(/\/api\/proxy\?/, route => {
-    const source = new URL(route.request().url()).searchParams.get('url')
-    if (source?.endsWith('/catalog.json')) return route.fulfill({
-      status: 200, contentType: 'application/json',
-      body: JSON.stringify({ schema: 1, apps: [{ id: 'notes', name: 'Notes', description: 'Write notes.', manifest_url: 'https://example.com/notes/mobius.json', raw_base: 'https://example.com/notes/' }] }),
-    })
-    return route.continue()
+test('an access check that returns after the owner moved on does not open a review', async ({ page }) => {
+  await stubCatalog(page)
+  let release
+  const held = new Promise(resolve => { release = resolve })
+  await page.route(/\/api\/apps\/preview$/, async route => {
+    await held
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ manifest: { id: 'memory' }, capability_contract: {}, capability_digest: 'late' }) })
   })
-  await page.route(/\/api\/apps\/$/, async route => {
-    const response = await route.fetch()
-    const apps = (await response.json()).filter(app => app.slug !== 'store')
-    await route.fulfill({ response, body: JSON.stringify(apps) })
-  })
-  const { guide, completionCount } = await openGuide(page)
-  for (let step = 0; step < 3; step += 1) await guide.getByRole('button', { name: 'Next' }).click()
-  await expect(guide.getByText('App Store is unavailable. You can continue the guide without installing anything.')).toBeVisible()
-  await expect(guide.getByRole('button', { name: /^Review .+ in App Store$/ }).first()).toBeDisabled()
-  await guide.getByRole('button', { name: 'Next' }).click()
-  await expect(guide.getByRole('heading', { name: 'Your settings' })).toBeFocused()
-  expect(completionCount()).toBe(0)
-})
-
-test('first-use guidance leaves the working shell interactive', async ({ page }) => {
-  const { guide, completionCount } = await openGuide(page)
-  await expect(guide).toHaveAttribute('role', 'region')
-  await expect(guide).not.toHaveAttribute('aria-modal', 'true')
-  await page.keyboard.press('Escape')
-  await expect(guide).toBeVisible()
-  expect(completionCount()).toBe(0)
-  await guide.getByRole('button', { name: 'Dismiss welcome' }).click()
-  await expect(guide).toHaveCount(0)
-  await expect.poll(completionCount).toBe(1)
+  const { guide } = await openGuide(page)
+  await goToScreen(guide, 'Make it yours')
+  await guide.getByRole('button', { name: 'Install Memory' }).click()
+  await guide.getByRole('button', { name: 'Continue' }).click()
+  release()
+  await expect(guide.getByRole('heading', { name: /Build useful/ })).toBeVisible()
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
 })
