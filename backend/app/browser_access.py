@@ -44,7 +44,7 @@ class BrowserAccessGrant(Base):
   epoch = Column(Integer, nullable=False, default=0)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
   revoked_at = Column(DateTime, nullable=True, default=None)
-  kind = Column(String(16), nullable=False, default="invitation")
+  kind = Column(String(16), nullable=False)
   issuer = Column(String(255), nullable=True)
   subject = Column(String(128), nullable=True)
   recipient_handle = Column(String(128), nullable=True)

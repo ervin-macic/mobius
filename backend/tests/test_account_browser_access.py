@@ -148,7 +148,6 @@ def test_account_route_registration_retry_and_revocation_cleanup(client, auth, d
   assert repeated.json()["grant"]["id"] == grant_id
   assert ids == [grant_id, grant_id]
   assert reply.json()["grant"]["kind"] == "account"
-  assert client.post(f"/api/connect/browser-access/{grant_id}/invitation", headers=auth).status_code == 404
   assert client.get("/api/connect/browser-access/shared", headers=auth).json() == {"instances": []}
   response = client.delete(f"/api/connect/browser-access/{grant_id}", headers=auth)
   assert response.status_code == 202

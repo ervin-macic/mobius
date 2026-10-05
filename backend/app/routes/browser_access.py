@@ -338,10 +338,7 @@ async def revoke_browser_access(
   return JSONResponse(body, status_code=202, headers=_NO_STORE)
 
 
-# ── Link invitations (retired) ───────────────────────────────────
-# New link invitations can no longer be created or re-issued; owners invite a
-# mobius.you handle instead. Existing link grants still list and revoke, and a
-# link issued before the upgrade can still be redeemed until it expires.
+# ── Link invitations (retired; redemption of already-issued links only) ──
 
 
 class RedeemRequest(BaseModel):
