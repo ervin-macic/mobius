@@ -46,6 +46,7 @@ from app.manifest_contract import (  # noqa: E402
   SKILL_MAX_BYTES,
   SYSTEM_PROMPT_MAX_BYTES,
   ManifestContractError,
+  package_bytes,
   static_asset_entries,
   validate_manifest_contract,
 )
@@ -187,20 +188,7 @@ def _package_size_errors(root: Path, manifest_path: Path, manifest: dict) -> lis
   if manifest_path.stat().st_size > MANIFEST_MAX_BYTES:
     errors.append(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
 
-  # Every file an install downloads, each counted once, against the one
-  # package bound that Store publication and install share.
-  schedule = manifest.get("schedule") or {}
-  declared = [
-    manifest["entry"],
-    manifest.get("icon"),
-    schedule.get("job"),
-    *(manifest.get("source_files") or []),
-    *static_asset_entries(manifest.get("static_assets") or {}).values(),
-    *(manifest.get("storage_seeds") or {}).values(),
-  ]
-  package_total = sum(
-    size(rel) for rel in dict.fromkeys(declared) if isinstance(rel, str) and rel
-  )
+  package_total = package_bytes(root, manifest)
   if package_total > PACKAGE_MAX_BYTES:
     errors.append(
       f"app package is {package_total} bytes; installs and the Store accept "

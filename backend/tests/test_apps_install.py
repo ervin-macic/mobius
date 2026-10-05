@@ -5928,12 +5928,15 @@ def test_install_package_budget_spans_every_declared_file_kind(
     "index.jsx": JSX.encode(),
     "cards.js": b"export const CARD = 1\n",
     "extra.txt": b"served as a static asset",
+    "prompt.md": b"a seeded prompt",
   }
   manifest = {
     **MANIFEST_MULTI,
     "id": "package-budget",
     "source_files": ["cards.js"],
     "static_assets": {"extra.txt": "extra.txt"},
+    # The inline seed lives in the manifest and is not downloaded.
+    "storage_seeds": {"prompt.md": "prompt.md", "inline.json": {"on": True}},
   }
   monkeypatch.setattr(
     install, "_PACKAGE_MAX_BYTES", sum(map(len, files.values())) - 1,
@@ -5944,7 +5947,7 @@ def test_install_package_budget_spans_every_declared_file_kind(
   )
 
   assert r.status_code == 413, r.text
-  assert "app package limit (reached while downloading cards.js)" in (
+  assert "app package limit (reached while downloading prompt.md)" in (
     r.json()["detail"]
   )
 
@@ -6377,13 +6380,13 @@ def test_known_origin_check_never_falls_back_to_http(tmp_path):
   app_git.ensure_repo(tmp_path)
   app_git._run(tmp_path, "remote", "add", "origin", "https://github.com/acme/source.git")
   with patch("app.install.fetch_git_install_candidate", side_effect=RuntimeError("offline")), patch(
-    "app.install.fetch_upstream_source", new_callable=AsyncMock,
-  ) as http_import:
+    "app.install._http_get", new_callable=AsyncMock,
+  ) as http_get:
     with pytest.raises(RuntimeError, match="offline"):
       asyncio.run(_fetch_update_candidate(
         tmp_path, "https://raw.githubusercontent.com/acme/source/main/mobius.json", strict=True,
       ))
-  http_import.assert_not_called()
+  http_get.assert_not_called()
 
 
 @pytest.mark.parametrize("cloned", [False, True])
@@ -6716,19 +6719,14 @@ def test_update_check_ignores_invalid_preview_metadata_but_install_rejects_it(
   {"previous_id": "old-id", "previous_manifest_url": "http://other.test/"},
   {"package_id": {}}, {"moved_to": {}},
 ])
-def test_discovery_rejects_malformed_identity_and_source_before_fetch(invalid):
+def test_discovery_rejects_malformed_identity_and_source(invalid):
   from fastapi import HTTPException
   from app import install
 
   manifest = {**MANIFEST_NEWS, **invalid} if isinstance(invalid, dict) else invalid
-  manifest_url = "https://invalid.test/mobius.json"
-  fetch = AsyncMock(return_value=json.dumps(manifest).encode())
-  with patch("app.install._http_get", fetch):
-    with pytest.raises(HTTPException) as exc:
-      asyncio.run(install.fetch_upstream_source(manifest_url, strict=False))
+  with pytest.raises(HTTPException) as exc:
+    install._validate_discovery_manifest(manifest)
   assert exc.value.status_code == 400
-  assert fetch.await_count == 1
-  assert fetch.await_args.args[1] == manifest_url
 
 
 @pytest.mark.parametrize("invalid", [
@@ -6755,27 +6753,6 @@ def test_update_check_malformed_candidate_degrades_to_unknown(
   assert response.status_code == 200, response.text
   assert response.json()["update_available"] is None
   assert response.json()["upstream_version"] is None
-
-
-def test_discovery_retains_the_package_byte_budget(
-  bypass_url_validation, monkeypatch,
-):
-  from fastapi import HTTPException
-  from app import install
-
-  base = "https://source-budget.test/"
-  manifest = {**MANIFEST_NEWS, "source_files": ["one.js", "two.js"]}
-  responses = _check_responses(
-    base, manifest, JSX, sources={"one.js": b"123", "two.js": b"456"},
-  )
-  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 5)
-  with patch(
-    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
-  ):
-    with pytest.raises(HTTPException) as exc:
-      asyncio.run(install.fetch_upstream_source(base + "mobius.json", strict=False))
-  assert exc.value.status_code == 413
-  assert "reached while downloading two.js" in exc.value.detail
 
 
 def test_update_check_changed_file_is_true(

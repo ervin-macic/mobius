@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 import json
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 import posixpath
 import re
@@ -22,12 +23,15 @@ RECOGNIZED_CAPABILITIES = (
 SKILLS_COUNT_MAX = 5
 MANIFEST_MAX_BYTES = 64 * 1024
 # The one size bound for an app package: every file its manifest declares
-# (entry, job, source files, static assets, storage seeds, icon). Install holds
-# a whole package from an untrusted host in memory to review and digest it, so
-# the total is the real safety bound. No single file or file kind has its own
-# cap: a large dataset is as valid as many small modules. Store publication
-# bounds the whole accepted tree by the same number, so every app the Store
-# accepts is installable. The Store host preserves releases up to 64 MiB too.
+# (entry, job, source files, static assets, storage seeds, icon), as summed by
+# `package_bytes`. Install holds a whole package from an untrusted host in
+# memory to review and digest it, so the total is the real safety bound, and
+# no single file or file kind has its own cap. Store publication bounds the
+# whole accepted tree by the same number, so every app the Store accepts is
+# installable. The Store host preserves releases up to 64 MiB too. What the
+# shell can load is a separate, smaller bound on the compiled module
+# (`app_compile_contract.COMPILED_MODULE_MAX_BYTES`): large data belongs in
+# `static_assets`, fetched at runtime, rather than imported into the bundle.
 PACKAGE_MAX_BYTES = 64 * 1024 * 1024
 SKILL_MAX_BYTES = 256 * 1024
 SYSTEM_PROMPT_MAX_BYTES = 256 * 1024
@@ -355,6 +359,29 @@ def static_asset_entries(value) -> dict[str, str]:
     return entries
   _fail("Manifest `static_assets` must be an object or array.")
 
+
+def package_bytes(root: Path, manifest: Mapping) -> int:
+  """Total size under `root` of every file the package declares, each once.
+
+  These are the files install downloads under `PACKAGE_MAX_BYTES`, so local
+  apply and the validator bound what Store publication and install bound. Sizes
+  come from file metadata, so an oversized package is refused before anything
+  is read. Inline seeds live in the manifest, which its own cap bounds; a
+  missing path counts as zero because its own check reports it.
+  """
+  schedule = manifest.get("schedule")
+  declared = [
+    manifest.get("entry"),
+    manifest.get("icon"),
+    schedule.get("job") if isinstance(schedule, Mapping) else None,
+    *(manifest.get("source_files") or []),
+    *static_asset_entries(manifest.get("static_assets")).values(),
+    *(manifest.get("storage_seeds") or {}).values(),
+  ]
+  paths = dict.fromkeys(rel for rel in declared if isinstance(rel, str) and rel)
+  return sum(
+    (root / rel).stat().st_size for rel in paths if (root / rel).is_file()
+  )
 
 def _validate_running_label(running_label, field: str) -> None:
   if (

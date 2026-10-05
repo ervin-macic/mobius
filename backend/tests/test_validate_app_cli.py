@@ -363,7 +363,7 @@ def _declare(tmp_path: Path, field: str, value) -> None:
 def test_validator_accepts_a_data_file_larger_than_any_former_per_file_cap(
   tmp_path,
 ):
-  """A bundled dataset is as valid as many small modules."""
+  """Only the package total bounds a declared data file."""
   _write_app(tmp_path, "export default function App(){ return <div /> }")
   (tmp_path / "data").mkdir()
   with open(tmp_path / "data" / "cases.bin", "wb") as data:
@@ -392,6 +392,38 @@ def test_validator_rejects_a_package_over_the_limit_install_and_store_share(
   assert f"installs and the Store accept at most {PACKAGE_MAX_BYTES}" in (
     result.stderr
   )
+
+
+def test_validator_counts_repeated_paths_once_and_skips_inline_seeds(tmp_path):
+  """Inline seeds live in the manifest, and a path declared twice is one file
+  to download, exactly as install measures the package."""
+  from app.manifest_contract import PACKAGE_MAX_BYTES
+
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  with open(tmp_path / "shared.bin", "wb") as data:
+    data.truncate(PACKAGE_MAX_BYTES // 2 + 1)
+  _declare(tmp_path, "source_files", ["shared.bin"])
+  _declare(tmp_path, "static_assets", {"shared.bin": "shared.bin"})
+  _declare(tmp_path, "storage_seeds", {"settings.json": {"on": True}, "rows.json": [1, 2]})
+
+  result = _run(tmp_path)
+  assert result.returncode == 0, result.stderr
+
+
+def test_validator_rejects_an_app_too_large_for_the_shell_to_load(tmp_path):
+  """A dataset imported into the bundle can make a module the shell refuses.
+  Validation says so, rather than the app installing and failing to open."""
+  _write_app(
+    tmp_path,
+    "import rows from './rows.json'\n"
+    "export default function App(){ return <div>{rows.length}</div> }",
+  )
+  (tmp_path / "rows.json").write_text(json.dumps(["x" * 1000] * 9000))
+  _declare(tmp_path, "source_files", ["rows.json"])
+
+  result = _run(tmp_path)
+  assert result.returncode == 1
+  assert "the shell can load" in result.stderr
 
 
 def test_validator_rejects_missing_declared_local_icon(tmp_path):

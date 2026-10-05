@@ -307,9 +307,9 @@ def test_local_apply_materializes_versioned_static_assets(client, auth):
 
 
 def test_local_apply_has_no_static_asset_count_cap(client, auth):
-  """Static assets were once capped at 256 files. The manifest's byte cap
-  already bounds how many can be listed, and the package byte bound limits
-  their size, so a count is never a reason to refuse an app."""
+  """Local apply once capped static assets at 256 files. The manifest's byte
+  cap already bounds how many can be listed, and the package byte bound limits
+  their size."""
   source = _source()
   asset_sources = source / "listing-assets"
   asset_sources.mkdir()
@@ -325,6 +325,34 @@ def test_local_apply_has_no_static_asset_count_cap(client, auth):
 
   assert accepted.status_code == 200, accepted.text
   assert len(list((source / "static" / "listing").iterdir())) == 300
+
+
+def test_local_apply_refuses_an_oversized_package_before_reading_it(
+  client, auth, monkeypatch,
+):
+  """Local apply bounds the same declared files install downloads, from their
+  sizes on disk, before it materializes anything."""
+  from app import app_apply
+  from app.manifest_contract import package_bytes
+
+  source = _source()
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  accepted_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  (source / "data.bin").write_bytes(b"x" * 64)
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["static_assets"] = {"data.bin": "data.bin"}
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  monkeypatch.setattr(
+    app_apply, "PACKAGE_MAX_BYTES", package_bytes(source, manifest) - 1,
+  )
+
+  rejected = _apply(client, auth, source)
+
+  assert rejected.status_code == 422, rejected.text
+  assert rejected.json()["detail"]["code"] == "package_too_large"
+  assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == accepted_head
+  assert not (source / "static" / "data.bin").exists()
 
 
 @pytest.mark.parametrize("symlink_component", ["source", "parent"])
