@@ -1,0 +1,62 @@
+.md-app-block { border:1px solid var(--border); border-radius:12px; margin:16px 0; overflow:hidden; background:var(--bg); }
+.md-app-block > header { display:flex; align-items:start; justify-content:space-between; gap:12px; padding:16px; }
+.md-app-block > header strong { min-width:0; overflow-wrap:anywhere; font-size:16px; }
+.md-app-block > header a { display:flex; align-items:center; flex-shrink:0; min-height:44px; font-size:14px; }
+.md-app-block > dl { display:flex; flex-wrap:wrap; gap:12px 20px; padding:0 16px; margin:0; }
+.md-app-block dt { color:var(--muted); font-size:14px; }
+.md-app-block dd { margin:2px 0 0; font-size:14px; overflow-wrap:anywhere; }
+.md-app-block dd a { color:var(--accent); text-underline-offset:2px; }
+.md-app-block > p { padding:0 16px; }
+.md-app-block__toggle { display:flex; align-items:center; gap:8px; border:0; background:transparent; color:var(--text); font:inherit; font-size:14px; min-height:44px; padding:12px 16px; cursor:pointer; width:100%; text-align:left; }
+.md-app-block__toggle:hover { background:var(--surface); }
+.md-app-block__toggle:focus-visible { outline:2px solid var(--accent); outline-offset:-3px; }
+.md-app-block__view { border-top:1px solid var(--border); }
+.md-app-block--link > header { padding:12px 16px 4px; align-items:center; }
+.md-app-block--link > dl { gap:6px 16px; padding-bottom:14px; }
+.md-app-block--link > dl > div { display:flex; gap:4px; align-items:baseline; }
+.md-app-block--link > dl dt,.md-app-block--link > dl dd { margin:0; font-size:14px; }
+.md-app-block--link > dl dt::after { content:':'; }
+@media (max-width:480px) { .md-app-block > header { flex-direction:column; gap:4px; } }
+
+/* Pull-request snapshot: the title row, then details with the app's action
+   in the bottom-right corner so the title keeps the full width. */
+.md-app-pull { display:grid; gap:6px; padding:12px 16px; }
+.md-app-pull__headline { line-height:1.5; overflow-wrap:anywhere; }
+.md-app-pull__title { margin-right:4px; font-size:16px; font-weight:600; }
+.md-app-pull__label { display:inline-block; margin:0 4px 0 0; padding:0 8px; border:1px solid var(--md-label-dark-border, var(--border)); border-radius:2em; background:var(--md-label-dark-bg, var(--surface)); color:var(--md-label-dark-fg, var(--text)); font-size:13px; font-weight:500; line-height:20px; vertical-align:1px; white-space:nowrap; }
+[data-theme="light"] .md-app-pull__label { border-color:transparent; background:var(--md-label-light-bg, var(--surface)); color:var(--md-label-light-fg, var(--text)); }
+.md-app-pull__footer { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; }
+.md-app-pull__meta { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; min-width:0; color:var(--muted); font-size:14px; }
+.md-app-pull__meta ins { color:var(--green, #3fb950); text-decoration:none; font-weight:600; }
+.md-app-pull__meta del { color:var(--danger, #f85149); text-decoration:none; font-weight:600; }
+.md-app-pull__badge { display:inline-flex; align-items:center; padding:0 8px; border-radius:2em; font-size:13px; font-weight:600; line-height:20px; white-space:nowrap;
+  background:color-mix(in srgb, var(--muted) 16%, transparent); color:var(--text); }
+.md-app-pull__badge.is-success { background:color-mix(in srgb, var(--green, #3fb950) 18%, transparent); color:var(--green, #3fb950); }
+.md-app-pull__badge.is-attention { background:color-mix(in srgb, var(--warning, #d29922) 20%, transparent); color:var(--warning, #d29922); }
+.md-app-pull__badge.is-danger { background:color-mix(in srgb, var(--danger, #f85149) 18%, transparent); color:var(--danger, #f85149); }
+.md-app-pull__badge.is-accent { background:color-mix(in srgb, var(--accent) 18%, transparent); color:var(--accent); }
+/* Chat prose underlines links; a PR row reads like GitHub's, underlined only on hover. */
+.md-app-pull a.md-app-pull__title, .md-app-pull a.md-app-pull__repo { text-decoration:none; }
+.md-app-pull a.md-app-pull__title:hover, .md-app-pull a.md-app-pull__repo:hover { text-decoration:underline; text-underline-offset:3px; }
+/* GitHub's colors: titles in text color, links in blue. */
+.md-app-pull a.md-app-pull__title { color:var(--text); }
+.md-app-pull a.md-app-pull__repo { color:#4493f8; font-weight:500; }
+[data-theme="light"] .md-app-pull a.md-app-pull__repo { color:#0969da; }
+.md-app-block__header-actions { display:flex; align-items:center; gap:12px; flex-shrink:0; }
+.md-app-block__action { display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; min-height:36px; padding:0 14px; border:0; border-radius:8px;
+  background:var(--accent); color:var(--accent-fg, #fff); font:inherit; font-size:14px; font-weight:600; white-space:nowrap; cursor:pointer; }
+.md-app-block__action:hover { filter:brightness(1.08); }
+.md-app-block__action[aria-pressed="true"] { background:color-mix(in srgb, var(--accent) 22%, transparent); color:var(--accent); }
+.md-app-block__action:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+@media (max-width:480px) { .md-app-block__action { min-height:40px; } }
+
+/* A batch: one header, the item rows, and the shared action at the bottom right. */
+.md-app-batch__head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:12px 16px 4px; }
+.md-app-batch__head strong { font-size:16px; overflow-wrap:anywhere; }
+.md-app-batch__head span { flex-shrink:0; color:var(--muted); font-size:14px; }
+.md-app-batch__list { list-style:none; margin:0; padding:0; }
+.md-app-batch__list > li + li { border-top:1px solid var(--border); }
+.md-app-batch__list .md-app-pull { padding-block:10px; }
+.md-app-batch__list .md-app-pull__title { font-size:15px; }
+.md-app-batch__title { display:block; padding:10px 16px; color:var(--text); font-weight:600; }
+.md-app-batch__foot { display:flex; justify-content:flex-end; padding:10px 16px 12px; border-top:1px solid var(--border); }
