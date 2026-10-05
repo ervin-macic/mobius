@@ -1877,11 +1877,10 @@ mobius.you handle: account grants pin a verified issuer and subject. The feature
 requires the configured HTTPS origin.
 
 Link invitations (`kind="invitation"`: an owner-labelled grant plus a hashed,
-one-use, one-day link) are retired. Nothing creates or re-issues them; the old
-create and re-issue routes answer 404. Existing link grants still list, keep
-their sessions and revoke like account grants, and a link issued before the
-upgrade can still be redeemed until it expires. Recipients are re-invited by
-handle.
+one-use, one-day link) are retired: nothing creates or re-issues them.
+Existing link grants still list, keep their sessions and revoke like account
+grants, and a link issued before the upgrade can still be redeemed until it
+expires. Recipients are re-invited by handle.
 
 `routes/browser_access.py` owns grant listing, account invitations, revocation
 and the same-origin cookie exchange. A 15-minute bearer stays in memory; the

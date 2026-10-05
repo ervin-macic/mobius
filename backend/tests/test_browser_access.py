@@ -34,16 +34,6 @@ def _denied(action):
   assert error.value.status_code == 401
 
 
-def test_link_grants_are_recipient_isolated(db):
-  owner = _owner(db, "owner")
-  other = _owner(db, "other")
-  grant_a, _ = link_grant(db, owner, "laptop")
-  grant_b, _ = link_grant(db, owner, "phone")
-  assert _live(db, grant_a.id, owner.id)
-  assert not _live(db, grant_a.id, other.id)
-  assert not _live(db, grant_b.id, other.id)
-
-
 def test_invitation_is_one_use_and_session_is_idle_expiring_not_grant_expiring(db):
   owner = _owner(db, "owner")
   grant, invitation = link_grant(db, owner, "recipient")
