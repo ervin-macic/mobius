@@ -124,7 +124,6 @@ def test_logout_revokes_minted_frame_and_media_tokens(https, auth, db):
 @pytest.mark.asyncio
 async def test_open_browser_event_stream_stops_before_next_revoked_event(db):
   from app.browser_access import BrowserLineage, redeem_invitation, revoke_grant
-  from app.database import SessionLocal
   from app.deps import Principal, revocable_browser_stream
   owner = models.Owner(username="stream-owner", hashed_password="unused")
   db.add(owner); db.commit()
