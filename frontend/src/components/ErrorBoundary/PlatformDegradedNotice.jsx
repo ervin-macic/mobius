@@ -36,8 +36,9 @@ const VARIANTS = {
         'changes did not finish loading. The latest source is preserved but ' +
         'is not being served.',
       '',
-      'Reproduce the import failure from the served backend, read the relevant ' +
-        'boot/container logs, find the root cause in /data/platform, and ' +
+      'Start with /data/logs/platform-boot.jsonl, the record of each startup ' +
+        'step and the exact error of a failed one. Reproduce the import failure ' +
+        'from the served backend, find the root cause in /data/platform, and ' +
         'implement a targeted fix so the normal platform serves again.',
       '',
       'Preserve the edits and all data. Do not reset or restore the platform ' +

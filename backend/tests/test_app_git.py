@@ -4641,16 +4641,21 @@ def _two_commit_switch(repo: Path) -> tuple[str, str]:
 
 def bump_ctime_without_changing_bytes(*paths: Path) -> None:
   """What a no-op ownership repair does: only ctime changes, and Git's index
-  caches it. Git compares ctime to the second unless built with USE_NSEC, so
-  wait for the clock to pass the file's current second before the chown that
-  makes the cached stat data stale."""
+  caches it. Git compares ctime to the second unless built with USE_NSEC, and
+  the kernel stamps ctime from a coarse clock that can trail the wall clock,
+  so repeat the chown until the file's own ctime reaches a later second."""
+  def ctime_second(path: Path) -> int:
+    return os.stat(path, follow_symlinks=False).st_ctime_ns // 1_000_000_000
+
   for path in paths:
-    second = os.stat(path, follow_symlinks=False).st_ctime_ns // 1_000_000_000
+    second = ctime_second(path)
     deadline = time.monotonic() + 5
-    while time.time_ns() // 1_000_000_000 <= second:
-      assert time.monotonic() < deadline, "clock never advanced"
+    while True:
+      os.chown(path, os.getuid(), os.getgid(), follow_symlinks=False)
+      if ctime_second(path) > second:
+        break
+      assert time.monotonic() < deadline, "ctime never advanced"
       time.sleep(0.01)
-    os.chown(path, os.getuid(), os.getgid(), follow_symlinks=False)
 
 
 def test_worktree_merge_treats_metadata_only_changes_as_unchanged(tmp_path):

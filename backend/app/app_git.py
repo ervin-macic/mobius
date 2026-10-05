@@ -450,7 +450,7 @@ def merge_trees_into_worktree(
 
   Two trees are Git's branch switch (carry unrelated uncommitted work, refuse
   to overwrite an edited path); three are a merge from an explicit base. Every
-  worktree-updating ``read-tree`` goes through here, because it is plumbing:
+  merging ``read-tree -m -u`` goes through here, because it is plumbing:
   unlike checkout, merge or status it never refreshes the index, and it
   rejects any entry whose cached stat data differs as "not uptodate" even when
   the bytes are unchanged. A metadata-only change such as an ownership or mode

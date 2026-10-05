@@ -2,6 +2,7 @@
 have to go on, so it must carry the failing command's own explanation."""
 
 import json
+import os
 import subprocess
 
 from app import platform_boot, platform_update
@@ -41,7 +42,12 @@ def test_activate_failure_is_printed_and_recorded_with_git_stderr(
 
   monkeypatch.setattr(platform_update, "settle_prepared_update_for_this_image", refuse)
 
-  assert platform_boot.main(["platform_boot", "activate"]) == 1
+  umask = os.umask(0)
+  os.umask(umask)
+  try:
+    assert platform_boot.main(["platform_boot", "activate"]) == 1
+  finally:
+    os.umask(umask)  # main sets the boot's umask for its whole process
 
   assert "not uptodate. Cannot merge." in capsys.readouterr().err
   assert not marker.exists()  # a failed transaction never publishes its protocol
@@ -68,3 +74,16 @@ def test_an_unwritable_boot_log_never_fails_the_boot(tmp_path, capsys):
   platform_boot.record_boot_run("activate", ok=True, detail="none", log=missing_dir)
 
   assert "could not record this run" in capsys.readouterr().err
+
+
+def test_a_failed_boot_log_write_leaves_no_staged_file(tmp_path, monkeypatch, capsys):
+  log = tmp_path / "platform-boot.jsonl"
+
+  def refuse(_staged, _log):
+    raise OSError("disk full")
+
+  monkeypatch.setattr(platform_boot.os, "replace", refuse)
+  platform_boot.record_boot_run("guard", ok=True, detail="clean", log=log)
+
+  assert "could not record this run" in capsys.readouterr().err
+  assert list(tmp_path.iterdir()) == []

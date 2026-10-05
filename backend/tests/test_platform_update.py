@@ -1013,8 +1013,11 @@ def test_boot_merge_back_survives_a_metadata_only_repair_of_every_file(clone_env
   assert pu.swap_in_prepared_update(cutover=True, repo=platform)
 
   _bump_ctime_of_every_tracked_file(platform)
-  # The trigger is real: Git's cached stat data no longer matches any file.
-  assert _git(platform, "diff-files", "--quiet", check=False).returncode == 1
+  # The trigger is real: Git's cached stat data matches no tracked file,
+  # including every file the merge-back rewrites.
+  stale = _git(platform, "diff-files", "--name-only", "-z").stdout.split("\0")
+  tracked = _git(platform, "ls-files", "-z").stdout.split("\0")
+  assert set(stale) - {""} == set(tracked) - {""}
 
   assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'LATE'\n"

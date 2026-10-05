@@ -29,6 +29,7 @@ the platform can read why a boot transaction failed.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -74,13 +75,15 @@ def record_boot_run(command: str, *, ok: bool, detail: str, log: Path | None = N
     "ok": ok,
     "detail": detail,
   }
+  staged = log.with_name(f".{log.name}.{os.getpid()}.tmp")
   try:
     lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
     lines = [*lines[-(_BOOT_LOG_RECORDS - 1):], json.dumps(record)]
-    staged = log.with_name(f".{log.name}.{os.getpid()}.tmp")
     staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(staged, log)
   except OSError as exc:
+    with contextlib.suppress(OSError):
+      staged.unlink(missing_ok=True)
     print(f"platform boot: could not record this run in {log}: {exc!r}", file=sys.stderr)
 
 
