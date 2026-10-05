@@ -58,15 +58,29 @@ start() {  # <image>
       || fail "the $1 container stopped before it was ready"
     sleep 1
   done
+  # A fresh /data seeds its checkout from the image, so the served code must
+  # be exactly the image's own release. /api/version's "sha" names only the
+  # image; the entrypoint's record names the tree uvicorn serves.
+  local expected served_sha
+  expected=$(docker exec "$name" git -c safe.directory='*' -C /app/platform-baked rev-parse HEAD)
+  served_sha=$(docker exec "$name" cat /tmp/serving-sha)
+  [ "$served_sha" = "$expected" ] || fail "the $1 container serves $served_sha, not its own $expected"
   docker cp "$ROOT/scripts/transcript_rollback_probe.py" "$name:/tmp/probe.py"
 }
 
-probe() {  # <command>: runs in the serving container with its baked code
-  docker exec -u mobius -e "PROBE_ROUND=${round:-1}" -w /app/platform-baked/backend -e PYTHONPATH=/app/platform-baked/backend \
-    "$name" python3 /tmp/probe.py "$1"
+probe() {  # <command>: runs in the tree the server runs; any error fails at once
+  local backend output
+  backend=$(docker exec "$name" sh -c 'readlink "/proc/$(pgrep -n -f "/bin/uvicorn app\.main:app")/cwd"') \
+    && [ -n "$backend" ] || fail "cannot locate the serving uvicorn process"
+  if ! output=$(docker exec -u mobius -e "PROBE_ROUND=${round:-1}" -w "$backend" -e PYTHONPATH="$backend" \
+      "$name" python3 /tmp/probe.py "$1" 2>"$work/probe.err"); then
+    cat "$work/probe.err" >&2
+    fail "probe '$1' failed in $backend"
+  fi
+  printf '%s\n' "$output"
 }
 
-offline_probe() {  # <image> <command>: no server running
+offline_probe() {  # <image> <command>: no server running; the image's own code reads raw SQLite
   docker run --rm --entrypoint python3 -u mobius -e "PROBE_ROUND=${round:-1}" -w /app/platform-baked/backend \
     -e PYTHONPATH=/app/platform-baked/backend -e SECRET_KEY=offline-probe-key-0123456789abcdef \
     -e DATABASE_URL=sqlite:////data/db/rollback.db -e DATA_DIR=/tmp \
@@ -74,10 +88,15 @@ offline_probe() {  # <image> <command>: no server running
     "$1" /tmp/probe.py "$2"
 }
 
-converge() {
-  until [ "$(probe pending)" = '{"pending": 0}' ]; do
-    [ "$(docker inspect -f '{{.State.Running}}' "$name")" = "true" ] || fail "candidate stopped while converting"
-    sleep 1
+converge() {  # waits only on a valid "still pending" answer
+  local answer
+  while :; do
+    answer=$(probe pending)
+    case $answer in
+      '{"pending": 0}') return 0 ;;
+      '{"pending": '[1-9]*'}') sleep 1 ;;
+      *) fail "unexpected conversion answer: $answer" ;;
+    esac
   done
 }
 
