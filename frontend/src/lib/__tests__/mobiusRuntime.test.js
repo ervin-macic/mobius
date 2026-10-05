@@ -875,6 +875,50 @@ test('nav helper sends shell back only to the most recent owned entry', async ()
   })
 })
 
+test('nav location reports bounded JSON to the parent and exposes the restored place', async () => {
+  await withFakeWindow(async ({ parent }) => {
+    const nav = makeNav({ location: '{"tab":"browse","item":"notes"}' })
+    assert.deepEqual(nav.location, { tab: 'browse', item: 'notes' })
+
+    nav.setLocation({ tab: 'browse', item: 'notes' })
+    assert.equal(parent.messages.length, 0, 'an unchanged place is not re-sent')
+
+    nav.setLocation({ tab: 'library' })
+    assert.deepEqual(parent.messages.at(-1), {
+      data: { type: 'moebius:nav-location', location: '{"tab":"library"}' },
+      origin: 'https://mobius.test',
+    })
+    assert.deepEqual(nav.location, { tab: 'library' })
+    nav.location.tab = 'mutated'
+    assert.deepEqual(nav.location, { tab: 'library' }, 'readers get a copy')
+
+    nav.setLocation(null)
+    assert.equal(parent.messages.at(-1).data.location, null)
+    assert.equal(nav.location, null)
+  })
+})
+
+test('nav location rejects oversized or non-JSON values without reporting them', async () => {
+  await withFakeWindow(async ({ parent }) => {
+    const nav = makeNav()
+    assert.throws(() => nav.setLocation({ query: 'x'.repeat(5000) }), RangeError)
+    assert.throws(() => nav.setLocation(() => {}), TypeError)
+    const cyclic = {}
+    cyclic.self = cyclic
+    assert.throws(() => nav.setLocation(cyclic), TypeError)
+    assert.equal(parent.messages.length, 0)
+    assert.equal(nav.location, null)
+  })
+})
+
+test('nav location ignores restored text that is not bounded JSON', async () => {
+  await withFakeWindow(async () => {
+    assert.equal(makeNav({ location: '{broken' }).location, null)
+    assert.equal(makeNav({ location: JSON.stringify({ q: 'x'.repeat(5000) }) }).location, null)
+    assert.equal(makeNav({ location: { tab: 'object, not text' } }).location, null)
+  })
+})
+
 test('signal helper queues bounded structured events instead of overwriting a file', async () => {
   const previousWindow = globalThis.window
   const previousDocument = globalThis.document

@@ -1,5 +1,6 @@
 """Mini-app compile contract shared by the compiler and local validator."""
 
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -48,12 +49,38 @@ COMPILED_RUNTIME_ABI = 1
 # compiled-runtime change that remains host-compatible. Keep ABI for actual
 # host/runtime incompatibilities: a revision-only rollout is safe while the
 # live checkout and backend process briefly run different generations.
-COMPILED_RUNTIME_ARTIFACT_REVISION = 8
+COMPILED_RUNTIME_ARTIFACT_REVISION = 9
 COMPILED_RUNTIME_GLOBAL = "__mobiusCompiledRuntime"
 COMPILED_RUNTIME_BANNER = (
   f"/* mobius-compiled-runtime-abi:{COMPILED_RUNTIME_ABI};"
   f"artifact-revision:{COMPILED_RUNTIME_ARTIFACT_REVISION} */"
 )
+
+
+def app_frame_version(
+  compiled_path: str | None,
+  capability_contract: Mapping | None,
+  token_nonce: str | None,
+) -> str:
+  """Identify what an app frame executes, for the shell's reload decision.
+
+  A frame runs one content-addressed bundle (its file name carries the
+  SHA-256, and the compile banner carries the runtime revision), initialized
+  with the accepted runtime declarations and bound to one storage generation.
+  Ordinary row writes such as a pin, rename, icon, or permission change touch
+  none of these, so the shell keeps the running frame and the app keeps its
+  place. The nonce enters only through the digest, never on the wire.
+  """
+  runtime = (
+    capability_contract.get("runtime")
+    if isinstance(capability_contract, Mapping) else None
+  )
+  identity = json.dumps(
+    [Path(compiled_path or "").name, runtime or {}, token_nonce or ""],
+    sort_keys=True,
+    separators=(",", ":"),
+  )
+  return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
 
 def runtime_inject_path() -> Path:

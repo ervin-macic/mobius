@@ -209,6 +209,8 @@ class AppOut(BaseModel):
   public_access_contract: dict | None = Field(default=None, exclude=True)
   public_access_digest: str | None = Field(default=None, exclude=True)
   public_published_at: datetime | None = Field(default=None, exclude=True)
+  # Storage generation; it reaches clients only through frame_version.
+  token_nonce: str | None = Field(default=None, exclude=True)
   # The manifest version currently installed (e.g. "1.7.0"). Null for
   # user-built apps and for rows installed before the column existed
   # (they backfill on their next update). The store reads this to show
@@ -235,6 +237,16 @@ class AppOut(BaseModel):
   capability_contract: dict | None = None
   created_at: datetime
   updated_at: datetime
+
+  @computed_field
+  @property
+  def frame_version(self) -> str:
+    """The app frame's reload key; see app_compile_contract.app_frame_version."""
+    from app.app_compile_contract import app_frame_version
+
+    return app_frame_version(
+      self.compiled_path, self.capability_contract, self.token_nonce,
+    )
 
   @computed_field
   @property

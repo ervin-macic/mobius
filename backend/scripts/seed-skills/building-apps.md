@@ -1107,7 +1107,7 @@ The shell installs a back-sentinel in its own history on `nav-push`, so the OS s
 - The host caps pending sentinels at 20 per app. On overflow it responds `{type:'moebius:nav-push-rejected', requestId}` — the helper above rejects its promise, so you simply don't render the nested view. If you bypass the helper, treat a rejection as a hard "stay where you are" and do NOT increment your local counter, or your count drifts above the host's permanently and the next `nav-pop` consumes the wrong sentinel.
 - The `requestId` is optional on the wire (the shell echoes whatever you send), but use a fresh id per push when multiple can be in flight — a stale ack can otherwise resolve a later promise.
 
-**Across app switches:** app-sentinels are preserved across drawer-driven app switches. Nest 2 levels in app A, drawer-tap to app B, and the user gets browser-style back (first back returns to app A showing its nested view, then unwinds app A, last back exits). Your iframe stays mounted in the LRU cache while invisible, so its state is preserved — just respond to `moebius:nav-back` correctly even when currently invisible (by the time it arrives, your iframe is visible again).
+**Across app switches:** app-sentinels are preserved across drawer-driven app switches. Nest 2 levels in app A, drawer-tap to app B, and the user gets browser-style back (first back returns to app A showing its nested view, then unwinds app A, last back exits). Your iframe stays mounted in the LRU cache while invisible, so its state is preserved until the frame is recreated (see *Keep your place across reloads*) — just respond to `moebius:nav-back` correctly even when currently invisible (by the time it arrives, your iframe is visible again).
 
 **Forward restoration:** the runtime retains each reversible entry's handlers.
 After Back it keeps the entry dormant; when browser Forward revisits the same
@@ -1119,3 +1119,48 @@ retires that ghost slot instead of swallowing the next Back. The
 internals: raw-protocol callers remain one-way and must not set `reversible`
 themselves. For multi-level navigation, each level needs its own reversible
 helper closure; labels are diagnostic, not a serialized navigation tree.
+
+### Keep your place across reloads
+
+The shell recreates an app's frame when its code changes (an agent apply or a
+Store update), when the bounded frame cache evicts it, after a crash, and when
+the shell itself reloads. In-memory state, including `nav.open` handlers, is
+gone then. Settings writes (pin, rename, permissions, icon) do not reload it.
+
+An app with nested views reports where it is and restores that on start:
+
+```jsx
+const nav = window.mobius?.nav
+const keepsPlace = typeof nav?.setLocation === 'function'
+const restoredRef = useRef(!keepsPlace)
+
+// Once the data the saved view needs has loaded:
+useEffect(() => {
+  if (!loaded || restoredRef.current) return
+  restoredRef.current = true
+  const saved = nav.location
+  const item = items.find(i => i.id === saved?.itemId)
+  if (saved?.view === 'detail' && item) openDetail(item) // the user-tap path
+}, [loaded])
+
+// After every navigation change, once restored:
+useEffect(() => {
+  if (!keepsPlace || !restoredRef.current) return
+  nav.setLocation(selected ? { view: 'detail', itemId: selected.id } : { view: 'list' })
+}, [selected])
+```
+
+- The location is a small JSON value: at most 4 KiB as UTF-8 JSON
+  (`RangeError` above that, `TypeError` for non-JSON). Keep ids and view names
+  in it, and drafts or larger state in `window.mobius.storage`.
+  `setLocation(null)` clears it.
+- Restore before you report: the first report replaces the saved place.
+- Restore through the same path as a user action, so a restored nested view
+  calls `nav.open(...)` and Back still works. Treat the saved value as untrusted
+  input: check its ids against loaded data and fall back to the start view.
+- The shell keeps one location per app installation for the current browser
+  tab. It survives a shell reload, not closing the tab, and is cleared on sign
+  out or an app data wipe. Other apps never receive it.
+- Feature-detect with `typeof window.mobius?.nav?.setLocation === 'function'`
+  (or `window.mobius.runtimeFeatures.navLocation`); without it the app starts at
+  its home view as before.

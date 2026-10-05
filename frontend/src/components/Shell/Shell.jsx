@@ -3099,7 +3099,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // Refresh server truth before warming or placing. app_updated/app_created
       // remain lifecycle refreshes; app_preview_ready is the explicit
       // build-session action that reveals either a new app or an updated one.
-      // `updated_at` drives the iframe live-swap; the chat-artifact query above
+      // `frame_version` drives the iframe live-swap; the chat-artifact query above
       // owns the durable Icon Drop and unread-dot state.
       Promise.all([
         invalidateShellListCache('apps'),
@@ -4428,9 +4428,10 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // Wipes an app's stored data back to empty while KEEPING it installed —
   // a separate, additive action from deleteApp (which tombstones the whole
   // app). Lives here, like deleteApp, so it has access to notifyShell and
-  // refreshApps. The app STAYS in the list; refreshApps picks up the bumped
-  // updated_at, which rotates versionForApp's cache-buster so an open iframe
-  // remounts against its now-empty storage — no manual cache eviction.
+  // refreshApps. The app STAYS in the list; refreshApps picks up the new
+  // storage generation in frame_version, which rotates versionForApp's
+  // cache-buster so an open iframe remounts against its now-empty storage —
+  // no manual cache eviction.
   async function deleteAppData(id) {
     let res
     try {

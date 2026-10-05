@@ -1,0 +1,96 @@
+"""The shell reloads an app frame only when what the frame executes changes.
+
+`frame_version` is the shell's reload key. Every App row write advances
+`updated_at`, so keying frames on it reloaded running apps (and lost their
+place) on a pin, rename, or permission change.
+"""
+
+import asyncio
+from pathlib import Path
+
+from app import compiler, models
+from app.app_compile_contract import app_frame_version
+from test_app_fixtures import create_local_app
+
+
+BUNDLE = "/data/compiled/app-7-" + "a" * 64 + ".js"
+CONTRACT = {
+  "runtime": {"camera": {"version": 1, "reason": "Scan"}},
+  "permissions": {"cross_app_access": "none"},
+}
+
+
+def test_frame_version_tracks_bundle_runtime_and_storage_generation():
+  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1")
+
+  assert base == app_frame_version(BUNDLE, dict(CONTRACT), "nonce-1")
+  assert len(base) == 20 and "nonce-1" not in base
+  assert app_frame_version(
+    BUNDLE.replace("a" * 64, "b" * 64), CONTRACT, "nonce-1",
+  ) != base
+  assert app_frame_version(
+    BUNDLE, {**CONTRACT, "runtime": {}}, "nonce-1",
+  ) != base
+  assert app_frame_version(BUNDLE, CONTRACT, "nonce-2") != base
+
+
+def test_frame_version_ignores_server_permissions_and_bundle_directory():
+  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1")
+  granted = {**CONTRACT, "permissions": {"cross_app_access": "read"}}
+
+  assert app_frame_version(BUNDLE, granted, "nonce-1") == base
+  assert app_frame_version(
+    "/elsewhere/" + Path(BUNDLE).name, CONTRACT, "nonce-1",
+  ) == base
+
+
+def test_settings_writes_keep_frame_version(client, auth):
+  app = create_local_app(client, auth, name="Reader", description="test")
+  before = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+
+  pinned = client.patch(
+    f"/api/apps/{app['id']}", json={"pinned": True}, headers=auth,
+  )
+  renamed = client.patch(
+    f"/api/apps/{app['id']}",
+    json={"name": "Reader 2", "share_with_apps": "read"},
+    headers=auth,
+  )
+
+  assert pinned.status_code == 200, pinned.text
+  assert renamed.status_code == 200, renamed.text
+  after = renamed.json()
+  assert after["updated_at"] != before["updated_at"]
+  assert after["frame_version"] == before["frame_version"]
+  assert "token_nonce" not in after
+
+
+def test_code_change_and_data_wipe_rotate_frame_version(
+  client, auth, db, monkeypatch,
+):
+  app = create_local_app(client, auth, name="Notes", description="test")
+  initial = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+
+  async def fake_compile(jsx, *, out_path=None, source_path=None):
+    Path(out_path).write_text("// a different bundle\n", encoding="utf-8")
+
+  monkeypatch.setattr(compiler, "compile_jsx", fake_compile)
+  row = db.query(models.App).filter(models.App.id == app["id"]).one()
+  asyncio.run(compiler.recompile_app_bundle(db, row, row.jsx_source))
+  rebuilt = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+  assert rebuilt["frame_version"] != initial["frame_version"]
+
+  wiped = client.delete(f"/api/apps/{app['id']}/data", headers=auth)
+  assert wiped.status_code in (200, 204), wiped.text
+  after_wipe = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+  assert after_wipe["frame_version"] != rebuilt["frame_version"]
+
+
+def test_standalone_boot_uses_the_same_frame_version(client, auth, db):
+  from app.routes.standalone import _standalone_boot_payload
+
+  app = create_local_app(client, auth, name="Solo", description="test")
+  listed = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+  row = db.query(models.App).filter(models.App.id == app["id"]).one()
+
+  assert _standalone_boot_payload(row)["frame_version"] == listed["frame_version"]

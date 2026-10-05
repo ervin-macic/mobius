@@ -9,10 +9,8 @@ import { stageComposerHandoff } from '../ChatView/composerDraft.js'
 import RecoveryPanel from '../ErrorBoundary/RecoveryPanel.jsx'
 import useAgentRepair from '../../hooks/useAgentRepair.js'
 import { buildAgentRepairPrompt, errorRecoveryFingerprint } from '../../lib/errorRecovery.js'
-import {
-  isVisualContentOnly,
-  standaloneAppVersion,
-} from '../../lib/standaloneBoot.js'
+import { isVisualContentOnly } from '../../lib/standaloneBoot.js'
+import { appFrameVersion } from '../../lib/appVersion.js'
 import { readableAppDiagnostic } from '../../lib/appDiagnostic.js'
 import { makeAppChatController } from '../../lib/appChatControl.js'
 import { handleAppProjectsRequest } from '../../lib/appProjectControl.js'
@@ -81,14 +79,17 @@ export default function StandaloneApp({ initialApp }) {
       return null
     }
     setRemoved(false)
-    if (apply) {
+    // A settings write keeps the frame version, so it applies in place.
+    if (apply || appFrameVersion(current) === appFrameVersion(app)) {
       setApp(current)
       setUpdateAvailable(false)
-    } else if (standaloneAppVersion(current) !== standaloneAppVersion(app)) {
+    } else {
       setUpdateAvailable(true)
     }
     return current
   }, [app, initialApp.id, queryClient])
+  const refreshAppRef = useRef(refreshApp)
+  refreshAppRef.current = refreshApp
 
   const captureCrash = useCallback((_appId, error) => {
     setCrash({
@@ -106,8 +107,7 @@ export default function StandaloneApp({ initialApp }) {
     if (event.type === 'app_deleted') {
       setRemoved(true)
     } else if (['app_updated', 'app_recovered', 'app_preview_ready'].includes(event.type)) {
-      setRemoved(false)
-      setUpdateAvailable(true)
+      void refreshAppRef.current().catch(() => {})
     }
   }, [initialApp.id]), {
     // Reconnect reconciliation is best-effort; the next system event or
@@ -247,7 +247,7 @@ export default function StandaloneApp({ initialApp }) {
         appId={app.id}
         appName={app.name}
         appSlug={app.slug}
-        version={standaloneAppVersion(app)}
+        version={appFrameVersion(app)}
         offlineCapable={app.offline_capable === true}
         capabilityContract={app.capability_contract || null}
         active

@@ -13,6 +13,7 @@ import {
   liveAppToken, resolveLatchedToken,
 } from '../../lib/appToken.js'
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
+import { readAppNavLocation, writeAppNavLocation } from '../../lib/appNavLocationStore.js'
 import {
   cacheAppToken, readAppFrameStorage, readCachedAppToken,
   isSharedVirtualStorageKey,
@@ -65,7 +66,7 @@ function appFrameRequestUrl(appId, version, frameRev) {
 // the opaque origin `null` and are attributed to an exact mounted contentWindow.
 //
 //   1. {type: 'moebius:frame-init', token, themeCss, bg,
-//       capabilityContract}                                parent → frame
+//       capabilityContract, navLocation}                   parent → frame
 //      Fired by `sendInit()` below — on iframe.onLoad AND whenever the
 //      token query resolves (covers the case where the iframe loaded
 //      before the token was ready). Idempotent — the frame's own
@@ -130,6 +131,13 @@ function appFrameRequestUrl(appId, version, frameRev) {
 // `nav-push-rejected` / `nav-back`) is handled below — see the
 // `onMessage` handler. These wire the iframe's own back-stack into
 // the shell's pushState so device-back unwinds in-app routes first.
+//
+// Navigation location: {type:'moebius:nav-location', location} frame → parent
+//      The live frame reports its current place as bounded JSON text (or null).
+//      The shell keeps it per app and installation (lib/appNavLocationStore.js)
+//      and returns it as frame-init's navLocation to the next frame of the same
+//      app, so a code update, eviction, crash or shell reload keeps the place.
+//      It is app data: validated and stored as text, never evaluated.
 //
 //   4. {type: 'moebius:immersive', value, appId}            frame → parent
 //      The app asks the shell to hide its chrome (top bar) so the canvas
@@ -206,7 +214,7 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //
 // Why token-free frame URL: `GET /api/apps/{id}/frame?v={version}` is
 // unauthenticated. Token arrives via postMessage so the long-lived JWT
-// never appears in frame history; `v` is the app.updated_at cache buster
+// never appears in frame history; `v` is the app's frame_version cache buster
 // that prevents the offline-app service-worker cache from serving an old
 // frame/module after an app update.
 // =================================================================
@@ -286,8 +294,9 @@ function CameraPreviewLayer({ preview }) {
   )
 }
 
-// `version` is bumped by Shell when an `app_updated` event arrives for this
-// app (a recompile advanced app.updated_at). Rather than remount the one iframe
+// `version` changes when Shell's refreshed app row carries a new frame_version:
+// a new compiled bundle, runtime declarations or storage generation, never a
+// mere settings write. Rather than remount the one iframe
 // on every bump — which blanked the running preview to a full-frame spinner and
 // dropped all in-app state on each ~1s agent save — we DOUBLE-BUFFER the swap:
 // keep the current frame visible and load the new version in a hidden frame
@@ -708,6 +717,7 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
+        navLocation: readAppNavLocation(appId, appTokenIdentity(token)?.appInstanceId),
       },
       '*',
     )
@@ -726,7 +736,7 @@ const AppCanvas = forwardRef(function AppCanvas({
   // or recompiles. This makes a first online open sufficient for the next
   // offline reload; the module travels separately through the parent broker.
   useEffect(() => {
-    // `0` is appVersionKey's missing-row sentinel while the app list restores;
+    // `0` is appFrameVersion's missing-row sentinel while the app list restores;
     // warming it could race the real version and evict the correct cache key.
     if (!appId || version === '0') return
     void requestAppCodeWarm({
@@ -901,6 +911,17 @@ const AppCanvas = forwardRef(function AppCanvas({
       // browsing context). Route acks back to the source frame via e.source
       // directly — it is the verified sender window.
       if (srcVersion !== liveVersionRef.current) return
+
+      // A replacement frame still loading in the background may report its
+      // start screen before it restores, so only the live frame's place counts.
+      if (msg.type === 'moebius:nav-location') {
+        writeAppNavLocation(
+          appId,
+          appTokenIdentity(hostTokenRef.current)?.appInstanceId,
+          msg.location,
+        )
+        return
+      }
 
       if (msg.type === 'moebius:clipboard-write') {
         if (!visibleRef.current) return

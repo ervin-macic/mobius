@@ -3033,6 +3033,39 @@ function makeChat({ appId, getToken, storage }) {
 }
 
 //#endregion
+//#region src/lib/appNavLocation.js
+const APP_NAV_LOCATION_MAX_BYTES = 4096;
+function byteLength(text) {
+	return new TextEncoder().encode(text).length;
+}
+/** Encode a location for the wire. null/undefined clears it. Throws on misuse. */
+function encodeNavLocation(value) {
+	if (value === void 0 || value === null) return null;
+	let text;
+	try {
+		text = JSON.stringify(value);
+	} catch (error) {
+		throw new TypeError(`window.mobius.nav.setLocation: the location must be JSON-serializable (${error?.message || error})`);
+	}
+	if (typeof text !== "string") throw new TypeError("window.mobius.nav.setLocation: the location must be JSON-serializable");
+	const bytes = byteLength(text);
+	if (bytes > 4096) throw new RangeError(`window.mobius.nav.setLocation: the location is ${bytes} bytes as JSON; the limit is ${APP_NAV_LOCATION_MAX_BYTES}. Keep ids and view names here and larger state in window.mobius.storage.`);
+	return text;
+}
+/** Return `text` when it is bounded, parseable location JSON, else null. */
+function validNavLocationText(text) {
+	if (typeof text !== "string" || text === "null") return null;
+	if (text.length > 4096) return null;
+	if (byteLength(text) > 4096) return null;
+	try {
+		JSON.parse(text);
+	} catch {
+		return null;
+	}
+	return text;
+}
+
+//#endregion
 //#region src/runtime/navigation.js
 const SPLIT_WIDE_BP = 600;
 const SPLIT_FLICK_VEL = .4;
@@ -3263,7 +3296,8 @@ function makeSplit() {
 		};
 	};
 }
-function makeNav() {
+function makeNav({ location = null } = {}) {
+	let locationText = validNavLocationText(location);
 	const stack = [];
 	const entries = /* @__PURE__ */ new Set();
 	const entriesByRequestId = /* @__PURE__ */ new Map();
@@ -3462,7 +3496,25 @@ function makeNav() {
 			}
 		};
 	}
-	return { open };
+	function setLocation(value) {
+		const text = encodeNavLocation(value);
+		if (text === locationText) return;
+		locationText = text;
+		if (window.parent === window) return;
+		try {
+			window.parent.postMessage({
+				type: "moebius:nav-location",
+				location: text
+			}, window.location.origin);
+		} catch (e) {}
+	}
+	return {
+		open,
+		setLocation,
+		get location() {
+			return locationText === null ? null : JSON.parse(locationText);
+		}
+	};
 }
 
 //#endregion
@@ -4462,9 +4514,10 @@ let _runtimeContext = null;
 const runtimeFeatures = Object.freeze({
 	authoritativeVersionedReads: true,
 	idleDocument: true,
+	navLocation: true,
 	projects: true
 });
-function init({ appId, appInstanceId = null, getToken, capabilityContract = null }) {
+function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null }) {
 	const identityKey = `${String(appId)}:${appInstanceId || "legacy"}`;
 	if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
 		_runtimeContext.tokenRef.current = getToken;
@@ -4522,7 +4575,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		signal,
 		capabilities,
 		chat,
-		nav: makeNav(),
+		nav: makeNav({ location: navLocation }),
 		split: makeSplit(),
 		immersive: makeImmersive({ appId }),
 		clipboard: makeClipboard(),

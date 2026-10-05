@@ -755,8 +755,8 @@ test.describe('AppCanvas: iframe-mount contract', () => {
     })
     await setupShellBasics(page)
 
-    // Digit-string updated_at values double as the frame version keys
-    // (appVersionKey passes them through): while the app sits at '1000' the
+    // The row's frame_version is the frame version key (appFrameVersion passes
+    // it through): while the app sits at '1000' the
     // live frame mounts at that version; once the test ARMS the swap the app
     // reports '2000', so the next refetch triggers the double-buffer swap and
     // mounts a hidden incoming frame.
@@ -772,7 +772,7 @@ test.describe('AppCanvas: iframe-mount contract', () => {
     // however many — returns '1000', and only the post-arm refetch returns
     // '2000'.
     let swapArmed = false
-    const appRow = (updatedAt) => ({
+    const appRow = (frameVersion) => ({
       id: appId,
       name: 'CrashToy',
       slug: 'crashtoy',
@@ -781,7 +781,8 @@ test.describe('AppCanvas: iframe-mount contract', () => {
       chat_id: null,
       source_dir: null,
       created_at: '1000',
-      updated_at: updatedAt,
+      updated_at: frameVersion,
+      frame_version: frameVersion,
     })
     await page.route(/\/api\/apps\/$/, route => {
       if (route.request().method() !== 'GET') return route.fallback()
@@ -877,7 +878,7 @@ test.describe('AppCanvas: iframe-mount contract', () => {
 
     // Arm the swap: the live frame has settled at '1000', so from here every
     // apps fetch reports '2000'. Then trigger an apps refetch (an unknown
-    // open-app target refetches once before giving up) — the bumped updated_at
+    // open-app target refetches once before giving up) — the new frame_version
     // starts the swap and mounts the hidden incoming frame.
     swapArmed = true
     const settledLiveFrame = await waitForContentFrame(

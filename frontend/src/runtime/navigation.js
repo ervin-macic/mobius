@@ -1,3 +1,4 @@
+import { encodeNavLocation, validNavLocationText } from '../lib/appNavLocation.js'
 
 // ── ChatSplit — window.mobius.split(opts) ────────────────────────────────────
 //
@@ -295,7 +296,11 @@ export function makeSplit() {
   }
 }
 
-export function makeNav() {
+// `location` is the JSON text the shell kept from this app's previous frame
+// (see lib/appNavLocation.js). The app reads it as `nav.location` to restore
+// its place and reports each new place with `nav.setLocation(value)`.
+export function makeNav({ location = null } = {}) {
+  let locationText = validNavLocationText(location)
   const stack = []
   const entries = new Set()
   const entriesByRequestId = new Map()
@@ -533,5 +538,24 @@ export function makeNav() {
     }
   }
 
-  return { open }
+  function setLocation(value) {
+    const text = encodeNavLocation(value)
+    if (text === locationText) return
+    locationText = text
+    if (window.parent === window) return
+    try {
+      window.parent.postMessage(
+        { type: 'moebius:nav-location', location: text },
+        window.location.origin,
+      )
+    } catch (e) {}
+  }
+
+  return {
+    open,
+    setLocation,
+    get location() {
+      return locationText === null ? null : JSON.parse(locationText)
+    },
+  }
 }

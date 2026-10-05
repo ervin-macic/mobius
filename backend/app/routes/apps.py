@@ -2948,8 +2948,8 @@ async def delete_app_data(
     # recreate the erased tree after the wipe, and a fresh runtime gets a clean
     # browser-local generation instead of adopting an old outbox.
     app.token_nonce = secrets.token_hex(16)
-    # Advance updated_at so the iframe cache-buster changes and a currently-open
-    # app remounts against its now-empty storage.
+    # The new nonce changes frame_version, so a currently-open app remounts
+    # against its now-empty storage; updated_at refreshes list consumers.
     app.updated_at = now_naive_utc()
     db.commit()
 
