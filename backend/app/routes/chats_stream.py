@@ -282,45 +282,36 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
   return content
 
 
+# One answer's files, bounded before canonicalization. Composer sends keep
+# their existing (unbounded) contract; this applies to card answers only.
+MAX_QUESTION_ATTACHMENTS = 20
+
+
 def _canonical_question_attachments(
   chat: models.Chat, attachments: list[dict] | None,
 ) -> list[dict] | None:
   """Resolve card-level file references once, before either answer path writes."""
   if not attachments:
     return None
+  if len(attachments) > MAX_QUESTION_ATTACHMENTS:
+    raise HTTPException(
+      status_code=422,
+      detail=f"Attach at most {MAX_QUESTION_ATTACHMENTS} files to one answer.",
+    )
   uploads = {entry.get("name"): entry for entry in (chat.uploads or [])}
-  canonical = []
+  canonical: dict[str, dict] = {}
   for attachment in attachments:
     name = attachment.get("name") if isinstance(attachment, dict) else None
     entry = uploads.get(name) if isinstance(name, str) and name else None
     path = _safe_upload_path(entry.get("path"), get_settings().data_dir) if entry else None
     if not path:
       raise HTTPException(status_code=409, detail="An attached file is no longer available.")
-    if not any(item["name"] == name for item in canonical):
-      canonical.append({
-        "name": name, "path": path,
-        "size": entry.get("size", 0),
-        "mime_type": entry.get("mime_type", "application/octet-stream"),
-      })
-  return canonical
-
-
-def _question_answer_with_attachments(
-  answers: dict, attachments: list[dict] | None,
-) -> dict:
-  """Add card-level context to the legacy native result, not to one answer."""
-  if not attachments:
-    return answers
-  lines = [
-    f"- {entry['name']} → {entry['path']} ({entry.get('mime_type', 'unknown')})"
-    for entry in attachments
-  ]
-  # Native results are a question-to-answer map. A separate context entry
-  # preserves every answer verbatim, including on multi-question cards.
-  key = "[Attached files]"
-  while key in answers:
-    key = "[" + key + "]"
-  return {**answers, key: "\n".join(lines)}
+    canonical.setdefault(name, {
+      "name": name, "path": path,
+      "size": entry.get("size", 0),
+      "mime_type": entry.get("mime_type", "application/octet-stream"),
+    })
+  return list(canonical.values())
 
 
 async def _append_to_pending(
@@ -1159,6 +1150,10 @@ async def _send_message_impl(
           "status": "queued", "answer_turn": "queued", "message": stored,
         })
       pending = questions.get(chat_id)
+      if pending is not None and body.attachments:
+        # Provider-native parked questions are disabled for Claude and Codex;
+        # only saved cards carry files. Refuse rather than drop them.
+        raise HTTPException(409, detail="This question can't take files. Remove the attachment to continue.")
       if pending is not None:
         if (
           body.question_id is not None
@@ -1181,7 +1176,6 @@ async def _send_message_impl(
             question_id=(body.question_id or pending.question_id),
             answers=body.answers,
             selected_options=body.selected_options,
-            attachments=body.attachments,
             restore_archived=restore_archived,
           )
         )
@@ -1212,9 +1206,7 @@ async def _send_message_impl(
             detail="The question is no longer accepting answers.",
           )
         if not pending.future.done():
-          pending.future.set_result(_question_answer_with_attachments(
-            body.answers, body.attachments,
-          ))
+          pending.future.set_result(body.answers)
         # Tell every connected client (and the catch-up replay) the question
         # is answered. Without this, an already-open stream — or any client
         # that reconnects mid-turn — never learns the answer: the live

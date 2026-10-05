@@ -8,10 +8,16 @@ export function resolveQuestionAnswer(answer, otherText) {
   return answer || ''
 }
 
+/**
+ * Card-level files can stand in for the answer only on a single-question card.
+ * On a grouped card every question needs its own answer, so a file never
+ * claims to have answered questions it says nothing about.
+ */
 export function questionAnswersReady(questions, answers, otherTexts, files) {
+  const filesAnswer = questions.length === 1 && files.length > 0
   return questions.every(question => (
     Boolean(resolveQuestionAnswer(answers[question.question], otherTexts[question.question]))
-    || files.length > 0
+    || filesAnswer
   ))
 }
 

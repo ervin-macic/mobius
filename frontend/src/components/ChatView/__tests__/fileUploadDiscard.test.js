@@ -16,17 +16,15 @@ function setup(t, initialFiles = []) {
   const hook = renderHook(() => useFileUpload({ chatId: 'chat', initialFiles }))
   return { hook, calls }
 }
-const record = (name, discard_token = 'receipt') => ({ name, discard_token, size: 3, mime_type: 'text/plain', status: 'done' })
+const record = name => ({ name, size: 3, mime_type: 'text/plain', status: 'done' })
 const uploadedFile = () => new File(['abc'], 'local.txt', { type: 'text/plain' })
 
-test('discard excludes committed names, cannot delete legacy owner files, and is idempotent', t => {
-  const { hook, calls } = setup(t, [record('unused.txt'), record('accepted.txt'), record('legacy.txt', undefined)])
-  // Explicitly model an older draft with no server receipt.
-  hook.result.current.restoreFiles([record('unused.txt'), record('accepted.txt'), { name: 'legacy.txt', status: 'done' }])
+test('discard excludes committed names and is idempotent', t => {
+  const { hook, calls } = setup(t, [record('unused.txt'), record('accepted.txt')])
   hook.result.current.discardFiles({ exceptNames: ['accepted.txt'] })
   hook.result.current.discardFiles()
   assert.equal(calls.length, 1)
-  assert.match(calls[0].url, /unused.txt\?only_if_unused=true&discard_token=receipt$/)
+  assert.match(calls[0].url, /unused.txt\?only_if_unused=true$/)
   assert.deepEqual(hook.result.current.files, [])
   hook.unmount()
 })
@@ -38,10 +36,10 @@ for (const action of ['remove', 'discard']) {
     if (action === 'remove') hook.result.current.removeFile(hook.result.current.files[0].id)
     else hook.result.current.discardFiles()
     assert.equal(calls.length, 1)
-    calls[0].resolve({ ok: true, json: async () => [record('server_1.txt', 'fresh')] })
+    calls[0].resolve({ ok: true, json: async () => [record('server_1.txt')] })
     await pending
     assert.deepEqual(hook.result.current.files, [])
-    assert.match(calls[1].url, /server_1.txt\?only_if_unused=true&discard_token=fresh$/)
+    assert.match(calls[1].url, /server_1.txt\?only_if_unused=true$/)
     hook.unmount()
   })
 }
@@ -53,7 +51,7 @@ test('navigation/unmount preserves completed drafts but discards orphaned late s
   calls[0].resolve({ ok: true, json: async () => [record('server.txt')] })
   await pending
   assert.equal(calls.length, 2)
-  assert.match(calls[1].url, /server.txt\?only_if_unused=true&discard_token=receipt$/)
+  assert.match(calls[1].url, /server.txt\?only_if_unused=true$/)
   assert.ok(!calls.some(call => call.url.includes('draft.txt')))
 })
 
@@ -63,7 +61,6 @@ test('server metadata replaces browser guesses', async t => {
   calls[0].resolve({ ok: true, json: async () => [record('server.txt')] })
   await pending
   assert.equal(hook.result.current.files[0].name, 'server.txt')
-  assert.equal(hook.result.current.files[0].discard_token, 'receipt')
   hook.unmount()
 })
 
@@ -78,7 +75,7 @@ test('discard preserves a late success explicitly included in accepted names', a
   hook.unmount()
 })
 
-test('removing an uploaded attachment after draft restoration keeps its deletion receipt', async t => {
+test('removing an attachment restored from a saved draft still discards it on the server', async t => {
   const values = new Map()
   const storage = {
     getItem: key => values.get(key) ?? null,
@@ -87,12 +84,12 @@ test('removing an uploaded attachment after draft restoration keeps its deletion
   }
   const { hook, calls } = setup(t)
   const pending = hook.result.current.addFiles([uploadedFile()])
-  calls[0].resolve({ ok: true, json: async () => [record('server.txt', 'fresh')] })
+  calls[0].resolve({ ok: true, json: async () => [record('server.txt')] })
   await pending
   persistComposerDraft('chat', '', hook.result.current.files, storage)
   hook.unmount()
 
-  // Restoration is persisted again on mount; both directions must retain it.
+  // Restoration is persisted again on mount; the restored chip must stay removable.
   const restored = readComposerDraft('chat', storage)
   persistComposerDraft('chat', restored.input, restored.attachments, storage)
   const second = readComposerDraft('chat', storage)
@@ -101,7 +98,7 @@ test('removing an uploaded attachment after draft restoration keeps its deletion
     remounted.result.current.removeFile(remounted.result.current.files[0].id)
     assert.deepEqual(remounted.result.current.files, [])
     assert.equal(calls.length, 2)
-    assert.match(calls[1].url, /server.txt\?only_if_unused=true&discard_token=fresh$/)
+    assert.match(calls[1].url, /server.txt\?only_if_unused=true$/)
   } finally {
     remounted.unmount()
   }

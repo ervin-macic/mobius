@@ -64,6 +64,7 @@ from app.goals import admit_goal
 from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
 from app.json_safety import json_safe
+from app.upload_lifecycle import claim_uploads
 from app.events import (
   TOOL_OUTPUT_INLINE_THRESHOLD,
   build_assistant_message,
@@ -323,7 +324,6 @@ class AnswerQuestion(_Command):
   legacy_save_only: bool = False
   require_exact_card: bool = False
   selected_options: dict | None = None
-  attachments: list[dict] | None = None
   restore_archived: bool = False
 
 
@@ -2478,11 +2478,10 @@ class ChatWriterActor:
         if not accepts_saved_answer(chat, cmd.question_id):
           raise AnswerConflict("This question is no longer open.")
         validate_saved_answer(card, cmd.answers, None)
-    metadata = {}
-    if cmd.selected_options is not None:
-      metadata["selected_options"] = cmd.selected_options
-    if cmd.attachments:
-      metadata["attachments"] = cmd.attachments
+    metadata = (
+      {"selected_options": cmd.selected_options}
+      if cmd.selected_options is not None else None
+    )
     if cmd.close_without_reply:
       from app.questions import (
         AnswerConflict, accepts_saved_answer, closes_without_reply,
@@ -3593,6 +3592,7 @@ class ChatWriterActor:
     if not resuming:
       _ensure_unique_ts(cmd.user_msg, existing)
       existing.append(cmd.user_msg)
+      claim_uploads(chat, cmd.user_msg.get("attachments"))
     chat.messages = existing
     # Allocate the current assistant's stable display id while history and the
     # queue are already in memory. Streaming snapshots can then update only the
@@ -4489,6 +4489,7 @@ class ChatWriterActor:
     else:
       pending.append(new_msg)
     chat.pending_messages = pending
+    claim_uploads(chat, new_msg.get("attachments"))
     if applied:
       # Both a recovered answer and an early continuation-card answer use the
       # queue. Retire the question, but leave a still-running turn's browser

@@ -332,88 +332,134 @@ def test_upload_multi_file_over_cap_cleans_partial(client, db, auth, chat, monke
   assert (chat.uploads or []) == []
 
 
-def test_discard_requires_exact_upload_receipt(client, db, auth, chat):
-  from pathlib import Path
-  record = client.post(
+def _upload(client, auth, chat, name, body=b"draft"):
+  return client.post(
     f"/api/chats/{chat.id}/uploads", headers=auth,
-    files=[("files", ("draft.txt", io.BytesIO(b"draft"), "text/plain"))],
+    files=[("files", (name, io.BytesIO(body), "text/plain"))],
   ).json()[0]
-  path = Path(record["path"])
-  for token in (None, "stale-receipt"):
-    params = {"only_if_unused": "true"}
-    if token:
-      params["discard_token"] = token
-    assert client.delete(f"/api/chats/{chat.id}/uploads/draft.txt", headers=auth, params=params).status_code == 204
-    assert path.exists()
-  owner_file = path.parent / "owner.txt"
-  owner_file.write_text("not uploaded by this browser")
-  assert client.delete(
-    f"/api/chats/{chat.id}/uploads/owner.txt", headers=auth,
-    params={"only_if_unused": "true", "discard_token": record["discard_token"]},
-  ).status_code == 204
-  assert owner_file.exists()
-  assert client.delete(
-    f"/api/chats/{chat.id}/uploads/draft.txt", headers=auth,
-    params={"only_if_unused": "true", "discard_token": record["discard_token"]},
-  ).status_code == 204
-  assert not path.exists()
+
+
+def _discard(client, auth, chat, name):
+  return client.delete(
+    f"/api/chats/{chat.id}/uploads/{name}", headers=auth,
+    params={"only_if_unused": "true"},
+  )
+
+
+def test_new_uploads_are_unclaimed_drafts_without_secrets(client, db, auth, chat):
+  record = _upload(client, auth, chat, "draft.txt")
+  assert record["claimed"] is False
+  assert "discard_token" not in record
+  listed = client.get(f"/api/chats/{chat.id}/uploads", headers=auth).json()
+  assert listed == [record]
+
+
+def test_discard_removes_only_unclaimed_drafts(client, db, auth, chat):
+  from pathlib import Path
+  draft = _upload(client, auth, chat, "draft.txt")
+  claimed = _upload(client, auth, chat, "claimed.txt")
+  legacy = _upload(client, auth, chat, "legacy.txt")
   db.refresh(chat)
-  assert chat.uploads == []
+  chat.uploads = [
+    draft,
+    {**claimed, "claimed": True},
+    {k: v for k, v in legacy.items() if k != "claimed"},
+  ]
+  db.commit()
+  stray = Path(draft["path"]).parent / "stray.txt"
+  stray.write_text("on disk but never recorded as an upload")
+
+  for name in ("claimed.txt", "legacy.txt", "stray.txt", "missing.txt", "caf\u00e9.txt"):
+    assert _discard(client, auth, chat, name).status_code == 204
+  for path in (claimed["path"], legacy["path"], stray):
+    assert Path(path).exists()
+
+  assert _discard(client, auth, chat, "draft.txt").status_code == 204
+  assert not Path(draft["path"]).exists()
+  db.refresh(chat)
+  assert [u["name"] for u in chat.uploads] == ["claimed.txt", "legacy.txt"]
 
 
-def test_discard_preserves_message_pending_and_card_references(client, db, auth, chat):
+def test_admitted_messages_claim_their_uploads(client, db, auth, chat):
   from pathlib import Path
-  record = client.post(
-    f"/api/chats/{chat.id}/uploads", headers=auth,
-    files=[("files", ("accepted.txt", io.BytesIO(b"keep"), "text/plain"))],
-  ).json()[0]
-  for column, message in [
-    ("messages", {"role": "user", "attachments": [{"name": record["name"]}]}),
-    ("pending_messages", {"attachments": [{"name": record["name"]}]}),
-    ("messages", {"blocks": [{"type": "question", "attachments": [record]}]}),
-    ("messages", {"content": f"See {record['path']}"}),
-  ]:
-    from app.chat_writer import get_writer, ReplaceTranscript, ClearPending, AppendPending
-    writer = get_writer()
-    writer.submit(ReplaceTranscript(
-      chat_id=chat.id, messages=[message] if column == "messages" else [],
-    )).result(timeout=5)
-    writer.submit(ClearPending(chat_id=chat.id)).result(timeout=5)
-    if column == "pending_messages":
-      writer.submit(AppendPending(chat_id=chat.id, user_msg=message)).result(timeout=5)
-    assert client.delete(
-      f"/api/chats/{chat.id}/uploads/{record['name']}", headers=auth,
-      params={"only_if_unused": "true", "discard_token": record["discard_token"]},
-    ).status_code == 204
+  from app.chat_writer import get_writer, AppendPending, ClearPending, StartTurn
+
+  started = _upload(client, auth, chat, "started.txt")
+  queued = _upload(client, auth, chat, "queued.txt")
+  untouched = _upload(client, auth, chat, "untouched.txt")
+  writer = get_writer()
+  writer.submit(StartTurn(
+    chat_id=chat.id, run_token="claim-run",
+    user_msg={"role": "user", "content": "see file", "ts": 5,
+              "attachments": [{"name": started["name"]}]},
+    title_source="see file",
+  )).result(timeout=5)
+  writer.submit(AppendPending(
+    chat_id=chat.id, user_msg={"role": "user", "content": "and this",
+                               "attachments": [{"name": queued["name"]}]},
+  )).result(timeout=5)
+  writer.submit(ClearPending(chat_id=chat.id)).result(timeout=5)
+
+  db.refresh(chat)
+  claimed = {u["name"]: u["claimed"] for u in chat.uploads}
+  assert claimed == {"started.txt": True, "queued.txt": True, "untouched.txt": False}
+  for record in (started, queued):
+    assert _discard(client, auth, chat, record["name"]).status_code == 204
     assert Path(record["path"]).exists()
-    db.refresh(chat)
-    assert chat.uploads == [record]
+  assert _discard(client, auth, chat, untouched["name"]).status_code == 204
+  assert not Path(untouched["path"]).exists()
 
 
-def test_discard_waits_for_answer_admission_and_rereads(client, db, auth, chat):
+def test_expired_drafts_are_swept_on_next_upload(client, db, auth, chat):
+  from datetime import UTC, datetime, timedelta
+  from pathlib import Path
+  from app.upload_lifecycle import UNCLAIMED_UPLOAD_TTL
+
+  old = (datetime.now(UTC) - UNCLAIMED_UPLOAD_TTL - timedelta(hours=1)).isoformat()
+  stale = _upload(client, auth, chat, "stale.txt")
+  sent = _upload(client, auth, chat, "sent.txt")
+  legacy = _upload(client, auth, chat, "legacy.txt")
+  fresh = _upload(client, auth, chat, "fresh.txt")
+  db.refresh(chat)
+  chat.uploads = [
+    {**stale, "uploaded_at": old},
+    {**sent, "uploaded_at": old, "claimed": True},
+    {k: v for k, v in {**legacy, "uploaded_at": old}.items() if k != "claimed"},
+    fresh,
+  ]
+  db.commit()
+
+  _upload(client, auth, chat, "next.txt")
+  db.refresh(chat)
+  assert [u["name"] for u in chat.uploads] == [
+    "sent.txt", "legacy.txt", "fresh.txt", "next.txt",
+  ]
+  assert not Path(stale["path"]).exists()
+  for record in (sent, legacy, fresh):
+    assert Path(record["path"]).exists()
+
+
+def test_discard_waits_for_admission_and_rereads(client, db, auth, chat):
   import asyncio
   from pathlib import Path
   from app import chat_queue
   from app.deps import Principal
   from app.routes.uploads import delete_upload
 
-  record = client.post(
-    f"/api/chats/{chat.id}/uploads", headers=auth,
-    files=[("files", ("race.txt", io.BytesIO(b"keep"), "text/plain"))],
-  ).json()[0]
+  record = _upload(client, auth, chat, "race.txt", b"keep")
   principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
 
   async def race():
     async with chat_queue.get_lock(chat.id):
       discard = asyncio.create_task(delete_upload(
-        chat.id, record["name"], only_if_unused=True,
-        discard_token=record["discard_token"], principal=principal, db=db,
+        chat.id, record["name"], only_if_unused=True, principal=principal, db=db,
       ))
       await asyncio.sleep(0)
       assert not discard.done()
-      from app.chat_writer import get_writer, ReplaceTranscript
-      await asyncio.wrap_future(get_writer().submit(ReplaceTranscript(
-        chat_id=chat.id, messages=[{"blocks": [{"attachments": [record]}]}],
+      from app.chat_writer import get_writer, AppendPending
+      await asyncio.wrap_future(get_writer().submit(AppendPending(
+        chat_id=chat.id,
+        user_msg={"role": "user", "content": "x", "attachments": [{"name": record["name"]}]},
       )))
     response = await discard
     assert response.status_code == 204

@@ -287,24 +287,3 @@ test('only one stored-handoff consumer may deliver the same queued Send', () => 
   assert.equal(consumeComposerHandoff('chat-a', 'One send', { autoSend: true, storage }), false)
   assert.equal(readComposerDraft('chat-a', storage).input, 'One send', 'claiming delivery does not delete the recoverable draft')
 })
-
-test('draft metadata preserves only nonempty string deletion receipts', () => {
-  for (const receipt of [undefined, null, '', 42, {}, 'server-receipt']) {
-    const storage = storageStub()
-    persistComposerDraft('receipts', '', [{
-      name: 'draft.txt', size: 3, mime_type: 'text/plain', status: 'done',
-      discard_token: receipt,
-    }], storage)
-    const stored = JSON.parse(storage.getItem('draft:receipts')).attachments[0]
-    const expected = receipt === 'server-receipt' ? receipt : undefined
-    assert.equal(stored.discard_token, expected)
-    assert.equal(readComposerDraft('receipts', storage).attachments[0].discard_token, expected)
-
-    // Read normalization also rejects malformed receipts from older storage.
-    stored.discard_token = receipt
-    storage.setItem('draft:receipts', JSON.stringify({
-      type: 'mobius-composer-draft', version: 2, input: '', attachments: [stored],
-    }))
-    assert.equal(readComposerDraft('receipts', storage).attachments[0].discard_token, expected)
-  }
-})

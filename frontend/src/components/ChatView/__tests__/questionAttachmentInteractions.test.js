@@ -77,10 +77,14 @@ test('pasting into question two uses one card tray, upload gates submit, and sub
     assert.equal(elements(card.result.current).filter(node => node.props?.['aria-label'] === 'Files for this answer').length, 1)
     finishUpload({ ok: true, json: async () => [{ name: 'notes.txt', size: 5, mime_type: 'text/plain' }] })
     await uploading
+    // A grouped card still needs every question answered; the file is context.
+    assert.equal(submit(card.result.current).props.disabled, true)
+    editor(card.result.current, 'First?').props.onChange('first answer')
+    editor(card.result.current, 'Second?').props.onChange('second answer')
     assert.equal(submit(card.result.current).props.disabled, false)
     submit(card.result.current).props.onClick({ currentTarget: { closest: () => null } })
-    assert.equal(posted[1]['First?'], 'Attached 1 file')
-    assert.equal(posted[1]['Second?'], 'Attached 1 file')
+    assert.equal(posted[1]['First?'], 'first answer')
+    assert.equal(posted[1]['Second?'], 'second answer')
     assert.deepEqual(posted[3].attachments, [{ name: 'notes.txt', size: 5, mime_type: 'text/plain' }])
     assert.equal(submit(card.result.current).props.disabled, true)
     assert.equal(chips(card.result.current).props.disabled, true)
@@ -156,7 +160,7 @@ test('failed uploads block submit until removed, and remote settlement safely di
     assert.equal(submit(card.result.current).props.disabled, false)
     globalThis.fetch = async (url, options) => {
       calls.push({ url, options })
-      return { ok: true, json: async () => [{ name: 'unsent.txt', size: 1, mime_type: 'text/plain', discard_token: 'draft' }] }
+      return { ok: true, json: async () => [{ name: 'unsent.txt', size: 1, mime_type: 'text/plain' }] }
     }
     await editor(card.result.current, 'Second?').props.onPasteFiles([new File(['a'], 'a.txt')])
     card.rerender({ ...props, answeredMap: { 'First?': 'Remote', 'Second?': 'Remote' }, attachments: [] })
@@ -166,10 +170,19 @@ test('failed uploads block submit until removed, and remote settlement safely di
 })
 
 
-test('card-level files satisfy empty single, multi-select and empty other answers consistently', () => {
+test('files answer a single-question card for empty single, multi-select and other answers', () => {
+  const single = questions.slice(0, 1)
   for (const answer of [undefined, [], '__other__', ['__other__']]) {
-    const selected = { 'First?': answer, 'Second?': answer }
-    assert.equal(questionAnswersReady(questions, selected, {}, []), false)
-    assert.equal(questionAnswersReady(questions, selected, {}, [{ name: 'answer.txt' }]), true)
+    const selected = { 'First?': answer }
+    assert.equal(questionAnswersReady(single, selected, {}, []), false)
+    assert.equal(questionAnswersReady(single, selected, {}, [{ name: 'answer.txt' }]), true)
   }
+})
+
+
+test('files never stand in for unanswered questions on a grouped card', () => {
+  const file = [{ name: 'answer.txt' }]
+  assert.equal(questionAnswersReady(questions, {}, {}, file), false)
+  assert.equal(questionAnswersReady(questions, { 'First?': 'Yes' }, {}, file), false)
+  assert.equal(questionAnswersReady(questions, { 'First?': 'Yes', 'Second?': 'No' }, {}, file), true)
 })

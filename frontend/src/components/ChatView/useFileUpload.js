@@ -21,7 +21,6 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     name: file.name,
     size: file.size,
     mime_type: file.mime_type,
-    discard_token: file.discard_token,
     objectUrl: file.objectUrl || null,
     status: file.status || 'done',
     error: file.error || null,
@@ -63,10 +62,10 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   }, [])
 
   const discardUpload = useCallback((file) => {
-    // Never infer deletion authority from a local/browser-supplied filename.
-    if (!file?.name || !file.discard_token) return
-    const query = new URLSearchParams({ only_if_unused: 'true', discard_token: file.discard_token })
-    fetch(`${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(file.name)}?${query}`, {
+    // The server removes only uploads no sent message or answer has claimed,
+    // so a stale chip or late cleanup can never delete a file in use.
+    if (!file?.name) return
+    fetch(`${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(file.name)}?only_if_unused=true`, {
       method: 'DELETE', headers: getAuthHeaders(),
     }).catch(() => {})
   }, [chatId])
@@ -115,7 +114,7 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
           }
           commitFiles(prev => prev.map(c =>
             c.id === chip.id
-              ? { ...c, name: uploaded.name, size: uploaded.size, mime_type: uploaded.mime_type, discard_token: uploaded.discard_token, status: 'done' }
+              ? { ...c, name: uploaded.name, size: uploaded.size, mime_type: uploaded.mime_type, status: 'done' }
               : c
           ))
         }

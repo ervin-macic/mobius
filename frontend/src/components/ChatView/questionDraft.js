@@ -94,7 +94,7 @@ export function writeQuestionDraft(
   const targets = storage ? [storage] : browserDraftStorages()
   const hasAnswers = Object.keys(answers || {}).length > 0
   const hasText = Object.values(otherTexts || {}).some(value => String(value || '').length > 0)
-  const savedFiles = files.filter(file => file.status === 'done').map(({ name, size, mime_type, discard_token }) => ({ name, size, mime_type, ...(discard_token ? { discard_token } : {}), status: 'done' }))
+  const savedFiles = files.filter(file => file.status === 'done').map(({ name, size, mime_type }) => ({ name, size, mime_type, status: 'done' }))
 
   // Clearing is authoritative across every fallback. Returning after the
   // first successful remove leaves older session data available to resurrect.

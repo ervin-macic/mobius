@@ -11,23 +11,28 @@ from app import models
 from app.chat_writer import apply_answers_to_last_question, _question_answer_fields
 
 
-def test_live_question_attachment_context_uses_verified_upload(tmp_path, monkeypatch):
+def test_question_attachments_resolve_once_per_upload(tmp_path, monkeypatch):
   upload = tmp_path / "chats" / "chat-a" / "uploads" / "photo.png"
   upload.parent.mkdir(parents=True)
   upload.write_bytes(b"image")
   monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
   chat = SimpleNamespace(uploads=[{
-    "name": "photo.png", "path": str(upload), "mime_type": "image/png",
+    "name": "photo.png", "path": str(upload), "size": 5, "mime_type": "image/png",
   }])
-  answers = {"Which option?": "Keep it"}
-
-  delivered = chats_stream._question_answer_with_attachments(
-    answers, chats_stream._canonical_question_attachments(chat, [{"name": "photo.png"}]),
+  resolved = chats_stream._canonical_question_attachments(
+    chat, [{"name": "photo.png", "path": "/forged"}, {"name": "photo.png"}],
   )
+  assert resolved == [{
+    "name": "photo.png", "path": str(upload), "size": 5, "mime_type": "image/png",
+  }]
 
-  assert answers == {"Which option?": "Keep it"}
-  assert delivered["Which option?"] == "Keep it"
-  assert str(upload) in delivered["[Attached files]"]
+
+def test_question_attachments_are_bounded(tmp_path, monkeypatch):
+  monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
+  too_many = [{"name": f"f{i}.txt"} for i in range(chats_stream.MAX_QUESTION_ATTACHMENTS + 1)]
+  with pytest.raises(HTTPException) as exc:
+    chats_stream._canonical_question_attachments(SimpleNamespace(uploads=[]), too_many)
+  assert exc.value.status_code == 422
 
 
 def test_live_question_attachment_context_rejects_unuploaded_file(tmp_path, monkeypatch):
@@ -105,7 +110,7 @@ def test_saved_card_route_canonical_attachments(
   canonical = {"name": "photo.png", "path": str(upload), "size": 5, "mime_type": "image/png"}
   with SessionLocal() as db:
     row = db.get(models.Chat, chat.id)
-    row.uploads = [{**canonical, "discard_token": "draft-only"}] if valid else []
+    row.uploads = [{**canonical, "claimed": False}] if valid else []
     db.commit()
   monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
   monkeypatch.setattr(chats_stream, "is_chat_running", lambda _: running)
@@ -129,13 +134,18 @@ def test_saved_card_route_canonical_attachments(
     "attachments": [{"name": "photo.png", "size": 999, "mime_type": "text/html", "path": "/forged"}],
   })
   if mode == "native":
+    resolved = future.done()
     questions.cancel(chat.id)
   loop.close()
-  assert res.status_code == (202 if valid else 409), res.text
+  assert res.status_code == (202 if valid and mode != "native" else 409), res.text
   with SessionLocal() as db:
     row = db.get(models.Chat, chat.id)
     card = next(b for m in row.messages for b in m.get("blocks", []) if b.get("question_id") == "saved-files")
-    if not valid:
+    if not valid or mode == "native":
+      if mode == "native":
+        # Provider-native questions are retired and refuse files outright.
+        assert not resolved
+      assert row.uploads == ([{**canonical, "claimed": False}] if valid else [])
       assert "answers" not in card
       assert not row.pending_messages
       assert not events
@@ -143,14 +153,11 @@ def test_saved_card_route_canonical_attachments(
       return
     assert card["answers"] == {"Pick one": "a", "Add details": "Attached 1 file"}
     assert card["attachments"] == [canonical]
-    if mode == "native":
-      assert future.result()["Pick one"] == "a"
-      assert str(upload) in future.result()["[Attached files]"]
-    else:
-      message = row.pending_messages[0] if running else scheduled[0]["next_user"]
-      assert message["attachments"] == [canonical]
-      assert str(upload) in message["content"]
-      assert "/forged" not in message["content"]
+    assert row.uploads == [{**canonical, "claimed": True}]
+    message = row.pending_messages[0] if running else scheduled[0]["next_user"]
+    assert message["attachments"] == [canonical]
+    assert str(upload) in message["content"]
+    assert "/forged" not in message["content"]
   applied = next(event for event in events if event["type"] == "answers_applied")
   assert applied["attachments"] == [canonical]
   assert applied["answers"] == {"Pick one": "a", "Add details": "Attached 1 file"}

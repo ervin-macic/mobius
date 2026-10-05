@@ -63,11 +63,11 @@ test('question drafts retain only completed file metadata and clear file-only dr
   const storage = new MemoryStorage()
   const key = questionDraftKey('chat-1', 'files', questions)
   writeQuestionDraft(key, {}, {}, storage, [
-    { name: 'photo.png', size: 12, mime_type: 'image/png', status: 'done', discard_token: 'receipt', objectUrl: 'blob:secret' },
+    { name: 'photo.png', size: 12, mime_type: 'image/png', status: 'done', objectUrl: 'blob:secret' },
     { name: 'pending.pdf', status: 'uploading' },
   ])
   assert.deepEqual(readQuestionDraft(key, storage).files, [
-    { name: 'photo.png', size: 12, mime_type: 'image/png', status: 'done', discard_token: 'receipt' },
+    { name: 'photo.png', size: 12, mime_type: 'image/png', status: 'done' },
   ])
   assert.doesNotMatch(storage.getItem(key), /blob:secret|pending.pdf/)
   writeQuestionDraft(key, {}, {}, storage, [])

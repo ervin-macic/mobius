@@ -126,11 +126,6 @@ export function _clearComposerDraftMemoryForTests() {
 function attachmentMetadata(attachment) {
   return {
     name: attachment.name,
-    // Retain the server receipt across both draft serialization and hydration.
-    // Legacy drafts remain readable without gaining deletion authority.
-    ...(typeof attachment.discard_token === 'string' && attachment.discard_token.length > 0
-      ? { discard_token: attachment.discard_token }
-      : {}),
     size: Number.isFinite(attachment.size) ? attachment.size : 0,
     mime_type: typeof attachment.mime_type === 'string'
       ? attachment.mime_type

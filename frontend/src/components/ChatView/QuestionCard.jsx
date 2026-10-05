@@ -269,7 +269,7 @@ export default function QuestionCard({
     const resolved = {}
     const lines = questions.map(q => {
       const val = resolveQuestionAnswer(answers[q.question], otherTexts[q.question])
-        || (readyFiles.length ? `Attached ${readyFiles.length} file${readyFiles.length === 1 ? '' : 's'}` : '')
+        || (questions.length === 1 && readyFiles.length ? `Attached ${readyFiles.length} file${readyFiles.length === 1 ? '' : 's'}` : '')
       resolved[q.question] = val
       return `- ${q.question}: ${val.replace(/\n/g, '\n  ')}`
     })

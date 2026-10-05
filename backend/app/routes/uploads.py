@@ -3,13 +3,13 @@
 
 import os
 import re
-import secrets
 import tempfile
 from datetime import UTC, datetime
 import pathlib
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,7 @@ from app.image_previews import discard_image_preview, display_image_preview
 from app.path_utils import validate_chat_id, validate_path_within_base
 from app.resource_access import get_active_chat_for_principal
 from app.storage_io import atomic_write
+from app.upload_lifecycle import is_draft, partition_expired_drafts
 
 router = APIRouter(prefix="/api/chats", tags=["uploads"])
 
@@ -125,7 +126,8 @@ async def upload_files(
           pathlib.Path(entry["path"]).replace(dest)
           written.append(dest)
           entry.update(name=name, path=str(dest))
-        chat.uploads = list(chat.uploads or []) + saved
+        kept, expired = partition_expired_drafts(chat.uploads or [])
+        chat.uploads = kept + saved
         db.commit()
       except BaseException:
         for path in written:
@@ -134,6 +136,11 @@ async def upload_files(
           except OSError:
             pass
         raise
+    if expired:
+      await run_in_threadpool(
+        _remove_upload_files, upload_dir,
+        [pathlib.Path(e.get("path") or "") for e in expired],
+      )
     return saved
 
 
@@ -171,7 +178,7 @@ async def _stage_uploads(files, upload_dir):
       "size": total,
       "mime_type": mime,
       "uploaded_at": datetime.now(UTC).isoformat(),
-      "discard_token": secrets.token_urlsafe(24),
+      "claimed": False,
     })
 
   return saved
@@ -201,58 +208,50 @@ async def delete_upload(
   chat_id: str,
   filename: str = Path(...),
   only_if_unused: bool = False,
-  discard_token: str | None = None,
   principal: Principal = Depends(get_owner_or_chat_embed_principal),
   db: Session = Depends(get_db),
 ):
-  """Removes an uploaded file from disk and from the chat's upload list."""
+  """Removes an uploaded file from disk and from the chat's upload list.
+
+  `only_if_unused` is the draft discard (see `app.upload_lifecycle`): it
+  removes the upload only while no admitted message has claimed it, so a
+  stale tab or late cleanup can never delete a file a sent message or answer
+  owns. Anything else is a silent no-op.
+  """
   validate_chat_id(chat_id)
   if principal.scope == "app":
     raise HTTPException(status_code=403, detail="App token is not valid here.")
   require_chat_embed_operation(principal, "chat:uploads")
   chat = get_active_chat_for_principal(db, chat_id, principal)
+  upload_dir = pathlib.Path(get_settings().data_dir) / "chats" / chat_id / "uploads"
+  file_path = validate_path_within_base(filename, upload_dir)
 
-  # Serialize with answer/send admission, and re-read after waiting: an answer
-  # accepted first owns its attachments; a discard accepted first removes the
-  # authoritative metadata before a subsequent answer can resolve it.
+  # Serialize with send/answer admission (which holds this lock while the
+  # writer claims), and re-read after waiting: an admission that wins claims
+  # the upload; a discard that wins removes the metadata first.
   async with chat_queue.get_lock(chat_id):
     db.refresh(chat)
+    uploads = list(chat.uploads or [])
     if only_if_unused:
-      entry = next((u for u in (chat.uploads or []) if u.get("name") == filename), None)
-      if (not entry or not discard_token
-          or not secrets.compare_digest(entry.get("discard_token", ""), discard_token)
-          or _references_upload(chat.messages, filename)
-          or _references_upload(chat.pending_messages, filename)):
+      entry = next((u for u in uploads if u.get("name") == filename), None)
+      if not entry or not is_draft(entry):
         return Response(status_code=204)
-
-    settings = get_settings()
-    upload_dir = pathlib.Path(settings.data_dir) / "chats" / chat_id / "uploads"
-    file_path = validate_path_within_base(filename, upload_dir)
-
-    if file_path.exists() and file_path.is_file():
-      file_path.unlink()
-      discard_image_preview(file_path, upload_dir)
-
-    if chat.uploads:
-      chat.uploads = [u for u in chat.uploads if u.get("name") != filename]
-      db.commit()
-
+    if uploads:
+      chat.uploads = [u for u in uploads if u.get("name") != filename]
+      await run_in_threadpool(db.commit)
+  await run_in_threadpool(_remove_upload_files, upload_dir, [file_path])
   return Response(status_code=204)
 
 
-def _references_upload(value, filename: str) -> bool:
-  """Conservatively keep structured attachments and text/path references.
-
-  Question answers can live inside assistant blocks, not just user messages.
-  False positives retain a file; false negatives would lose owner data.
-  """
-  if isinstance(value, str):
-    return filename in value
-  if isinstance(value, dict):
-    return any(_references_upload(item, filename) for item in value.values())
-  if isinstance(value, list):
-    return any(_references_upload(item, filename) for item in value)
-  return False
+def _remove_upload_files(upload_dir: pathlib.Path, paths: list[pathlib.Path]) -> None:
+  for path in paths:
+    try:
+      safe = validate_path_within_base(path.name, upload_dir)
+    except HTTPException:
+      continue
+    if safe.is_file():
+      safe.unlink()
+      discard_image_preview(safe, upload_dir)
 
 
 @router.get("/{chat_id}/uploads/{filename}")
