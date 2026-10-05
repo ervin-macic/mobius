@@ -4,6 +4,7 @@ have to go on, so it must carry the failing command's own explanation."""
 import json
 import os
 import subprocess
+from types import SimpleNamespace
 
 from app import platform_boot, platform_update
 
@@ -74,6 +75,36 @@ def test_an_unwritable_boot_log_never_fails_the_boot(tmp_path, capsys):
   platform_boot.record_boot_run("activate", ok=True, detail="none", log=missing_dir)
 
   assert "could not record this run" in capsys.readouterr().err
+
+
+def test_a_damaged_boot_log_never_fails_a_settled_boot(tmp_path, monkeypatch):
+  """A boot that settled the platform must exit 0 whatever the log holds;
+  otherwise every later boot would refuse to start on the same file."""
+  log = tmp_path / "platform-boot.jsonl"
+  log.write_bytes(b'{"command": "guard"}\n\xff\xfe not text\n')
+  monkeypatch.setattr(platform_boot, "BOOT_LOG", log)
+  monkeypatch.setattr(platform_update, "boot_guard_sync", lambda: "clean")
+
+  umask = os.umask(0)
+  os.umask(umask)
+  try:
+    assert platform_boot.main(["platform_boot", "guard"]) == 0
+  finally:
+    os.umask(umask)
+
+  last = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+  assert last["command"] == "guard" and last["ok"] is True
+
+
+def test_an_unexpected_recording_error_never_escapes(tmp_path, monkeypatch, capsys):
+  def unserializable(_record):
+    raise TypeError("not serializable")
+
+  monkeypatch.setattr(platform_boot, "json", SimpleNamespace(dumps=unserializable))
+  platform_boot.record_boot_run("guard", ok=True, detail="clean", log=tmp_path / "log")
+
+  assert "could not record this run" in capsys.readouterr().err
+  assert list(tmp_path.iterdir()) == []
 
 
 def test_a_failed_boot_log_write_leaves_no_staged_file(tmp_path, monkeypatch, capsys):

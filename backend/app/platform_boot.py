@@ -66,7 +66,13 @@ def failure_detail(exc: BaseException) -> str:
 
 
 def record_boot_run(command: str, *, ok: bool, detail: str, log: Path | None = None) -> None:
-  """Append this run to the bounded boot log; never fails the boot."""
+  """Append this run to the bounded boot log; never fails the boot.
+
+  The log is diagnostics on the boot's critical path: a run that settled the
+  platform must not exit nonzero because its record could not be written, or
+  every later boot would refuse to start on the same file. Earlier lines are
+  read leniently, so a damaged byte ages out instead of stopping the log.
+  """
   log = log or BOOT_LOG
   record = {
     "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -77,11 +83,14 @@ def record_boot_run(command: str, *, ok: bool, detail: str, log: Path | None = N
   }
   staged = log.with_name(f".{log.name}.{os.getpid()}.tmp")
   try:
-    lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    lines = (
+      log.read_text(encoding="utf-8", errors="replace").splitlines()
+      if log.exists() else []
+    )
     lines = [*lines[-(_BOOT_LOG_RECORDS - 1):], json.dumps(record)]
     staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(staged, log)
-  except OSError as exc:
+  except Exception as exc:  # noqa: BLE001 - recording must never fail the boot
     with contextlib.suppress(OSError):
       staged.unlink(missing_ok=True)
     print(f"platform boot: could not record this run in {log}: {exc!r}", file=sys.stderr)
