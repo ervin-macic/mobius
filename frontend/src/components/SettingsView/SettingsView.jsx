@@ -278,6 +278,7 @@ export default function SettingsView({
   active = true,
   refreshToken = 0,
   onLeaveSharedAccess = null,
+  onStatusBarThemeReload = null,
 }) {
   const settingsBoundaryRef = useRef(null)
   const queryClient = useQueryClient()
@@ -880,6 +881,10 @@ export default function SettingsView({
     // postMessages `moebius:frame-theme` to live iframes.
     try {
       await themeService.toggleTheme(queryClient, currentMode, api)
+      // An installed iPhone app re-reads its status-bar colour only when the
+      // page loads or returns to the foreground; the shell's controlled reload
+      // keeps the current screen painted while the new document takes over.
+      if (window.navigator.standalone === true) onStatusBarThemeReload?.()
     } catch {
       setThemeMode(currentMode)
       setThemeError(

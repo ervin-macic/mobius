@@ -5339,6 +5339,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 active={settingsFullBleed || !!settingsPaned}
                 refreshToken={settingsRefreshToken}
                 onLeaveSharedAccess={sharedBrowserAccess?.onLeave || null}
+                onStatusBarThemeReload={applyShellUpdate}
               />
             </Suspense>
           </div>
