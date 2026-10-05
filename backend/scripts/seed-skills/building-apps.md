@@ -888,7 +888,7 @@ shortcuts. It applies only to a direct child frame of your app document:
     if (e.source === p && e.data?.type === 'moebius:frame-shortcuts') shortcuts = e.data.shortcuts || []
   })
   document.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.repeat) return
+    if (e.isComposing || e.repeat || e.getModifierState?.('AltGraph')) return
     const hit = shortcuts.find(({ binding: b }) => String(e.key || '').toLowerCase() === b.key.toLowerCase()
       && (e.metaKey || e.ctrlKey) === !!b.mod && e.shiftKey === !!b.shift && e.altKey === !!b.alt)
     if (!hit) return
