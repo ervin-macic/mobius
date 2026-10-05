@@ -1,4 +1,3 @@
-import FileChips from './FileChips.jsx'
 /**
  * ChatInputBar — the chat composer.
  *
@@ -82,6 +81,7 @@ import FileChips from './FileChips.jsx'
  */
 
 import { useRef, useState, useEffect, useLayoutEffect } from 'react'
+import FileChips from './FileChips.jsx'
 import { ArrowUp, DoubleChevronRight, Stop } from '@openai/apps-sdk-ui/components/Icon'
 import {
   composerHistoryNativeProbe,

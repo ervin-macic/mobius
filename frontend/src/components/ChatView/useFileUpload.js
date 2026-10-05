@@ -9,7 +9,7 @@ import { getAuthHeaders, BASE } from '../../api/client.js'
  *   files: Array,
  *   addFiles: (fileList: File[]) => Promise<void>,
  *   removeFile: (id: string) => void,
- *   discardFiles: (opts?: {exceptNames?: string[]}) => void,
+ *   discardFiles: () => void,
  *   clearFiles: (opts?: {revoke?: boolean}) => void,
  *   restoreFiles: (files: Array) => void,
  *   releaseFiles: (files: Array) => void,
@@ -30,8 +30,9 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   // without closing over a stale `files` state value.
   const filesRef = useRef(files)
   filesRef.current = files
-  // Explicit removal/settlement and unmount own otherwise-orphaned successes.
-  const discardedIds = useRef(new Map())
+  // In-flight uploads the caller already gave up on (removed, discarded or
+  // unmounted): their late success is discarded instead of shown.
+  const discardedIds = useRef(new Set())
   const onFilesChangeRef = useRef(onFilesChange)
   onFilesChangeRef.current = onFilesChange
 
@@ -57,7 +58,7 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
       if (f.objectUrl) URL.revokeObjectURL(f.objectUrl)
       // Completed uploads are durable drafts. In-flight uploads have no saved
       // server name yet, and cannot be restored after this hook unmounts.
-      if (f.status === 'uploading') discardedIds.current.set(f.id, new Set())
+      if (f.status === 'uploading') discardedIds.current.add(f.id)
     }
   }, [])
 
@@ -106,10 +107,8 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
           const data = await res.json().catch(() => [])
           const uploaded = data?.[0]
           if (!uploaded?.name) throw new Error('Upload response is missing file metadata')
-          const exceptNames = discardedIds.current.get(chip.id)
-          if (exceptNames) {
-            discardedIds.current.delete(chip.id)
-            if (!exceptNames.has(uploaded.name)) discardUpload(uploaded)
+          if (discardedIds.current.has(chip.id)) {
+            discardUpload(uploaded)
             continue
           }
           commitFiles(prev => prev.map(c =>
@@ -136,7 +135,7 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     const removing = filesRef.current.find(c => c.id === id)
     if (removing?.objectUrl) URL.revokeObjectURL(removing.objectUrl)
     commitFiles(prev => prev.filter(c => c.id !== id))
-    if (removing?.status === 'uploading') discardedIds.current.set(id, new Set())
+    if (removing?.status === 'uploading') discardedIds.current.add(id)
     if (removing?.status === 'done') discardUpload(removing)
   }, [commitFiles, discardUpload])
 
@@ -152,11 +151,12 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     commitFiles([])
   }, [releaseFiles, commitFiles])
 
-  const discardFiles = useCallback(({ exceptNames = [] } = {}) => {
-    const keep = new Set(exceptNames)
+  // Drop every held file. The server keeps any a sent message or answer has
+  // already claimed, so callers need not work out which ones were sent.
+  const discardFiles = useCallback(() => {
     for (const file of filesRef.current) {
-      if (file.status === 'uploading') discardedIds.current.set(file.id, keep)
-      else if (!keep.has(file.name)) discardUpload(file)
+      if (file.status === 'uploading') discardedIds.current.add(file.id)
+      else discardUpload(file)
     }
     clearFiles()
   }, [clearFiles, discardUpload])

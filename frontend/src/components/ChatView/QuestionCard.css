@@ -241,15 +241,8 @@
   transform-origin: center;
 }
 
-.qcard__answer-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  margin-top: 10px;
-  min-width: 0;
-}
 .qcard__composer {
-  flex: 1;
+  margin-top: 10px;
   min-width: 0;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -438,8 +431,6 @@
 
 .qcard__attachments {
   margin-top: 12px;
-}
-.qcard__attachment-actions {
   display: flex;
   align-items: center;
   gap: 6px;

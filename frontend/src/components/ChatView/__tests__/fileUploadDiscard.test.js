@@ -19,12 +19,13 @@ function setup(t, initialFiles = []) {
 const record = name => ({ name, size: 3, mime_type: 'text/plain', status: 'done' })
 const uploadedFile = () => new File(['abc'], 'local.txt', { type: 'text/plain' })
 
-test('discard excludes committed names and is idempotent', t => {
+test('discard asks the server to drop every held draft, once', t => {
   const { hook, calls } = setup(t, [record('unused.txt'), record('accepted.txt')])
-  hook.result.current.discardFiles({ exceptNames: ['accepted.txt'] })
   hook.result.current.discardFiles()
-  assert.equal(calls.length, 1)
-  assert.match(calls[0].url, /unused.txt\?only_if_unused=true$/)
+  hook.result.current.discardFiles()
+  assert.deepEqual(calls.map(call => call.url.split('/').pop()), [
+    'unused.txt?only_if_unused=true', 'accepted.txt?only_if_unused=true',
+  ])
   assert.deepEqual(hook.result.current.files, [])
   hook.unmount()
 })
@@ -61,17 +62,6 @@ test('server metadata replaces browser guesses', async t => {
   calls[0].resolve({ ok: true, json: async () => [record('server.txt')] })
   await pending
   assert.equal(hook.result.current.files[0].name, 'server.txt')
-  hook.unmount()
-})
-
-test('discard preserves a late success explicitly included in accepted names', async t => {
-  const { hook, calls } = setup(t)
-  const pending = hook.result.current.addFiles([uploadedFile()])
-  hook.result.current.discardFiles({ exceptNames: ['server.txt'] })
-  calls[0].resolve({ ok: true, json: async () => [record('server.txt')] })
-  await pending
-  assert.equal(calls.length, 1)
-  assert.deepEqual(hook.result.current.files, [])
   hook.unmount()
 })
 

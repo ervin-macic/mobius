@@ -1221,7 +1221,6 @@ async def _send_message_impl(
           "type": "answers_applied",
           "question_id": body.question_id or pending.question_id,
           "answers": body.answers,
-          "attachments": body.attachments or [],
         }
         sink = get_active_sink(chat_id)
         bc = get_broadcast(chat_id)

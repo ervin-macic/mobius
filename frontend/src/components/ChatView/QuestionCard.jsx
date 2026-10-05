@@ -185,14 +185,13 @@ export default function QuestionCard({
   useEffect(() => {
     if (answered) {
       clearQuestionDraft(draftKey)
-      if (files.length) discardFiles({
-        exceptNames: (attachments || localAnswer?.body?.attachments || submitted?.attachments || [])
-          .map(file => file.name),
-      })
+      // Files still held here were never sent from this tab. The server keeps
+      // any another tab's answer claimed, so discarding them all is safe.
+      if (files.length) discardFiles()
       return
     }
     writeQuestionDraft(draftKey, answers, otherTexts, undefined, files)
-  }, [draftKey, answers, otherTexts, files, answered, attachments, localAnswer, submitted, discardFiles])
+  }, [draftKey, answers, otherTexts, files, answered, discardFiles])
 
   const allAnswered = questionAnswersReady(questions, answers, otherTexts, readyFiles)
   const selectedOptions = restartCardSelectedOptions(
@@ -481,29 +480,27 @@ export default function QuestionCard({
             </div>}
             {(!completedAction || respondedRestartAction)
               && (!restartAction || writtenRestartAction) && (
-              <div className="qcard__answer-row">
-                <div className={`qcard__composer${isOtherSelected || answeredWithOther ? ' qcard__composer--active' : ''}`}>
-                  {/* One file set per card, shown inside the answer box nearest
-                      Submit, as the message composer shows its files. */}
-                  {qi === questions.length - 1 && answerFiles}
-                  <CustomAnswerArea
-                    answered={selectionLocked}
-                    canSubmit={canSubmit}
-                    disabled={inactive}
-                    placeholder={writtenRestartAction
-                      ? 'Or tell me what you’d like to do instead…'
-                      : hasOptions ? undefined : 'Type your answer…'}
-                    onChange={text => setOtherText(q.question, text)}
-                    onPasteFiles={platformAction || inactive ? undefined : addFiles}
-                    onSubmitShortcut={(questionCard) => {
-                      if (canSubmit) handleSubmit(questionCard, null)
-                    }}
-                    question={q.question}
-                    value={selectionLocked
-                      ? writtenAnswer
-                      : (otherTexts[q.question] || '')}
-                  />
-                </div>
+              <div className={`qcard__composer${isOtherSelected || answeredWithOther ? ' qcard__composer--active' : ''}`}>
+                {/* One file set per card, shown inside the answer box nearest
+                    Submit, as the message composer shows its files. */}
+                {qi === questions.length - 1 && answerFiles}
+                <CustomAnswerArea
+                  answered={selectionLocked}
+                  canSubmit={canSubmit}
+                  disabled={inactive}
+                  placeholder={writtenRestartAction
+                    ? 'Or tell me what you’d like to do instead…'
+                    : hasOptions ? undefined : 'Type your answer…'}
+                  onChange={text => setOtherText(q.question, text)}
+                  onPasteFiles={platformAction || inactive ? undefined : addFiles}
+                  onSubmitShortcut={(questionCard) => {
+                    if (canSubmit) handleSubmit(questionCard, null)
+                  }}
+                  question={q.question}
+                  value={selectionLocked
+                    ? writtenAnswer
+                    : (otherTexts[q.question] || '')}
+                />
               </div>
             )}
           </div>
@@ -512,21 +509,19 @@ export default function QuestionCard({
       </div>
       {!platformAction && !selectionLocked && !disabled && (
         <div className="qcard__attachments">
-              <div className="qcard__attachment-actions">
-                <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
-                  disabled={submitting}
-                  aria-label="Attach files to your answer"
-                  onChange={e => {
-                    const selected = Array.from(e.target.files || [])
-                    e.target.value = ''
-                    if (!submitting) addFiles(selected)
-                  }} />
-                <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
-                  title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>
-                  <Paperclip width={18} height={18} aria-hidden="true" />
-                </button>
-                <span>Files for {grouped ? 'all answers' : 'this answer'} · attach or paste</span>
-              </div>
+          <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
+            disabled={submitting}
+            aria-label="Attach files to your answer"
+            onChange={e => {
+              const selected = Array.from(e.target.files || [])
+              e.target.value = ''
+              if (!submitting) addFiles(selected)
+            }} />
+          <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
+            title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>
+            <Paperclip width={18} height={18} aria-hidden="true" />
+          </button>
+          <span>Files for {grouped ? 'all answers' : 'this answer'} · attach or paste</span>
         </div>
       )}
       {!completedAction && (answered || !disabled) && (
