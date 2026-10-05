@@ -142,7 +142,7 @@ test('rejected and locally queued submissions retain the draft for retry', async
   }
 })
 
-test('failed uploads block submit until removed, and remote settlement safely discards unsent files', async () => {
+test('a failed upload does not block submit, and remote settlement safely discards unsent files', async () => {
   const originalFetch = globalThis.fetch
   const calls = []
   const props = { chatId: 'remote-chat', questionId: 'remote-card', questions }
@@ -155,9 +155,9 @@ test('failed uploads block submit until removed, and remote settlement safely di
     editor(card.result.current, 'First?').props.onChange('first answer')
     editor(card.result.current, 'Second?').props.onChange('second answer')
     await editor(card.result.current, 'Second?').props.onPasteFiles([new File(['a'], 'a.txt')])
-    assert.equal(submit(card.result.current).props.disabled, true)
-    chips(card.result.current).props.onRemove(chips(card.result.current).props.files[0].id)
+    assert.equal(chips(card.result.current).props.files[0].status, 'error')
     assert.equal(submit(card.result.current).props.disabled, false)
+    chips(card.result.current).props.onRemove(chips(card.result.current).props.files[0].id)
     globalThis.fetch = async (url, options) => {
       calls.push({ url, options })
       return { ok: true, json: async () => [{ name: 'unsent.txt', size: 1, mime_type: 'text/plain' }] }

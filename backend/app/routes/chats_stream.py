@@ -257,8 +257,14 @@ def _sse(data: dict) -> str:
   return f"data: {json.dumps(data)}\n\n"
 
 
-def _content_with_uploads(chat: models.Chat, content: str) -> str:
-  """Returns message content with the session upload notice appended."""
+def _content_with_uploads(
+  chat: models.Chat, content: str, attachments: list[dict] | None = None,
+) -> str:
+  """Returns message content with the session upload notice appended.
+
+  Files carried by this message's own `attachments` are marked, so the agent
+  can tell what a message or answer refers to among the session's files.
+  """
   settings = get_settings()
   # Force-steer resends the exact canonical pending-message content. Pending
   # rows already include this hidden upload manifest; appending it again makes
@@ -268,6 +274,9 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
   if "[Files in this session:" in content:
     return content
   if chat.uploads:
+    own = {
+      a.get("name") for a in (attachments or []) if isinstance(a, dict)
+    }
     safe_entries = []
     for f in chat.uploads:
       safe = _safe_upload_path(f['path'], settings.data_dir)
@@ -275,6 +284,7 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
         safe_entries.append(
           f"- {f['name']} → {safe}"
           f" ({f.get('mime_type', 'unknown')}, {round(f['size'] / 1024)} KB)"
+          + (" — attached to this message" if f.get("name") in own else "")
         )
     if safe_entries:
       lines = "\n".join(safe_entries)
@@ -483,7 +493,7 @@ def _user_message_from_body(
   """Builds the durable user message payload for a send request."""
   user_msg = {
     "role": "user",
-    "content": _content_with_uploads(chat, body.content),
+    "content": _content_with_uploads(chat, body.content, body.attachments),
     "ts": int(time.time() * 1000),
   }
   # Carry the client-minted identity when present; API clients may omit it, so
@@ -1927,12 +1937,16 @@ async def update_pending_message(
   require_chat_embed_operation(principal, "chat:send")
   require_nondelegated_owner_control(principal)
   chat = get_active_chat_for_principal(
-    db, chat_id, principal, load_fields=(models.Chat.uploads,),
+    db, chat_id, principal,
+    load_fields=(models.Chat.uploads, models.Chat.pending_messages),
   )
   content = body.content.strip()
   if not content:
     raise HTTPException(status_code=422, detail="Queued message cannot be empty.")
-  content = _content_with_uploads(chat, content)
+  # A row's attachments never change after admission, so this snapshot read
+  # is safe even if the writer later finds the row already promoted.
+  row = next((m for m in chat.pending_messages or [] if m.get("cid") == cid), {})
+  content = _content_with_uploads(chat, content, row.get("attachments"))
   # The actor's UpdatePending is the SOLE runtime mutator of pending_messages,
   # so an edit racing a concurrent promote/cancel can't lost-update.
   ack = get_writer().submit(

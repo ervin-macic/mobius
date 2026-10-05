@@ -502,3 +502,35 @@ def test_upload_reads_outside_admission_then_commits_under_lock(db, chat):
   assert Path(records[0]["path"]).read_bytes() == b"new"
   upload_dir = Path(get_settings().data_dir) / "chats" / chat.id / "uploads"
   assert not list(upload_dir.glob(".pending-*"))
+
+
+def test_session_file_notice_marks_this_messages_attachments(client, db, auth, chat):
+  """The agent can tell which session files a message or answer carries."""
+  from app.routes.chats_stream import _content_with_uploads
+
+  _upload(client, auth, chat, "report.pdf")
+  _upload(client, auth, chat, "other.pdf")
+  db.refresh(chat)
+
+  lines = _content_with_uploads(chat, "see attached", [{"name": "report.pdf"}]).splitlines()
+
+  assert any("report.pdf" in line and "attached to this message" in line for line in lines)
+  assert any("other.pdf" in line and "attached to this message" not in line for line in lines)
+
+
+def test_pending_edit_keeps_the_rows_attachment_mark(client, db, auth, chat):
+  """Re-deriving the notice on a queued edit still marks the row's own files."""
+  chat.pending_messages = [
+    {"role": "user", "content": "before", "ts": 100, "cid": "c-mark",
+     "attachments": [{"name": "report.pdf"}]},
+  ]
+  db.commit()
+  _upload(client, auth, chat, "report.pdf")
+
+  resp = client.patch(
+    f"/api/chats/{chat.id}/pending/c-mark", headers=auth, json={"content": "after"},
+  )
+
+  assert resp.status_code == 200, resp.text
+  edited = resp.json()["pending_messages"][0]["content"]
+  assert "report.pdf" in edited and "attached to this message" in edited

@@ -150,7 +150,9 @@ export default function QuestionCard({
   if (initialFilesRef.current === null) initialFilesRef.current = readQuestionDraft(draftKey).files
   const { files, addFiles, removeFile, clearFiles, discardFiles } = useFileUpload({ chatId, initialFiles: initialFilesRef.current })
   const readyFiles = files.filter(file => file.status === 'done')
-  const pendingFiles = files.some(file => file.status !== 'done')
+  // Like the composer: wait for uploads in flight; a failed one shows its
+  // error on the chip and is simply not sent.
+  const pendingFiles = files.some(file => file.status === 'uploading')
 
   const localAnswers = useContext(LocalAnswersContext)
   const localAnswer = (localAnswers || []).find(record => (
