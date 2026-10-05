@@ -40,6 +40,7 @@ import {
   serveModuleRequest,
   serveStorageRpc,
 } from './appFrameProtocol.js'
+import { useManagedAppFrameForwarding } from '../../hooks/useManagedAppEvents.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import {
   initSwapState, reduceSwap, compareVersions, INCOMING_SWAP_TIMEOUT_MS,
@@ -316,6 +317,7 @@ function CameraPreviewLayer({ preview }) {
 const AppCanvas = forwardRef(function AppCanvas({
   appId, version = 0, appName, appSlug, offlineCapable = false,
   capabilityContract = null,
+  managedAppEvent = null,
   // The shell's applied presentation for this app: full-bleed immersive,
   // status-bar-preserving chrome collapse, or null. One value keeps safe-area
   // forwarding and the runtime echo from observing contradictory booleans.
@@ -650,6 +652,8 @@ const AppCanvas = forwardRef(function AppCanvas({
     // checks on replies plus the frame's parent-origin check on receipt.
     framesRef.current.get(v)?.contentWindow?.postMessage(message, '*')
   }
+
+  useManagedAppFrameForwarding(framesRef, managedAppEvent, capabilityContract)
 
   // A host that owns the browser-history cursor may ask the visible app to
   // follow it. Keep exact contentWindow selection here rather than making the
