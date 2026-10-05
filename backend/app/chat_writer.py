@@ -64,7 +64,7 @@ from app.goals import admit_goal
 from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
 from app.json_safety import json_safe
-from app.upload_lifecycle import claim_uploads
+from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
   TOOL_OUTPUT_INLINE_THRESHOLD,
   build_assistant_message,
@@ -5390,6 +5390,7 @@ class ChatWriterActor:
     remaining = [m for m in pending if cid_of(m) != cmd.cid]
     if len(remaining) != len(pending):
       chat.pending_messages = remaining
+      release_uploads(chat, [m for m in pending if cid_of(m) == cmd.cid])
       chat.updated_at = datetime.now(UTC)
       if not _commit_or_rollback(db):
         raise _PersistFailed("CancelPending did not persist")

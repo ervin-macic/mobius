@@ -3,7 +3,6 @@
 
 import os
 import re
-import tempfile
 from datetime import UTC, datetime
 import pathlib
 from typing import List
@@ -24,7 +23,6 @@ from app.deps import (
 from app.image_previews import discard_image_preview, display_image_preview
 from app.path_utils import validate_chat_id, validate_path_within_base
 from app.resource_access import get_active_chat_for_principal
-from app.storage_io import atomic_write
 from app.upload_lifecycle import is_draft, partition_expired_drafts
 
 router = APIRouter(prefix="/api/chats", tags=["uploads"])
@@ -108,80 +106,107 @@ async def upload_files(
   require_chat_embed_operation(principal, "chat:uploads")
   chat = get_active_chat_for_principal(db, chat_id, principal)
 
-  settings = get_settings()
-  upload_dir = _resolve_upload_dir(settings.data_dir, chat_id)
-  # Multipart bodies are already spooled by FastAPI, but reading/capping them
-  # can still yield for disk I/O. Stage outside admission so answers and Stop
-  # do not wait behind a large upload. Only name allocation, final placement,
-  # and the refreshed metadata append need the shared queue lock.
-  with tempfile.TemporaryDirectory(prefix=".pending-", dir=upload_dir) as staging:
-    saved = await _stage_uploads(files, pathlib.Path(staging))
-    written: list[pathlib.Path] = []
-    async with chat_queue.get_lock(chat_id):
-      db.refresh(chat)
-      try:
-        for entry in saved:
-          name = _unique_name(upload_dir, entry["name"])
-          dest = upload_dir / name
-          pathlib.Path(entry["path"]).replace(dest)
-          written.append(dest)
-          entry.update(name=name, path=str(dest))
-        kept, expired = partition_expired_drafts(chat.uploads or [])
-        chat.uploads = kept + saved
-        db.commit()
-      except BaseException:
-        for path in written:
-          try:
-            path.unlink()
-          except OSError:
-            pass
-        raise
-    if expired:
-      await run_in_threadpool(
-        _remove_upload_files, upload_dir,
-        [pathlib.Path(e.get("path") or "") for e in expired],
+  upload_dir = _resolve_upload_dir(get_settings().data_dir, chat_id)
+  # Files are read and written outside the chat lock so answers and Stop never
+  # wait behind a large upload; exclusive creation keeps concurrent uploads of
+  # one name apart. Only the metadata update below is serialized with
+  # admission and discard.
+  saved: list[dict] = []
+  try:
+    for file in files:
+      mime = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
+      content = await _read_capped(file)
+      dest = await run_in_threadpool(
+        _create_upload_file, upload_dir, _safe_filename(file.filename or "upload"), content,
       )
-    return saved
-
-
-async def _stage_uploads(files, upload_dir):
-  saved = []
-  for file in files:
-    mime = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
-    # Stream-read in chunks with the per-file cap, aborting the instant it's
-    # exceeded, rather than buffering the whole upload before the size check —
-    # so a giant file can't balloon memory on the tight host before being
-    # rejected.
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-      chunk = await file.read(1024 * 1024)
-      if not chunk:
-        break
-      total += len(chunk)
-      if total > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-          status_code=413,
-          detail=(
-            f"{file.filename} exceeds the "
-            f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
-          ),
-        )
-      chunks.append(chunk)
-    content = b"".join(chunks)
-    name = _unique_name(upload_dir, _safe_filename(file.filename or "upload"))
-    dest = upload_dir / name
-    atomic_write(dest, content)
-    saved.append({
-      "name": name,
-      "path": str(dest),
-      "size": total,
-      "mime_type": mime,
-      "uploaded_at": datetime.now(UTC).isoformat(),
-      "claimed": False,
-    })
-
+      saved.append({
+        "name": dest.name,
+        "path": str(dest),
+        "size": len(content),
+        "mime_type": mime,
+        "uploaded_at": datetime.now(UTC).isoformat(),
+        "claimed": False,
+      })
+    async with chat_queue.get_lock(chat_id):
+      expired = await run_in_threadpool(_record_uploads, db, chat, saved)
+  except BaseException:
+    # A later file over the cap, or a commit failure, must not leave this
+    # request's files on disk with no metadata row.
+    await run_in_threadpool(_remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
+    raise
+  await run_in_threadpool(_remove_upload_files, upload_dir, expired)
   return saved
+
+
+async def _read_capped(file: UploadFile) -> bytes:
+  # Stream-read in chunks with the per-file cap, aborting the instant it's
+  # exceeded, rather than buffering the whole upload before the size check —
+  # so a giant file can't balloon memory on the tight host before being
+  # rejected.
+  chunks: list[bytes] = []
+  total = 0
+  while chunk := await file.read(1024 * 1024):
+    total += len(chunk)
+    if total > _MAX_UPLOAD_BYTES:
+      raise HTTPException(
+        status_code=413,
+        detail=(
+          f"{file.filename} exceeds the "
+          f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
+        ),
+      )
+    chunks.append(chunk)
+  return b"".join(chunks)
+
+
+def _create_upload_file(upload_dir: pathlib.Path, filename: str, content: bytes) -> pathlib.Path:
+  """Write content under a name no other file holds, claimed by exclusive create."""
+  while True:
+    dest = upload_dir / _unique_name(upload_dir, filename)
+    try:
+      fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+      continue
+    try:
+      with os.fdopen(fd, "wb") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    except BaseException:
+      dest.unlink(missing_ok=True)
+      raise
+    return dest
+
+
+def _record_uploads(db: Session, chat: models.Chat, saved: list[dict]) -> list[pathlib.Path]:
+  """Append new drafts and drop expired ones; the caller holds the chat lock."""
+  db.refresh(chat)
+  kept, expired = partition_expired_drafts(chat.uploads or [])
+  chat.uploads = kept + saved
+  db.commit()
+  return [pathlib.Path(e.get("path") or "") for e in expired]
+
+
+def _sweep_expired(db: Session, chat: models.Chat, keep: set[str]) -> list[pathlib.Path]:
+  kept, expired = partition_expired_drafts(chat.uploads or [], keep=keep)
+  if not expired:
+    return []
+  chat.uploads = kept
+  db.commit()
+  return [pathlib.Path(e.get("path") or "") for e in expired]
+
+
+async def sweep_expired_uploads(
+  db: Session, chat: models.Chat, keep: set[str] = frozenset(),
+) -> None:
+  """Drop drafts past their TTL when a message arrives; caller holds the chat lock.
+
+  `keep` names the arriving message's own files, which it is about to claim.
+  """
+  expired = await run_in_threadpool(_sweep_expired, db, chat, keep)
+  if expired:
+    upload_dir = pathlib.Path(get_settings().data_dir) / "chats" / chat.id / "uploads"
+    await run_in_threadpool(_remove_upload_files, upload_dir, expired)
 
 
 @router.get("/{chat_id}/uploads")
@@ -207,16 +232,14 @@ def list_uploads(
 async def delete_upload(
   chat_id: str,
   filename: str = Path(...),
-  only_if_unused: bool = False,
   principal: Principal = Depends(get_owner_or_chat_embed_principal),
   db: Session = Depends(get_db),
 ):
-  """Removes an uploaded file from disk and from the chat's upload list.
+  """Discards a draft upload: its file and its entry in the chat's upload list.
 
-  `only_if_unused` is the draft discard (see `app.upload_lifecycle`): it
-  removes the upload only while no admitted message has claimed it, so a
-  stale tab or late cleanup can never delete a file a sent message or answer
-  owns. Anything else is a silent no-op.
+  Only a draft (see `app.upload_lifecycle`) can be deleted, so a stale tab or a
+  late cleanup can never remove a file a sent message or answer uses. Anything
+  else is a silent no-op.
   """
   validate_chat_id(chat_id)
   if principal.scope == "app":
@@ -227,20 +250,22 @@ async def delete_upload(
   file_path = validate_path_within_base(filename, upload_dir)
 
   # Serialize with send/answer admission (which holds this lock while the
-  # writer claims), and re-read after waiting: an admission that wins claims
-  # the upload; a discard that wins removes the metadata first.
+  # writer claims): whichever wins, the other sees its committed result.
   async with chat_queue.get_lock(chat_id):
-    db.refresh(chat)
-    uploads = list(chat.uploads or [])
-    if only_if_unused:
-      entry = next((u for u in uploads if u.get("name") == filename), None)
-      if not entry or not is_draft(entry):
-        return Response(status_code=204)
-    if uploads:
-      chat.uploads = [u for u in uploads if u.get("name") != filename]
-      await run_in_threadpool(db.commit)
-  await run_in_threadpool(_remove_upload_files, upload_dir, [file_path])
+    removed = await run_in_threadpool(_forget_draft, db, chat, filename)
+  if removed:
+    await run_in_threadpool(_remove_upload_files, upload_dir, [file_path])
   return Response(status_code=204)
+
+
+def _forget_draft(db: Session, chat: models.Chat, filename: str) -> bool:
+  db.refresh(chat)
+  uploads = list(chat.uploads or [])
+  if not any(u.get("name") == filename and is_draft(u) for u in uploads):
+    return False
+  chat.uploads = [u for u in uploads if u.get("name") != filename]
+  db.commit()
+  return True
 
 
 def _remove_upload_files(upload_dir: pathlib.Path, paths: list[pathlib.Path]) -> None:

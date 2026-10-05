@@ -83,13 +83,7 @@ export function readQuestionDraft(key, storage) {
 }
 
 
-export function writeQuestionDraft(
-  key,
-  answers,
-  otherTexts,
-  storage,
-  files = [],
-) {
+export function writeQuestionDraft(key, { answers, otherTexts, files = [] }, storage) {
   if (!key) return
   const targets = storage ? [storage] : browserDraftStorages()
   const hasAnswers = Object.keys(answers || {}).length > 0

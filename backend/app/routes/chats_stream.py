@@ -60,6 +60,8 @@ from app.database import get_db
 from app.memory_observability import record_memory_checkpoint_once
 from app.goal_commands import goal_clear_requested
 from app.owner_input import publish_owner_input_changed
+from app.routes.uploads import sweep_expired_uploads
+from app.upload_lifecycle import attachment_names
 from app.deps import (
   Principal, get_chat_view_principal, get_owner_or_chat_embed_principal,
   get_current_owner, reject_cross_site,
@@ -313,11 +315,11 @@ def _canonical_question_attachments(
   for attachment in attachments:
     name = attachment.get("name") if isinstance(attachment, dict) else None
     entry = uploads.get(name) if isinstance(name, str) and name else None
-    path = _safe_upload_path(entry.get("path"), get_settings().data_dir) if entry else None
-    if not path:
+    if not entry or not _safe_upload_path(entry.get("path"), get_settings().data_dir):
       raise HTTPException(status_code=409, detail="An attached file is no longer available.")
+    # Same shape as composer attachments: the file is addressed by name.
     canonical.setdefault(name, {
-      "name": name, "path": path,
+      "name": name,
       "size": entry.get("size", 0),
       "mime_type": entry.get("mime_type", "application/octet-stream"),
     })
@@ -1369,6 +1371,7 @@ async def _send_message_locked(
   duplicate = _duplicate_send_response(chat_id, chat, body.cid)
   if duplicate is not None:
     return duplicate
+  await sweep_expired_uploads(db, chat, attachment_names(body.attachments))
 
   if _delegation_manages_chat(db, chat_id):
     raise HTTPException(

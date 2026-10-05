@@ -22,9 +22,7 @@ def test_question_attachments_resolve_once_per_upload(tmp_path, monkeypatch):
   resolved = chats_stream._canonical_question_attachments(
     chat, [{"name": "photo.png", "path": "/forged"}, {"name": "photo.png"}],
   )
-  assert resolved == [{
-    "name": "photo.png", "path": str(upload), "size": 5, "mime_type": "image/png",
-  }]
+  assert resolved == [{"name": "photo.png", "size": 5, "mime_type": "image/png"}]
 
 
 def test_question_attachments_are_bounded(tmp_path, monkeypatch):
@@ -107,10 +105,11 @@ def test_saved_card_route_canonical_attachments(
   )).result(timeout=5)
   upload = tmp_path / "photo.png"
   upload.write_bytes(b"image")
-  canonical = {"name": "photo.png", "path": str(upload), "size": 5, "mime_type": "image/png"}
+  canonical = {"name": "photo.png", "size": 5, "mime_type": "image/png"}
+  stored = {**canonical, "path": str(upload)}
   with SessionLocal() as db:
     row = db.get(models.Chat, chat.id)
-    row.uploads = [{**canonical, "claimed": False}] if valid else []
+    row.uploads = [{**stored, "claimed": False}] if valid else []
     db.commit()
   monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
   monkeypatch.setattr(chats_stream, "is_chat_running", lambda _: running)
@@ -145,7 +144,7 @@ def test_saved_card_route_canonical_attachments(
       if mode == "native":
         # Provider-native questions are retired and refuse files outright.
         assert not resolved
-      assert row.uploads == ([{**canonical, "claimed": False}] if valid else [])
+      assert row.uploads == ([{**stored, "claimed": False}] if valid else [])
       assert "answers" not in card
       assert not row.pending_messages
       assert not events
@@ -153,7 +152,7 @@ def test_saved_card_route_canonical_attachments(
       return
     assert card["answers"] == {"Pick one": "a", "Add details": "Attached 1 file"}
     assert card["attachments"] == [canonical]
-    assert row.uploads == [{**canonical, "claimed": True}]
+    assert row.uploads == [{**stored, "claimed": True}]
     message = row.pending_messages[0] if running else scheduled[0]["next_user"]
     assert message["attachments"] == [canonical]
     assert str(upload) in message["content"]
@@ -161,3 +160,44 @@ def test_saved_card_route_canonical_attachments(
   applied = next(event for event in events if event["type"] == "answers_applied")
   assert applied["attachments"] == [canonical]
   assert applied["answers"] == {"Pick one": "a", "Add details": "Attached 1 file"}
+
+
+def test_quiet_close_answer_refuses_files(client, auth, chat, monkeypatch, tmp_path):
+  """A choice that closes the card without a reply cannot carry files."""
+  from app.database import SessionLocal
+  from app.chat_writer import get_writer, ReplaceTranscript, QuestionCommit
+
+  get_writer().submit(ReplaceTranscript(
+    chat_id=chat.id, messages=[{"role": "user", "content": "Choose", "ts": 1}],
+  )).result(timeout=5)
+  get_writer().submit(QuestionCommit(
+    chat_id=chat.id,
+    snapshot={"role": "assistant", "content": "", "ts": 2, "blocks": [{
+      "type": "question", "question_id": "quiet-files", "response_mode": "continuation",
+      "questions": [{"id": "q", "question": "Proceed?", "options": [
+        {"id": "0", "label": "Not now", "on_answer": "close"},
+      ]}],
+    }]},
+  )).result(timeout=5)
+  upload = tmp_path / "photo.png"
+  upload.write_bytes(b"image")
+  with SessionLocal() as db:
+    row = db.get(models.Chat, chat.id)
+    row.uploads = [{"name": "photo.png", "path": str(upload), "size": 5,
+                    "mime_type": "image/png", "claimed": False}]
+    db.commit()
+  monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
+
+  res = client.post(f"/api/chats/{chat.id}/messages", headers=auth, json={
+    "content": "- Proceed?: Not now", "hidden": True, "question_id": "quiet-files",
+    "answers": {"Proceed?": "Not now"}, "selected_options": {"q": ["0"]},
+    "attachments": [{"name": "photo.png"}],
+  })
+
+  assert res.status_code == 409, res.text
+  assert "closes the card without sending files" in res.json()["detail"]
+  with SessionLocal() as db:
+    row = db.get(models.Chat, chat.id)
+    card = next(b for m in row.messages for b in m.get("blocks", []) if b.get("question_id") == "quiet-files")
+    assert "answers" not in card
+    assert row.uploads[0]["claimed"] is False

@@ -23,7 +23,7 @@ test('a file-only question answer can submit and ordinary cards offer upload', (
   try {
     const questions = [{ question: 'Send a picture', options: [] }]
     const key = questionDraftKey('file-only', 'file-only-q', questions)
-    writeQuestionDraft(key, {}, {}, storage, [{ name: 'photo.png', status: 'done', size: 4, mime_type: 'image/png' }])
+    writeQuestionDraft(key, { answers: {}, otherTexts: {}, files: [{ name: 'photo.png', status: 'done', size: 4, mime_type: 'image/png' }] }, storage)
     const html = renderToStaticMarkup(createElement(QuestionCard, {
       chatId: 'file-only', questionId: 'file-only-q', questions,
     }))
@@ -199,7 +199,7 @@ test('unanswered question cards do not have a stale gray state', () => {
     'multi-select options should compose with a written custom answer')
   assert.match(component, /if \(!q\?\.multiSelect\) \{\s*setOtherTexts\(prev => \(\{ \.\.\.prev, \[question\]: '' \}\)\)/,
     'choosing a single option should clear custom text that is no longer active')
-  assert.match(component, /writeQuestionDraft\(draftKey, answers, otherTexts, undefined, files\)/,
+  assert.match(component, /writeQuestionDraft\(draftKey, \{ answers, otherTexts, files \}\)/,
     'unsubmitted selections, custom text, and files should be cached')
   assert.match(component, /if \(answered\) \{\s*clearQuestionDraft\(draftKey\)/,
     'committed answers should clear their cached draft')

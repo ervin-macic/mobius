@@ -24,7 +24,7 @@ test('discard asks the server to drop every held draft, once', t => {
   hook.result.current.discardFiles()
   hook.result.current.discardFiles()
   assert.deepEqual(calls.map(call => call.url.split('/').pop()), [
-    'unused.txt?only_if_unused=true', 'accepted.txt?only_if_unused=true',
+    'unused.txt', 'accepted.txt',
   ])
   assert.deepEqual(hook.result.current.files, [])
   hook.unmount()
@@ -40,7 +40,7 @@ for (const action of ['remove', 'discard']) {
     calls[0].resolve({ ok: true, json: async () => [record('server_1.txt')] })
     await pending
     assert.deepEqual(hook.result.current.files, [])
-    assert.match(calls[1].url, /server_1.txt\?only_if_unused=true$/)
+    assert.match(calls[1].url, /server_1.txt$/)
     hook.unmount()
   })
 }
@@ -52,7 +52,7 @@ test('navigation/unmount preserves completed drafts but discards orphaned late s
   calls[0].resolve({ ok: true, json: async () => [record('server.txt')] })
   await pending
   assert.equal(calls.length, 2)
-  assert.match(calls[1].url, /server.txt\?only_if_unused=true$/)
+  assert.match(calls[1].url, /server.txt$/)
   assert.ok(!calls.some(call => call.url.includes('draft.txt')))
 })
 
@@ -88,7 +88,7 @@ test('removing an attachment restored from a saved draft still discards it on th
     remounted.result.current.removeFile(remounted.result.current.files[0].id)
     assert.deepEqual(remounted.result.current.files, [])
     assert.equal(calls.length, 2)
-    assert.match(calls[1].url, /server.txt\?only_if_unused=true$/)
+    assert.match(calls[1].url, /server.txt$/)
   } finally {
     remounted.unmount()
   }

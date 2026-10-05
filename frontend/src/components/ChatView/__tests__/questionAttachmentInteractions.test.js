@@ -28,7 +28,7 @@ const vite = await createServer({
   }],
 })
 const { renderHook } = await vite.ssrLoadModule(hooksPath)
-const { default: QuestionCard } = await vite.ssrLoadModule('/src/components/ChatView/QuestionCard.jsx')
+const { default: QuestionCard, CustomAnswerArea } = await vite.ssrLoadModule('/src/components/ChatView/QuestionCard.jsx')
 after(() => vite.close())
 
 function elements(node) {
@@ -74,7 +74,7 @@ test('pasting into question two uses one card tray, upload gates submit, and sub
     assert.equal(editor(card.result.current, 'Second?').props.canSubmit, false)
     editor(card.result.current, 'Second?').props.onSubmitShortcut(null)
     assert.equal(posted, undefined)
-    assert.equal(elements(card.result.current).filter(node => node.props?.['aria-label'] === 'Files for this answer').length, 1)
+    assert.equal(elements(card.result.current).filter(node => node.props?.['aria-label'] === 'Files for all answers').length, 1)
     finishUpload({ ok: true, json: async () => [{ name: 'notes.txt', size: 5, mime_type: 'text/plain' }] })
     await uploading
     // A grouped card still needs every question answered; the file is context.
@@ -185,4 +185,34 @@ test('files never stand in for unanswered questions on a grouped card', () => {
   assert.equal(questionAnswersReady(questions, {}, {}, file), false)
   assert.equal(questionAnswersReady(questions, { 'First?': 'Yes' }, {}, file), false)
   assert.equal(questionAnswersReady(questions, { 'First?': 'Yes', 'Second?': 'No' }, {}, file), true)
+})
+
+
+test('answer paste matches the composer: Markdown by default, plain on the shortcut, never once answered', () => {
+  const clipboard = {
+    files: [], items: [],
+    getData: type => ({ 'text/plain': 'hi', 'text/markdown': '**hi**' })[type] || '',
+  }
+  const paste = props => {
+    const changes = []
+    const box = renderHook(CustomAnswerArea, {
+      question: 'Q?', value: 'ab', canSubmit: false, onSubmitShortcut: () => {},
+      onChange: value => changes.push(value), ...props,
+    })
+    let prevented = false
+    try {
+      const textarea = box.result.current
+      if (props.plainShortcut) textarea.props.onKeyDown({ key: 'v', shiftKey: true, metaKey: true })
+      textarea.props.onPaste({
+        clipboardData: clipboard,
+        preventDefault: () => { prevented = true },
+        currentTarget: { selectionStart: 1, selectionEnd: 1 },
+      })
+    } finally { box.unmount() }
+    return { changes, prevented }
+  }
+
+  assert.deepEqual(paste({}), { changes: ['a**hi**b'], prevented: true })
+  assert.deepEqual(paste({ plainShortcut: true }), { changes: ['ahib'], prevented: true })
+  assert.deepEqual(paste({ answered: true }), { changes: [], prevented: false })
 })

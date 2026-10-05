@@ -63,10 +63,10 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   }, [])
 
   const discardUpload = useCallback((file) => {
-    // The server removes only uploads no sent message or answer has claimed,
+    // The server deletes only drafts no sent message or answer has claimed,
     // so a stale chip or late cleanup can never delete a file in use.
     if (!file?.name) return
-    fetch(`${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(file.name)}?only_if_unused=true`, {
+    fetch(`${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(file.name)}`, {
       method: 'DELETE', headers: getAuthHeaders(),
     }).catch(() => {})
   }, [chatId])

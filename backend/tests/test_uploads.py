@@ -340,10 +340,7 @@ def _upload(client, auth, chat, name, body=b"draft"):
 
 
 def _discard(client, auth, chat, name):
-  return client.delete(
-    f"/api/chats/{chat.id}/uploads/{name}", headers=auth,
-    params={"only_if_unused": "true"},
-  )
+  return client.delete(f"/api/chats/{chat.id}/uploads/{name}", headers=auth)
 
 
 def test_new_uploads_are_unclaimed_drafts_without_secrets(client, db, auth, chat):
@@ -452,7 +449,7 @@ def test_discard_waits_for_admission_and_rereads(client, db, auth, chat):
   async def race():
     async with chat_queue.get_lock(chat.id):
       discard = asyncio.create_task(delete_upload(
-        chat.id, record["name"], only_if_unused=True, principal=principal, db=db,
+        chat.id, record["name"], principal=principal, db=db,
       ))
       await asyncio.sleep(0)
       assert not discard.done()
@@ -501,7 +498,7 @@ def test_upload_reads_outside_admission_then_commits_under_lock(db, chat):
   records = asyncio.run(race())
   assert Path(records[0]["path"]).read_bytes() == b"new"
   upload_dir = Path(get_settings().data_dir) / "chats" / chat.id / "uploads"
-  assert not list(upload_dir.glob(".pending-*"))
+  assert [p.name for p in upload_dir.iterdir()] == ["outside.txt"]
 
 
 def test_session_file_notice_marks_this_messages_attachments(client, db, auth, chat):
@@ -534,3 +531,53 @@ def test_pending_edit_keeps_the_rows_attachment_mark(client, db, auth, chat):
   assert resp.status_code == 200, resp.text
   edited = resp.json()["pending_messages"][0]["content"]
   assert "report.pdf" in edited and "attached to this message" in edited
+
+
+def test_cancelled_queued_message_releases_files_no_other_message_names(client, db, auth, chat):
+  from pathlib import Path
+  from app.chat_writer import get_writer, AppendPending, CancelPending
+
+  alone = _upload(client, auth, chat, "alone.txt")
+  shared = _upload(client, auth, chat, "shared.txt")
+  writer = get_writer()
+  for cid, names in (("c-cancel", [alone, shared]), ("c-keep", [shared])):
+    writer.submit(AppendPending(chat_id=chat.id, user_msg={
+      "role": "user", "content": cid, "cid": cid,
+      "attachments": [{"name": r["name"]} for r in names],
+    })).result(timeout=5)
+  writer.submit(CancelPending(chat_id=chat.id, cid="c-cancel")).result(timeout=5)
+
+  db.refresh(chat)
+  assert {u["name"]: u["claimed"] for u in chat.uploads} == {"alone.txt": False, "shared.txt": True}
+  assert _discard(client, auth, chat, shared["name"]).status_code == 204
+  assert Path(shared["path"]).exists()
+  assert _discard(client, auth, chat, alone["name"]).status_code == 204
+  assert not Path(alone["path"]).exists()
+
+
+def test_expired_drafts_are_swept_when_a_message_arrives_but_not_its_own(client, db, auth, chat):
+  from datetime import UTC, datetime, timedelta
+  from pathlib import Path
+  from unittest.mock import patch
+  from app.upload_lifecycle import UNCLAIMED_UPLOAD_TTL
+
+  old = (datetime.now(UTC) - UNCLAIMED_UPLOAD_TTL - timedelta(hours=1)).isoformat()
+  stale = _upload(client, auth, chat, "stale.txt")
+  restored = _upload(client, auth, chat, "restored.txt")
+  db.refresh(chat)
+  chat.uploads = [{**stale, "uploaded_at": old}, {**restored, "uploaded_at": old}]
+  db.commit()
+
+  async def fake_run_chat(*args, **kwargs):
+    return None
+
+  with patch("app.routes.chats_stream.run_chat", new=fake_run_chat):
+    res = client.post(f"/api/chats/{chat.id}/messages", headers=auth, json={
+      "content": "sending an old draft", "attachments": [{"name": "restored.txt"}],
+    })
+  assert res.status_code == 202, res.text
+
+  db.refresh(chat)
+  assert [(u["name"], u["claimed"]) for u in chat.uploads] == [("restored.txt", True)]
+  assert not Path(stale["path"]).exists()
+  assert Path(restored["path"]).exists()

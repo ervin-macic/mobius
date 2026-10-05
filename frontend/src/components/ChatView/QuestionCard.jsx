@@ -9,7 +9,12 @@ import {
 } from './questionDraft.js'
 import { autoGrowTextarea, textareaUsesNativeSizing } from './composerTextareaSizing.js'
 import { placeCaretAtTextEnd } from './composerFocusPolicy.js'
-import { isInlineEditorSubmit } from './composerShortcuts.js'
+import { isInlineEditorSubmit, isPlainTextPasteShortcut } from './composerShortcuts.js'
+import {
+  assistantClipboardText,
+  insertClipboardText,
+  queueClipboardTextUndoably,
+} from './markdownClipboard.js'
 import { isTouchPrimary } from '../../lib/pointerPrimary.js'
 import {
   pointerSelectionChangedWithin,
@@ -38,7 +43,7 @@ function resizeCustomAnswer(textarea) {
 }
 
 
-function CustomAnswerArea({
+export function CustomAnswerArea({
   answered,
   canSubmit,
   disabled,
@@ -50,10 +55,43 @@ function CustomAnswerArea({
   value,
 }) {
   const textareaRef = useRef(null)
+  const plainPasteRef = useRef(false)
+  const pendingCaretRef = useRef(null)
 
   useLayoutEffect(() => {
-    resizeCustomAnswer(textareaRef.current)
+    const textarea = textareaRef.current
+    resizeCustomAnswer(textarea)
+    const caret = pendingCaretRef.current
+    pendingCaretRef.current = null
+    if (caret !== null) {
+      try { textarea?.setSelectionRange(caret, caret) } catch { /* detached */ }
+    }
   }, [value])
+
+  // Paste behaves as in the message composer: files attach, copied Möbius
+  // text keeps its Markdown (plain with Cmd/Ctrl+Shift+V), and the insertion
+  // stays undoable where the browser allows it.
+  function handlePaste(e) {
+    const preferPlainText = plainPasteRef.current
+    plainPasteRef.current = false
+    if (answered) return
+    const files = onPasteFiles ? pastedFiles(e.clipboardData) : []
+    if (files.length) {
+      if (filePasteNeedsDefaultPrevented(e.clipboardData, files)) e.preventDefault()
+      onPasteFiles(files)
+      return
+    }
+    const text = assistantClipboardText(e.clipboardData, preferPlainText)
+    if (text === null) return
+    e.preventDefault()
+    const { selectionStart, selectionEnd } = e.currentTarget
+    const insertControlled = () => {
+      const next = insertClipboardText(value, selectionStart, selectionEnd, text)
+      pendingCaretRef.current = next.caret
+      onChange(next.value)
+    }
+    if (!queueClipboardTextUndoably(e.currentTarget, text, insertControlled)) insertControlled()
+  }
 
   // The measured fallback also reacts to width: wrapping can add lines without
   // changing the answer value when a pane or device rotates.
@@ -88,17 +126,13 @@ function CustomAnswerArea({
       wrap="soft"
       value={value}
       onChange={e => onChange(e.target.value)}
-      onPaste={e => {
-        if (!onPasteFiles) return
-        const files = pastedFiles(e.clipboardData)
-        if (!files.length) return
-        if (filePasteNeedsDefaultPrevented(e.clipboardData, files)) e.preventDefault()
-        onPasteFiles?.(files)
-      }}
+      onPaste={handlePaste}
+      onKeyUp={() => { plainPasteRef.current = false }}
       onFocus={e => placeCaretAtTextEnd(e.currentTarget)}
       readOnly={answered}
       disabled={disabled && !answered}
       onKeyDown={e => {
+        plainPasteRef.current = isPlainTextPasteShortcut(e)
         // Let Enter stay a newline until every question is answered, so a
         // half-filled grouped card can still take multi-line custom text.
         if (!canSubmit) return
@@ -192,7 +226,7 @@ export default function QuestionCard({
       if (files.length) discardFiles()
       return
     }
-    writeQuestionDraft(draftKey, answers, otherTexts, undefined, files)
+    writeQuestionDraft(draftKey, { answers, otherTexts, files })
   }, [draftKey, answers, otherTexts, files, answered, discardFiles])
 
   const allAnswered = questionAnswersReady(questions, answers, otherTexts, readyFiles)
@@ -320,7 +354,7 @@ export default function QuestionCard({
     ? 'Confirming answer…' : 'Queued on this device'
 
   const answerFiles = platformAction ? null : (
-    <div className="qcard__answer-files" role="group" aria-label="Files for this answer">
+    <div className="qcard__answer-files" role="group" aria-label={grouped ? 'Files for all answers' : 'Files for this answer'}>
       {selectionLocked
         ? <Attachments attachments={attachments || localAnswer?.body?.attachments || submitted?.attachments} chatId={chatId} />
         : <FileChips files={files} onRemove={removeFile} chatId={chatId} disabled={submitting || disabled} />}
@@ -483,9 +517,9 @@ export default function QuestionCard({
             {(!completedAction || respondedRestartAction)
               && (!restartAction || writtenRestartAction) && (
               <div className={`qcard__composer${isOtherSelected || answeredWithOther ? ' qcard__composer--active' : ''}`}>
-                {/* One file set per card, shown inside the answer box nearest
-                    Submit, as the message composer shows its files. */}
-                {qi === questions.length - 1 && answerFiles}
+                {/* A single answer shows its files inside the box, as the
+                    message composer does; a grouped card shows them once below. */}
+                {!grouped && answerFiles}
                 <CustomAnswerArea
                   answered={selectionLocked}
                   canSubmit={canSubmit}
@@ -509,6 +543,7 @@ export default function QuestionCard({
         )
         })}
       </div>
+      {grouped && answerFiles}
       {!platformAction && !selectionLocked && !disabled && (
         <div className="qcard__attachments">
           <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
