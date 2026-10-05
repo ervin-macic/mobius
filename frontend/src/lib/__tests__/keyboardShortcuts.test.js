@@ -34,6 +34,13 @@ test('search uses the conventional Cmd/Ctrl+K chord without stealing variants', 
   assert.equal(shortcutMatches({ metaKey: true, key: 'k', repeat: true }, shortcut), false)
 })
 
+test('AltGr never matches a Ctrl+Alt binding', () => {
+  const binding = { key: '2', mod: true, alt: true }
+  const event = { ctrlKey: true, altKey: true, key: '2' }
+  assert.equal(shortcutMatches(event, binding), true)
+  assert.equal(shortcutMatches({ ...event, getModifierState: state => state === 'AltGraph' }, binding), false)
+})
+
 test('keyboard help uses Cmd/Ctrl+slash as a separate shell surface', () => {
   const shortcut = SHELL_SHORTCUTS.openShortcutHelp
   assert.equal(shortcutMatches({ metaKey: true, key: '/' }, shortcut), true)

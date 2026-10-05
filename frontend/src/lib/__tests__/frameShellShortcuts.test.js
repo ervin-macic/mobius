@@ -78,6 +78,14 @@ test('the app cannot make the embedded chat capture typing or invent actions', (
   assert.deepEqual(doc.posts.map(post => post.message), [{ type: 'moebius:frame-shortcuts-request' }])
 })
 
+test('the app cannot make the embedded chat swallow AltGr characters', () => {
+  const doc = nestedDocument()
+  doc.advertise(doc.parent, [{ actionId: 'search.open', binding: { key: 'q', mod: true, alt: true } }])
+  const altGraph = { key: 'q', metaKey: false, ctrlKey: true, altKey: true, getModifierState: state => state === 'AltGraph' }
+  assert.equal(doc.key(altGraph), false, 'AltGr reports Ctrl+Alt on Windows but types a character')
+  assert.equal(doc.key({ ...altGraph, getModifierState: () => false }), true, 'a real Ctrl+Alt chord still matches')
+})
+
 test('a top-level document has no parent to forward to', () => {
   const win = { addEventListener() { assert.fail('must not listen') } }
   win.parent = win

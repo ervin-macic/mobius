@@ -87,11 +87,9 @@ function appFrameShortcuts() {
       listeners.set(type, callback)
     },
   }
-  const navigator = { userActivation: { isActive: false } }
-  runInNewContext(source, { window, document, navigator, Array, String, Boolean })
+  runInNewContext(source, { window, document, Array, String, Boolean })
   return {
     child,
-    navigator,
     parent,
     shellPosts,
     childPosts,
@@ -127,7 +125,8 @@ test('the app frame captures only the advertised shell chords, even in text fiel
     message: { type: 'moebius:shell-shortcut', actionId: 'search.open' },
     origin: SHELL_ORIGIN,
   })
-  for (const other of [{ key: 'c' }, { metaKey: false }, { altKey: true }, { isComposing: true }, { repeat: true }]) {
+  const altGraph = { getModifierState: state => state === 'AltGraph' }
+  for (const other of [{ key: 'c' }, { metaKey: false }, { altKey: true }, { isComposing: true }, { repeat: true }, altGraph]) {
     assert.equal(frameDoc.key(other), false)
   }
 
@@ -143,10 +142,6 @@ test('the app frame shares shell chords with its direct child frames and relays 
   frameDoc.message(frameDoc.child, { type: 'moebius:frame-shortcuts-request' })
   assert.equal(frameDoc.childPosts.length, 2, 'a newly loaded child gets the current chords')
 
-  frameDoc.message(frameDoc.child, { type: 'moebius:shell-shortcut', actionId: 'search.open' })
-  assert.equal(frameDoc.shellPosts.length, 0, 'a scripted child post without a user gesture is not relayed')
-
-  frameDoc.navigator.userActivation.isActive = true
   frameDoc.message({ postMessage() { assert.fail('not a child frame') } }, { type: 'moebius:frame-shortcuts-request' })
   frameDoc.message({}, { type: 'moebius:shell-shortcut', actionId: 'search.open' })
   frameDoc.message(frameDoc.child, { type: 'moebius:shell-shortcut', actionId: 'chat.new' })

@@ -216,6 +216,9 @@ export function resolveShellCommands(overrides = readShortcutOverrides()) {
 
 export function shortcutMatches(event, binding) {
   if (!event || !binding || event.isComposing || event.repeat) return false
+  // AltGr reports Ctrl+Alt on Windows; it types characters (such as @ on a
+  // German layout), so it never matches a Ctrl+Alt binding.
+  if (event.getModifierState?.('AltGraph')) return false
   const eventKey = typeof event.key === 'string' ? event.key.toLocaleLowerCase() : ''
   const bindingKey = String(binding.key || '').toLocaleLowerCase()
   if (!bindingKey || eventKey !== bindingKey) return false
