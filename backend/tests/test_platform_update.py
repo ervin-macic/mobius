@@ -35,7 +35,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import app_git, platform_activation, platform_boot
+from app import app_git, platform_activation, platform_boot, restart_util
 from app import platform_update as pu
 
 
@@ -71,6 +71,12 @@ _PROVIDERS_PY = (
   + "def get_provider():\n  return 'ready'\n"
 )
 
+# Fixture clones stub restart admission's check; tests needing it capture it.
+_REAL_VALIDATE_RESTART_SOURCE = restart_util.validate_restart_source
+# The candidate-owned selftest imports the server itself, as the real one does.
+_SELFTEST_PY = "import app.main\nfrom app.providers import get_provider\nget_provider()\n"
+_ROUTES_PY = "def require_all_routers_loaded():\n  return None\n"
+
 
 def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FOO_PY):
   app_dir = root / "backend" / "app"
@@ -78,9 +84,9 @@ def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FO
   (app_dir / "__init__.py").write_text("")
   (app_dir / "main.py").write_text(main_py)
   (app_dir / "providers.py").write_text(_PROVIDERS_PY)
-  (app_dir / "startup_selftest.py").write_text(
-    "from app.providers import get_provider\nget_provider()\n"
-  )
+  (app_dir / "startup_selftest.py").write_text(_SELFTEST_PY)
+  (app_dir / "routes").mkdir(exist_ok=True)
+  (app_dir / "routes" / "__init__.py").write_text(_ROUTES_PY)
   if foo_py is not None:
     (app_dir / "foo.py").write_text(foo_py)
 
@@ -204,8 +210,8 @@ def clone_env(tmp_path, monkeypatch):
   monkeypatch.setattr(
     pu, "PREPARED_UPDATE_PATH", tmp_path / ".prepared-update.json",
   )
-  # The real startup check imports the full platform; these fixture clones
-  # carry only a minimal backend, so the check is exercised separately.
+  # Restart admission's check is exercised separately; a test that needs it on
+  # these minimal clones restores _REAL_VALIDATE_RESTART_SOURCE.
   monkeypatch.setattr(
     "app.restart_util.validate_restart_source", lambda platform_root=None: None,
   )
@@ -1268,6 +1274,29 @@ def test_an_answer_that_fails_the_startup_check_is_never_prepared(
   assert worktree.exists() and pu.CONFLICT_FLAG.exists()
 
 
+def test_prepared_overlay_rejects_text_clean_merge_that_fails_the_selftest(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  monkeypatch.setattr(
+    "app.restart_util.validate_restart_source", _REAL_VALIDATE_RESTART_SOURCE,
+  )
+  _local_commit(platform, edits={"backend/app/providers.py": _PROVIDERS_PY.replace(
+    "sync_app_model_providers(data_dir):", "sync_app_model_providers():",
+  )}, msg="local signature")
+  _advance_origin(origin, edits={"backend/app/providers.py": _PROVIDERS_PY.replace(
+    "return 'ready'", "sync_app_model_providers('/data')\n  return 'ready'",
+  )}, msg="upstream caller")
+  served, _target, worktree = _park_resolved_line_a_conflict(platform, origin)
+
+  with pytest.raises(pu.PlatformUpdateError, match="TypeError"):
+    pu.continue_platform_overlay_update(platform)
+
+  assert pu.read_prepared_update() is None
+  assert _served_sha(platform) == served
+  assert worktree.exists() and pu.CONFLICT_FLAG.exists()
+
+
 def test_a_failed_swap_keeps_the_live_checkout_and_the_prepared_update(
   clone_env, monkeypatch,
 ):
@@ -1541,7 +1570,7 @@ def test_candidate_smoke_can_rename_internal_provider_function(clone_env):
   _advance_origin(origin, edits={
     "backend/app/providers.py": "def select_provider():\n  return 'ready'\n",
     "backend/app/startup_selftest.py": (
-      "from app.providers import select_provider\nselect_provider()\n"
+      "import app.main\nfrom app.providers import select_provider\nselect_provider()\n"
     ),
   })
   result = pu.reconcile_clone(platform)
@@ -1576,6 +1605,21 @@ def test_candidate_without_selftest_uses_import_only(clone_env):
   ok, error = pu._import_probe(platform)
   assert not ok
   assert "bad main" in error
+
+
+def test_update_rolls_back_when_the_router_registry_reports_a_failure(clone_env):
+  origin, platform = clone_env
+  pre = _served_sha(platform)
+  _advance_origin(origin, edits={"backend/app/routes/__init__.py": (
+    "def require_all_routers_loaded():\n"
+    "  raise RuntimeError('Router imports failed: chat')\n"
+  )})
+
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "rolled_back"
+  assert "Router imports failed: chat" in (result.error or "")
+  assert _served_sha(platform) == pre
 
 
 def test_candidate_smoke_rejects_text_clean_provider_signature_merge(clone_env):
@@ -1624,7 +1668,7 @@ def test_failed_candidate_never_rolls_back_a_newer_concurrent_writer(
   _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'update'\n"})
   raced: dict[str, str] = {}
 
-  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT):
+  def fail_after_concurrent_commit(repo=platform):
     raced["sha"] = _local_commit(
       platform, edits={"concurrent.txt": "newer owner\n"},
       msg="concurrent writer after activation",
@@ -6363,7 +6407,7 @@ def test_rollback_preserves_uncommitted_edits_arriving_after_activation(
   _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
   path = platform / 'backend/app/foo.py'
 
-  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT):
+  def changed_then_fail(repo=platform):
     path.write_text("VALUE = 'arrived after activation'\n")
     return False, 'candidate rejected'
 

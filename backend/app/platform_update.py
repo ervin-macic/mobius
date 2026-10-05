@@ -68,8 +68,8 @@ from typing import Callable, Literal, NotRequired, TypedDict
 from sqlalchemy.orm import Session
 
 from app import app_git, platform_activation, runtime_provenance
-from app.config import import_probe_env
 from app.platform_activation import PlatformActivationImpact
+from app.restart_util import run_candidate_startup_check
 
 
 log = logging.getLogger(__name__)
@@ -179,10 +179,6 @@ _FETCH_TIMEOUT = 120
 # the platform tree ever sees it as content, and a conflicting merge can stay
 # parked there for a resolver without touching the served checkout.
 _OVERLAY_CANDIDATE_DIRNAME = "mobius-overlay-candidate"
-# The post-merge import probe. A module-level infinite loop or a blocking call
-# in agent-edited code would otherwise wedge boot forever; a timeout-kill counts
-# as probe-fail -> roll back.
-_PROBE_TIMEOUT = 60
 # Hook installation only copies a handful of local files and updates one
 # repo-local config value. A long run is a wedged filesystem/process, not work.
 _HOOK_INSTALL_TIMEOUT = 15
@@ -1205,43 +1201,16 @@ def _clear_upstream(repo: Path) -> None:
   )
 
 
-def _import_probe(repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT):
-  """Import the backend and run its candidate-owned startup smoke when present.
+def _import_probe(repo: Path = PLATFORM_REPO) -> tuple[bool, str]:
+  """Run ``run_candidate_startup_check`` on ``repo``'s backend.
 
-  ``app.startup_selftest`` is the stable module entry point, not a promise about
-  internal provider APIs. Older candidates without that module get import-only
-  validation. Errors inside a present selftest fail the probe, never fall back.
   The fresh interpreter validates the new on-disk tree, not this updater's
-  already-imported modules. Its cwd/env mirror uvicorn: PYTHONPATH and GIT_*
-  pointers are scrubbed, DATABASE_URL / DATA_DIR retained, and the withheld
-  signing key replaced by an import-only placeholder. Returns (ok, error).
+  already-imported modules. Returns ``(ok, error)``.
   """
-  backend = repo / "backend"
-  env = dict(os.environ)
-  for var in (
-    "PYTHONPATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-  ):
-    env.pop(var, None)
-  import_probe_env(env)
-  probe = (
-    "import app.main\n"
-    "import importlib.util, runpy\n"
-    "if importlib.util.find_spec('app.startup_selftest') is not None:\n"
-    "    runpy.run_module('app.startup_selftest', run_name='__main__')\n"
-  )
-  try:
-    proc = subprocess.run(
-      [sys.executable or "python3", "-c", probe],
-      cwd=str(backend), capture_output=True, text=True, timeout=timeout, env=env,
-    )
-  except subprocess.TimeoutExpired:
-    return False, f"import probe timed out after {timeout}s"
-  except OSError as exc:
-    return False, f"import probe could not run: {exc!r}"
-  if proc.returncode == 0:
+  failure = run_candidate_startup_check(repo / "backend")
+  if failure is None:
     return True, ""
-  return False, (proc.stderr or proc.stdout or "").strip()[-_ERROR_EXCERPT_CHARS:]
+  return False, failure[-_ERROR_EXCERPT_CHARS:]
 
 
 @contextlib.contextmanager

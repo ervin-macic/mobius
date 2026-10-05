@@ -44,26 +44,48 @@ class RestartSourceInvalid(RuntimeError):
   """The editable platform would not survive the next startup probe."""
 
 
-def validate_restart_source(platform_root: Path | None = None) -> None:
-  """Run the production boot import verdict before accepting a restart.
+# A module-level infinite loop or blocking call in agent-edited source would
+# otherwise wedge the gate; a timeout counts as a failed check.
+STARTUP_CHECK_TIMEOUT_SECONDS = 60
 
-  The entrypoint deliberately falls back to the baked platform when an edited
-  backend or router cannot import.  A planned restart must catch that condition
-  while the healthy worker can still explain and repair it, rather than using
-  the fallback as a delayed test result.
+_STARTUP_CHECK = (
+  "import importlib.util, runpy\n"
+  "if importlib.util.find_spec('app.startup_selftest') is None:\n"
+  "    import app.main\n"
+  "else:\n"
+  "    runpy.run_module('app.startup_selftest', run_name='__main__')\n"
+  "from app.routes import require_all_routers_loaded\n"
+  "require_all_routers_loaded()\n"
+)
 
-  This mirrors ``_platform_import_probe`` in the frozen entrypoint: same
-  backend cwd, scrubbed repository/Python controls, and the explicit router
-  registry verdict.  A missing editable backend is valid for a baked-only
-  installation; first-boot seeding remains owned by the entrypoint.
+
+def run_candidate_startup_check(
+  backend: Path, *, timeout: int = STARTUP_CHECK_TIMEOUT_SECONDS,
+) -> str | None:
+  """Prove a backend tree would start; return None, or why it would not.
+
+  A fresh interpreter, cwd ``backend``, runs the candidate's own
+  ``python -m app.startup_selftest`` (which imports ``app.main`` and resolves
+  local provider configuration offline), then the route registry's explicit
+  ``require_all_routers_loaded`` verdict. A tree without that selftest module
+  (an older candidate, or one that deleted it) gets only the import and
+  router verdict; that silent downgrade is accepted. A present selftest that fails is a
+  failure, never a fallback.
+
+  Gates that run this check: platform update reconcile (``_import_probe``),
+  restart admission (``validate_restart_source`` from Settings, the update
+  button and Restart cards), and the prepared/overlay update
+  (``validate_restart_source`` on the frozen checkout). The frozen root-owned
+  entrypoint's ``_platform_import_probe`` is the remaining import-only gate:
+  every boot runs import plus router verdict alone, because that file ships
+  with the image and is not changed to delegate to the candidate.
+
+  The child mirrors the entrypoint's uvicorn exec: PYTHONPATH, GIT_* pointers
+  and server-only credentials are scrubbed, DATA_DIR / DATABASE_URL retained,
+  bytecode writes disabled, and the withheld signing key replaced by an
+  import-only placeholder. It must stay offline: no authentication, provider
+  process, network call or database write.
   """
-  platform_root = platform_root or Path(
-    os.environ.get("MOBIUS_PLATFORM_DIR", "/data/platform")
-  )
-  backend = platform_root / "backend"
-  if not (backend / "app").is_dir():
-    return
-
   env = os.environ.copy()
   for key in (
     "PYTHONPATH",
@@ -80,32 +102,46 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
     env.pop(key, None)
   env["PYTHONDONTWRITEBYTECODE"] = "1"
   import_probe_env(env)
-  command = [
-    sys.executable,
-    "-c",
-    (
-      "import app.main; "
-      "from app.routes import require_all_routers_loaded; "
-      "require_all_routers_loaded()"
-    ),
-  ]
   try:
     completed = subprocess.run(
-      command,
+      [sys.executable or "python3", "-c", _STARTUP_CHECK],
       cwd=backend,
       env=env,
       capture_output=True,
       text=True,
-      timeout=60,
+      timeout=timeout,
       check=False,
     )
-  except subprocess.TimeoutExpired as exc:
-    raise RestartSourceInvalid(
-      "Restart stopped: the current platform source did not finish its "
-      "startup check within 60 seconds. Ask Möbius to repair it before "
-      "restarting."
-    ) from exc
+  except subprocess.TimeoutExpired:
+    return f"the startup check did not finish within {timeout} seconds"
+  except OSError as exc:
+    return f"the startup check could not run: {exc!r}"
   if completed.returncode == 0:
+    return None
+  return (completed.stderr or completed.stdout or "").strip() or (
+    f"the startup check exited with status {completed.returncode}"
+  )
+
+
+def validate_restart_source(platform_root: Path | None = None) -> None:
+  """Run the candidate startup check before accepting a restart.
+
+  The entrypoint deliberately falls back to the baked platform when an edited
+  backend or router cannot import.  A planned restart must catch that condition
+  while the healthy worker can still explain and repair it, rather than using
+  the fallback as a delayed test result. See ``run_candidate_startup_check``
+  for what the check covers. A missing editable backend is valid for a
+  baked-only installation; first-boot seeding remains owned by the entrypoint.
+  """
+  platform_root = platform_root or Path(
+    os.environ.get("MOBIUS_PLATFORM_DIR", "/data/platform")
+  )
+  backend = platform_root / "backend"
+  if not (backend / "app").is_dir():
+    return
+
+  failure = run_candidate_startup_check(backend)
+  if failure is None:
     # The next boot also refuses source that needs a newer image's packages.
     from app.platform_update import release_packages_missing_from_image
 
@@ -113,14 +149,12 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
     if reason:
       raise RestartSourceInvalid(f"Restart stopped: {reason}")
     return
-  detail = (completed.stderr or completed.stdout or "").strip()
-  if len(detail) > 1200:
-    detail = detail[-1200:]
-  suffix = f" Details: {detail}" if detail else ""
+  if len(failure) > 1200:
+    failure = failure[-1200:]
   raise RestartSourceInvalid(
-    "Restart stopped: the current platform source failed the same startup "
-    "check the next boot would run. Ask Möbius to repair it before "
-    f"restarting.{suffix}"
+    "Restart stopped: the current platform source failed its startup check. "
+    "Ask Möbius to repair it before restarting. "
+    f"Details: {failure}"
   )
 
 

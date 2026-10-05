@@ -143,8 +143,9 @@ overlap handed over with **Fix with an agent**) and every combined source-and-co
 update are *prepared*, not applied: the answer is committed on the reviewed
 release and recorded in `.platform-prepared-update.json`. The live checkout
 keeps serving its snapshot, and nothing edited afterwards enters the update.
-A restart-only update is checked with the same startup check boot runs and is
-swapped in by the shutdown drain: it pauses every chat, saves the live state as
+A restart-only update must pass the candidate startup check
+(`restart_util.run_candidate_startup_check`) and is swapped in by the shutdown
+drain: it pauses every chat, saves the live state as
 one commit under `refs/mobius/update-late`, and points the checkout at the
 prepared commit, crash-safe through the reconcile marker.
 
