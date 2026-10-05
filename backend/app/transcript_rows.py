@@ -231,7 +231,12 @@ def convert(db, chat_id: str) -> bool:
   error = None
   try:
     messages = json.loads(raw)
-    if not isinstance(messages, list):
+    if messages is None:
+      # The previous release displayed a JSON null as an empty chat; the
+      # mirror rewrites it as the empty list the rows now hold.
+      messages = []
+      _changed(db, chat_id)
+    elif not isinstance(messages, list):
       error = "The stored transcript is not a message list"
   except (ValueError, UnicodeError) as exc:
     error = f"The stored transcript is not valid JSON: {exc}"
@@ -244,6 +249,31 @@ def convert(db, chat_id: str) -> bool:
   _insert(db, chat_id, 0, damaged_messages())
   _changed(db, chat_id)
   return True
+
+
+def live_working_set(db) -> list[str]:
+  """Unconverted chats boot recovery, sweeps and resumed turns will read.
+
+  Unconverted chats only come into existence while older code runs, so they
+  all exist at boot: converting this set before recovery means no event-loop
+  reader meets one of these chats unconverted. The set is chats with a
+  non-terminal run, chats with queued messages, chats with an open Goal, and
+  both ends of every delegation touching one of those.
+  """
+  if not legacy_present(db) or conversion_settled(db.get_bind()):
+    return []
+  m = models
+  live = set(db.execute(select(m.ChatRun.chat_id).where(
+    m.ChatRun.status.in_(m.NONTERMINAL_RUN_STATUSES),
+  )).scalars())
+  live |= set(db.execute(select(m.Chat.id).where(
+    m.Chat.pending_messages.cast(Text).not_in(("[]", "null")),
+  )).scalars())
+  live |= set(db.execute(select(m.ChatGoal.chat_id).where(m.ChatGoal.status == "open")).scalars())
+  for parent, child in db.execute(select(m.Delegation.parent_chat_id, m.Delegation.child_chat_id)).all():
+    if parent in live or child in live:
+      live.update(chat for chat in (parent, child) if chat)
+  return sorted(chat_id for chat_id in live if needs_conversion(db, chat_id))
 
 
 def next_unconverted(db, after: str | None) -> str | None:

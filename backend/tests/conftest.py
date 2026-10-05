@@ -207,21 +207,46 @@ def _assert_legacy_mirrors_rows(connection) -> None:
 
 
 def _install_unconverted_request_audit():
-  """Audit mode (MOBIUS_TEST_UNCONVERT_ON_REQUEST=1): before every HTTP request
-  the database looks as if the previous release had just written every chat.
+  """Audit mode (MOBIUS_TEST_UNCONVERT_ON_REQUEST=1): before every HTTP
+  request, every boot plan and every supervisor tick, the database looks as if
+  the previous release had just written every chat.
 
-  That is the state a first boot after an upgrade serves. A run in this mode
-  finds event-loop code that reads some chat's rows without awaiting
+  That is the state a first boot after an update serves (and, for a chat
+  whose conversion failed or was deferred, any later moment). A run in this
+  mode finds event-loop code that reads some chat's rows without awaiting
   ``transcript_rows.ensure_converted_async``. Off by default.
   """
   if os.environ.get("MOBIUS_TEST_UNCONVERT_ON_REQUEST") != "1":
     return
+  import functools
 
-  @app.middleware("http")
-  async def unconvert_every_chat(request, call_next):
+  from app import chat as chat_module, chat_waits, delegations, startup
+
+  def unconvert_every_chat():
     with engine.begin() as connection:
       connection.exec_driver_sql("DELETE FROM chat_transcript_state")
+
+  @app.middleware("http")
+  async def unconvert_before_request(request, call_next):
+    unconvert_every_chat()
     return await call_next(request)
+
+  def unconverting(function):
+    @functools.wraps(function)
+    async def wrapper(*args, **kwargs):
+      unconvert_every_chat()
+      return await function(*args, **kwargs)
+    return wrapper
+
+  for module, name in (
+    (startup, "run_startup_plan"),
+    (chat_module, "sweep_wedged_runs"),
+    (chat_module, "sweep_idle_pending_chats"),
+    (chat_module, "sweep_reset_parks"),
+    (chat_waits, "sweep_due_waits"),
+    (delegations, "wake_parents_for_completed_delegations"),
+  ):
+    setattr(module, name, unconverting(getattr(module, name)))
 
 
 _install_unconverted_request_audit()

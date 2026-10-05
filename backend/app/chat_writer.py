@@ -1155,7 +1155,7 @@ class ConvertNextTranscript(_Command):
 
 
 class TranscriptConversionBlocked(RuntimeError):
-  """Background conversion stopped at the platform's critical-disk floor."""
+  """Background conversion stopped at the platform's constrained-disk tier."""
 
 
 @dataclass
@@ -5369,11 +5369,16 @@ class ChatWriterActor:
     """One background step: convert the next chat after ``after``.
 
     Background conversion is deferrable bulk work that grows the database by
-    about the legacy transcript size, so it stops at the platform's existing
-    critical-disk floor (the verdict that already defers agent turns); the
-    next boot resumes it. A chat whose conversion fails is recorded and
-    skipped, so it never gates the chats after it. Returns the chat id
-    either way.
+    about the legacy transcript size. It must never itself push the volume
+    into the critical tier, where agent admission defers every turn, so it
+    stops one tier earlier, at the existing "constrained" verdict. (A
+    per-chat byte bound against the critical floor is not provable: an FTS5
+    insert can trigger an incremental merge that rewrites segments in
+    proportion to the whole search index, not to this chat, and those pages
+    sit in the WAL until a checkpoint.) A disk-pressure recovery re-arms the
+    run (``rearm_transcript_conversion``). A chat whose conversion fails is
+    recorded and skipped, so it never gates the chats after it. Returns the
+    chat id either way.
     """
     from app.config import get_settings
     from app.resource_pressure import resource_status
@@ -5383,10 +5388,11 @@ class ChatWriterActor:
       db.rollback()
       return None
     disk = resource_status(get_settings().data_dir)["pressure"]["disk"]
-    if disk.get("state") == "critical":
+    if disk.get("state") in ("constrained", "critical"):
       db.rollback()
       raise TranscriptConversionBlocked(
-        "background transcript conversion paused: the data disk is critically low",
+        "background transcript conversion paused: the data disk is low "
+        f"({disk.get('state')}); it resumes when disk pressure recovers",
       )
     try:
       self._convert_transcript(db, chat_id)
@@ -7323,6 +7329,24 @@ def start_transcript_conversion() -> None:
   )
 
 
+def rearm_transcript_conversion(disk_state: str) -> bool:
+  """Restart a disk-blocked background conversion once pressure has recovered.
+
+  Called from the existing capacity-monitor tick, so recovery is driven by
+  that supervisor's observation, never by a timer of its own. Only a run
+  that stopped for disk restarts; failed chats stay recorded.
+  """
+  task = _transcript_conversion_task
+  if (
+    transcript_conversion_status.get("state") != "blocked"
+    or disk_state != "normal"
+    or (task is not None and not task.done())
+  ):
+    return False
+  start_transcript_conversion()
+  return True
+
+
 async def convert_remaining_transcripts() -> None:
   """Convert every chat whose rows are not yet authoritative.
 
@@ -7330,9 +7354,9 @@ async def convert_remaining_transcripts() -> None:
   writer command converting one chat in one transaction, so live commands
   interleave at chat granularity and an interruption resumes from the state
   table on the next boot. A chat that fails is recorded and skipped, never
-  retried here. The critical-disk floor stops the run; nothing re-arms it
-  except the next boot, and readers still convert the chats they open once
-  the disk has room again.
+  retried here. The constrained-disk tier stops the run; the capacity
+  monitor re-arms it when disk pressure is normal again, and readers convert
+  the chats they open meanwhile.
   """
   status = transcript_conversion_status
   status.update(state="running", error=None, failed={})

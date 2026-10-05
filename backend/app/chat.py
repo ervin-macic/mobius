@@ -1337,6 +1337,8 @@ async def sweep_wedged_runs(db: Session) -> list[str]:
     if _runner_alive(chat_id):
       continue
     try:
+      from app.delegations import ensure_parent_helpers_converted
+      await ensure_parent_helpers_converted(chat_id)
       async with asyncio.timeout(chat_queue.TERMINAL_LOCK_TIMEOUT_SECS):
         async with chat_queue.get_lock(chat_id):
           db.expire_all()
@@ -2429,11 +2431,22 @@ async def sweep_reset_parks(
   for physical in orphan_candidates:
     if is_chat_running(physical.chat_id):
       continue
-    chat = db.query(models.Chat).filter(
-      models.Chat.id == physical.chat_id,
-      models.Chat.deleted_at.is_(None),
-    ).first()
-    recovered = _auto_resume_recovery(db, chat, physical)
+    # One candidate's failure (an unconvertible transcript, a damaged row)
+    # must never stop every other resume in this sweep.
+    try:
+      from app.delegations import ensure_parent_helpers_converted
+      await ensure_parent_helpers_converted(physical.chat_id)
+      chat = db.query(models.Chat).filter(
+        models.Chat.id == physical.chat_id,
+        models.Chat.deleted_at.is_(None),
+      ).first()
+      recovered = _auto_resume_recovery(db, chat, physical)
+    except Exception:
+      log.warning(
+        "sweep_reset_parks: orphan recovery check failed chat_id=%s run_token=%s",
+        physical.chat_id, physical.id, exc_info=True,
+      )
+      continue
     if recovered is None:
       continue
     park, _payload = recovered
@@ -5326,7 +5339,10 @@ async def _run_chat_impl_with_db(
 ) -> chat_queue.TerminalDisposition:
   """Run a turn with a session whose lifetime is owned by the wrapper."""
   if chat_id:
-    await transcript_rows.ensure_converted_async(chat_id, db)
+    # This turn reads its own transcript and, for helper results and
+    # resumed-turn context, its helpers' transcripts.
+    from app.delegations import ensure_parent_helpers_converted
+    await ensure_parent_helpers_converted(chat_id)
   log = _get_logger()
   settings = get_settings()
   raw_user_message = messages[-1].content

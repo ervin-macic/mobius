@@ -614,6 +614,25 @@ def _assistant_result(chat: models.Chat) -> str:
   return ""
 
 
+async def ensure_parent_helpers_converted(parent_chat_id: str) -> None:
+  """Convert a parent chat and its helpers' chats before event-loop code reads them.
+
+  Helper results (``derived_status``), resumed-turn context
+  (``active_parent_context``) and wake or steer notices read the children's
+  transcripts. A child the previous release wrote last stays unconverted
+  until something converts it, and the event loop never waits inside a read
+  (transcript_rows.require_rows), so these async callers await first.
+  """
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    children = [row[0] for row in db.query(models.Delegation.child_chat_id).filter(
+      models.Delegation.parent_chat_id == parent_chat_id,
+    )]
+  for chat_id in (parent_chat_id, *children):
+    await transcript_rows.ensure_converted_async(chat_id)
+
+
 def derived_status(
   db: Session, row: models.Delegation, *, load_result: bool = True,
 ) -> tuple[str, models.ChatRun | None, str]:
@@ -2686,6 +2705,7 @@ async def steer_results_into_running_parent(
   from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
   from app.database import SessionLocal
 
+  await ensure_parent_helpers_converted(parent_chat_id)
   async with chat_queue.get_lock(parent_chat_id):
     with SessionLocal() as db:
       chat = db.query(models.Chat).filter(
@@ -2801,7 +2821,7 @@ async def _deliver_parent_wake_once(
   )
   from app.database import SessionLocal
 
-  await transcript_rows.ensure_converted_async(parent_chat_id)
+  await ensure_parent_helpers_converted(parent_chat_id)
   async with chat_queue.get_transition_lock(parent_chat_id):
     with SessionLocal() as db:
       parent_chat = (

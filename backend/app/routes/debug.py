@@ -229,7 +229,13 @@ def debug_status(
   pending = transcript_rows.unconverted_count(db)
   if (pending or transcript_conversion_status.get("error")
       or transcript_conversion_status.get("failed")):
-    result["transcript_conversion"] = {"pending": pending, **transcript_conversion_status}
+    result["transcript_conversion"] = {
+      "pending": pending, **transcript_conversion_status,
+      # Converting adds about the converted chats' legacy transcript size to
+      # the database; neither a rollback nor the next release's column drop
+      # returns it without a VACUUM.
+      "growth": "about 1x the converted chats' transcript bytes; reclaimed only by VACUUM",
+    }
 
   return result
 
