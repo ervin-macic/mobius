@@ -318,6 +318,14 @@ export default function QuestionCard({
   if (locallyQueued) submitLabel = localAnswer.deliveryOutcome === 'delivered'
     ? 'Confirming answer…' : 'Queued on this device'
 
+  const answerFiles = platformAction ? null : (
+    <div className="qcard__answer-files" role="group" aria-label="Files for this answer">
+      {selectionLocked
+        ? <Attachments attachments={attachments || localAnswer?.body?.attachments || submitted?.attachments} chatId={chatId} />
+        : <FileChips files={files} onRemove={removeFile} chatId={chatId} disabled={submitting || disabled} />}
+    </div>
+  )
+
   return (
     <div
       className={`qcard${grouped ? ' qcard--grouped' : ''}${answered ? ' qcard--answered' : ''}`}
@@ -475,6 +483,9 @@ export default function QuestionCard({
               && (!restartAction || writtenRestartAction) && (
               <div className="qcard__answer-row">
                 <div className={`qcard__composer${isOtherSelected || answeredWithOther ? ' qcard__composer--active' : ''}`}>
+                  {/* One file set per card, shown inside the answer box nearest
+                      Submit, as the message composer shows its files. */}
+                  {qi === questions.length - 1 && answerFiles}
                   <CustomAnswerArea
                     answered={selectionLocked}
                     canSubmit={canSubmit}
@@ -499,11 +510,8 @@ export default function QuestionCard({
         )
         })}
       </div>
-      {!platformAction && (
-        <div className="qcard__attachments" role="group" aria-label="Files for this answer">
-          {selectionLocked
-            ? <Attachments attachments={attachments || localAnswer?.body?.attachments || submitted?.attachments} chatId={chatId} />
-            : !disabled && <>
+      {!platformAction && !selectionLocked && !disabled && (
+        <div className="qcard__attachments">
               <div className="qcard__attachment-actions">
                 <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
                   disabled={submitting}
@@ -519,8 +527,6 @@ export default function QuestionCard({
                 </button>
                 <span>Files for {grouped ? 'all answers' : 'this answer'} · attach or paste</span>
               </div>
-              <FileChips files={files} onRemove={removeFile} chatId={chatId} disabled={submitting} />
-            </>}
         </div>
       )}
       {!completedAction && (answered || !disabled) && (

@@ -263,6 +263,16 @@
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+/* Files sit inside the answer box above the text, like the message composer. */
+.qcard__answer-files {
+  padding: 10px 10px 0;
+}
+.qcard__answer-files:empty {
+  display: none;
+}
+.qcard__answer-files .chat__attachments {
+  max-width: 100%;
+}
 .qcard__input {
   display: block;
   width: 100%;
