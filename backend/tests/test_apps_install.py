@@ -3567,6 +3567,106 @@ def test_conflict_resolver_merges_in_private_checkout_before_its_turn(
   assert not (app_dir / ".git" / "MERGE_HEAD").exists()
 
 
+def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  # The published App Store's "Fix with an agent" sends every blocked update
+  # in one request. This drives that route end to end, including each app's
+  # recorded upstream version in the seed message.
+  apps = []
+  for suffix in ("one", "two"):
+    base = f"https://batch-conflict-{suffix}.test/repo/"
+    manifest = {
+      **MANIFEST_NEWS,
+      "id": f"batch-conflict-{suffix}",
+      "name": f"Batch Conflict {suffix.title()}",
+    }
+    installed = _install_v1(client, auth, base, manifest, JSX_MULTI)
+    assert installed.status_code == 201, installed.text
+    app_dir = (
+      Path(get_settings().data_dir) / "apps" / f"batch-conflict-{suffix}"
+    )
+    app_dir.joinpath("index.jsx").write_text(
+      JSX_MULTI.replace("ORIGINAL TITLE", f"LOCAL {suffix.upper()}"),
+    )
+    updated = _update_v2(
+      client,
+      auth,
+      base,
+      {**manifest, "version": "2.0.0"},
+      JSX_MULTI.replace("ORIGINAL TITLE", f"UPSTREAM {suffix.upper()}"),
+    )
+    assert updated.status_code == 201, updated.text
+    assert updated.json()["mode"] == "conflict"
+    apps.append((installed.json()["id"], app_dir, manifest["name"]))
+  app_ids = [app_id for app_id, _path, _name in apps]
+
+  starts = []
+
+  async def fake_start_turn(db, chat_id, title, content, provider):
+    # Mirrors the real helper's idempotence: only an unstarted chat starts.
+    started = chat_id not in {start["chat_id"] for start in starts}
+    starts.append({"chat_id": chat_id, "content": content})
+    return started
+
+  monkeypatch.setattr(
+    "app.routes.apps._start_conflict_resolver_turn",
+    fake_start_turn,
+  )
+  monkeypatch.setattr(
+    "app.background_agents.resolve_background_chat_choice",
+    lambda data_dir, db: {
+      "provider": "codex",
+      "agent_settings": {"model": "gpt-5.5", "effort": "xhigh"},
+    },
+  )
+  response = client.post(
+    "/api/apps/conflict-resolver-batch",
+    headers=auth,
+    json={"app_ids": app_ids, "resolution_policy": "preserve_local"},
+  )
+  assert response.status_code == 200, response.text
+  body = response.json()
+  assert body["created"] is True
+  assert body["started"] is True
+  assert len(starts) == 1
+  assert starts[0]["chat_id"] == body["chat_id"]
+  for _id, _path, name in apps:
+    assert f"## {name} to v2.0.0" in starts[0]["content"]
+  # One real merge per app, each in its private checkout; the served source
+  # directories are never half-merged.
+  assert all(
+    app_git.merge_in_progress(install.pending_update_worktree(path))
+    and not (path / ".git" / "MERGE_HEAD").exists()
+    for _id, path, _name in apps
+  )
+
+  from app.database import SessionLocal
+  db = SessionLocal()
+  try:
+    stored = db.query(models.App).filter(models.App.id.in_(app_ids)).all()
+    assert {app.conflict_resolver_chat_id for app in stored} == {
+      body["chat_id"],
+    }
+    resolver = db.get(models.Chat, body["chat_id"])
+    assert resolver.provider == "codex"
+  finally:
+    db.close()
+
+  repeated = client.post(
+    "/api/apps/conflict-resolver-batch",
+    headers=auth,
+    json={"app_ids": app_ids, "resolution_policy": "preserve_local"},
+  )
+  assert repeated.status_code == 200, repeated.text
+  assert repeated.json() == {
+    "chat_id": body["chat_id"],
+    "created": False,
+    "started": False,
+  }
+  assert [start["chat_id"] for start in starts] == [body["chat_id"]] * 2
+
+
 def _resolve_in(checkout: Path, files: dict[str, str]) -> None:
   """Act as the resolver: write the reconciled files and commit them."""
   for rel, text in files.items():

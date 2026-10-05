@@ -538,6 +538,15 @@ class AppConflictResolverChatRequest(BaseModel):
   resolution_policy: Literal["preserve_local"] | None = None
 
 
+class AppConflictResolverBatchChatRequest(BaseModel):
+  """One owner-approved resolver turn for a complete Store issue set."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  app_ids: list[int] = Field(min_length=1, max_length=50)
+  resolution_policy: Literal["preserve_local"] | None = None
+
+
 class ProviderCodeRequest(BaseModel):
   code: str
 
