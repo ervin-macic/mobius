@@ -5,6 +5,7 @@ import {
   DRAWER_ROW_HEIGHT,
   DRAWER_ROW_OVERSCAN,
   clampDrawerRowWindow,
+  drawerListHoldHeight,
   drawerRowSpacerHeights,
   drawerRowWindow,
   drawerRowWindowContaining,
@@ -111,4 +112,38 @@ test('desktop active-chat reveal moves the window only for an unmounted Recent r
   assert.notEqual(moved, current)
   assert.ok(moved.start <= 620 && moved.end > 620)
   assert.equal(moved.end - moved.start, DRAWER_INITIAL_WINDOW_ROWS)
+})
+
+test('a shorter list is padded until the viewport can reach its previous position', () => {
+  assert.equal(
+    drawerListHoldHeight({ reach: 1200, scrollHeight: 500, holdHeight: 0 }),
+    701,
+  )
+})
+
+test('the list hold shrinks as the owner scrolls up and is released once inert', () => {
+  // 700px of padding under 500px of content; the viewport bottom is now at 1050.
+  assert.equal(
+    drawerListHoldHeight({ reach: 1050, scrollHeight: 1200, holdHeight: 700 }),
+    551,
+  )
+  // The content alone now covers the viewport bottom: nothing left to hold.
+  assert.equal(
+    drawerListHoldHeight({ reach: 800, scrollHeight: 1900, holdHeight: 700 }),
+    0,
+  )
+})
+
+test('a list taller than the viewport reach needs no hold', () => {
+  assert.equal(
+    drawerListHoldHeight({ reach: 900, scrollHeight: 3000, holdHeight: 0 }),
+    0,
+  )
+})
+
+test('the list hold tolerates missing or non-finite metrics', () => {
+  assert.equal(
+    drawerListHoldHeight({ reach: NaN, scrollHeight: 10, holdHeight: NaN }),
+    0,
+  )
 })

@@ -61,6 +61,7 @@ import { isDrawerAppShareEligible } from './appShareState.js'
 import { recentsProjectChip } from '../../lib/recentsProjectChip.js'
 import {
   clampDrawerRowWindow,
+  drawerListHoldHeight,
   drawerRowSpacerHeights,
   drawerRowWindow,
   drawerRowWindowForIndex,
@@ -219,17 +220,14 @@ export default function Drawer({
   // machinery below; each device remembers which one it shows.
   const [listTab, setListTab] = useState(readListTab)
   const showingArchived = listTab === 'archived'
-  const listPanelRef = useRef(null)
-  const listTabRef = useRef(listTab)
-  listTabRef.current = listTab
+  const listHoldRef = useRef(null)
   const tabSwitchScrollRef = useRef(null)
   const selectListTab = useCallback((tab) => {
-    if (tab === listTabRef.current) return
-    // Capture the scroll position and panel height so the layout effect below
-    // can keep the tab header stationary across the switch.
+    // Capture the scroll position and extent before the swap so the layout
+    // effect below can keep the tab header stationary.
     const root = navigationScrollRef.current
     tabSwitchScrollRef.current = root
-      ? { scrollTop: root.scrollTop, panelHeight: listPanelRef.current?.offsetHeight ?? 0 }
+      ? { scrollTop: root.scrollTop, reach: root.scrollHeight }
       : null
     setListTab(tab)
     writeListTab(tab)
@@ -327,77 +325,67 @@ export default function Drawer({
   }, [listItems.length])
 
   // A shorter list shrinks the scrollable area, so the browser clamps
-  // scrollTop and the tab header moves under the pointer. On a tab switch the
-  // panel inherits the previous list's height and scrollTop is restored. The
-  // surplus is then trimmed once the row window has settled and again on each
-  // scroll, so it never leaves scrollable blank space.
+  // scrollTop and the tab header moves under the pointer. On a tab switch a
+  // trailing spacer pads the list back to the previous scroll extent and
+  // scrollTop is restored. The spacer is trimmed once the row window has
+  // settled and on each scroll, so it never leaves scrollable blank space.
   const listHoldRafRef = useRef(0)
-  const trimListHold = useCallback(() => {
+  const syncListHold = useCallback(() => {
     listHoldRafRef.current = 0
     const root = navigationScrollRef.current
-    const panel = listPanelRef.current
-    const held = panel?.style.minHeight
-    if (!root || !panel || !held) return
-    const target = root.scrollTop
-    const heldPx = parseFloat(held)
-    const spare = root.scrollHeight - (target + root.clientHeight)
-    // Tolerate 2px of rounding error: a trim that nudges scrollTop would fire
-    // another scroll event and re-enter this function.
-    if (spare <= 2) return
-    // scrollHeight and min-height can use different pixel units under display
-    // zoom, so derive the scrollHeight change per min-height pixel by probing
-    // rather than assuming 1:1.
-    const probe = Math.min(50, heldPx)
-    const before = root.scrollHeight
-    panel.style.minHeight = `${heldPx - probe}px`
-    const scale = probe > 0 ? (before - root.scrollHeight) / probe : 0
-    if (scale <= 0.01) {
-      // The list's own content determines the height; the hold is inert.
-      panel.style.minHeight = held
-      root.scrollTop = target
-      return
-    }
-    const next = heldPx - spare / scale + 2
-    panel.style.minHeight = next > 0 ? `${next}px` : ''
-    root.scrollTop = target // the probe can clamp scrollTop
-    // Revert if the trim still moved the scroll position.
-    if (Math.abs(root.scrollTop - target) > 0.5) {
-      panel.style.minHeight = held
-      root.scrollTop = target
-    }
+    const hold = listHoldRef.current
+    if (!root || !hold) return
+    const next = drawerListHoldHeight({
+      reach: root.scrollTop + root.clientHeight,
+      scrollHeight: root.scrollHeight,
+      holdHeight: parseFloat(hold.style.height),
+    })
+    hold.style.height = next > 0 ? `${next}px` : ''
   }, [])
-  const scheduleListHoldTrim = useCallback(() => {
+  const scheduleListHoldSync = useCallback(() => {
     if (listHoldRafRef.current) return
-    listHoldRafRef.current = requestAnimationFrame(trimListHold)
-  }, [trimListHold])
+    listHoldRafRef.current = requestAnimationFrame(syncListHold)
+  }, [syncListHold])
   useLayoutEffect(() => {
     const root = navigationScrollRef.current
-    const panel = listPanelRef.current
+    const hold = listHoldRef.current
     const saved = tabSwitchScrollRef.current
+    if (!root || !hold || !saved) return
+    // The row window still describes the previous list. Settle it first so the
+    // extent measured below is the new list's own.
+    const settled = clampDrawerRowWindow(listWindow, listItems.length)
+    if (!sameDrawerRowWindow(listWindow, settled)) {
+      setListWindow(settled)
+      return
+    }
     tabSwitchScrollRef.current = null
-    if (!root || !panel || !saved) return
-    // scrollTop 0 cannot be clamped, so no hold is needed.
-    panel.style.minHeight = saved.scrollTop > 0 ? `${saved.panelHeight}px` : ''
-    if (saved.scrollTop <= 0) return
+    hold.style.height = ''
+    const next = drawerListHoldHeight({
+      reach: saved.reach,
+      scrollHeight: root.scrollHeight,
+      holdHeight: 0,
+    })
+    if (next <= 0) return
+    hold.style.height = `${next}px`
     root.scrollTop = saved.scrollTop
-    scheduleListHoldTrim()
-  }, [listTab, scheduleListHoldTrim])
+    scheduleListHoldSync()
+  }, [listTab, listWindow, listItems.length, scheduleListHoldSync])
   useEffect(() => {
     if (!open) return undefined
     const root = navigationScrollRef.current
-    const panel = listPanelRef.current
-    if (!root || !panel) return undefined
+    const hold = listHoldRef.current
+    if (!root || !hold) return undefined
     const onScroll = () => {
-      if (panel.style.minHeight) scheduleListHoldTrim()
+      if (hold.style.height) scheduleListHoldSync()
     }
     root.addEventListener('scroll', onScroll, { passive: true })
     return () => {
       root.removeEventListener('scroll', onScroll)
       cancelAnimationFrame(listHoldRafRef.current)
       listHoldRafRef.current = 0
-      panel.style.minHeight = ''
+      hold.style.height = ''
     }
-  }, [open, scheduleListHoldTrim])
+  }, [open, scheduleListHoldSync])
 
   // Measure once before an opened drawer paints, then update the small row
   // window at most once per animation frame while it scrolls. The scroll path
@@ -1478,7 +1466,6 @@ export default function Drawer({
                 </div>
                 <div
                   id="drawer-list-panel"
-                  ref={listPanelRef}
                   role="tabpanel"
                   aria-labelledby={`drawer-tab-${listTab}`}
                 >
@@ -1555,6 +1542,7 @@ export default function Drawer({
                       aria-hidden="true"
                     />
                   )}
+                  <div ref={listHoldRef} aria-hidden="true" />
                 </div>
               </section>
             </div>
