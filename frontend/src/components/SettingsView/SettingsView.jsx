@@ -880,7 +880,6 @@ export default function SettingsView({
     // postMessages `moebius:frame-theme` to live iframes.
     try {
       await themeService.toggleTheme(queryClient, currentMode, api)
-      if (themeService.reloadForInstalledStatusBar()) return
     } catch {
       setThemeMode(currentMode)
       setThemeError(
