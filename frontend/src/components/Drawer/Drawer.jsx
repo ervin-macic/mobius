@@ -225,8 +225,8 @@ export default function Drawer({
   const tabSwitchScrollRef = useRef(null)
   const selectListTab = useCallback((tab) => {
     if (tab === listTabRef.current) return
-    // Remember where the owner is scrolled so a shorter list can't yank the
-    // tab header down when the browser clamps the scroll position.
+    // Capture the scroll position and panel height so the layout effect below
+    // can keep the tab header stationary across the switch.
     const root = navigationScrollRef.current
     tabSwitchScrollRef.current = root
       ? { scrollTop: root.scrollTop, panelHeight: listPanelRef.current?.offsetHeight ?? 0 }
@@ -326,11 +326,11 @@ export default function Drawer({
     ))
   }, [listItems.length])
 
-  // Switching to a shorter list would shrink the scrollable area and make the
-  // browser clamp scrollTop, dragging the tab header away from the pointer. So
-  // the new list is given the previous list's height, scroll is restored, and
-  // the spare space is trimmed on the next frame (once the row window has
-  // settled) and again on every scroll, so it is never scrollable blank space.
+  // A shorter list shrinks the scrollable area, so the browser clamps
+  // scrollTop and the tab header moves under the pointer. On a tab switch the
+  // panel inherits the previous list's height and scrollTop is restored. The
+  // surplus is then trimmed once the row window has settled and again on each
+  // scroll, so it never leaves scrollable blank space.
   const listHoldRafRef = useRef(0)
   const trimListHold = useCallback(() => {
     listHoldRafRef.current = 0
@@ -341,26 +341,26 @@ export default function Drawer({
     const target = root.scrollTop
     const heldPx = parseFloat(held)
     const spare = root.scrollHeight - (target + root.clientHeight)
-    // A couple of pixels of slack absorbs zoom/rounding and keeps a trim from
-    // nudging scrollTop, which would fire another scroll event and trim again.
+    // Tolerate 2px of rounding error: a trim that nudges scrollTop would fire
+    // another scroll event and re-enter this function.
     if (spare <= 2) return
-    // Scroll metrics and min-height can be in different pixel units (display
-    // zoom), so measure how far scrollHeight moves per min-height pixel
-    // instead of assuming 1:1.
+    // scrollHeight and min-height can use different pixel units under display
+    // zoom, so derive the scrollHeight change per min-height pixel by probing
+    // rather than assuming 1:1.
     const probe = Math.min(50, heldPx)
     const before = root.scrollHeight
     panel.style.minHeight = `${heldPx - probe}px`
     const scale = probe > 0 ? (before - root.scrollHeight) / probe : 0
     if (scale <= 0.01) {
-      // Natural content, not the hold, sets the height: nothing to trim.
+      // The list's own content determines the height; the hold is inert.
       panel.style.minHeight = held
       root.scrollTop = target
       return
     }
     const next = heldPx - spare / scale + 2
     panel.style.minHeight = next > 0 ? `${next}px` : ''
-    root.scrollTop = target // the probe may have clamped it
-    // If trimming still moved the owner's position, undo it rather than drift.
+    root.scrollTop = target // the probe can clamp scrollTop
+    // Revert if the trim still moved the scroll position.
     if (Math.abs(root.scrollTop - target) > 0.5) {
       panel.style.minHeight = held
       root.scrollTop = target
@@ -376,7 +376,7 @@ export default function Drawer({
     const saved = tabSwitchScrollRef.current
     tabSwitchScrollRef.current = null
     if (!root || !panel || !saved) return
-    // At the top nothing can be clamped, so no hold is needed.
+    // scrollTop 0 cannot be clamped, so no hold is needed.
     panel.style.minHeight = saved.scrollTop > 0 ? `${saved.panelHeight}px` : ''
     if (saved.scrollTop <= 0) return
     root.scrollTop = saved.scrollTop
