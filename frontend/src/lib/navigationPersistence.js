@@ -19,6 +19,10 @@ export function readRestoredCanvas(storage = globalThis.localStorage) {
   } catch { return null }
 }
 
+export function rememberReturnToSettings(storage = globalThis.sessionStorage) {
+  try { storage?.setItem(RETURN_VIEW_KEY, 'settings') } catch {}
+}
+
 export function consumeReturnView(storage = globalThis.sessionStorage) {
   try {
     const view = storage?.getItem(RETURN_VIEW_KEY)

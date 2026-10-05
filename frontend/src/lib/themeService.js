@@ -8,6 +8,7 @@ import {
 import { themeQueries } from '../hooks/queries.js'
 import { applyTheme, inferMode, HEX_RE } from './applyTheme.js'
 import { captureLayoutSpace, clientPointToLayout } from './layoutSpace.js'
+import { rememberReturnToSettings } from './navigationPersistence.js'
 
 /**
  * Owns the theme lifecycle: read, transform, apply (DOM + body bg
@@ -470,4 +471,21 @@ export async function toggleTheme(queryClient, currentMode, api) {
   }
 
   return { newMode, newCss, newBg }
+}
+
+/**
+ * An installed iPhone app reads its opaque status-bar colour from
+ * `theme-color` only when the document loads. Reload after a Settings theme
+ * change so the bar follows; the pre-paint script restores the saved theme and
+ * Settings reopens. Returns whether a reload was started.
+ */
+export function reloadForInstalledStatusBar({
+  navigator = globalThis.navigator,
+  location = globalThis.location,
+  storage = globalThis.sessionStorage,
+} = {}) {
+  if (navigator?.standalone !== true) return false
+  rememberReturnToSettings(storage)
+  location.reload()
+  return true
 }
