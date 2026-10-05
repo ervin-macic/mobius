@@ -42,7 +42,7 @@ test('previewing_an_apps_access_only_reads_its_manifest', async () => {
 
 test('installing_sends_exactly_the_digest_the_owner_reviewed', async () => {
   const calls = stubFetch(200, { id: 7 })
-  assert.deepEqual(await installReviewedApp('https://example.test/mobius.json', 'd1'), { status: 'installed' })
+  assert.deepEqual(await installReviewedApp('https://example.test/mobius.json', 'd1'), { status: 'installed', warnings: [] })
   assert.deepEqual(calls[0].body, { manifest_url: 'https://example.test/mobius.json', reviewed_capability_digest: 'd1' })
 })
 
@@ -57,4 +57,9 @@ test('an_app_whose_access_changed_after_review_comes_back_for_a_new_review', asy
 test('a_failed_install_reports_the_servers_reason', async () => {
   stubFetch(400, { detail: 'The manifest is invalid.' })
   await assert.rejects(installReviewedApp('https://example.test/mobius.json', 'd1'), /manifest is invalid/)
+})
+
+test('install_warnings_are_passed_on_so_the_owner_can_see_them', async () => {
+  stubFetch(200, { warnings: ['The app icon could not be fetched.'] })
+  assert.deepEqual(await installReviewedApp('https://example.test/mobius.json', 'd1'), { status: 'installed', warnings: ['The app icon could not be fetched.'] })
 })

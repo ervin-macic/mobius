@@ -95,3 +95,51 @@ test('an_access_check_resolving_after_unmount_does_not_reopen_the_review', async
   await checking
   assert.equal(result.current.confirmation, null)
 })
+
+const TWO_APPS = new Map([
+  ['maps', { id: 'maps', manifest_url: 'https://example.test/maps/mobius.json' }],
+  ['pages', { id: 'pages', manifest_url: 'https://example.test/pages/mobius.json' }],
+])
+
+test('a_second_app_cannot_start_while_the_first_is_being_checked', async () => {
+  const calls = []
+  let resolveFirst
+  globalThis.fetch = (url, init) => {
+    calls.push(JSON.parse(init.body).manifest_url)
+    return new Promise(resolve => { resolveFirst = resolve })
+  }
+  const { result } = renderHook(useAppInstall, TWO_APPS)
+  const first = result.current.begin('maps')
+  await result.current.begin('pages')
+  assert.deepEqual(calls, ['https://example.test/maps/mobius.json'])
+  assert.equal(result.current.busy, true)
+  resolveFirst(new Response(JSON.stringify(PREVIEW.body), { status: 200 }))
+  await first
+  assert.equal(result.current.confirmation.id, 'maps')
+  assert.equal(result.current.busy, true)
+  await result.current.begin('pages')
+  assert.equal(result.current.confirmation.id, 'maps')
+})
+
+test('an_access_check_that_returns_after_the_review_was_dismissed_is_dropped', async () => {
+  let resolveFetch
+  globalThis.fetch = () => new Promise(resolve => { resolveFetch = resolve })
+  const { result } = renderHook(useAppInstall, TWO_APPS)
+  const checking = result.current.begin('maps')
+  result.current.dismiss()
+  assert.equal(result.current.busy, false)
+  resolveFetch(new Response(JSON.stringify(PREVIEW.body), { status: 200 }))
+  await checking
+  assert.equal(result.current.confirmation, null)
+  assert.equal(result.current.statusOf('maps'), null)
+})
+
+test('closing_a_review_frees_the_next_app_to_start', async () => {
+  const calls = stubServer({ preview: PREVIEW })
+  const { result } = renderHook(useAppInstall, TWO_APPS)
+  await result.current.begin('maps')
+  result.current.dismiss()
+  await result.current.begin('pages')
+  assert.equal(calls.length, 2)
+  assert.equal(result.current.confirmation.id, 'pages')
+})

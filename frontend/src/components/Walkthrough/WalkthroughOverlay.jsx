@@ -69,7 +69,7 @@ function Title({ kind, plain, accent }) {
   </>
 }
 
-export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp, onStoreSuspendedChange }) {
+export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp, onHandoffChange }) {
   const queryClient = useQueryClient()
   const cardRef = useRef(null)
   const titleRef = useRef(null)
@@ -95,9 +95,9 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   // guide is handing back from another app. Publish the lease at the same commit
   // that hides the guide, and release it on return or unmount.
   useLayoutEffect(() => {
-    onStoreSuspendedChange?.(suspended)
-    return () => { if (suspended) onStoreSuspendedChange?.(false) }
-  }, [onStoreSuspendedChange, suspended])
+    onHandoffChange?.(suspended)
+    return () => { if (suspended) onHandoffChange?.(false) }
+  }, [onHandoffChange, suspended])
 
   // Back from the hand-off, the guide opens again where the owner left it.
   const wasSuspendedRef = useRef(false)
@@ -153,7 +153,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
         {screen.content === 'chat' && <AgentChatDemo />}
         {screen.content === 'brain' && <AgentBrainFlow />}
         {screen.content === 'store' && <WalkthroughStore store={store} />}
-        {screen.content === 'group' && <WalkthroughAppGroup group={screen.group} store={store} statusOf={installer.statusOf} onInstall={installer.begin} />}
+        {screen.content === 'group' && <WalkthroughAppGroup group={screen.group} store={store} statusOf={installer.statusOf} locked={installer.busy} onInstall={installer.begin} />}
         {screen.content === 'connect' && <WalkthroughSetup />}
         {screen.content === 'finish' && <>
           <WalkthroughInstall />

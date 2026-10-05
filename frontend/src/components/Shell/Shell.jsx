@@ -12,7 +12,6 @@ import {
 } from '../navigationIcons.js'
 import Drawer from '../Drawer/Drawer.jsx'
 import AppCanvas from '../AppCanvas/AppCanvas.jsx'
-import WalkthroughOverlay from '../Walkthrough/WalkthroughOverlay.jsx'
 import NotificationCenter from '../NotificationBell/NotificationCenter.jsx'
 import {
   api, apiFetch, jsonOrThrow, probeDeletion, clearAppRuntimeData,
@@ -222,6 +221,8 @@ const SYSTEM_RECONNECT_LIST_TIMEOUT_MS = 5_000
 const CHAT_ROW_REFRESH_BATCH_MS = 250
 // Mode timing lives with the pure snapshot geometry in workspaceView.js; browser
 // transition completion owns its lifetime, so Shell has no animation timers.
+// Shown once per account, so it stays out of the main bundle.
+const WalkthroughOverlay = lazy(() => import('../Walkthrough/WalkthroughOverlay.jsx'))
 const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
 
 // Capture the incoming fragment before navigation normalizes the URL; consume
@@ -290,9 +291,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // outgoing surface becomes inert. The callback is filled after the shared
   // composer handoff exists below.
   const beforeRestoreRouteRef = useRef(null)
-  const walkthroughStoreSuspendedRef = useRef(false)
-  const onWalkthroughStoreSuspendedChange = useCallback((suspended) => {
-    walkthroughStoreSuspendedRef.current = suspended
+  const walkthroughHandoffRef = useRef(false)
+  const onWalkthroughHandoffChange = useCallback((suspended) => {
+    walkthroughHandoffRef.current = suspended
   }, [])
 
   const {
@@ -886,9 +887,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // only for a saved draft; on desktop it restores keyboard focus.
   beforeRestoreRouteRef.current = (route) => {
     if (route?.view !== 'chat' || route.chatId == null) return
-    // The modeless guide owns focus when Back leaves its Store review. A chat
-    // restore still restores the chat; only its composer-focus request yields.
-    if (walkthroughStoreSuspendedRef.current) return
+    // The guide owns focus when Back returns from an app it handed the owner
+    // to. A chat restore still restores the chat; only its composer-focus request yields.
+    if (walkthroughHandoffRef.current) return
     focusSelectedChatComposer(route.chatId)
   }
 
@@ -4742,12 +4743,14 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       />
 
       {showWalkthrough && (
-        <WalkthroughOverlay
-          apps={apps}
-          activeAppId={activeView === 'canvas' ? activeAppId : null}
-          onOpenApp={openAppWithIntent}
-          onStoreSuspendedChange={onWalkthroughStoreSuspendedChange}
-        />
+        <Suspense fallback={null}>
+          <WalkthroughOverlay
+            apps={apps}
+            activeAppId={activeView === 'canvas' ? activeAppId : null}
+            onOpenApp={openAppWithIntent}
+            onHandoffChange={onWalkthroughHandoffChange}
+          />
+        </Suspense>
       )}
 
       {/* inert on the main content while the modal drawer is open — mirrors

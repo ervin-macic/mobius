@@ -8,7 +8,8 @@ export default function WalkthroughAccessConfirm({ confirmation, app, icon, onAp
   const dialogRef = useRef(null)
   const confirmRef = useRef(null)
   const installButtonRef = useRef(null)
-  const { rows, notice } = confirmation
+  const { rows, notice, manifest, item } = confirmation
+  const libraries = manifest?.runtime?.esm_deps || []
   // Focus starts on Confirm, Tab and the page behind are held, Escape cancels, and focus goes back to
   // the Install button when it closes. The button is looked up rather than remembered, because some
   // browsers do not focus a button when it is tapped.
@@ -33,6 +34,8 @@ export default function WalkthroughAccessConfirm({ confirmation, app, icon, onAp
               <em className={row.tone === 'read' || row.tone === 'muted' ? 'is-read' : ''}>{row.tag}</em>
             </li>)}
           </ul>}
+        {libraries.length > 0 && <p className="wt-confirm__meta">Loads {libraries.length === 1 ? 'one library' : `${libraries.length} libraries`} from esm.sh on first open: {libraries.join(', ')}.</p>}
+        <p className="wt-confirm__meta">Source: {item.manifest_url}</p>
       </section>
       <div className="wt-confirm__actions">
         <button type="button" className="wt-btn" onClick={onCancel}>Cancel</button>

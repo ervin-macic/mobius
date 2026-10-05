@@ -1,8 +1,7 @@
-/* The App Store's access disclosure, ported so the guide can show exactly what
-   an app asks for before it is installed. Source of truth:
-   /data/apps/store/ui/CapabilityContract.jsx (capabilityRows). Keep the two in
-   step: a data grant must never be hidden from review because this copy lacks
-   its polished wording (the unknown-grant fallback below covers new grants). */
+/* The access disclosure for installing an app from the guide. It mirrors the App Store's wording row
+   for row (capabilityRows in the Store app's CapabilityContract), because the Store ships separately
+   and cannot be imported here. A data grant must never be hidden from review just because this copy
+   lacks its polished wording; the unknown-grant fallback below covers new grants. */
 import { apiFetch } from '../../api/client.js'
 import { detailToMessage } from '../../lib/errorDetail.js'
 
@@ -193,5 +192,5 @@ export async function installReviewedApp(manifestUrl, reviewedDigest) {
     return { status: 'changed', preview: { capability_contract: data.detail.capability_contract, capability_digest: data.detail.capability_digest } }
   }
   if (!response.ok) throw new Error(detailToMessage(data.detail, 'The app could not be installed.'))
-  return { status: 'installed' }
+  return { status: 'installed', warnings: Array.isArray(data.warnings) ? data.warnings : [] }
 }

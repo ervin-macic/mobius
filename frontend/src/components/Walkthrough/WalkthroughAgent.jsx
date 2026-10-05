@@ -22,10 +22,10 @@ const CHAT_PROMPT = 'Build me an app to track my expenses'
 // One finger runs through phases 1 to 5: it arrives at the brain and presses, waits while the picker opens, glides to the row, presses, and fades.
 const CHAT_PHASES = [400, 1100, 450, 450, 450, 500, 2400, 1500, 2000, 4200]
 const PHASE = { blank: 0, tapBrain: 1, open: 2, aim: 3, tapRow: 4, chosen: 5, typing: 6, thinking: 7, building: 8, done: 9 }
-// Rows as the real picker lists them (connected providers in order, Codex then Claude); Sonnet 5.5 gets chosen.
+// Rows as the real picker lists them (connected providers in order, Codex then Claude); Opus 4.8 gets chosen.
 const PICKER_MODELS = [
-  { name: 'GPT-6-Astra', provider: 'codex' },
-  { name: 'Claude Sonnet 5.5', provider: 'claude', chosen: true },
+  { name: 'GPT-5.6-Sol', provider: 'codex' },
+  { name: 'Claude Opus 4.8', provider: 'claude', chosen: true },
 ]
 const CLAUDE_EFFORTS = PROVIDER_INFO.claude.efforts
 const EXPENSE_BARS = [38, 62, 46, 80, 54]
@@ -129,51 +129,44 @@ const goalPlan = stage => ({ tasks: GOAL_STEPS.map((title, index) => ({
   status: stage > index ? 'completed' : stage === index ? 'running' : 'pending',
   waiting_on: stage < index ? [`step-${index - 1}`] : [],
 })) })
-const BUY_QUESTION = [{ question: 'Which one should I order?', options: [
-  { label: 'Aero Q45 · $79', description: 'Best match, arrives Tuesday' },
-  { label: 'Nimbus ANC · $64', description: 'Cheapest, arrives Thursday' },
+const REMIND_QUESTION = [{ question: 'When should I remind you?', options: [
+  { label: 'Tomorrow · 9:00 AM', description: 'Before your first meeting' },
+  { label: 'Friday · 6:00 PM', description: 'After work' },
 ] }]
+const REMIND_PICK = REMIND_QUESTION[0].options[0].label
 
 /* What each request leaves behind. These are the pieces a real chat shows, using
    Möbius' own components and classes so type, spacing and shape match the app. */
 
-/* The agent stops and asks. This is the real question card. A finger taps the first option, the
-   answer goes in, and the agent carries on and confirms the order. It plays by itself: the card is
-   not tappable here (the Submit button is hidden for the same reason). */
-function BuyResult({ onFinger }) {
+/* The agent stops and asks. This is the real question card, shown read-only: a finger glides to the
+   first option, and the card then renders as answered (the same state a real answered card has), and
+   the agent confirms. Nothing is clicked or typed, so no draft is ever stored. */
+function ReminderResult({ onFinger }) {
   const reduced = usePrefersReducedMotion()
-  const [picked, setPicked] = useState(null)
+  const [picked, setPicked] = useState(reduced)
   const wrapRef = useRef(null)
   const replyRef = useRef(null)
   useEffect(() => { if (picked) replyRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }) }, [picked])
   useEffect(() => {
+    if (reduced) return undefined
     const wrap = wrapRef.current
-    const option = () => wrap?.querySelectorAll('.qcard__opt')[0]
-    const timers = []
-    const at = (ms, fn) => timers.push(setTimeout(fn, ms))
-    if (reduced) { at(0, () => option()?.click()); at(450, () => wrap?.querySelector('.qcard__submit:not(:disabled)')?.click()) } else {
-      // The finger lives in the frame around the chat (the log clips anything that sticks out of it).
-      at(700, () => {
-        const target = option()
+    const timers = [
+      setTimeout(() => {
+        const target = wrap?.querySelector('.qcard__opt')
         const frame = wrap?.closest('.wt-chatflow-wrap')
         const log = wrap?.closest('.wt-chatflow__log')
         if (!target || !frame || !log) return
         const spot = fingerPath(target, frame)
         onFinger({ ...spot, y: spot.y - log.scrollTop, out: false })
-      })
-      at(1400, () => option()?.click())
-      at(1950, () => { onFinger(value => value && { ...value, out: true }); wrap?.querySelector('.qcard__submit:not(:disabled)')?.click() })
-    }
+      }, 700),
+      setTimeout(() => setPicked(true), 1400),
+      setTimeout(() => onFinger(value => value && { ...value, out: true }), 1950),
+    ]
     return () => { timers.forEach(clearTimeout); onFinger(null) }
   }, [reduced, onFinger])
-  const onAnswer = (_text, resolved) => {
-    const label = Object.values(resolved)[0]
-    setPicked(BUY_QUESTION[0].options.find(option => option.label === label) || { label, description: '' })
-    return Promise.resolve(true)
-  }
-  return <div ref={wrapRef} className="wt-native" aria-label="Result: a question asking which headphones to order. The first option gets picked.">
-    <QuestionCard chatId="walkthrough" questionId="walkthrough-buy" questions={BUY_QUESTION} onAnswer={onAnswer} disabled={false} />
-    {picked && <div ref={replyRef} className="chat__text chat__text--assistant wt-native">I ordered the {picked.label.split(' · ')[0]} for {picked.label.split(' · ')[1]}. It {picked.description.split(', ')[1] || 'is on its way'}.</div>}
+  return <div ref={wrapRef} className="wt-native" aria-label="Result: a question asking when to send a reminder. The first option gets picked.">
+    <QuestionCard chatId="walkthrough" questionId="walkthrough-reminder" questions={REMIND_QUESTION} answeredMap={picked ? { [REMIND_QUESTION[0].question]: REMIND_PICK } : undefined} disabled />
+    {picked && <div ref={replyRef} className="chat__text chat__text--assistant wt-native">Done. I’ll remind you tomorrow at 9:00 AM.</div>}
   </div>
 }
 
@@ -216,7 +209,7 @@ function HelpResult() {
 }
 
 const REQUESTS = [
-  { id: 'buy', summary: 'The agent asks which headphones to order. It picks the Aero Q45 for $79 and confirms the order.', short: 'Buy something', label: 'Buy me headphones under $100', tools: [['search', 'Searched stores'], ['web', 'Compared prices'], ['plan', 'Asked which to order']], Result: BuyResult },
+  { id: 'remind', summary: 'The agent asks when to send the reminder. The first option, tomorrow at 9:00 AM, gets picked and the agent confirms it.', short: 'Set a reminder', label: 'Remind me to call Mom', tools: [['search', 'Checked your calendar'], ['plan', 'Asked when to remind you'], ['edit', 'Saved the reminder']], Result: ReminderResult },
   { id: 'look', summary: 'The agent answers: go in late March to early April for cherry blossoms, or mid November for autumn leaves, and book about a month ahead. It cites three references.', short: 'Look something up', label: 'Look up the best time to visit Kyoto', tools: [['web', 'Searched the web'], ['files', 'Read 3 pages'], ['edit', 'Wrote the answer']], Result: LookupResult },
   { id: 'help', summary: 'The agent works through a goal to plan a weekend trip to Lisbon: find flights and a hotel, plan each day, and save the itinerary. The goal completes.', short: 'Plan a big task', label: 'Plan a weekend trip to Lisbon', tools: [['search', 'Looked up flights and hotels'], ['plan', 'Planned the days'], ['edit', 'Saved the itinerary']], Result: HelpResult },
 ]
