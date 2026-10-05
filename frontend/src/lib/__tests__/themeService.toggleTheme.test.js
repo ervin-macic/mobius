@@ -633,3 +633,32 @@ test('toggleTheme keeps a foreground the theme declared for itself', async () =>
   assert.ok(newCss.includes('--accent-fg: #123456'),
     'an explicitly declared foreground is never overwritten by derivation')
 })
+
+test('onPersisted fires once, right after the server accepts the theme', async () => {
+  const qc = makeQueryClient({ css: DARK_CSS, bg: '#0d0f14' })
+  const api = makeApi(DARK_CSS)
+  const seen = []
+  let invalidatedAtHook = -1
+  await themeService.toggleTheme(qc, 'dark', api, {
+    onPersisted: () => {
+      seen.push(api.calls.map(c => c[0]))
+      invalidatedAtHook = qc.invalidated.length
+    },
+  })
+  assert.equal(seen.length, 1)
+  assert.ok(seen[0].includes('putThemeCss') && seen[0].includes('putThemeMode'),
+    `the reload hook must wait for both saves; saw: ${seen[0].join(', ')}`)
+  assert.equal(invalidatedAtHook, 0,
+    'the hook runs before same-document bookkeeping, so a reload is not held behind it')
+})
+
+test('onPersisted does not fire when saving the theme fails', async () => {
+  const qc = makeQueryClient({ css: DARK_CSS, bg: '#0d0f14' })
+  const api = makeApi(DARK_CSS)
+  api.storage.shared.putThemeMode = () => Promise.reject(new Error('offline'))
+  let fired = 0
+  await assert.rejects(themeService.toggleTheme(qc, 'dark', api, {
+    onPersisted: () => { fired += 1 },
+  }))
+  assert.equal(fired, 0)
+})

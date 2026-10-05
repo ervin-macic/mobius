@@ -375,7 +375,7 @@ function _seedThemeQueries(queryClient, css, bg, mode) {
  *   meta theme-color pointing at the previous mode's color even
  *   though the <style> block reflects the new mode.
  */
-export async function toggleTheme(queryClient, currentMode, api) {
+export async function toggleTheme(queryClient, currentMode, api, { onPersisted } = {}) {
   const newMode = currentMode === 'dark' ? 'light' : 'dark'
 
   // Swap relative to the css the user is CURRENTLY looking at, read
@@ -455,6 +455,11 @@ export async function toggleTheme(queryClient, currentMode, api) {
     // the UI painted light, then the service worker served the old dark body.
     await _refreshThemeSwCache(newCss, newBg, newMode)
     await persistTheme(newCss, newMode, api)
+    // The server now holds the new theme and the service worker's cached body
+    // already matches it, so a caller that reloads (the installed iPhone
+    // status-bar refresh) can start now instead of after the follow-up
+    // bookkeeping below, which only keeps this same document consistent.
+    onPersisted?.()
     _seedThemeQueries(queryClient, newCss, newBg, newMode)
     await _refreshThemeSwCache(newCss, newBg, newMode)
     // Mark stale so future explicit reloads know the query can refresh, but do

@@ -880,11 +880,17 @@ export default function SettingsView({
     // theme queries; AppCanvas's useEffect picks that up and
     // postMessages `moebius:frame-theme` to live iframes.
     try {
-      await themeService.toggleTheme(queryClient, currentMode, api)
       // An installed iPhone app re-reads its status-bar colour only when the
       // page loads or returns to the foreground; the shell's controlled reload
       // keeps the current screen painted while the new document takes over.
-      if (window.navigator.standalone === true) onStatusBarThemeReload?.()
+      // It starts the moment the server accepts the theme, not after the rest
+      // of the toggle's same-document bookkeeping.
+      const reloadForStatusBar = window.navigator.standalone === true
+        ? onStatusBarThemeReload
+        : null
+      await themeService.toggleTheme(queryClient, currentMode, api, {
+        onPersisted: reloadForStatusBar || undefined,
+      })
     } catch {
       setThemeMode(currentMode)
       setThemeError(

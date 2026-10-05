@@ -2212,6 +2212,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     updateAvailable: shellUpdateAvailable,
     markShellUpdateAvailable,
     applyShellUpdate,
+    reloadShell,
   } = useShellUpdateController({
     win: window,
     doc: document,
@@ -5339,7 +5340,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 active={settingsFullBleed || !!settingsPaned}
                 refreshToken={settingsRefreshToken}
                 onLeaveSharedAccess={sharedBrowserAccess?.onLeave || null}
-                onStatusBarThemeReload={applyShellUpdate}
+                onStatusBarThemeReload={reloadShell}
               />
             </Suspense>
           </div>
