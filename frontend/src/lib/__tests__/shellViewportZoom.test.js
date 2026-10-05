@@ -74,7 +74,7 @@ test('app authors are told to zoom content locally, with an accessible control p
 
 test('installed shell and offline fallback share the chosen opaque iOS status mode', () => {
   const statusStyle = html => html.match(/apple-mobile-web-app-status-bar-style" content="([^"]+)"/)?.[1]
-  assert.equal(statusStyle(indexHtml), 'black')
+  assert.equal(statusStyle(indexHtml), 'default')
   assert.match(
     indexCss,
     /@media \(display-mode: standalone\)[\s\S]*html,[\s\S]*body\s*\{\s*height:\s*100vh/,
@@ -83,7 +83,7 @@ test('installed shell and offline fallback share the chosen opaque iOS status mo
   assert.doesNotMatch(indexCss + shellCss, /--ios-standalone-height|100dvh\s*\+/)
   assert.match(indexCss, /--shell-fit-visual-viewport:\s*1/)
   assert.equal((indexCss + shellCss).match(/@supports \(-webkit-touch-callout: none\)/g)?.length, 1)
-  assert.match(buildingApps, /Every installed iPhone app[\s\S]*opaque black status-bar policy/)
+  assert.match(buildingApps, /Every installed iPhone app[\s\S]*opaque status-bar policy/)
   assert.doesNotMatch(
     applyTheme,
     /querySelector\(['"]meta\[name=["']apple-mobile-web-app-status-bar-style/,

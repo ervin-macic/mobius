@@ -6,8 +6,10 @@
          scale the toolbar and drawer with the active app; zoomable content owns
          its gesture locally so it can transform without moving the shell. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
-    <!-- Default theme-color; applyTheme updates this to the active theme's --bg. -->
-    <meta name="theme-color" content="#0d0d0d" />
+    <!-- Default header colours per system scheme; the pre-paint script and
+         applyTheme set both to the active Möbius theme's --bg. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f0eeeb" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d0d0d" />
     <!-- Android/Chrome consults color-scheme before JS/CSS fully applies.
          Dark is the static fallback because Möbius defaults dark, but the
          pre-paint script rewrites this to `light dark` when the active theme
@@ -21,7 +23,7 @@
          games (which reuse this document). Immersive apps cannot paint under
          the notch. iOS may pin this policy at Home Screen installation, so a
          reload alone may not adopt a changed launch policy. -->
-    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Möbius" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="icon" type="image/png" href="/moebius.png" />
@@ -153,8 +155,8 @@
     root.style.setProperty('--bg', bg);
     root.setAttribute('data-theme', mode);
     root.style.colorScheme = mode;
-    var themeColorMeta = document.querySelector('meta[name="theme-color"]');
-    if (themeColorMeta) themeColorMeta.setAttribute('content', bg);
+    var themeColorMetas = document.querySelectorAll('meta[name="theme-color"]');
+    for (var t = 0; t < themeColorMetas.length; t++) themeColorMetas[t].setAttribute('content', bg);
     var colorSchemeMeta = document.querySelector('meta[name="color-scheme"]');
     if (colorSchemeMeta) colorSchemeMeta.setAttribute('content', mode === 'light' ? 'light dark' : 'dark light');
     // Persist in the TOP-LEVEL SHELL ONLY for the next shell boot.

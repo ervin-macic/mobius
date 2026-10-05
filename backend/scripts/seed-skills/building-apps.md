@@ -891,7 +891,7 @@ useEffect(() => {
 
 ### Requesting the most immersive OS presentation
 
-`viewport-fit=cover` allows edge-to-edge painting where the OS permits it, while the safe variables above keep controls clear. Every installed iPhone app at `/apps/<slug>/` reuses the shell’s opaque black status-bar policy, including light themes and `display: fullscreen` games: that OS-owned strip cannot be themed or painted by the app. Hiding the Möbius toolbar is separate from asking the browser or OS to remove its own status bar:
+`viewport-fit=cover` allows edge-to-edge painting where the OS permits it, while the safe variables above keep controls clear. Every installed iPhone app at `/apps/<slug>/` reuses the shell’s opaque status-bar policy (`default` style, tinted to the active theme’s background), including `display: fullscreen` games: the app cannot paint under that OS-owned strip. Hiding the Möbius toolbar is separate from asking the browser or OS to remove its own status bar:
 
 - **Installed standalone PWA** — declare `"display": "fullscreen"` in your `mobius.json` to request the browser's most immersive supported launch. Supported Chromium installs can remove the OS status bar. iOS accepts the display mode but can retain its OS status bar, so safe-area padding remains mandatory. Valid values: `standalone` (default), `fullscreen`, `minimal-ui`, `browser`.
 - **In-shell (inside Möbius)** — Möbius itself is one `display: standalone` PWA. On supported browsers, dropping the OS status bar at runtime requires the Fullscreen API, granted **only on a user gesture**. Request it on the player's first tap (re-requesting after a system-gesture exit); the shell calls `exitFullscreen()` for you when the game is left:
