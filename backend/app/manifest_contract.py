@@ -1,6 +1,6 @@
 """Dependency-free manifest contract shared by install and preflight."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import json
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -23,12 +23,13 @@ RECOGNIZED_CAPABILITIES = (
 SKILLS_COUNT_MAX = 5
 MANIFEST_MAX_BYTES = 64 * 1024
 # The one size bound for an app package: every file its manifest declares
-# (entry, job, source files, static assets, storage seeds, icon), as summed by
-# `package_bytes`. Install holds a whole package from an untrusted host in
-# memory to review and digest it, so the total is the real safety bound, and
-# no single file or file kind has its own cap. Store publication bounds the
-# whole accepted tree by the same number, so every app the Store accepts is
-# installable. The Store host preserves releases up to 64 MiB too. What the
+# (entry, job, source files, static assets, storage seeds, icon), summed per
+# declaration by `package_bytes`. Install holds a whole package from an
+# untrusted host in memory to review, digest and write it, so the total is the
+# real safety bound, and no single file or file kind has its own cap. Store
+# publication bounds both its whole tree and this declared sum by the same
+# number, so every app the Store accepts is installable. The Store host
+# preserves releases up to 64 MiB too. What the
 # shell can load is a separate, smaller bound on the compiled module
 # (`app_compile_contract.COMPILED_MODULE_MAX_BYTES`): large data belongs in
 # `static_assets`, fetched at runtime, rather than imported into the bundle.
@@ -360,14 +361,18 @@ def static_asset_entries(value) -> dict[str, str]:
   _fail("Manifest `static_assets` must be an object or array.")
 
 
-def package_bytes(root: Path, manifest: Mapping) -> int:
-  """Total size under `root` of every file the package declares, each once.
+def package_bytes(manifest: Mapping, size_of: Callable[[str], int]) -> int:
+  """Bytes installing this package downloads and writes, per declaration.
 
-  These are the files install downloads under `PACKAGE_MAX_BYTES`, so local
-  apply and the validator bound what Store publication and install bound. Sizes
-  come from file metadata, so an oversized package is refused before anything
-  is read. Inline seeds live in the manifest, which its own cap bounds; a
-  missing path counts as zero because its own check reports it.
+  Counts the entry, icon and job, every source file, and the file behind every
+  static-asset destination and file seed. A file named by several declarations
+  counts once for each, because each is written separately, so one file cannot
+  stand in for thousands of destinations. Install charges its download budget
+  the same way, and local apply, the validator, Git installs and Store
+  publication bound this same sum by `PACKAGE_MAX_BYTES`, so a package the
+  Store accepts installs everywhere. Inline seeds live in the manifest, which
+  its own cap bounds. `size_of` gives a declared file's size, or 0 when it is
+  missing (its own check reports that).
   """
   schedule = manifest.get("schedule")
   declared = [
@@ -378,10 +383,16 @@ def package_bytes(root: Path, manifest: Mapping) -> int:
     *static_asset_entries(manifest.get("static_assets")).values(),
     *(manifest.get("storage_seeds") or {}).values(),
   ]
-  paths = dict.fromkeys(rel for rel in declared if isinstance(rel, str) and rel)
-  return sum(
-    (root / rel).stat().st_size for rel in paths if (root / rel).is_file()
-  )
+  return sum(size_of(rel) for rel in declared if isinstance(rel, str) and rel)
+
+
+def package_bytes_on_disk(root: Path, manifest: Mapping) -> int:
+  """`package_bytes` for a source tree, from file metadata before any read."""
+  def size_of(rel: str) -> int:
+    path = root / rel
+    return path.stat().st_size if path.is_file() else 0
+  return package_bytes(manifest, size_of)
+
 
 def _validate_running_label(running_label, field: str) -> None:
   if (

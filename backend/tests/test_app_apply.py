@@ -333,7 +333,7 @@ def test_local_apply_refuses_an_oversized_package_before_reading_it(
   """Local apply bounds the same declared files install downloads, from their
   sizes on disk, before it materializes anything."""
   from app import app_apply
-  from app.manifest_contract import package_bytes
+  from app.manifest_contract import package_bytes_on_disk
 
   source = _source()
   created = _apply(client, auth, source)
@@ -344,7 +344,7 @@ def test_local_apply_refuses_an_oversized_package_before_reading_it(
   manifest["static_assets"] = {"data.bin": "data.bin"}
   (source / "mobius.json").write_text(json.dumps(manifest))
   monkeypatch.setattr(
-    app_apply, "PACKAGE_MAX_BYTES", package_bytes(source, manifest) - 1,
+    app_apply, "PACKAGE_MAX_BYTES", package_bytes_on_disk(source, manifest) - 1,
   )
 
   rejected = _apply(client, auth, source)

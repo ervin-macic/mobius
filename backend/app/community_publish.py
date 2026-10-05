@@ -13,7 +13,12 @@ from pathlib import Path, PurePosixPath
 
 from app import app_git, models
 from app.config import get_settings
-from app.manifest_contract import PACKAGE_MAX_BYTES
+from app.manifest_contract import (
+  PACKAGE_MAX_BYTES,
+  ManifestContractError,
+  package_bytes,
+  validate_manifest_contract,
+)
 from app.storage_io import atomic_write
 
 
@@ -546,13 +551,13 @@ def build_public_snapshot(app: models.App) -> tuple[str, list[dict[str, str]]]:
   entries = _public_tree_entries(repo, commit)
 
   files: list[dict[str, str]] = []
+  sizes: dict[str, int] = {}
   total = 0
   for entry in entries:
     content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
     assert isinstance(content, bytes)
+    sizes[entry.path] = len(content)
     total += len(content)
-    # The same bound install applies, over a superset of what install reads,
-    # so an accepted snapshot is always installable.
     if total > PACKAGE_MAX_BYTES:
       raise CommunityPublicationError(
         "The public app snapshot is larger than the "
@@ -582,5 +587,19 @@ def build_public_snapshot(app: models.App) -> tuple[str, list[dict[str, str]]]:
   if not isinstance(manifest, dict) or not manifest.get("id") or not manifest.get("entry"):
     raise CommunityPublicationError(
       "mobius.json is missing required publication fields.", "invalid_manifest",
+    )
+  try:
+    validate_manifest_contract(manifest)
+  except ManifestContractError as exc:
+    raise CommunityPublicationError(str(exc), "invalid_manifest") from exc
+  # Install charges each declaration in full, so bound the same declared sum:
+  # every snapshot the Store accepts is then installable.
+  declared = package_bytes(manifest, lambda rel: sizes.get(rel, 0))
+  if declared > PACKAGE_MAX_BYTES:
+    raise CommunityPublicationError(
+      f"This app declares {declared} bytes of files, more than the "
+      f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit.",
+      "payload_too_large",
+      413,
     )
   return commit, files

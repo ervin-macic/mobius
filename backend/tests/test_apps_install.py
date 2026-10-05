@@ -5952,13 +5952,14 @@ def test_install_package_budget_spans_every_declared_file_kind(
   )
 
 
-def test_install_counts_a_path_declared_twice_once(
+def test_install_charges_every_declaration_of_a_shared_file(
   client, auth, bypass_url_validation, monkeypatch,
 ):
-  """Install reads a subset of the tree Store publication bounded. A file
-  declared as both a source file and a static asset must not count twice,
-  or an accepted Store release could still fail to install."""
+  """Each static-asset destination and file seed is written separately, so a
+  manifest cannot point many destinations at one file to multiply what one
+  download writes. The shared file is still downloaded once."""
   from app import install
+  from app.manifest_contract import package_bytes
 
   shared = b'{"rows": [1, 2, 3]}'
   files = {"index.jsx": JSX.encode(), "data.json": shared}
@@ -5966,17 +5967,66 @@ def test_install_counts_a_path_declared_twice_once(
     **MANIFEST_MULTI,
     "id": "shared-path",
     "source_files": ["data.json"],
-    "static_assets": {"data.json": "data.json"},
+    "static_assets": {f"copy-{n}.json": "data.json" for n in range(3)},
+    "storage_seeds": {f"seed-{n}.json": "data.json" for n in range(2)},
   }
-  monkeypatch.setattr(
-    install, "_PACKAGE_MAX_BYTES", sum(map(len, files.values())),
-  )
+  declared = package_bytes(manifest, lambda rel: len(files[rel]))
+  assert declared == len(JSX) + 6 * len(shared)
 
-  r = _install_package(
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", declared - 1)
+  refused = _install_package(
     client, auth, "https://shared-path.test/", manifest, files,
   )
+  assert refused.status_code == 413, refused.text
+  assert "reached while downloading data.json" in refused.json()["detail"]
 
-  assert r.status_code == 201, r.text
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", declared)
+  accepted = _install_package(
+    client, auth, "https://shared-path.test/", manifest, files,
+  )
+  assert accepted.status_code == 201, accepted.text
+
+
+def test_install_budget_binds_the_optional_icon(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  """A broken icon only warns, but an icon past the package budget fails the
+  install, as it fails local apply and validation."""
+  from app import install
+
+  files = {"index.jsx": JSX.encode(), "icon.png": b"x" * 64}
+  manifest = {
+    **MANIFEST_MULTI, "id": "icon-budget", "source_files": [], "icon": "icon.png",
+  }
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 63)
+
+  r = _install_package(client, auth, "https://icon-budget.test/", manifest, files)
+
+  assert r.status_code == 413, r.text
+  assert "reached while downloading icon.png" in r.json()["detail"]
+
+
+def test_git_package_inputs_are_bounded_like_http_installs(monkeypatch):
+  from app import install
+
+  manifest = {
+    **MANIFEST_MULTI,
+    "id": "git-budget",
+    "source_files": [],
+    "static_assets": {f"copy-{n}.bin": "data.bin" for n in range(4)},
+  }
+  tree = {
+    "mobius.json": json.dumps(manifest).encode(),
+    "index.jsx": JSX.encode(),
+    "data.bin": b"x" * 100,
+  }
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 399)
+
+  with pytest.raises(ValueError, match="app package limit"):
+    install._read_git_package_inputs(tree, strict=True)
+
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 400)
+  assert install._read_git_package_inputs(tree, strict=True).static_assets
 
 
 def test_multifile_install_rejects_incomplete_source_files(

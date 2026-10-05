@@ -75,6 +75,7 @@ from app.manifest_contract import (
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
+  package_bytes,
   python_lock,
   skill_member_paths,
   static_asset_entries,
@@ -839,12 +840,12 @@ async def _http_get(
 
 
 class _PackageDownload:
-  """Download one app package's declared files under `_PACKAGE_MAX_BYTES`.
+  """Read one app package's declared files under `_PACKAGE_MAX_BYTES`.
 
-  Each read may use only what the package has left, so the stream stops the
-  moment the running total would cross the bound. A path declared more than
-  once (say, as a source file and a static asset) is fetched and counted once.
-  So an install never downloads more than the published tree it reads from.
+  Every read is one declaration and is charged in full, exactly as
+  `manifest_contract.package_bytes` counts them, because each declaration is
+  written separately. A file declared more than once is downloaded once, and
+  a first download stops streaming the moment it would cross the bound.
   """
 
   def __init__(self, client: httpx.AsyncClient, raw_base: str) -> None:
@@ -853,23 +854,27 @@ class _PackageDownload:
     self._files: dict[str, bytes] = {}
     self._total = 0
 
+  def _over_limit(self, rel: str) -> HTTPException:
+    return HTTPException(
+      413,
+      f"This app is larger than the {_PACKAGE_MAX_BYTES // (1024 * 1024)} "
+      f"MiB app package limit (reached while downloading {rel}).",
+    )
+
   async def read(self, rel: str) -> bytes:
-    if rel in self._files:
-      return self._files[rel]
-    try:
-      data = await _http_get(
-        self._client, self._raw_base + rel, _PACKAGE_MAX_BYTES - self._total,
-      )
-    except HTTPException as exc:
-      if exc.status_code != 413:
-        raise
-      raise HTTPException(
-        413,
-        f"This app is larger than the {_PACKAGE_MAX_BYTES // (1024 * 1024)} "
-        f"MiB app package limit (reached while downloading {rel}).",
-      ) from exc
+    remaining = _PACKAGE_MAX_BYTES - self._total
+    data = self._files.get(rel)
+    if data is None:
+      try:
+        data = await _http_get(self._client, self._raw_base + rel, remaining)
+      except HTTPException as exc:
+        if exc.status_code != 413:
+          raise
+        raise self._over_limit(rel) from exc
+      self._files[rel] = data
+    elif len(data) > remaining:
+      raise self._over_limit(rel)
     self._total += len(data)
-    self._files[rel] = data
     return data
 
 
@@ -1487,6 +1492,12 @@ class PackageContentError(ValueError):
 def _package_input_bytes(value: PackageContentBytes) -> bytes:
   # Parsing manifest/icon/job syntax requires bytes; opaque assets do not.
   return value.read_bytes() if isinstance(value, app_git.GitTreeBlob) else value
+
+
+def _package_input_size(value: PackageContentBytes | None) -> int:
+  if value is None:
+    return 0
+  return value.size if isinstance(value, app_git.GitTreeBlob) else len(value)
 
 
 def package_content_digest_from_tree(
@@ -2451,6 +2462,12 @@ def _read_git_package_inputs(
     _validate_manifest(manifest)
   else:
     _validate_discovery_manifest(manifest)
+  size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
+  if size > _PACKAGE_MAX_BYTES:
+    raise ValueError(
+      f"candidate package is {size} bytes, more than the "
+      f"{_PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit",
+    )
 
   entry_bytes = required(manifest["entry"], "entry")
   source_files = {
@@ -2802,7 +2819,10 @@ async def _fetch_install_candidate(
         icon_warning = f"icon: {exc}"
         log.info("install: icon skipped — %s", exc)
       except HTTPException as exc:
-        # A broken optional icon must not block an otherwise valid app.
+        # A broken optional icon must not block an otherwise valid app, but
+        # the package budget binds the icon like every declared file.
+        if exc.status_code == 413:
+          raise
         icon_warning = f"icon: {exc.detail}"
         log.info("install: icon skipped — %s", exc.detail)
 

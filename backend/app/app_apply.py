@@ -43,7 +43,7 @@ from app.manifest_contract import (
   MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES,
   ManifestContractError,
-  package_bytes,
+  package_bytes_on_disk,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
@@ -372,7 +372,7 @@ def _read_manifest(snapshot_dir: Path) -> dict:
     validate_manifest_contract(manifest)
   except ManifestContractError as exc:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
-  size = package_bytes(snapshot_dir, manifest)
+  size = package_bytes_on_disk(snapshot_dir, manifest)
   if size > PACKAGE_MAX_BYTES:
     raise AppApplyError(
       "package_too_large",

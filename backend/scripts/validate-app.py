@@ -46,7 +46,7 @@ from app.manifest_contract import (  # noqa: E402
   SKILL_MAX_BYTES,
   SYSTEM_PROMPT_MAX_BYTES,
   ManifestContractError,
-  package_bytes,
+  package_bytes_on_disk,
   static_asset_entries,
   validate_manifest_contract,
 )
@@ -188,7 +188,7 @@ def _package_size_errors(root: Path, manifest_path: Path, manifest: dict) -> lis
   if manifest_path.stat().st_size > MANIFEST_MAX_BYTES:
     errors.append(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
 
-  package_total = package_bytes(root, manifest)
+  package_total = package_bytes_on_disk(root, manifest)
   if package_total > PACKAGE_MAX_BYTES:
     errors.append(
       f"app package is {package_total} bytes; installs and the Store accept "

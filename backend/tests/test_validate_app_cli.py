@@ -394,20 +394,29 @@ def test_validator_rejects_a_package_over_the_limit_install_and_store_share(
   )
 
 
-def test_validator_counts_repeated_paths_once_and_skips_inline_seeds(tmp_path):
-  """Inline seeds live in the manifest, and a path declared twice is one file
-  to download, exactly as install measures the package."""
+def test_validator_accepts_inline_seeds(tmp_path):
+  """Inline object and array seeds live in the manifest, not in files."""
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  _declare(tmp_path, "storage_seeds", {"settings.json": {"on": True}, "rows.json": [1, 2]})
+
+  result = _run(tmp_path)
+  assert result.returncode == 0, result.stderr
+
+
+def test_validator_counts_every_declaration_of_a_shared_file(tmp_path):
+  """Install writes each declaration separately and charges it in full."""
   from app.manifest_contract import PACKAGE_MAX_BYTES
 
   _write_app(tmp_path, "export default function App(){ return <div /> }")
   with open(tmp_path / "shared.bin", "wb") as data:
     data.truncate(PACKAGE_MAX_BYTES // 2 + 1)
-  _declare(tmp_path, "source_files", ["shared.bin"])
-  _declare(tmp_path, "static_assets", {"shared.bin": "shared.bin"})
-  _declare(tmp_path, "storage_seeds", {"settings.json": {"on": True}, "rows.json": [1, 2]})
+  _declare(tmp_path, "static_assets", {"a.bin": "shared.bin", "b.bin": "shared.bin"})
 
   result = _run(tmp_path)
-  assert result.returncode == 0, result.stderr
+  assert result.returncode == 1
+  assert f"installs and the Store accept at most {PACKAGE_MAX_BYTES}" in (
+    result.stderr
+  )
 
 
 def test_validator_rejects_an_app_too_large_for_the_shell_to_load(tmp_path):
