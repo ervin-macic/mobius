@@ -33,11 +33,11 @@ async def _drive_turn(chat_id, monkeypatch, *, expected_include):
 
   def fake_connector_plan(
     _db, *, include_owner_connectors, owner_id, owner_epoch,
-    browser_grant_id, browser_grant_epoch,
+    browser_grant_id,
   ):
     observed.append(include_owner_connectors)
     assert type(owner_id) is int and type(owner_epoch) is int
-    assert browser_grant_id is None and browser_grant_epoch is None
+    assert browser_grant_id is None
     return granted_plan if include_owner_connectors else None
 
   monkeypatch.setattr("app.connectors.build_turn_plan", fake_connector_plan)

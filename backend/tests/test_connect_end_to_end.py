@@ -124,7 +124,7 @@ def test_real_runner_full_unicode_output_pages_and_rotated_retry(real_connect, t
   )
   rid = uuid.uuid4().hex
   admission_deadline = time.time() + 10
-  first_channel = connect._channels[host_id].connected_at
+  first_channel = connect._channels[host_id]
   status, started = _exec(base, owner, host_id, request_id=rid,
                           script=script, timeout=15,
                           admission_deadline=admission_deadline)
@@ -155,7 +155,7 @@ def test_real_runner_full_unicode_output_pages_and_rotated_retry(real_connect, t
   assert ''.join(c['text'] for c in chunks if c['stream'] == 'stdout') == expected
   assert cursor == page['output_seq'] == page['available_next']
   _until(lambda: connect._channels.get(host_id) is not None
-         and connect._channels[host_id].connected_at > first_channel, timeout=6)
+         and connect._channels[host_id] is not first_channel, timeout=6)
   status, retried = _exec(base, owner, host_id, request_id=rid,
                           script=script, timeout=15,
                           admission_deadline=admission_deadline)

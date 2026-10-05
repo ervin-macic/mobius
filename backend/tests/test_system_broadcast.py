@@ -401,6 +401,65 @@ async def test_system_broadcast_delivers_to_subscriber():
 
 
 @pytest.mark.asyncio
+async def test_worker_thread_publish_wakes_the_reader_loop():
+  """Synchronous routes (archive, pin, app apply…) publish from worker
+  threads. Delivery must be handed to the subscriber's loop so a reader
+  blocked in `get()` wakes promptly, and the publisher never touches the
+  loop-owned queue itself."""
+  import threading
+  import time
+
+  sb = SystemBroadcast()
+  q = sb.subscribe()
+
+  def publish_while_loop_sleeps():
+    time.sleep(0.1)  # let the loop settle into its idle wait first
+    sb.publish({"type": "chat_archive_changed", "chatId": "c"})
+
+  publisher = threading.Thread(target=publish_while_loop_sleeps)
+  try:
+    started = asyncio.get_running_loop().time()
+    publisher.start()
+    # Generous outer bound; the elapsed check is the contract. A direct
+    # cross-thread put leaves the idle loop asleep until that bound expires.
+    assert await asyncio.wait_for(q.get(), timeout=5.0) == {
+      "type": "chat_archive_changed", "chatId": "c",
+    }
+    assert asyncio.get_running_loop().time() - started < 1.0
+  finally:
+    publisher.join(timeout=1.0)
+    sb.unsubscribe(q)
+
+
+def test_publish_after_reader_loop_closed_never_raises():
+  """A committed owner action must not become an error response because a
+  departed subscriber's loop has already shut down."""
+  import threading
+
+  sb = SystemBroadcast()
+  other_loop = asyncio.new_event_loop()
+
+  async def subscribe_there():
+    return sb.subscribe()
+
+  stale = other_loop.run_until_complete(subscribe_there())
+  other_loop.close()
+  errors = []
+
+  def publish():
+    try:
+      sb.publish({"type": "chat_archive_changed", "chatId": "c"})
+    except Exception as exc:  # pragma: no cover - the regression itself
+      errors.append(exc)
+
+  publisher = threading.Thread(target=publish)
+  publisher.start()
+  publisher.join(timeout=1.0)
+  assert errors == []
+  sb.unsubscribe(stale)
+
+
+@pytest.mark.asyncio
 async def test_notify_endpoint_reaches_system_broadcast(client, auth):
   """POST /api/notify must publish to the SystemBroadcast — that is
   the channel Shell.jsx subscribes to so app_updated reaches the

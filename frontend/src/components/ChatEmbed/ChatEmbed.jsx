@@ -8,6 +8,7 @@ import {
 } from '../../api/client.js'
 import { applyThemeToDom } from '../../lib/themeService.js'
 import { handoffEmbedBootstrap } from '../../lib/chatEmbedBootstrap.js'
+import { installFrameShellShortcuts } from '../../lib/frameShellShortcuts.js'
 import {
   INIT, GUIDANCE, READY, MESSAGE_SENT, TURN_DONE, ERROR, AUTH_EXPIRING,
   BOOTSTRAP_READY,
@@ -41,6 +42,9 @@ export default function ChatEmbed() {
   const contextNonceRef = useRef(0)
   const pendingContextResolversRef = useRef(new Map())
   const turnDoneGateRef = useRef(EMPTY_TURN_DONE_GATE)
+
+  // Shell shortcuts keep working while the owner types in the embedded chat.
+  useEffect(() => installFrameShellShortcuts(), [])
 
   function postToParent(type, extra) {
     const target = parentRef.current

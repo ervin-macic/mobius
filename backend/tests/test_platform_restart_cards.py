@@ -17,7 +17,7 @@ from app.chat_event_sink import (
 from app.chat_writer import (
   AppendRestartFeedback,
   AnswerQuestion,
-  CancelActivationWaits,
+  PrepareChatStop,
   ResolvePlatformRestartCard,
   StartContinuation,
   get_writer,
@@ -26,6 +26,22 @@ from app.database import SessionLocal
 from app.platform_restart import activation_notice, activation_wait_verdict
 from app.routes import chats_stream
 from app.timeutil import now_naive_utc
+
+
+@pytest.fixture(autouse=True)
+def isolated_restart_source(monkeypatch, tmp_path):
+  # Card tests exercise the real preflight boundary without importing the live
+  # editable platform. Broken-source rejection is covered explicitly below;
+  # the router-verdict contract lives in test_restart_util.
+  root = tmp_path / "platform"
+  app = root / "backend" / "app"
+  app.mkdir(parents=True)
+  (app / "__init__.py").write_text("", encoding="utf-8")
+  (app / "main.py").write_text("from app import routes\n", encoding="utf-8")
+  (app / "routes.py").write_text(
+    "def require_all_routers_loaded():\n  return None\n", encoding="utf-8",
+  )
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(root))
 
 
 def _requirement(action_id="platform-restart:test"):
@@ -201,7 +217,7 @@ def test_free_text_cannot_claim_restart_but_post_stop_button_still_does():
       chat_id="restart-guard", question_id=qid,
       answers={"restart": "Restart now"},
     ))
-  assert _submit(CancelActivationWaits(chat_id="restart-guard")) == 1
+  assert _submit(PrepareChatStop(chat_id="restart-guard")) == 1
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-guard")
     wait = db.get(models.ChatWait, wait_id)
@@ -1142,7 +1158,7 @@ def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_inpu
       "role": "user", "content": "B", "cid": f"b-{chat_id}", "ts": 3,
     }))
   stopped_id, _, stopped_wait, _, _ = participants["stopped"]
-  assert _submit(CancelActivationWaits(chat_id=stopped_id)) == 1
+  assert _submit(PrepareChatStop(chat_id=stopped_id)) == 1
   input_id, input_qid, input_wait, _, _ = participants["unrelated-input"]
   newer_qid = "unrelated-owner-decision"
   with SessionLocal() as read:

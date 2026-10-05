@@ -48,7 +48,7 @@ test('automatic resume markers explain what caused the continuation', () => {
  assert.match(recovered, /Interrupted work recovered — continuing automatically/)
 })
 
-test('composer Waiting follows the compact Goal identity instead of a tile or badge', async () => {
+test('in-conversation Waiting follows the compact handoff identity instead of a tile or badge', async () => {
  const { WaitCard } = await vite.ssrLoadModule('/src/components/ChatView/WaitingChip.jsx')
  const html = render(h(WaitCard, { wait: { id: 'sample', kind: 'condition', description: 'Review approved' }, expanded: false, onToggle: () => {}, onCancel: () => {} }))
  assert.match(html, /chat__progress-identity/)

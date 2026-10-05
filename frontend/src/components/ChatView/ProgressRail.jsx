@@ -1,7 +1,7 @@
 /* ProgressRail renders the shared compact status sequence above the composer. */
 
 import { useEffect, useState } from 'react'
-import { Check, X } from '@openai/apps-sdk-ui/components/Icon'
+import { Check, ChevronRight, X } from '@openai/apps-sdk-ui/components/Icon'
 
 function ProgressStep({ item, detailsExpanded, onDetailsToggle, onClear, onAction }) {
   const [labelExpanded, setLabelExpanded] = useState(false)
@@ -59,6 +59,7 @@ function ProgressStep({ item, detailsExpanded, onDetailsToggle, onClear, onActio
       }}
     >
       {label}
+      <ChevronRight className="chat__panel-chevron" width={14} height={14} aria-hidden="true" />
     </button>
   )
 

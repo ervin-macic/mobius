@@ -35,6 +35,16 @@ def _message_markdown(message: dict):
       yield text
 
 
+def _stored_dimensions(base: Path, filename: str) -> dict | None:
+  try:
+    file_path = validate_path_within_base(filename, base)
+  except HTTPException:
+    return None
+  if not file_path.is_file():
+    return None
+  return stored_image_dimensions(file_path, base)
+
+
 def project_message_image_dimensions(
   messages: list[dict],
   *,
@@ -63,28 +73,18 @@ def project_message_image_dimensions(
     if not references:
       continue
 
+    # Every referenced path gets an entry. ``None`` says the server looked and
+    # the image is unreadable (invalid path, missing file or undecodable
+    # bytes), so the renderer shows an error. A path with no entry is merely
+    # unknown to this map, e.g. text streamed after the response was built,
+    # and keeps the default frame.
     dimensions = {}
     for url_path, (kind, filename) in references.items():
-      base = chat_root / kind
-      try:
-        file_path = validate_path_within_base(filename, base)
-      except HTTPException:
-        # Validation failures are represented by absent metadata. The frontend
-        # then shows the same explicit image error as an unreadable file.
-        continue
-      if not file_path.is_file():
-        continue
-      size = stored_image_dimensions(file_path, base)
-      if size is not None:
-        dimensions[url_path] = size
+      dimensions[url_path] = _stored_dimensions(chat_root / kind, filename)
 
     if projected is None:
       projected = list(messages)
     next_message = dict(message)
-    # An empty map is meaningful: the response understood this local image but
-    # could not read valid dimensions, so the renderer errors instead of
-    # guessing. Absence of the field is reserved for old cached/backend payloads
-    # during a rolling frontend/backend reload.
     next_message["media_dimensions"] = dimensions
     projected[message_index] = next_message
 

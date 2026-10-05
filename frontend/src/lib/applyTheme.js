@@ -1,4 +1,5 @@
-import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+// A guest's theme comes from the server each time; only the owner caches it.
+import { ownerStore } from './workspaceStorage.js'
 
 /**
  * Theme application library — the SINGLE source of truth for how a
@@ -44,11 +45,6 @@ const SLOT_ID = '__mobius-theme__'
 const STORE_KEY = 'mobius-theme'
 const DEFAULT_BG = '#0d0d0d'
 const DEFAULT_MODE = 'dark'
-
-function defaultStore() {
-  if (isSharedBrowserRoute()) return null
-  try { return globalThis.localStorage } catch { return null }
-}
 
 export function colorSchemeMetaContent(mode) {
   return mode === 'light' ? 'light dark' : 'dark light'
@@ -99,7 +95,7 @@ export function inferMode(bg) {
  * behind, so they don't need css here). `mode` always resolves —
  * d.mode || inferMode(d.bg) || 'dark'.
  */
-export function resolveTheme({ doc = globalThis.document, store = defaultStore() } = {}) {
+export function resolveTheme({ doc = globalThis.document, store = ownerStore() } = {}) {
   // 1. Server-serialized slot.
   try {
     const el = doc && doc.getElementById(SLOT_ID)
@@ -138,7 +134,7 @@ export function resolveTheme({ doc = globalThis.document, store = defaultStore()
  *
  * `doc`/`store` are injectable for tests; default to globals.
  */
-export function applyTheme(theme, { doc = globalThis.document, store = defaultStore() } = {}) {
+export function applyTheme(theme, { doc = globalThis.document, store = ownerStore() } = {}) {
   const css = theme && typeof theme.css === 'string' ? theme.css : ''
   const bg = theme && theme.bg
   let themeStyleEl = null

@@ -156,6 +156,7 @@ function MsgContentInner({
   onResume,
   resumeState,
   continuationWait = null,
+  handoff = null,
   onInternalNav,
   autoResumeEnabled,
   autoResumeAvailable,
@@ -356,7 +357,7 @@ function MsgContentInner({
               chatId={chatId}
               generatedFiles={generatedFiles}
               generatedCapturePending={isStreaming}
-              live={false}
+              live={Boolean(block.reply_activity_live)}
               surfaceKey={messageKey}
               detailRef={block.detail_segments ? null : {
                 message_index: block.message_index,
@@ -517,18 +518,22 @@ function MsgContentInner({
           questionOwnsTurn,
         })
         const { parked, resourceWait, modelCapacity } = errorCardViewModel(block)
-        const automaticContinuation = recoveryOwner && parked && !!autoResumeEnabled
+        const automaticContinuation = recoveryOwner && parked
+          && handoff?.kind === 'automatic' && !!autoResumeEnabled
         // A resource wait owns its automatic retry. Offering Resume while the
         // same measured pressure remains only launches a turn admission will
-        // re-park, so it is a false action rather than useful recovery.
+        // re-park. Once the scheduler reports manual recovery, expose the
+        // existing recovery action instead of leaving the owner at a dead end.
         // Auto-continue schedules the next attempt; it does not remove the
         // owner's explicit retry after adding credits or changing providers.
-        const manualResumeAvailable = recoveryOwner && !resourceWait && !modelCapacity
+        const manualResumeAvailable = recoveryOwner
+          && ((!resourceWait && !modelCapacity) || handoff?.kind === 'recovery')
         return (
           <ErrorCard
             key={assistantBlockKey(block, i)}
             block={block}
             continuationWait={recoveryOwner ? continuationWait : null}
+            manualRecovery={recoveryOwner && handoff?.kind === 'recovery'}
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}
@@ -625,7 +630,8 @@ function MsgContentInner({
             // the reconnect catch-up window is still live (see ChatView's
             // isStreaming prop). A settled stretch above the tail never
             // re-renders on its own.
-            const live = isActiveAnswer && isStreaming && nodeIdx === nodes.length - 1
+            const live = (isActiveAnswer && isStreaming && nodeIdx === nodes.length - 1)
+              || node.group.some(entry => entry.item.reply_activity_live)
             // Key the stretch by its FIRST entry (assistantBlockKey): a
             // thinking-first stretch keeps its thinking idx, a tool-first stretch
             // its `tool_use_id`/`t-<idx>`, so a single→group / live↔DB /
@@ -720,6 +726,7 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.onResume === next.onResume
     && prev.resumeState === next.resumeState
     && prev.continuationWait === next.continuationWait
+    && prev.handoff === next.handoff
     && prev.onInternalNav === next.onInternalNav
     && prev.autoResumeEnabled === next.autoResumeEnabled
     && prev.autoResumeAvailable === next.autoResumeAvailable

@@ -113,14 +113,14 @@ test('MsgContent gates the Resume button on a resumable tail note', () => {
   assert.match(msgContent, /onResume/,
     'MsgContent must accept an onResume prop')
   assert.equal(ownsRecoveryAction({
-    block: { resumable: true },
+    block: { type: 'error', resumable: true },
     entryIndex: 4,
     lastEntryIndex: 4,
     isLastMessage: true,
     canResume: true,
   }), true, 'the resumable visible tail owns the action')
   assert.equal(ownsRecoveryAction({
-    block: { resumable: true },
+    block: { type: 'error', resumable: true },
     entryIndex: 3,
     lastEntryIndex: 4,
     isLastMessage: true,
@@ -135,7 +135,7 @@ test('MsgContent gates the Resume button on a resumable tail note', () => {
 
 test('restart recovery waits for a durable run identity instead of showing a false Resume', () => {
   const resumeHook = readFileSync(new URL('../hooks/useResume.js', import.meta.url), 'utf8')
-  assert.match(resumeHook, /unavailable: !runId/,
+  assert.match(resumeHook, /unavailable: !hasTarget/,
     'the resume state records when a restart has not published its replacement run')
   assert.match(resumeHook, /onRefresh\(\)\s*\n\s*return false/,
     'an unavailable recovery identity refreshes without an owner-facing failure')
@@ -143,8 +143,8 @@ test('restart recovery waits for a durable run identity instead of showing a fal
     'the interrupted-turn card explains the short restart handoff')
   assert.match(msgContent, /resumeState\?\.pending \|\| resumeState\?\.unavailable/,
     'the recovery action cannot be invoked before its identity is durable')
-  assert.doesNotMatch(chatView, /actionKind: 'resume'/,
-    'only the interrupted-turn card resumes; an idle Goal is simply your turn')
+  assert.match(chatView, /goalResumeState\.pending \|\| goalResumeState\.unavailable/,
+    'the exact-Goal rail action cannot run before its identity is durable')
 })
 
 test('MsgContent memo compares onResume so a stable ref skips re-render', () => {
@@ -311,8 +311,8 @@ test('ariaStatus announces the recovery state instead of "Response ready."', () 
     'an automatic park announces the bounded retry check')
   assert.match(chatView, /Ready to retry; availability is not confirmed\./,
     'an elapsed manual park announces a retry, not restored quota')
-  assert.match(chatView, /resumeStatus\s*\n?\s*\?\?/,
-    'the recovery status takes precedence over the "Response ready." fallback')
+  assert.match(chatView, /recoveryStatus: resumeStatus/,
+    'the shared current-work announcement receives recovery before its ready fallback')
 })
 
 test('message equality compares the error-card fields (stale-red-card guard)', () => {

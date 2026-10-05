@@ -219,20 +219,43 @@ async def clear_presented_goal(
   return {"cleared": True, "goal": None}
 
 
+class CannotCompleteOutcome(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+  reason: str = Field(min_length=1, max_length=1500)
+  efforts: str = Field(min_length=1, max_length=2000)
+  unmet_outcome: str = Field(min_length=1, max_length=1000)
+
+
 class GoalUpdateRequest(BaseModel):
-  """One agent-facing Goal operation: edit tasks, then checkpoint or complete."""
+  """One atomic agent-facing Goal plan and outcome operation."""
 
   model_config = ConfigDict(extra="forbid")
   goal_id: str | None = Field(default=None, min_length=1, max_length=64)
   tasks: list[dict[str, Any]] | None = Field(default=None, min_length=1)
   next_action: str | None = Field(default=None, min_length=1, max_length=2000)
-  complete: str | None = Field(default=None, min_length=1, max_length=4000)
+  complete: bool | str | None = None
+  cannot_complete: CannotCompleteOutcome | None = None
+  cancel: str | None = Field(default=None, min_length=1, max_length=4000)
+  defer: str | None = Field(default=None, min_length=1, max_length=2000)
   finished_claims: list[str] = Field(default_factory=list, max_length=50)
+
+  @field_validator("complete", mode="before")
+  @classmethod
+  def completion_signal(cls, value):
+    # Preserve already-running clients with the old string tool schema.
+    # Advertise only true to new agents; never coerce 1 or "true" into it.
+    if value is None or value is True:
+      return value
+    if isinstance(value, str) and value.strip() and len(value) <= 4000:
+      return value
+    raise ValueError("complete must be true")
 
   @model_validator(mode="after")
   def one_record_operation(self) -> "GoalUpdateRequest":
-    if self.complete is not None and self.next_action is not None:
-      raise ValueError("Complete or leave a next action, not both.")
+    if sum(value is not None for value in (
+      self.complete, self.cannot_complete, self.cancel, self.defer, self.next_action,
+    )) > 1:
+      raise ValueError("Choose one outcome, deferral, or next action.")
     if self.finished_claims and self.complete is None:
       raise ValueError("Only a completion can name finished claims.")
     return self
@@ -241,21 +264,25 @@ class GoalUpdateRequest(BaseModel):
   def changes_anything(self) -> bool:
     return any(
       value is not None
-      for value in (self.goal_id, self.tasks, self.next_action, self.complete)
+      for value in (self.goal_id, self.tasks, self.next_action, self.complete,
+                    self.cannot_complete, self.cancel, self.defer)
     )
 
 
 def _goal_summary(db: Session, goal) -> dict[str, Any]:
   from app.agent_work_claims import open_claim_keys
+  from app.goals import goal_hold
   return {
+    "hold": goal_hold(goal) if goal.status == "stopped" else None,
     "id": goal.id, "status": goal.status, "revision": goal.revision,
     "objective": goal.objective, "next_action": goal.next_action,
+    "result": goal.result,
     "held_work_keys": sorted(open_claim_keys(db, chat_id=goal.chat_id, goal_id=goal.id)),
   }
 
 
 async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
-                              goal_id: str | None):
+                              goal_id: str | None, *, deferring: bool = False):
   """Return this attempt's Goal rows, attaching the attempt when needed.
 
   An ordinary turn that resumes unfinished work is not yet bound to the Goal
@@ -265,7 +292,7 @@ async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
   rows = active_goal_rows(db, chat_id)
   if (
     rows is not None and rows[0].id == principal.run_id
-    and rows[0].status == "running"
+    and rows[0].status == "running" and (rows[1].status != "stopped" or deferring)
     and (goal_id is None or rows[1].id == goal_id)
   ):
     return rows
@@ -280,7 +307,10 @@ async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
   else:
     presented = presented_goal_rows(db, chat_id)
     target = presented[1] if presented else None
-  if target is None or target.status != "open":
+  # Naming a held Goal is a deliberate reattachment. An implicit plan write
+  # must never undo a hold simply because that Goal remains on screen.
+  allowed = {"open", "stopped"} if goal_id is not None else {"open"}
+  if target is None or target.status not in allowed:
     raise HTTPException(status_code=409, detail={
       "code": "no_active_goal",
       "message": "This chat has no open Goal to update. Promote one first.",
@@ -307,7 +337,7 @@ async def update_goal(
   principal: Principal = Depends(get_agent_run_principal),
   db: Session = Depends(get_db),
 ):
-  """Edit the plan and optionally checkpoint or complete, as one operation.
+  """Edit the plan and optionally settle the Goal, as one atomic revision.
 
   With no fields it reads the presented Goal without attaching to it.
   """
@@ -321,43 +351,41 @@ async def update_goal(
       return {"goal": None, "plan": None}
     return {"goal": _goal_summary(db, rows[1]), "plan": serialize_plan(db, *rows)}
   from app import chat_queue
-  from app.goal_plans import edit_plan
   from app.goals import update_goal_record
   record = None
   async with chat_queue.get_transition_lock(chat_id):
     db.rollback()
-    run, goal = await _attach_run_to_goal(db, chat_id, principal, body.goal_id)
-    tasks_saved = False
+    run, goal = await _attach_run_to_goal(db, chat_id, principal, body.goal_id,
+                                         deferring=body.defer is not None)
     try:
-      if body.tasks is not None:
-        edit_plan(db, physical=run, root=goal, edits=body.tasks)
-        db.refresh(goal)
-        tasks_saved = True
-      if body.next_action is not None or body.complete is not None:
+      if any(value is not None for value in (
+        body.tasks, body.next_action, body.complete, body.cannot_complete, body.cancel, body.defer,
+      )):
         record = update_goal_record(
           db, run, goal, goal.revision,
+          tasks=body.tasks,
           checkpoint="Plan saved." if body.next_action is not None else None,
-          next_action=body.next_action, result=body.complete,
+          next_action=body.next_action, complete=body.complete,
+          cannot_complete=(body.cannot_complete.model_dump() if body.cannot_complete else None),
+          cancel=body.cancel, defer=body.defer,
           finished_claims=body.finished_claims,
         )
         db.refresh(goal)
     except (GoalPlanError, GoalPlanConflict) as exc:
-      if tasks_saved:
-        # The task edits committed before the record operation was refused;
-        # say so, or a retry would re-apply them as if nothing had changed.
-        _publish(chat_id, serialize_plan(db, run, goal))
-      prefix = "Task edits were saved, but " if tasks_saved else ""
+      db.rollback()
       if isinstance(exc, GoalPlanError):
         refusal = _plan_refusal(exc)
-        refusal.detail["message"] = prefix + refusal.detail["message"]
         raise refusal from exc
-      raise HTTPException(status_code=409, detail=prefix + str(exc)) from exc
+      raise HTTPException(status_code=409, detail=str(exc)) from exc
     plan = serialize_plan(db, run, goal)
   if plan is not None:
     _publish(chat_id, plan)
-  if record is not None and record.get("status") == "completed":
+  if record is not None and record.get("status") in {"completed", "cannot_complete", "cancelled"}:
     # Completion settled the Goal's claims and fired Waits in the same commit;
     # wake claim followers and withdraw now-stale resume notices.
     from app.goals import settle_after_goal_completion
     await settle_after_goal_completion(chat_id)
+  elif record is not None and record.get("status") == "stopped":
+    from app.agent_coordination import settle_claims_with_owner
+    await settle_claims_with_owner(chat_id)
   return {"goal": _goal_summary(db, goal), "plan": plan}

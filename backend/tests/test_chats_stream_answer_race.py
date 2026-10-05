@@ -50,6 +50,7 @@ def _seed_question_block(
   question_id: str,
   *,
   user_content: str = "go",
+  assistant_run_id: str | None = None,
 ) -> None:
   """Persist an assistant message carrying the open question block.
 
@@ -67,6 +68,7 @@ def _seed_question_block(
       {"role": "user", "content": user_content, "ts": 1},
       {
         "role": "assistant",
+        **({"id": assistant_run_id} if assistant_run_id else {}),
         "content": "",
         "ts": 2,
         "blocks": [
@@ -224,8 +226,9 @@ def test_answer_delivers_immediately_when_pending_registered(
   asyncio.run(go())
 
 
+@pytest.mark.parametrize("assistant_run_id", ["rt-interrupted-goal", None])
 def test_answer_recovers_durable_question_without_live_pending(
-  client, auth, chat, monkeypatch,
+  client, auth, chat, monkeypatch, assistant_run_id,
 ):
   """A restart kills the in-memory future but keeps the question block.
 
@@ -249,6 +252,7 @@ def test_answer_recovers_durable_question_without_live_pending(
     qid = "q-recovered"
     _seed_question_block(
       chat.id, qid, user_content="/goal finish the migration",
+      assistant_run_id=assistant_run_id,
     )
     db = SessionLocal()
     try:
@@ -311,7 +315,10 @@ def test_answer_recovers_durable_question_without_live_pending(
       running = db.query(models.ChatRun).filter_by(
         chat_id=chat.id, status="running",
       ).one()
-      assert running.goal_objective == "finish the migration"
+      # An identified card recovers its exact Goal. Legacy cards with no
+      # run identity remain answerable, but cannot borrow the latest Goal.
+      assert running.goal_id == assistant_run_id
+      assert running.goal_objective == ("finish the migration" if assistant_run_id else None)
     finally:
       db.close()
 

@@ -3,7 +3,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { QueryClient } from '@tanstack/react-query'
+import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import { settingsQueries } from '../../hooks/queries.js'
 import {
   clampUsagePercent,
@@ -62,6 +62,42 @@ test('Brain usage refetches when a chat mounts and on window focus', () => {
   const querySource = readFileSync(new URL('../../hooks/queries.js', import.meta.url), 'utf8')
   assert.match(querySource, /function useProviderUsageQuery[\s\S]*staleTime: 0,[\s\S]*refetchOnWindowFocus: true/)
 })
+
+for (const provider of ['codex', 'claude']) {
+  const otherProvider = provider === 'codex' ? 'claude' : 'codex'
+  test(`${provider} allowance event clears only that provider and refetches open Brain observers`, async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const key = settingsQueries.providerUsage.keyFor(provider)
+    const reading = percent => ({ state: 'ready', windows: [{ used_percent: percent }] })
+    client.setQueryData(key, reading(100))
+    client.setQueryData(settingsQueries.providerUsage.keyFor(otherProvider), reading(80))
+    let finishOld
+    const oldReading = new Promise(resolve => { finishOld = resolve })
+    let probes = 0
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: () => ++probes === 1 ? oldReading : Promise.resolve(reading(7)),
+      staleTime: 0,
+    })
+    const unsubscribe = observer.subscribe(() => {})
+    try {
+      assert.equal(probes, 1)
+      await settingsQueries.providerUsage.reset(client, provider)
+      finishOld(reading(100))
+      await oldReading
+      assert.equal(probes, 2)
+      assert.equal(observer.getCurrentResult().data.windows[0].used_percent, 7)
+      assert.equal(client.getQueryData(settingsQueries.providerUsage.keyFor(otherProvider)).windows[0].used_percent, 80)
+      assert.ok(
+        /ev\.type === 'provider_usage_changed'[\s\S]*?providerUsage\.reset\(queryClient, ev\.provider\)/.test(shellSource),
+        'Shell must clear the affected provider on the usage-change event',
+      )
+    } finally {
+      unsubscribe()
+      client.clear()
+    }
+  })
+}
 
 test('connected plan status uses the compact green-disclosure copy', () => {
   assert.equal(formatPlanStatus('Max plan'), 'Plan: Max')

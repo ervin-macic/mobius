@@ -115,7 +115,13 @@ function _safeTarget(raw) {
           ? `/shell/?app=${app}&intent=${encodeURIComponent(intent)}`
           : `/shell/?app=${app}`
       }
-      if (chat && /^[A-Za-z0-9_-]+$/.test(chat)) return `/shell/?chat=${chat}`
+      // A saved owner-input card's notification asks the chat to reveal its
+      // open question; that one fixed instruction is the only extra kept.
+      if (chat && /^[A-Za-z0-9_-]+$/.test(chat)) {
+        return params.get('focus') === 'question'
+          ? `/shell/?chat=${chat}&focus=question`
+          : `/shell/?chat=${chat}`
+      }
     } catch { /* fall through */ }
     return '/shell/'
   }
@@ -136,11 +142,6 @@ self.addEventListener('notificationclick', (e) => {
     if (match && match.target) target = match.target
   }
   target = _safeTarget(target)
-  // Answer alerts sent before focus links existed still have a durable title.
-  // Preserve their promised destination when the owner taps them later.
-  if (data.title === 'Möbius needs your answer' && /^\/shell\/\?chat=/.test(target)) {
-    target += '&focus=question'
-  }
 
   e.waitUntil((async () => {
     // `includeUncontrolled` is load-bearing here: this worker deliberately

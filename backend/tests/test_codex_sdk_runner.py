@@ -5123,6 +5123,47 @@ def test_typed_size_failure_reaches_recovery_without_matching_error_prose(
     assert "model's context window" in bc.events[-1]["message"]
 
 
+@pytest.mark.parametrize("reached_type, credits", [
+  ("workspace_owner_credits_depleted", True),
+  ("workspace_member_credits_depleted", True),
+  ("workspace_member_usage_limit_reached", False),
+])
+def test_structured_credits_depletion_reaches_park_exit_as_credits_pause(
+  monkeypatch, reached_type, credits,
+):
+  # The structured reached type, not the error wording, decides whether a
+  # reached Codex limit is a timed rate limit or a manual credits pause.
+  from app import chat
+  types = pytest.importorskip("openai_codex.generated.v2_all")
+  sdk = _fake_sdk(None)
+  limits = types.AccountRateLimitsUpdatedNotification.model_validate({
+    "rateLimits": {"rateLimitReachedType": reached_type},
+  })
+  error = types.TurnError.model_validate({"message": "Codex usage limit reached."})
+  result, bc = _run_turn_whose_stream_dies(
+    monkeypatch, AssertionError("must finish at the limit error"),
+    notifications=[
+      SimpleNamespace(method="account/rateLimits/updated", payload=limits),
+      SimpleNamespace(method="error", payload=sdk["ErrorNotification"](
+        error=error, thread_id="thread-1", turn_id="turn-1", will_retry=False,
+      )),
+    ],
+    sdk_patch={
+      "AccountRateLimitsUpdatedNotification":
+        types.AccountRateLimitsUpdatedNotification,
+      "ErrorNotification": sdk["ErrorNotification"],
+    },
+  )
+  assert result["api_error_status"] == 429
+  assert result.get("credits_depleted", False) is credits
+  kwargs = chat._park_exit(bc, result, result["error"], provider_id="codex")
+  if credits:
+    assert kwargs == {"parked": False}
+    assert bc.events[-1]["pause"] == {"kind": "credits", "provider": "codex"}
+  else:
+    assert kwargs["parked"] is True
+
+
 @pytest.mark.parametrize("info", [
   None, "badRequest", "sessionBudgetExceeded", "usageLimitExceeded",
   {"httpConnectionFailed": {"httpStatusCode": 400}},

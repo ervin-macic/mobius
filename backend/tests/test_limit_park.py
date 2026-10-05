@@ -346,6 +346,80 @@ def test_park_exit_non_limit_error_stays_plain():
   assert sink.events[-1] == {"type": "error", "message": "syntax error"}
 
 
+@pytest.mark.parametrize("error", [
+  "quota exceeded",
+  "model overloaded, try again",
+  "You've hit your weekly limit · resets 1:40am",
+])
+def test_park_exit_parks_on_shared_usage_limit_kind(error):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {"error": error}, error)["parked"] is True
+
+
+@pytest.mark.parametrize("error", [
+  # Out of credits does not reset by itself, even when it mentions a quota.
+  "insufficient_quota: You exceeded your current quota",
+  "Credit balance is too low",
+  # A request id that happens to contain 429 is not a rate limit.
+  "request id req_14290 failed",
+])
+def test_park_exit_does_not_park_non_limits(error):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {"error": error}, error) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": error}
+
+
+@pytest.mark.parametrize("error", [
+  "payload too large",
+  "unexpected status 413 Payload Too Large",
+  "context_length_exceeded",
+  "request_body_too_large",
+])
+def test_park_exit_treats_shared_size_refusals_as_oversized(error):
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, {"error": error}, error)
+  assert kwargs == {"parked": False, "oversized": True}
+  assert "too large to send" in sink.events[-1]["message"]
+
+
+@pytest.mark.parametrize("runner_result", [
+  None,
+  {},
+  # Codex may first report the depleted credits as a reached rate limit.
+  {"api_error_status": 429, "rate_limit_resets_at": "2099-05-08T12:34:00Z"},
+])
+def test_exhausted_workspace_credits_is_a_manual_credits_pause(runner_result):
+  text = "Your workspace is out of credits. Add credits to continue."
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, runner_result, text, provider_id="codex")
+  assert kwargs == {"parked": False}
+  assert sink.events[-1] == {
+    "type": "error",
+    "message": text,
+    "resumable": True,
+    "pause": {"kind": "credits", "provider": "codex"},
+  }
+
+
+def test_structured_credits_flag_pauses_whatever_the_wording():
+  # The workspace-member variant and the runner's fallback wording carry no
+  # exact sentence; the runner's structured flag still makes it a credits pause.
+  text = "Codex usage limit reached."
+  sink = _Sink()
+  result = {"api_error_status": 429, "credits_depleted": True}
+  assert chat_mod._park_exit(sink, result, text, provider_id="codex") == {
+    "parked": False,
+  }
+  assert sink.events[-1]["pause"] == {"kind": "credits", "provider": "codex"}
+
+
+def test_other_credit_failures_stay_plain_errors():
+  text = "Payment failed: card declined. Add credits to continue."
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {}, text) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": text}
+
+
 def test_model_capacity_parks_for_a_short_automatic_retry():
   sink = _Sink()
   kwargs = chat_mod._park_exit(
@@ -731,7 +805,10 @@ def test_owner_message_queues_behind_future_limit_park(
   assert response.json()["status"] == "queued"
   assert scheduled == []
   assert _run_row("rt-park-owner-queue")["status"] == "parked"
-  assert _chat_row(cid)["pending"] == [{
+  pending = _chat_row(cid)["pending"]
+  accepted_at = pending[0].pop("_owner_input_at")
+  assert datetime.fromisoformat(accepted_at).tzinfo == UTC
+  assert pending == [{
     "role": "user",
     "content": "also check the weekly limit",
     "ts": response.json()["ts"],

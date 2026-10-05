@@ -620,3 +620,56 @@ def test_git_output_with_non_utf8_path_is_safely_sanitized():
   assert result["working"]["files"] == 1
   assert result["working"]["untracked"] == 1
   assert result["working"]["paths"][0]["path"] == "odd-�.js"
+
+
+def test_local_changes_since_a_proposal_source_survive_rewritten_history(
+  monkeypatch,
+):
+  repo = _repo("since-demo")
+  (repo / "a.js").write_text("a1\n", encoding="utf-8")
+  (repo / "b.js").write_text("b1\n", encoding="utf-8")
+  _git(repo, "add", "a.js", "b.js")
+  proposal_source = _commit(repo, "local work")
+  # A platform-style reconcile rebuilds the live branch, so the proposal's
+  # source commit is no longer an ancestor of HEAD. Only b.js really moved.
+  _git(repo, "checkout", "-q", "-b", "rebuilt", "upstream")
+  (repo / "a.js").write_text("a1\n", encoding="utf-8")
+  (repo / "b.js").write_text("b2\n", encoding="utf-8")
+  _git(repo, "add", "a.js", "b.js")
+  _commit(repo, "reconciled")
+  assert subprocess.run(
+    ["git", "-C", str(repo), "merge-base", "--is-ancestor",
+     proposal_source, "HEAD"],
+  ).returncode != 0
+  # Contribute sends every project's recorded sources to every project, so
+  # most are unknown here; those must cost no per-commit processes.
+  others = [f"{n:040x}" for n in range(1, 40)]
+  real_git = source_status._git
+  since_calls = []
+
+  def counted_git(target, *args, **kwargs):
+    if args[:1] == ("cat-file",) or args[:2] == ("diff", "--no-renames"):
+      since_calls.append(args[:2])
+    return real_git(target, *args, **kwargs)
+
+  monkeypatch.setattr(source_status, "_git", counted_git)
+
+  project = source_status.build_app_status(
+    _app(repo), since=source_status.source_commits(
+      [proposal_source.upper(), proposal_source, "not-a-sha", *others],
+    ),
+  )
+
+  changed = project["reconciliation"]["local_changed_since"]
+  assert changed == {proposal_source: ["b.js"]}
+  assert since_calls == [
+    ("cat-file", "--batch-check=%(objecttype)"),
+    ("diff", "--no-renames"),
+  ], "one batch existence check, then one diff per known commit"
+  assert set(project["reconciliation"]["local_only_paths"]) == {"a.js", "b.js"}
+
+
+def test_source_commits_are_distinct_full_ids_and_bounded():
+  shas = [f"{n:040x}" for n in range(100)]
+  assert source_status.source_commits(shas + shas[:3]) == tuple(shas[:64])
+  assert source_status.source_commits(["abc", "", None]) == ()

@@ -327,37 +327,46 @@ test('unmount during Resume acknowledgement does not reconnect a dead view', asy
 })
 
 
-test('chat switches during durable intent registration keep POST and retirement bound to the original chat', async () => {
-  await setup()
-  globalThis.indexedDB = new IDBFactory()
-  const token = `stub.${Buffer.from(JSON.stringify({ sub: 'test-owner', epoch: 1 })).toString('base64url')}.stub`
-  globalThis.localStorage = { getItem: () => token }
-  const accepted = deferred()
-  const posted = deferred()
-  let path
-  globalThis.fetch = async (url, options) => {
-    path = url
-    assert.equal(options.method, 'POST')
-    posted.resolve()
-    return accepted.promise
-  }
-  const sending = hook.result.current.sendMessage('continue', undefined, {
-    cid: 'resume-original-chat', continuation: 'manual', resumeRunId: 'interrupted-a',
+for (const [targetName, target, wireTarget] of [
+  ['Run', { resumeRunId: 'interrupted-a' }, { resume_run_id: 'interrupted-a' }],
+  ['Goal', { resumeGoalId: 'held-goal', resumeGoalRevision: 7 }, { resume_goal_id: 'held-goal', resume_goal_revision: 7 }],
+]) {
+  test(`${targetName} chat switches during durable intent registration keep POST and retirement bound to the original chat`, async () => {
+    await setup()
+    globalThis.indexedDB = new IDBFactory()
+    const token = `stub.${Buffer.from(JSON.stringify({ sub: 'test-owner', epoch: 1 })).toString('base64url')}.stub`
+    globalThis.localStorage = { getItem: () => token }
+    const accepted = deferred()
+    const posted = deferred()
+    let path, postedBody
+    globalThis.fetch = async (url, options) => {
+      path = url
+      postedBody = JSON.parse(options.body)
+      assert.equal(options.method, 'POST')
+      posted.resolve()
+      return accepted.promise
+    }
+    const sending = hook.result.current.sendMessage('continue', undefined, {
+      cid: 'resume-original-chat', continuation: 'manual', ...target,
+    })
+    // enqueueIntent has not yielded back yet: the view switches before the
+    // durable write finishes and before HTTP begins.
+    hook.rerender('b')
+    await posted.promise
+    const principal = outboxPrincipalKey(token)
+    const pending = await listIntents(principal)
+    assert.equal(path, '/api/chats/a/messages')
+    assert.equal(pending.length, 1)
+    for (const [key, value] of Object.entries(wireTarget)) assert.equal(postedBody[key], value)
+    assert.equal(pending[0].chatId, 'a')
+    for (const [key, value] of Object.entries(wireTarget)) assert.equal(pending[0].body[key], value)
+    assert.equal(pending[0].body[targetName === 'Goal' ? 'resume_run_id' : 'resume_goal_id'], undefined)
+    accepted.resolve(Response.json({ status: 'started' }))
+    await sending
+    assert.deepEqual(await listIntents(principal), [], 'accepted intent retires in its original chat')
   })
-  // enqueueIntent has not yielded back yet: the view switches before the
-  // durable write finishes and before HTTP begins.
-  hook.rerender('b')
-  await posted.promise
-  const principal = outboxPrincipalKey(token)
-  const pending = await listIntents(principal)
-  assert.equal(path, '/api/chats/a/messages')
-  assert.equal(pending.length, 1)
-  assert.equal(pending[0].chatId, 'a')
-  assert.equal(pending[0].body.resume_run_id, 'interrupted-a')
-  accepted.resolve(Response.json({ status: 'started' }))
-  await sending
-  assert.deepEqual(await listIntents(principal), [], 'accepted intent retires in its original chat')
-})
+
+}
 
 for (const order of ['visible-online', 'online-visible']) {
   test(`wake ${order} and runtime attachment share a pending replacement`, async () => {

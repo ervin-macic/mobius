@@ -24,10 +24,11 @@ test('Goal history summarizes a terminal outcome and its plan', () => {
     ariaLabel: 'Completed goal: Ship the Goal experience',
     metadata: '3 of 3 steps complete · 2m 5s',
     hasPlan: true,
+    reason: '',
   })
 })
 
-test('Goal history rejects active snapshots and labels failed outcomes', () => {
+test('Goal history preserves neutral labels for legacy failed snapshots', () => {
   assert.equal(goalHistoryViewModel({ objective: 'Still working', status: 'active' }), null)
   assert.deepEqual(goalHistoryViewModel({
     objective: 'Needs repair', status: 'failed', duration_seconds: null,
@@ -36,7 +37,17 @@ test('Goal history rejects active snapshots and labels failed outcomes', () => {
     completed: false,
     kicker: 'Goal needs attention',
     ariaLabel: 'Goal needing attention: Needs repair',
+    reason: '',
     metadata: '',
     hasPlan: false,
   })
+})
+
+test('terminal Goal outcomes retain their honest result in history', () => {
+  const cancelled = goalHistoryViewModel({ objective: 'Ship', status: 'cancelled', result: { reason: 'Owner stopped it' } })
+  assert.equal(cancelled.kicker, 'Goal cancelled')
+  assert.equal(cancelled.reason, 'Owner stopped it')
+  const impossible = goalHistoryViewModel({ objective: 'Ship', status: 'cannot_complete', result: 'Dependency unavailable' })
+  assert.equal(impossible.kicker, 'Goal cannot complete')
+  assert.equal(impossible.reason, 'Dependency unavailable')
 })

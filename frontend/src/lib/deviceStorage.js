@@ -1,4 +1,4 @@
-import { currentSharedBrowserStorage, isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+import { localStore } from './workspaceStorage.js'
 
 export const DEVICE_STORAGE = 'device.storage'
 
@@ -13,9 +13,7 @@ function capabilityError(name, message, code) {
 }
 
 function browserStorage(explicit) {
-  if (explicit !== undefined) return explicit
-  if (isSharedBrowserRoute()) return currentSharedBrowserStorage()
-  try { return globalThis.localStorage || null } catch { return null }
+  return explicit !== undefined ? explicit : localStore()
 }
 
 function storageNamespace(identity) {

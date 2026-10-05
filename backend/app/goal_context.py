@@ -64,6 +64,20 @@ def project_goal(goal, task_id=None):
   ancestors = path(task_id)[:-1] if task_id else []
   payload = {"id": goal.id, "revision": goal.revision, "objective": goal.objective,
              "status": goal.status, "focus": task_id}
+  if goal.status == "stopped":
+    from app.goals import goal_hold
+    hold = goal_hold(goal)
+    if hold:
+      payload["hold"] = hold
+  if goal.status == "open":
+    payload["outcome_contract"] = (
+      "Preserve the original objective. Complete only verified success; if it seems "
+      "unreachable, first seek an actionable owner decision. Temporary owner action "
+      "or approval leaves this Goal open with a saved card, not terminal failure. "
+      "Cannot complete records the specific reason, efforts and partial results, "
+      "and unmet outcome; Cancelled requires the owner to call it off. Settle "
+      "the checklist and helpers honestly in the same terminal update."
+    )
   for key in ("checkpoint", "next_action"):
     if getattr(goal, key, None):
       payload[key] = getattr(goal, key)

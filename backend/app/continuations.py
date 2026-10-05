@@ -42,8 +42,20 @@ PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
 # Goal travels the same slot and resumes under that Goal's identity.
 PEER_MESSAGE_WAKE_KIND = "peer_message"
 
+GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
+  "The Goal is still unfinished: the agent ended without recording an "
+  "outcome or saving its next handoff. Automatic settlement cannot safely "
+  "continue. Resume to recover this execution; "
+  "the Goal has not been declared impossible."
+)
+
+
 def recovery_attempted(db, run, *, reason: str) -> bool:
-  """Exact predecessor controls bound recovery; manual owner Resume resets it."""
+  """Fail closed when recovery was used or its exact lineage cannot be proven.
+
+  Manual owner Resume resets the budget. A broken chain is not evidence that
+  an attempt happened, only that another automatic attempt is not justified.
+  """
   from app import models
   seen = set()
   while run is not None:
@@ -135,8 +147,8 @@ def continuation_reason(message: Mapping[str, Any] | None) -> str:
 def is_retired_goal_handoff(message: Mapping[str, Any] | None) -> bool:
   """A queued automatic-Goal control the pre-2026-09-27 writer left behind.
 
-  Goals no longer continue themselves. Such a row may still sit behind owner
-  input in a persisted queue; it is retired unrun, never promoted as input.
+  The former revision-budget loop is retired. Such a row may still sit behind
+  owner input; it must not become the new bounded settlement recovery.
   """
   return continuation_reason(message) == "goal_handoff"
 
@@ -172,13 +184,15 @@ def continuation_protocol_source(
       "automatic size-recovery attempt for this logical turn."
     ),
     "model_capacity": "Resume the interrupted owner work now that the selected model may be available.",
-    "quiet_write_failure": (
-      "A result-independent write reported a failure or uncertain outcome. "
-      "This is one failure-only recovery, not another owner request. Inspect the attached "
-      "write failure reports and the owning saved state before repeating any side effect. "
-      "Repair within the original authority using ordinary result-bearing tools, or "
-      "report the concrete unresolved failure. Never assume an unknown write did not happen. "
-      "Do not repeat completed substantive work. This recovery will not automatically repeat."
+    "goal_settlement": (
+      "The exact Goal remains open after a clean execution ended without an outcome or durable handoff. "
+      "This is one targeted settlement recovery, not permission to redo verified work or shrink the objective. "
+      "Read the saved Goal and reconcile its checklist. Complete only if the original promised outcome is verified. "
+      "Otherwise continue necessary authorized work in this run, or save a concrete owner question/approval "
+      "with instructions and meaningful choices. If unreachable, explain why, efforts and partial results, "
+      "and seek actionable owner input before declaring Cannot complete. Use a durable Wait/helper only "
+      "when it actually owns continuation. Do not end with optional Unpause or a prose promise. "
+      "This recovery will not automatically repeat."
     ),
   }
   source = {
@@ -203,6 +217,7 @@ def continuation_control_envelope(
   *, reason: str, control_id: str,
   source_work_id: str | None = None, goal_id: str | None = None,
   supersedes_run_token: str | None = None,
+  goal_revision: int | None = None,
 ) -> dict:
   """Return the bounded durable half of a provider-only continuation."""
   envelope = {
@@ -215,7 +230,21 @@ def continuation_control_envelope(
     envelope["goal_id"] = goal_id
   if supersedes_run_token is not None:
     envelope["supersedes_run_token"] = supersedes_run_token
+  if goal_revision is not None:
+    envelope["goal_revision"] = goal_revision
   return envelope
+
+
+def manual_resume_matches(control, *, control_id, run_id=None,
+                          goal_id=None, goal_revision=None):
+  """A lost Resume receipt can acknowledge only the original exact target."""
+  if control.get("control_id") != control_id or control.get("reason") != "manual":
+    return False
+  if goal_id is not None or "goal_revision" in control:
+    return (goal_id == control.get("goal_id")
+            and goal_revision == control.get("goal_revision") and run_id is None)
+  recorded_run = control.get("supersedes_run_token")
+  return run_id is None or recorded_run is None or recorded_run == run_id
 
 
 def manual_continuation_run_token(chat_id: str, control_id: str) -> str:

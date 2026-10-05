@@ -954,7 +954,7 @@ def test_source_status_releases_db_before_waiting_on_repository_locks(
     return {"key": "platform", "available": True}
 
   monkeypatch.setattr(github_access_routes.asyncio, "to_thread", checked_to_thread)
-  result = asyncio.run(github_access_routes.github_source_status(None, db))
+  result = asyncio.run(github_access_routes.github_source_status(None, db, since=[]))
 
   assert result["platform"] == {"key": "platform", "available": True}
   assert result["apps"] == []
@@ -1071,11 +1071,11 @@ def test_source_status_projects_local_distribution_manifest_identity(
   finally:
     session.close()
 
-  monkeypatch.setattr(source_status, "build_platform_status", lambda: {
+  monkeypatch.setattr(source_status, "build_platform_status", lambda since=(): {
     "key": "platform", "available": True,
   })
 
-  def inspect(app):
+  def inspect(app, since=()):
     assert app["manifest_url"] is None
     assert app["published_manifest_url"] == distribution_url
     return {"key": f"app:{app['id']}", "name": app["name"]}
@@ -1931,11 +1931,11 @@ def test_source_status_keeps_healthy_apps_when_one_checkout_fails(
   finally:
     session.close()
 
-  monkeypatch.setattr(source_status, "build_platform_status", lambda: {
+  monkeypatch.setattr(source_status, "build_platform_status", lambda since=(): {
     "key": "platform", "available": True,
   })
 
-  def inspect(app):
+  def inspect(app, since=()):
     if app["id"] == bad_id:
       raise RuntimeError("damaged checkout")
     return {"key": f'app:{app["id"]}', "name": app["name"]}

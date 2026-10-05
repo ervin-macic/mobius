@@ -69,19 +69,13 @@ export function outboxPrincipalKey(token) {
     if (!['owner', 'chat_embed', 'browser_shared'].includes(scope)) return null
     if (scope === 'browser_shared' && (
       typeof sharedGrant !== 'string' || !sharedGrant
-      || !Number.isInteger(claims.browser_grant_epoch)
-      || claims.browser_grant_epoch < 0
       || typeof claims.browser_session !== 'string'
       || !claims.browser_session
     )) return null
-    return JSON.stringify([
-      claims.sub,
-      claims.epoch ?? 0,
-      scope,
-      scope === 'chat_embed' ? String(claims.app_id ?? '') : scope === 'browser_shared' ? sharedGrant : '',
-      scope === 'chat_embed' ? String(claims.chat_id ?? '') : scope === 'browser_shared' ? claims.browser_grant_epoch : '',
-      ...(scope === 'browser_shared' ? [claims.browser_session] : []),
-    ])
+    const partition = scope === 'chat_embed'
+      ? [String(claims.app_id ?? ''), String(claims.chat_id ?? '')]
+      : scope === 'browser_shared' ? [sharedGrant, claims.browser_session] : ['', '']
+    return JSON.stringify([claims.sub, claims.epoch ?? 0, scope, ...partition])
   } catch {
     return null
   }

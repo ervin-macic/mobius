@@ -1201,27 +1201,39 @@ column remains only as an internal latch: it defaults on and is cleared solely
 by `delegations.mark_cancelled`, so a cancelled delegated child cannot
 resurrect itself when the boot sweep claims restart parks.
 
-### A Goal is a note, a checklist, and Done
+### A Goal owns an outcome; attempts own execution
 
-`ChatGoal` owns the stable objective, revision-checked plan, checkpoint, next
-step, and explicit outcome. `ChatRun.goal_id` attaches each execution attempt
-to that record. A failed, interrupted, or cleanly ended attempt cannot complete
-or fail the obligation. Stop and dismissal are explicit; a deliberate Resume
-can reopen stopped work but stale deliveries cannot. Migration 0063 copies
-historical plans without deleting run snapshots and leaves uncertain work open.
+`ChatGoal` owns the original objective, revision-checked checklist, checkpoint,
+next step, and explicit Completed / Cannot complete / Cancelled outcome.
+`ChatRun.goal_id` attaches an execution attempt without replacing that obligation.
+Task edits and terminal settlement share one transaction: a refusal saves neither.
+A green checklist alone is not completion, and an interruption is not capitulation.
 
-The writer admits Goal identity and the attempt in the same transaction.
-Execution turns are not a budget, and an unfinished Goal never schedules its
-own next turn. Goal work moves only through what already wakes a chat: owner
-input, a Wait result, a helper result, peer or activation delivery, and
-restart or usage-limit recovery. A turn that ends cleanly needs no Goal
-handoff: nothing checks it, and an idle unfinished Goal is simply the owner's
-turn. The Goal record reports only its own lifecycle (`active` while a turn
-runs, `paused` while idle or stopped, `completed`); who moves next is derived
-from chat state the client already holds — an open card, armed Waits, running
-helpers — never from a per-Goal ownership query. Retired automatic-continuation
-bookkeeping (`goal_plan_revision_at_admission`, the `automatic_remaining`
-column) is inert historical schema.
+The writer records a deliberate Stop or quiet card answer as a Goal hold before
+interrupting execution. `hold_json` identifies the actor, exact action/card and
+attempt, and time. Generic `FinishRun` never manufactures Goal intent. Absent or
+invalid historical attribution remains held but neutral: **Interrupted**, never
+**Paused by you**. Dismissal and verified terminal outcomes remain distinct.
+Migrations 0081/0082 add nullable provenance without rewriting historical intent.
+
+Resume uses the existing acknowledged continuation path. A Goal action carries
+its exact ID and revision; a reply action carries its physical run ID. Neither is
+queued behind activation or allowed to bypass a saved question. Receipt retries
+acknowledge only the original target. Named `update_goal` can attach later owner
+work to a retained Goal, preserving its objective and checklist. Reopening a hold
+requires durable owner-admission evidence, not a different run ID or guessed text.
+`owner_input_at` records direct/queued acceptance; physical recovery inherits that
+time rather than renewing authority. Unknown holds accept new owner input, not
+inherited recovery. Automatic results and parks cannot override held/settled work.
+
+An unfinished Goal retains responsibility until a truthful outcome, answerable
+saved card, or genuine automatic wake. The existing writer/continuation runner
+admits one bounded settlement pass after a clean unhanded ending; another such
+ending records a visible technical recovery failure, not a fabricated outcome.
+No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
+Goal labels derive only from that Goal's cards, Waits, helpers and eligible parks;
+chat-wide handoff guards conflicting actions without borrowing another task's
+question. Retired revision-budget columns remain inert historical schema.
 
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired
@@ -1286,6 +1298,16 @@ the carrier as its next turn, whose completed Finalize records it. Until a cut
 or completed Finalize, the result is owed. Stop drops a queued carrier, because
 the Delegation row still owes the result and the next owner turn's context
 carries it.
+
+A helper's delivered result is its latest assistant message's last text block,
+plus that message's latest error so a failed or stopped helper stays actionable.
+Earlier text blocks in the same message are progress narration, split off by
+tool calls or by separate provider items; they stay in the child transcript as
+evidence but are not replayed to the parent. As with Claude Code and Codex
+subagents, a helper's final message is its report, and the helper system
+prompt tells it to write that report last, after any tool calls. One status still reads
+report content: a failed run whose text carries the write-review marker
+projects as `needs_review`.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
@@ -1626,69 +1648,6 @@ and ownership semantics without flaky wall-clock thresholds.
 
 **GUARDRAIL — never write `Chat.messages` / `Chat.live_assistant` / `Chat.pending_messages` directly** from a request handler or SDK runner. SQLite WAL serializes commits but NOT the app-level JSON snapshot READ: two readers both see the pre-write snapshot and one silently overwrites the other (the lost-update race the actor closes). The only justified direct writer is `reconcile_interrupted_chats` (`chat.py`, runs at boot before the actor starts); all runtime writes otherwise pass through the actor.
 
-### Quiet, result-independent agent writes
-
-`agent_write_context` supplies one shared delivery contract to normal chats
-and routed helpers. It adds no provider-specific write mechanism or new agent tool.
-`checkpoint_chat` includes title, digest and cumulative summary with unchanged
-save semantics. Apps opt in through reviewed `result_independent` declarations.
-
-The per-run prompt declares eligible tools and a nonce-scoped, explicit
-`MOBIUS_WRITE` frame. `agent_write_channel` filters normalized assistant events
-inside `ChatEventSink`, after helper attribution but before reduction, broadcast
-or persistence. Deltas never authorize effects. An authoritative **item** final
-can occur mid-task and authorizes one immutable batch; a whole-turn completion
-is not required. Finals replace rather than concatenate deltas, and late
-deltas cannot expose already-finalized private payloads. Changed finals fail;
-identical replays deduplicate. Frames in tool output/thinking are not commands.
-If a provider omits a delta's identity, provisional presentation stops for that
-turn: complete snapshots still display, but anonymous snapshots never execute
-writes. This deliberately trades incremental presentation for privacy rather
-than guessing how ambiguous suffixes belong together. Capacity overflow uses
-the same presentation-only final path; ordinary prose never creates a write
-failure or repair request merely because tracking capacity was reached.
-
-`agent_write_delivery` admits those batches through the existing writer actor,
-off the event loop, then drains one owned dispatcher asynchronously. Migration
-`0078_agent_write_journal` adds run streams and intents. Admission commits
-before execution; the actor commits an atomic claim before calling the effect.
-Logical-root/operation identity prevents replay, while physical run/item
-receipts preserve immutable accepted/rejected batches. States distinguish
-queued, executing, succeeded, failed, cancelled and unknown. Neither worker
-loss nor restart changes unknown back to queued. Bounds are explicit: 64 KiB
-per frame, eight writes per item, 256 items, 128 admitted writes/1 MiB arguments
-and 32 detailed diagnostics per run, with a count of further omitted diagnostics
-that advances failure-report acknowledgment. These cap one protocol turn, not
-owner data.
-
-`agent_write_tools` launches the existing control dispatcher with the exact
-already-materialized run/delegation environment; payloads cannot choose caller
-identity. Browser grants are revalidated at admission and claim; failure repair
-retains the same grant and cannot renew revoked access. Installed app eligibility
-comes from the accepted manifest contract;
-the platform declares its own eligible controls. Success receipts reach only
-the activity sink/journal, not a provider result or continuation. Result-bearing
-tools and calls whose outcome determines the next action remain ordinary.
-
-The sink retains ownership through joined write teardown, independently of
-whether the provider is still steerable. Stop fences admissions before awaiting
-anything and cancels/joins the exact dispatcher, including during final drain.
-Accepted pre-card writes drain, but a saved terminal owner card closes further
-admission. No worker outlives run teardown. Recovery records ambiguous effects
-without replay and preserves negative reports behind Stop/card/wait barriers.
-
-Only negative outcomes can create one existing-queue recovery continuation,
-subject to exact run ownership, delegation attribution, owner input, activation,
-Wait and Goal boundaries. It prioritizes its exact triggering report, then
-fills a bounded backlog. Successful provider consumption acknowledges report
-fingerprints, never unseen later changes. Helper result projection retains the
-substantive predecessor and appends repair status along exact continuation
-lineage. A repair cannot replace the task answer or revive a cancelled helper.
-Failure metadata links to owner-only `GET /api/chats/{chat}/write-outcomes/{run}/{operation}`
-for exact original arguments when needed. This is a bounded read, not a new
-agent tool, replay operation or automatic payload injection; a fresh provider
-session can repair from durable evidence without relying on its private log.
-
 ## Multi-pane workspace
 
 The shell ships a responsive tiled workspace. Wide layouts can show several
@@ -1779,6 +1738,27 @@ On narrow layouts the drawer is modeled as a *virtual route*: opening it pushes 
 
 The mobile design satisfies a few hard desiderata — no "two drawers" artifact during Chrome-Android swipe-back, the 250ms slide stays visible, one back-press exits the PWA from home, and closing the drawer (overlay tap / X) must never navigate. Three load-bearing invariants in `useNavigation.js` enforce this: (1) **`navTo` consumes the existing drawer-sentinel rather than pushing** when the drawer is open (it pushes one `'nav'` entry only if the drawer was closed), so an in-app nav reuses the drawer's history slot instead of growing the stack — keeping history pinned to a pre-drawer snapshot and killing the BFCache artifact; (2) **every close path funnels through `history.back()` → `handleBack`**, whose drawer-first guard (`if (drawerOpenRef && drawerPushedRef) { close; return }`) prevents over-popping `navStackRef`; (3) **`drawerPushedRef` is a ref, not state** (mutated synchronously in the same task as the history call) and is the single source of truth for "is a drawer-sentinel above the current entry." Activating the already-current destination is a close/no-op and must not create a duplicate history edge. Every shell-pushed entry is tagged `{__mobiusNav:true, kind}` via `navHistory.js` and written to *both* the classic History store and the Navigation API entry (`updateCurrentEntry`); both back handlers ignore untagged pops so sandboxed-iframe phantom entries can't over-pop — do not drop the tag from any push site or genuine sentinels read as phantoms and back-nav dies. Mini-apps install their own back-targets via the `moebius:nav-push` postMessage protocol (per-app counts in `appSentinelCountsRef`, capped at 20), consumed before navStack pops; `Shell.deleteChat` must scrub `navStackRef` of the deleted chat's entries or back lands on a 404'd chat. Three architectures were tried and rejected (per-nav pushState, `flushSync`-before-pushState, perpetual single-sentinel) — read `tests/navigation.spec.mjs` before changing anything.
 
+Ordinary reloads preserve a matching tagged chat/app route and its shell index,
+rather than reclassifying the current entry as a new base. A base entry that
+shows a non-chat surface is still replaced and gets the HOME seed behind it, so
+Back after reload reaches chat instead of leaving Möbius. Each shell push marks
+its tagged source with `hasShellForward`, so even a popstate-only browser can
+recover the Forward edge after reload without a second persisted history stack.
+Where available, the Navigation API's next entry verifies that Forward remains
+inside shell-owned history. Explicit launch destinations still establish their
+own base; a fresh push discards the previous Forward branch.
+
+New Chat's provisional row ownership outlives its visible presentation. Leaving
+releases the keyboard lease, not the creation session: Back/Forward must restore
+its composer without reading a not-yet-created row as a deletion. An off-screen
+allocation may publish success or failure but never redirect the workspace;
+an off-screen id conflict is remembered and applies the same silent rotation
+when its chat is visible again. A queued first Send waits for that chat to be
+materialized, visible, and runtime-ready; handing it over retires the creation
+session. Consuming
+its durable handoff is a one-shot claim shared by retained/remounted views, not
+merely a component-local request token.
+
 Transient shell surfaces that should dismiss on browser Back use the same owner
 through `useHistoryDismiss`. Opening one pushes a tagged `kind:'dismissible'`
 entry before the surface paints. An explicit close (X, backdrop, Escape)
@@ -1842,7 +1822,7 @@ Every mini-app ships a `mobius.json`; the dependency-free source of truth is `ba
 
 Published apps should generate one random UUID once and declare it as `package_id` (for example `urn:uuid:550e8400-e29b-41d4-a716-446655440000`). It remains unchanged across product, manifest-id, repository-path, and owner renames. GitHub-backed packages are additionally bound to GitHub's immutable numeric repository identity, so a repository rename or transfer only changes the fetch locator. Moving code into a different repository is an explicit trust transfer: the old trusted manifest declares the same `package_id` plus `moved_to: {"manifest_url": "https://.../mobius.json"}`. Existing installs accept the new repository only after fetching and verifying that declaration from their current source; a separate fork generates a new package id. A reviewed service uses its own stable `service.id`, independent of both the package's current `id` and installed slug. Manifests that declare both `package_id` and `service` must declare `service.id` explicitly.
 
-Optional fields the parser recognizes include `package_id`, `moved_to`, `previous_id`, `icon`, colors/display, `offline_capable`, `embeds_agent`, `offline`, `permissions`, `storage_seeds`, `static_assets`, `source_files`, `skills`, `system_prompt`, `schedule`, and `agent_activities`. `previous_id` and `previous_manifest_url` remain bounded migration aids for installs that predate permanent package identities; they are not the steady-state identity model. Decorative-only fields such as `author`, `license`, and `homepage` are not validated or stored. Three gotchas: (1) **`runtime` (`imports`/`esm_deps`) is informational**; dependency resolution is governed by the pinned self-contained compiler in `app_compile_contract.py`. (2) **`storage_seeds` value type is a switch**: a string is a repo-relative file the installer fetches; a non-string is stored inline as JSON. (3) **`schedule.job` has dual semantics** — with an exactly five-field `schedule.default` it installs recurring cron; without it the script is an on-demand build hook. In either mode the script declares its interpreter with an absolute shebang; the platform never guesses from its filename or executable bit. `static_assets` caps at 256 files / 16 MB each / 64 MB total and logical destination `x` is materialized at source path `static/x`.
+Optional fields the parser recognizes include `package_id`, `moved_to`, `previous_id`, `icon`, colors/display, `offline_capable`, `embeds_agent`, `offline`, `permissions`, `storage_seeds`, `static_assets`, `source_files`, `skills`, `system_prompt`, `schedule`, and `agent_activities`. `previous_id` and `previous_manifest_url` remain bounded migration aids for installs that predate permanent package identities; they are not the steady-state identity model. Decorative-only fields such as `author`, `license`, and `homepage` are not validated or stored. Three gotchas: (1) **`runtime` (`imports`/`esm_deps`) is informational**; dependency resolution is governed by the pinned self-contained compiler in `app_compile_contract.py`. (2) **`storage_seeds` value type is a switch**: a string is a repo-relative file the installer fetches; a non-string is stored inline as JSON. (3) **`schedule.job` has dual semantics** — with an exactly five-field `schedule.default` it installs recurring cron; without it the script is an on-demand build hook. In either mode the script declares its interpreter with an absolute shebang; the platform never guesses from its filename or executable bit. Logical `static_assets` destination `x` is materialized at source path `static/x`. One 64 MiB `PACKAGE_MAX_BYTES` bounds every file a package declares (entry, icon, job, source files, static assets and file seeds), summed per declaration because each is written separately (`manifest_contract.package_bytes`): HTTP and Git installs charge that sum, local apply and `validate-app.py` check it from file sizes, and Store publication bounds both it and its whole tree, so every published app is installable. Beyond the 64 KiB manifest cap and the skill and system-prompt caps that bound agent context, no declared file or file kind has its own size or count cap; Store publication also limits a release to 250 files. The compile contract refuses a compiled module larger than the 8 MiB the shell loads, so large data belongs in `static_assets`, fetched at runtime.
 
 `agent_activities` is the app-neutral presentation contract for scripts an app
 asks the chat agent to run. Each activity declares an id, a repo-relative
@@ -1892,31 +1872,41 @@ cover it deterministically.
 Connect manages per-recipient access to this instance, not screen mirroring or
 isolated accounts. `browser_access.py` owns grants (until explicitly revoked),
 hashed one-use invitations (one day), and hashed renewal sessions (30-day idle
-window). Recipient labels are owner-assigned attribution, not verified account
-identities. The invitation is a possession credential and must be delivered
-privately. The feature requires the configured HTTPS origin.
+window). Legacy invitation labels are owner-assigned attribution, not verified
+account identities; invitations are possession credentials delivered privately.
+Account grants instead pin a verified mobius.you issuer and subject. Both use the
+same local revocation and descendant-work lineage. The feature requires the
+configured HTTPS origin.
 
 `routes/browser_access.py` owns invitation management and the same-origin
 cookie exchange. A 15-minute bearer stays in memory; the renewal credential is
 HttpOnly/Secure/SameSite=Strict and path-confined to the session routes. Accepting
 a new invitation atomically retires the previous session presented by its cookie.
-Cookie exchanges use an origin-scoped Web Lock across live tabs; browsers without
-that capability fail visibly before sending an exchange. A tab dying mid-request
-can still interrupt cookie ordering; server-side grant validation remains the
-authority boundary. If cleanup of a superseded redemption fails, its cookie may
-remain restorable; the page must not imply server sign-out succeeded. Independent
-browsers may hold separate sessions.
+Only a sign-in (invite redemption or account finalization) writes that cookie,
+with a long fixed lifetime; renewal returns a bearer and never rewrites it, so a
+late renewal response cannot overwrite a newer sign-in. The server-side idle
+expiry is the authority. When two tabs sign this browser in, the last one wins
+and the other tab notices at its next renewal. Independent browsers may hold
+separate sessions.
 This never replaces the installation owner's login. `/shell/shared` owns an
 independent query cache and grant/tab-scoped navigation and drafts. Leaving ends
 that browser session, while revoking the recipient ends all their sessions.
 
-Every bearer descendant retains `browser_grant` and its epoch. Browser-derived
-app, embedded-chat and media tokens also retain the originating session. The
-central resolver checks the live grant/session rather than trusting JWT expiry.
+Every bearer descendant retains one `BrowserLineage`: the `browser_grant`, and
+for browser-derived app, embedded-chat and media tokens also the originating
+session. `browser_access.is_live` is the single rule every resolver, stream,
+writer admission, delegation, app service and Connect replay uses; it checks the
+live grant/session rather than trusting JWT expiry. Revocation is terminal
+(nothing clears `revoked_at`), so the grant id alone is sufficient lineage.
 Guest-started agent runs and child delegations retain durable grant lineage;
 renewing or resuming work cannot manufacture installation-owner authority.
 Turn-issued MCP broker capabilities also carry owner/grant lineage; upload and
-response streams stop forwarding after their authority is revoked. Bytes already
+response streams stop forwarding after their authority is revoked. Guest event
+streams and broker exchanges share `access_signal.until_revoked`: committed
+writes to access tables advance one in-process revision, and an open stream
+rechecks liveness in a worker thread only when it moves (or after a 30-second
+safety interval for out-of-process writes), so idle streams close on revocation
+and busy ones cost no query per event. Bytes already
 forwarded to a remote service cannot be recalled.
 Installation identity, credential, access administration and lifecycle controls
 remain separately gated; ordinary readable owner-input cards retain their
@@ -1929,5 +1919,38 @@ keeps its content and identity. A remote stop is not claimed until confirmed:
 survives Connect reconnection. This is trusted full workspace access, not a
 hostile-tenant sandbox: it cannot undo copied data, completed writes, publication,
 external actions or deliberate persistent machine changes. No screen relay,
-private-network tunnel, verified mobius.you guest identity, or automatic grant
-expiry is included in this version.
+private-network tunnel or automatic grant expiry is included in this version.
+
+#### Account-linked shared access
+
+`account_browser_access.py` owns a separate guest PKCE flow, never the owner's
+runtime-enrollment receipt. Connect registers a local account grant with the
+configured issuer using the existing managed broker or linked-account bearer.
+The issuer derives the owner and origin from that credential, lists active
+registrations in Shared with me, and issues one-use, identity-only proofs after
+recipient sign-in and explicit consent. Directory entries are discovery, not
+authorization. A lost registration response retries the reserved grant ID;
+revocation or account replacement racing registration cannot activate it.
+
+The callback verifies issuer, audience, subject, origin, grant, nonce and proof
+expiry, then redirects with a non-secret pending ID. It never writes the refresh
+cookie: a cross-site callback cannot receive the old SameSite=Strict cookie.
+The shared shell removes the marker and finalizes with a same-origin POST. That
+transaction consumes the browser-bound proof,
+rechecks local permission, and retires the previous browser session. Failed proof
+validation leaves that prior session unchanged. Verified proof admission expires
+within 60 seconds; old pending rows are pruned on subsequent starts.
+
+Local validation pins the issuer, runtime origin and grantor credential generation
+(or managed instance ID and owner subject). Changing those bindings invalidates
+existing account-derived sessions and credentials; Connect lists such grants as
+`inactive`, and inviting the same handle again replaces them. One live grant
+exists per handle. Revoke and unlink share `browser_access.end_grant`. Unlink commits revocation of
+all account grants before attempting descendant stops and issuer cleanup; partial
+cleanup retains the link for an explicit retry. Legacy invitation grants are not
+revoked by account unlink. Issuer-side link loss blocks discovery and new proofs;
+it does not independently push revocation into an otherwise valid local session.
+
+This protocol adds no new owner account and does not distribute owner passwords.
+Deploy both issuer and runtime implementations before offering account sharing;
+source-only tests do not activate the feature on a running installation.

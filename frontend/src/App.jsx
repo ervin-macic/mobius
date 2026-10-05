@@ -16,7 +16,7 @@ import { rememberProjectCopyRequest } from './lib/projectCopies.js'
 import { readStandaloneBoot } from './lib/standaloneBoot.js'
 import { shellReloadNavigationTransitionIsActive } from './lib/shellReloadNavigationTransition.js'
 import { opensDegradedRepairChat } from './lib/errorRecovery.js'
-import { consumeSharedBrowserInvite } from './lib/sharedBrowserInvite.js'
+import { consumeSharedBrowserEntry } from './lib/sharedBrowserInvite.js'
 import { isSharedBrowserRoute } from './lib/sharedBrowserWorkspace.js'
 
 // These flows are mutually exclusive. Keep setup, login, the full shell, and
@@ -32,8 +32,8 @@ const ProjectCopyPage = lazy(() => import('./components/Projects/ProjectCopyPage
 const SharedApp = lazy(() => import('./components/Projects/SharedApp.jsx'))
 const SharedBrowserAccess = lazy(() => import('./components/SharedBrowserAccess/SharedBrowserAccess.jsx'))
 const SHARED_BROWSER_ROUTE = isSharedBrowserRoute(window.location.pathname)
-const sharedBrowserInvite = SHARED_BROWSER_ROUTE
-  ? consumeSharedBrowserInvite(window.location, window.history) : ''
+const sharedBrowserEntry = SHARED_BROWSER_ROUTE
+  ? consumeSharedBrowserEntry(window.location, window.history) : null
 const sharedBrowserQueryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30_000 } } })
 
 // True when this SPA load is the stripped-chrome chat embed
@@ -112,7 +112,7 @@ export default function App() {
   if (SHARED_BROWSER_ROUTE) {
     return <QueryClientProvider client={sharedBrowserQueryClient}>
       <ErrorBoundary label="shared-browser-access" recoveryKey="shared-browser-access:root" canAskAgent={false}>
-        <Suspense fallback={<RouteLoading />}><SharedBrowserAccess initialInvite={sharedBrowserInvite} /></Suspense>
+        <Suspense fallback={<RouteLoading />}><SharedBrowserAccess initialEntry={sharedBrowserEntry} /></Suspense>
       </ErrorBoundary>
     </QueryClientProvider>
   }

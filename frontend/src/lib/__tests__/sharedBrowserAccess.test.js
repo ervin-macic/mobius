@@ -1,9 +1,10 @@
 /* The invitation and workspace never use owner URL or storage state. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { consumeSharedBrowserInvite, watchSharedBrowserInvites } from '../sharedBrowserInvite.js'
+import { consumeSharedBrowserEntry, watchSharedBrowserEntries } from '../sharedBrowserInvite.js'
 import { isSharedBrowserRoute, sharedBrowserShellHref, sharedBrowserStorageForGrant, sharedBrowserWorkspaceStorage, setActiveSharedBrowserGrantId } from '../sharedBrowserWorkspace.js'
 import { readAppFrameStorage, setAppFrameStorage } from '../appFrameStorage.js'
+import { isOwnerWorkspace, localStore, ownerStore, sessionStore } from '../workspaceStorage.js'
 import { persistActiveNavigation, readStoredChatId } from '../navigationPersistence.js'
 import { resolveInitialNav } from '../resolveInitialNav.js'
 
@@ -11,13 +12,13 @@ test('invitation is returned once from a fragment and removed from the URL', () 
   const calls = []
   const location = { hash: '#invite=secret%2Bvalue', pathname: '/shell/shared', search: '' }
   const history = { state: { x: 1 }, replaceState: (...args) => calls.push(args) }
-  assert.equal(consumeSharedBrowserInvite(location, history), 'secret+value')
+  assert.deepEqual(consumeSharedBrowserEntry(location, history), { kind: 'invite', value: 'secret+value' })
   assert.deepEqual(calls, [[history.state, '', '/shell/shared']])
 })
 
 test('invitation is not read from a query parameter', () => {
   const history = { replaceState: () => assert.fail('should not rewrite URL') }
-  assert.equal(consumeSharedBrowserInvite({ hash: '', pathname: '/shell/shared', search: '?invite=secret' }, history), '')
+  assert.equal(consumeSharedBrowserEntry({ hash: '', pathname: '/shell/shared', search: '?invite=secret' }, history), null)
 })
 
 test('same-document invitation hash is stripped and admitted for fresh consent exactly once', () => {
@@ -37,13 +38,13 @@ test('same-document invitation hash is stripped and admitted for fresh consent e
     },
   }
   const acceptedForConsent = []
-  const stop = watchSharedBrowserInvites(win, invite => acceptedForConsent.push(invite))
+  const stop = watchSharedBrowserEntries(win, invite => acceptedForConsent.push(invite))
   location.hash = '#invite=second%2Bgrant'
   listeners.get('hashchange')()
   assert.deepEqual(calls, ['/shell/shared'])
-  assert.deepEqual(acceptedForConsent, ['second+grant'])
+  assert.deepEqual(acceptedForConsent, [{ kind: 'invite', value: 'second+grant' }])
   listeners.get('hashchange')()
-  assert.deepEqual(acceptedForConsent, ['second+grant'])
+  assert.deepEqual(acceptedForConsent, [{ kind: 'invite', value: 'second+grant' }])
   stop()
   assert.equal(listeners.has('hashchange'), false)
 })
@@ -110,6 +111,10 @@ test('mini-app storage cannot see owner or another grant’s cache', () => {
   setActiveSharedBrowserGrantId('grant-A')
   assert.equal(setAppFrameStorage('app-1', 'note', 'guest-A'), true)
   assert.equal(readAppFrameStorage('app-1').note, 'guest-A')
+  // Renewal re-announces the same grant; caches keyed by the store survive it.
+  const store = localStore()
+  setActiveSharedBrowserGrantId('grant-A')
+  assert.equal(localStore(), store)
   setActiveSharedBrowserGrantId('grant-B')
   assert.equal(readAppFrameStorage('app-1').note, undefined)
   setActiveSharedBrowserGrantId(null)
@@ -134,6 +139,53 @@ test('unavailable sessionStorage falls back to isolated document memory, never o
   } finally {
     if (oldDescriptor) Object.defineProperty(globalThis, 'sessionStorage', oldDescriptor)
     else delete globalThis.sessionStorage
+    globalThis.location = oldLocation
+  }
+})
+
+test('account finalization is document-local, URL-stripped, and distinct from invitation consent', () => {
+  const paths = []
+  const history = { replaceState: (_state, _title, path) => paths.push(path) }
+  const entry = consumeSharedBrowserEntry({ hash: '#account-finalize=flow-123', pathname: '/shell/shared', search: '' }, history)
+  assert.deepEqual(entry, { kind: 'account', value: 'flow-123' })
+  assert.deepEqual(paths, ['/shell/shared'])
+  for (const hash of ['#account-finalize', '#invite=x&account-finalize=y', '#account-finalize=x&account-finalize=y']) {
+    assert.deepEqual(consumeSharedBrowserEntry({ hash, pathname: '/shell/shared', search: '' }, history), { kind: 'invalid' })
+  }
+})
+
+test('workspace storage is owner origin storage, or one grant store for a guest', () => {
+  const oldLocation = globalThis.location
+  const ownerLocal = { getItem: () => 'owner' }
+  const values = new Map()
+  globalThis.localStorage = ownerLocal
+  globalThis.sessionStorage = {
+    get length() { return values.size },
+    key: index => [...values.keys()][index] ?? null,
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: key => values.delete(key),
+  }
+  try {
+    globalThis.location = { pathname: '/shell/' }
+    setActiveSharedBrowserGrantId('grant-A')
+    assert.equal(isOwnerWorkspace(), true)
+    assert.equal(localStore(), ownerLocal)
+    assert.equal(ownerStore(), ownerLocal)
+    assert.equal(sessionStore(), globalThis.sessionStorage)
+
+    globalThis.location = { pathname: '/shell/shared' }
+    assert.equal(isOwnerWorkspace(), false)
+    assert.equal(ownerStore(), null)
+    const guest = localStore()
+    assert.equal(sessionStore(), guest)
+    guest.setItem('k', 'v')
+    assert.deepEqual([...values.keys()], ['mobius:shared-browser:grant-A:k'])
+    setActiveSharedBrowserGrantId(null)
+    assert.equal(localStore(), null)
+    assert.equal(sessionStore(), null)
+  } finally {
+    setActiveSharedBrowserGrantId(null)
     globalThis.location = oldLocation
   }
 })

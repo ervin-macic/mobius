@@ -5777,6 +5777,276 @@ def _add_embed_browser_lineage(eng) -> None:
         conn.execute(text(f"ALTER TABLE chat_embed_grants ADD COLUMN {name} {sqltype}"))
 
 
+def _add_browser_account_grants(eng) -> None:
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("browser_access_grants"):
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("browser_access_grants")}
+  with eng.begin() as conn:
+    for name, sqltype in (
+      ("kind", "VARCHAR(16) NOT NULL DEFAULT 'invitation'"),
+      ("issuer", "VARCHAR(255)"), ("subject", "VARCHAR(128)"),
+      ("recipient_handle", "VARCHAR(128)"), ("origin", "VARCHAR(255)"),
+      ("remote_status", "VARCHAR(24)"),
+      ("grantor_binding", "VARCHAR(128)"),
+    ):
+      if name not in columns:
+        conn.execute(text(f"ALTER TABLE browser_access_grants ADD COLUMN {name} {sqltype}"))
+    conn.execute(text("CREATE TABLE IF NOT EXISTS browser_account_pending (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), state_hash VARCHAR(64) NOT NULL UNIQUE, cookie_hash VARCHAR(64) NOT NULL, verifier VARCHAR(128) NOT NULL, nonce VARCHAR(64) NOT NULL, grant_epoch INTEGER NOT NULL, owner_token_epoch INTEGER NOT NULL, issuer VARCHAR(255) NOT NULL, subject VARCHAR(128) NOT NULL, expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP, verified_at TIMESTAMP, verified_expires_at TIMESTAMP)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_browser_account_pending_grant_id ON browser_account_pending(grant_id)"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_account_pending_cookie_hash ON browser_account_pending(cookie_hash)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_browser_account_pending_expires_at ON browser_account_pending(expires_at)"))
+
+
+def _add_goal_hold(eng) -> None:
+  """Add explicit pause attribution without inventing intent for old stops."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_goals" not in inspector.get_table_names():
+    return
+  if "hold_json" not in {c["name"] for c in inspector.get_columns("chat_goals")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_goals ADD COLUMN hold_json JSON"))
+
+
+def _add_run_owner_input_at(eng) -> None:
+  """Remember new owner admissions; never infer authority for historical runs."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "owner_input_at" not in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN owner_input_at DATETIME"))
+
+
+def _retire_quiet_write_sessions(eng) -> None:
+  """Never resume a provider session that may hold the quiet-write instruction.
+
+  The instruction rode on every turn from the moment the write journal was
+  added (0078) until this release, and a resumed session keeps its own
+  history, so the model keeps emitting frames nothing reads any more: raw text
+  in the reply and a lost save. Every session a run used in that window is
+  retired, and so is each chat's current session if the chat ran in it, which
+  also covers runs that died before recording their session (a missing link is
+  added already retired). A helper's
+  session pointer is cleared instead (shared-host helpers resume through it
+  rather than a session link), so its next follow-up gets the ordinary
+  no-replay refusal. Idempotent; chat history is untouched.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+  tables = set(sa_inspect(eng).get_table_names())
+  if "chat_session_links" not in tables:
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("chat_session_links")}
+  with eng.begin() as conn:
+    if "resume_retired_at" not in columns:
+      conn.execute(text("ALTER TABLE chat_session_links ADD COLUMN resume_retired_at DATETIME"))
+    if not {"schema_migrations", "chat_runs", "chats"} <= tables:
+      return
+    since = conn.execute(text(
+      "SELECT applied_at FROM schema_migrations WHERE version = '0078_agent_write_journal'"
+    )).scalar()
+    if since is None:
+      return  # This database never ran with the instruction.
+    window = "SELECT chat_id FROM chat_runs WHERE started_at >= :since"
+    conn.execute(text(f"""
+      UPDATE chat_session_links SET resume_retired_at = :now
+      WHERE resume_retired_at IS NULL AND (
+        session_id IN (
+          SELECT provider_session_id FROM chat_runs
+          WHERE started_at >= :since AND provider_session_id IS NOT NULL
+        )
+        OR session_id IN (
+          SELECT session_id FROM chats
+          WHERE session_id IS NOT NULL AND id IN ({window})
+        )
+      )
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    conn.execute(text(f"""
+      INSERT INTO chat_session_links
+        (provider, session_id, chat_id, first_seen_at, last_seen_at, resume_retired_at)
+      SELECT c.provider, c.session_id, MIN(c.id), :now, :now, :now FROM chats c
+      WHERE c.session_id IS NOT NULL AND c.provider IS NOT NULL AND c.provider <> ''
+        AND length(c.session_id) <= 128 AND c.id IN ({window})
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_session_links l WHERE l.session_id = c.session_id
+        )
+      GROUP BY c.provider, c.session_id
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    if "delegations" in tables:
+      conn.execute(text(f"""
+        UPDATE chats SET session_id = NULL
+        WHERE session_id IS NOT NULL
+          AND id IN (SELECT child_chat_id FROM delegations)
+          AND id IN ({window})
+      """), {"since": since})
+
+
+def _drop_agent_write_journal(eng) -> None:
+  """Retire the text-frame write journal; saves are ordinary tool calls."""
+  from sqlalchemy import inspect as sa_inspect, text
+  tables = set(sa_inspect(eng).get_table_names())
+  with eng.begin() as conn:
+    for table in ("agent_write_intents", "agent_write_streams"):
+      if table in tables:
+        conn.execute(text(f"DROP TABLE {table}"))
+
+
+def _add_app_shell_shortcuts(eng) -> None:
+  """Per-app opt-out from shell shortcuts; see ``models.App.shell_shortcuts``.
+
+  Existing apps default to true: shell shortcuts reach every app unless its
+  manifest declares otherwise, which the next apply records.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "shell_shortcuts" in columns:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE apps ADD COLUMN shell_shortcuts BOOLEAN "
+      "NOT NULL DEFAULT TRUE"
+    ))
+
+
+def _move_chat_media_out_of_generated(eng) -> None:
+  """Move old chat images from ``generated/`` to ``media/`` and relink them.
+
+  Chat images once lived in ``chats/<id>/generated/`` and transcripts linked
+  them as ``/api/chats/<id>/generated/<name>``. Current code writes and serves
+  only ``media/``. Finding the old links needs a ``LIKE`` over every stored
+  transcript, which no index can serve, so this runs once from the ledger
+  instead of at every boot.
+
+  Each step leaves a readable state if interrupted: copy into ``media/`` (the
+  old copy stays), commit the link rewrite, then delete the old copy. Name
+  collisions are checked before anything changes. A chat whose ``generated/``
+  file would replace a different ``media/`` file is left exactly as it was
+  and logged, so neither image is lost and boot is never blocked by it.
+  """
+  import filecmp
+  import logging
+  import shutil
+
+  from sqlalchemy import bindparam, inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chats" not in inspector.get_table_names():
+    return
+  columns = {column["name"] for column in inspector.get_columns("chats")}
+  transcripts = [
+    name for name in ("messages", "pending_messages") if name in columns
+  ]
+  if not transcripts:
+    return
+  chats_root = Path(os.environ.get("DATA_DIR", "/data")) / "chats"
+  legacy_link = "'%/api/chats/' || id || '/generated/%'"
+  with eng.connect() as conn:
+    chat_ids = set(conn.execute(text(
+      "SELECT id FROM chats WHERE " + " OR ".join(
+        f"CAST({name} AS TEXT) LIKE {legacy_link}" for name in transcripts
+      )
+    )).scalars())
+    # Orphaned directories without a chat row are left alone. ``os.path.isdir``
+    # never raises, so a chat folder that can be listed but not entered is
+    # skipped here and handled per chat below instead of stopping boot.
+    on_disk = sorted(
+      path.parent.name
+      for path in chats_root.glob("*/generated")
+      if os.path.isdir(path)
+    ) if os.path.isdir(chats_root) else []
+    for offset in range(0, len(on_disk), 500):
+      chat_ids.update(conn.execute(
+        text("SELECT id FROM chats WHERE id IN :ids").bindparams(
+          bindparam("ids", expanding=True),
+        ),
+        {"ids": on_disk[offset:offset + 500]},
+      ).scalars())
+
+  def old_files(chat_id: str) -> list[Path]:
+    old_dir = chats_root / chat_id / "generated"
+    # Never follow a symlink: copying its target into media/ would serve a
+    # file from outside the chat, which the media route otherwise refuses.
+    if old_dir.is_symlink() or not old_dir.is_dir():
+      return []
+    return [
+      source for source in old_dir.iterdir()
+      if source.is_file() and not source.is_symlink()
+    ]
+
+  def first_collision(sources: list[Path], media_dir: Path) -> str | None:
+    for source in sources:
+      destination = media_dir / source.name
+      if destination.exists() and (
+        not destination.is_file()
+        or not filecmp.cmp(source, destination, shallow=False)
+      ):
+        return source.name
+    return None
+
+  log = logging.getLogger(__name__)
+  for chat_id in sorted(chat_ids):
+    media_dir = chats_root / chat_id / "media"
+    # Any file error leaves this chat exactly as it was, like a collision:
+    # a one-time migration must never stop boot.
+    try:
+      sources = old_files(chat_id)
+      collision = first_collision(sources, media_dir)
+      if collision is not None:
+        log.warning(
+          "Left chat %s on legacy generated/ media: media/%s already exists "
+          "with different bytes",
+          chat_id, collision,
+        )
+        continue
+      for source in sources:
+        destination = media_dir / source.name
+        if destination.exists():
+          continue
+        media_dir.mkdir(parents=True, exist_ok=True)
+        # Copy under a temporary name so an interrupted copy never leaves a
+        # truncated file that a retry would mistake for a collision.
+        partial = media_dir / f".{source.name}.partial"
+        shutil.copy2(source, partial)
+        os.replace(partial, destination)
+    except OSError as error:
+      log.warning("Left chat %s on legacy generated/ media: %s", chat_id, error)
+      continue
+    # Bump updated_at only on chats whose links change: the browser reuses
+    # its cached copy of a chat while updated_at matches.
+    with eng.begin() as conn:
+      conn.execute(text(
+        "UPDATE chats SET " + ", ".join(
+          f"{name} = REPLACE({name}, :old, :new)" for name in transcripts
+        ) + ", updated_at = :now WHERE id = :chat_id AND (" + " OR ".join(
+          f"CAST({name} AS TEXT) LIKE :pattern" for name in transcripts
+        ) + ")"
+      ), {
+        "chat_id": chat_id,
+        "old": f"/api/chats/{chat_id}/generated/",
+        "new": f"/api/chats/{chat_id}/media/",
+        "pattern": f"%/api/chats/{chat_id}/generated/%",
+        "now": datetime.now(UTC).replace(tzinfo=None),
+      })
+    try:
+      for source in sources:
+        source.unlink()
+      old_dir = chats_root / chat_id / "generated"
+      if not old_dir.is_symlink() and old_dir.is_dir() and not any(old_dir.iterdir()):
+        old_dir.rmdir()
+    except OSError as error:
+      log.warning(
+        "Moved chat %s media but could not remove the old generated/ copy: %s",
+        chat_id, error,
+      )
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5869,6 +6139,15 @@ _SCHEMA_MIGRATIONS = (
   ("0079_chat_run_browser_lineage", _add_chat_run_browser_lineage),
   ("0080_embed_browser_lineage", _add_embed_browser_lineage),
   ("0078_agent_write_journal", _add_agent_write_journal),
+  ("0081_browser_account_grants", _add_browser_account_grants),
+  ("0081_goal_hold", _add_goal_hold),
+  ("0082_run_owner_input_at", _add_run_owner_input_at),
+  ("0082_drop_agent_write_journal", _drop_agent_write_journal),
+  # Window-based, so it needs no journal. A new ID (not an edited 0082) so
+  # databases that ran an earlier, journal-based draft also run this once.
+  ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
+  ("0084_chat_media_directory", _move_chat_media_out_of_generated),
+  ("0085_app_shell_shortcuts", _add_app_shell_shortcuts),
 )
 
 

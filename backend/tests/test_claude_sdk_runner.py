@@ -2229,6 +2229,87 @@ def test_dispatch_assistant_empty_text_block_is_silent():
   assert bus.events == []
 
 
+def test_failed_api_attempts_surface_as_one_error_not_prose():
+  """The CLI reports each failed API attempt (here a safety refusal it retried
+  once) as a synthetic assistant message carrying `error`, then ends the turn
+  with an error result holding the same report. Only the result may surface:
+  the attempts are not model prose, so the chat shows one error block."""
+  def refusal(request_id: str) -> AssistantMessage:
+    return AssistantMessage(
+      content=[TextBlock(text=f"API Error: flagged.\n\nRequest ID: {request_id}")],
+      model="<synthetic>",
+      error="invalid_request",
+      stop_reason="refusal",
+    )
+
+  bus = _Bus()
+  session_id = None
+  for message in (refusal("req_1"), refusal("req_2")):
+    session_id, terminal = dispatch_sdk_message(message, bus, session_id)
+    assert terminal is None
+  _, terminal = dispatch_sdk_message(ResultMessage(
+    subtype="success",
+    duration_ms=20,
+    duration_api_ms=15,
+    is_error=True,
+    num_turns=1,
+    session_id="sess-1",
+    stop_reason="refusal",
+    total_cost_usd=0.0,
+    result="API Error: flagged.\n\nRequest ID: req_2",
+  ), bus, session_id)
+
+  assert [e for e in bus.events if e["type"] in ("text", "text_final")] == []
+  assert terminal["error"] == "API Error: flagged.\n\nRequest ID: req_2"
+
+
+def test_failed_api_call_keeps_the_last_real_context_size():
+  """The CLI's synthetic error message carries zeroed usage. It is not a
+  model call, so neither the live meter nor the saved context size may
+  drop to 0 after it: both keep the last real call's occupancy."""
+  bus = _Bus()
+  usage_state: dict = {}
+  real_call = AssistantMessage(
+    content=[TextBlock(text="Working on it.")],
+    model="claude-opus",
+    usage={
+      "input_tokens": 10,
+      "cache_creation_input_tokens": 200,
+      "cache_read_input_tokens": 3_000,
+      "output_tokens": 5,
+    },
+  )
+  failed_call = AssistantMessage(
+    content=[TextBlock(text="API Error: overloaded")],
+    model="<synthetic>",
+    error="server_error",
+    usage={
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0,
+    },
+  )
+  for message in (real_call, failed_call):
+    dispatch_sdk_message(message, bus, None, usage_state=usage_state)
+  _, terminal = dispatch_sdk_message(ResultMessage(
+    subtype="success",
+    duration_ms=20,
+    duration_api_ms=15,
+    is_error=True,
+    num_turns=1,
+    session_id="sess-1",
+    total_cost_usd=0.0,
+    usage={"input_tokens": 3_210, "output_tokens": 5},
+    result="API Error: overloaded",
+  ), bus, None, usage_state=usage_state)
+
+  context = [e["input_tokens"] for e in bus.events if e["type"] == "context_usage"]
+  assert context == [3_210]
+  assert terminal["usage_metrics"]["latest_model_input_tokens"] == 3_210
+  assert terminal["error"] == "API Error: overloaded"
+
+
 def test_each_root_model_call_publishes_its_live_context_occupancy():
   bus = _Bus()
   msg = AssistantMessage(

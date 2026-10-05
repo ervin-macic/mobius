@@ -17,6 +17,7 @@ from sqlalchemy import Text, case, cast, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.chat_handoffs import project_handoff
 from app import (
   activity,
   auth,
@@ -51,10 +52,11 @@ from app.chat import (
   mark_chat_deleted,
   recover_chat_generation,
   stop_chat_for,
-  usage_limit_waiting_chat_ids,
+  continuation_handoff_for_chat,
   continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
+from app.chat_compaction_state import compaction_kind
 from app.recovery_notifications import (
   complete_recovery_action,
   publish_recovery_notification,
@@ -71,7 +73,7 @@ from app.chat_titles import (
 )
 from app.database import get_db
 from app.delegations import background_helper_chat_ids, serialize_background_helpers
-from app.goal_plans import presented_goal
+from app.goal_plans import presented_goal, presented_deferred_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
 from app.owner_input import OwnerInputKind
@@ -446,27 +448,24 @@ def issue_media_token(
       app_nonce=principal.app_instance_id,
       chat_id=chat_id,
       session_id=principal.embed_session_id,
-      browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
-      browser_session_id=principal.browser_session_id,
+      browser=principal.browser,
     )
   else:
     token = auth.create_media_token(
       chat_id=chat_id,
       owner_username=principal.owner.username,
       token_epoch=principal.owner.token_epoch,
-      browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
-      browser_session_id=principal.browser_session_id,
+      browser=principal.browser,
     )
   return {"token": token, "expires_in": 900}
+
 
 
 def _owner_chat_summary(
   chat,
   *,
   durable_running: bool = False,
-  durable_waiting: bool = False,
+  handoff: dict | None = None,
   transient_owner_input_kind: OwnerInputKind | None = None,
   unseen_failure_version: int | None = None,
   project_ref: dict | None = None,
@@ -493,7 +492,8 @@ def _owner_chat_summary(
     # Waiting is durable idle work, distinct from an agent actively streaming.
     # The drawer renders it explicitly rather than making an armed chat look
     # inactive or overloading the running indicator.
-    "waiting": durable_waiting,
+    "waiting": bool(handoff and handoff["kind"] == "automatic"),
+    "handoff": handoff or {"kind": "none", "reason": None},
     # A turn parked on the owner's AskUserQuestion answer is `running` but is
     # NOT streaming — nothing to interrupt, and the card is durable — so the
     # shell excludes it from the reload-defer's active-turn test. The durable
@@ -770,6 +770,7 @@ def _chat_detail_response(
     "total": total,
     "offset": start,
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
     "runtime_revision": runtime_revision,
@@ -810,6 +811,14 @@ def _chat_detail_response(
       if expose_session else {"count": 0, "items": []}
     ),
   }
+  response["handoff"] = project_handoff(
+    owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
+    running=running,
+    waits=response["waits"],
+    helper_count=response["background_helpers"]["count"],
+    park=continuation_handoff_for_chat(db, chat.id),
+    goal=response["goal"],
+  )
   if requested_anchor_found is not None:
     response["requested_anchor_found"] = requested_anchor_found
   return response
@@ -906,11 +915,14 @@ def list_chats(
     # owner conversation into the drawer by setting owner_visible at creation.
     chats = [c for c in chats if _visible_in_owner_drawer(c)]
   durable_running = running_chat_ids(db, (chat.id for chat in chats))
-  durable_waiting = (
-    outstanding_wait_chat_ids(db)
-    | background_helper_chat_ids(db, (chat.id for chat in chats))
-    | usage_limit_waiting_chat_ids(db, (chat.id for chat in chats))
-  )
+  wait_chat_ids = outstanding_wait_chat_ids(db)
+  helper_chat_ids = background_helper_chat_ids(db, (chat.id for chat in chats))
+  park_candidates = {
+    row[0] for row in db.query(models.ChatRun.chat_id).filter(
+      models.ChatRun.chat_id.in_([chat.id for chat in chats]),
+      models.ChatRun.status.in_(("parked", "resume_pending")),
+    ).distinct().all()
+  }
   unseen_failures = chat_failure_activity.unseen_versions(
     db, (chat.id for chat in chats),
   )
@@ -920,14 +932,29 @@ def list_chats(
       "shell_chat_list_first_response",
       chat_count=len(chats),
     )
-  return [
-    _owner_chat_summary(
+  deferred_goals = presented_deferred_goals(db, (chat.id for chat in chats))
+  result = []
+  for chat in chats:
+    owner_kind = "question" if chat.pending_question_id is not None else (
+      "secure_input" if chat.id in secure_input_chats else None
+    )
+    waits = [serialize_wait(row, db=db) for row in outstanding_waits_for_chat(db, chat.id)] \
+      if chat.id in wait_chat_ids else []
+    park = continuation_handoff_for_chat(db, chat.id) if chat.id in park_candidates \
+      else {"kind": "none", "reason": None}
+    handoff = project_handoff(
+      owner_input=bool(owner_kind),
+      running=chat.id in durable_running or is_chat_running(chat.id),
+      waits=waits,
+      helper_count=1 if chat.id in helper_chat_ids else 0,
+      park=park,
+      goal=deferred_goals.get(chat.id),
+    )
+    result.append(_owner_chat_summary(
       chat,
       durable_running=chat.id in durable_running,
-      durable_waiting=chat.id in durable_waiting,
-      transient_owner_input_kind=(
-        "secure_input" if chat.id in secure_input_chats else None
-      ),
+      handoff=handoff,
+      transient_owner_input_kind=owner_kind,
       unseen_failure_version=unseen_failures.get(chat.id),
       project_ref=(
         {
@@ -936,12 +963,10 @@ def list_chats(
           "root_path": chat.project_root_path,
           "color": chat.project_color,
         }
-        if chat.project_ref_id is not None
-        else None
+        if chat.project_ref_id is not None else None
       ),
-    )
-    for chat in chats
-  ]
+    ))
+  return result
 
 
 class ChatFailureSeenRequest(BaseModel):
@@ -1811,8 +1836,9 @@ def get_chat_runtime(
   )
   running = is_chat_running(chat.id)
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
-  return {
+  response = {
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
@@ -1833,6 +1859,14 @@ def get_chat_runtime(
       if principal.scope != "chat_embed" else {"count": 0, "items": []}
     ),
   }
+  response["handoff"] = project_handoff(
+    owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
+    running=running, waits=response["waits"],
+    helper_count=response["background_helpers"]["count"],
+    park=continuation_handoff_for_chat(db, chat.id),
+    goal=response["goal"],
+  )
+  return response
 
 
 @router.get("/{chat_id}/message-sources")
@@ -2197,29 +2231,6 @@ def get_thinking_trace_by_id(
       "X-Thinking-Complete": "1" if row.complete else "0",
     },
   )
-
-
-@router.get("/{chat_id}/write-outcomes/{run_id}/{operation_id}")
-def get_chat_write_outcome(
-  chat_id: str, run_id: str, operation_id: str,
-  _: models.Owner = Depends(get_current_owner),
-  db: Session = Depends(get_db),
-):
-  """Read one original write for repair, without replay or execution authority.
-
-  Like agent-context, this is owner/owner-agent observability, not an app or
-  shared-frame surface. Arguments are never automatically stuffed into failure
-  context; the agent retrieves one bounded operation only when it needs it.
-  """
-  get_active_chat_or_404(db, chat_id, load_fields=())
-  row = db.query(models.AgentWriteIntent).filter_by(
-    chat_id=chat_id, source_run_id=run_id, operation_id=operation_id,
-  ).first()
-  if row is None:
-    raise HTTPException(status_code=404, detail="Write outcome not found.")
-  return {"run_id": run_id, "id": row.operation_id, "tool": row.tool,
-          "arguments": json.loads(row.arguments_json), "status": row.status,
-          "stage": row.stage, "reason": row.reason}
 
 
 @router.get("/{chat_id}/agent-context")
@@ -2694,6 +2705,7 @@ async def _compact_chat_locked(
   db: Session,
 ):
   """Run one provider switch while settings PATCHes are excluded."""
+  from app.chat_compaction_state import compacting
   from app.chat_writer import (
     SwitchProviderWithCompaction, await_ack, get_writer,
     messages_fingerprint,
@@ -2786,116 +2798,119 @@ async def _compact_chat_locked(
   if auth_error is not None:
     raise HTTPException(status_code=409, detail=auth_error)
 
-  messages = list(chat.messages or [])
-  source_messages_hash = messages_fingerprint(messages)
-  source_summary = load_cumulative_summary(data_dir, chat_id)
-  source_summary_hash = (
-    hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
-    if source_summary is not None
-    else None
-  )
-  try:
-    summary = await summarize_chat(
-      messages,
+  # Only a switch that will actually run marks the chat; refused or replayed
+  # requests return above without flashing the notice in every view.
+  with compacting(chat_id, "provider_switch"):
+    messages = list(chat.messages or [])
+    source_messages_hash = messages_fingerprint(messages)
+    source_summary = load_cumulative_summary(data_dir, chat_id)
+    source_summary_hash = (
+      hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
+      if source_summary is not None
+      else None
+    )
+    try:
+      summary = await summarize_chat(
+        messages,
+        data_dir=data_dir,
+        provider_id=body.provider,
+        source_summary=source_summary,
+        model=settings_patch.get("model"),
+        effort=settings_patch.get("effort"),
+      )
+    except CompactionError as exc:
+      raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+      log.warning(
+        "provider-switch synthesis failed for chat %s: %s", chat_id, exc,
+      )
+      raise HTTPException(
+        status_code=502,
+        detail="The incoming provider could not prepare the chat.",
+      )
+
+    # The note is a separate file the agent saves as it works. If it was
+    # rewritten while synthesis ran, retry from the fresh detailed source rather
+    # than committing a handoff the incoming provider derived from stale data.
+    latest_summary = load_cumulative_summary(data_dir, chat_id)
+    latest_hash = (
+      hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
+      if latest_summary is not None
+      else None
+    )
+    if latest_hash != source_summary_hash:
+      raise HTTPException(
+        status_code=409,
+        detail=(
+          "The chat summary changed while preparing the switch. Try again."
+        ),
+      )
+
+    ack = get_writer().submit(
+      SwitchProviderWithCompaction(
+        chat_id=chat_id,
+        switch_id=body.switch_id,
+        expected_provider=source_provider,
+        provider=body.provider,
+        settings_patch=settings_patch,
+        summary=summary,
+        source_messages_hash=source_messages_hash,
+        source_summary_hash=source_summary_hash,
+        data_dir=data_dir,
+        request_fingerprint=request_fingerprint,
+      )
+    )
+    try:
+      result = await await_ack(ack)
+    except Exception:
+      raise HTTPException(
+        status_code=503, detail="Could not save the provider switch; try again."
+      )
+    if result.get("status") == "conflict":
+      reason = result.get("reason")
+      if reason == "busy":
+        detail = "Chat is busy — finish or stop the turn before switching."
+      elif reason == "provider_pinned":
+        detail = (
+          "This chat runs in the background and stays on its original "
+          "provider; its provider can't be switched."
+        )
+      elif reason == "request_mismatch":
+        detail = "That provider-switch request id has different settings."
+      else:
+        detail = "The chat changed while preparing the switch. Try again."
+      raise HTTPException(status_code=409, detail=detail)
+
+    # The actor used its own session. Refresh this request's identity map before
+    # mirroring the committed choice to new-chat defaults.
+    db.expire_all()
+    settings_obj = _coerce_agent_settings(result.get("agent_settings_json"))
+    _mirror_agent_defaults(
+      db,
       data_dir=data_dir,
       provider_id=body.provider,
-      source_summary=source_summary,
-      model=settings_patch.get("model"),
-      effort=settings_patch.get("effort"),
+      settings_obj=settings_obj,
     )
-  except CompactionError as exc:
-    raise HTTPException(status_code=422, detail=str(exc))
-  except Exception as exc:
-    log.warning(
-      "provider-switch synthesis failed for chat %s: %s", chat_id, exc,
-    )
-    raise HTTPException(
-      status_code=502,
-      detail="The incoming provider could not prepare the chat.",
-    )
-
-  # The note is a separate file the agent saves as it works. If it was
-  # rewritten while synthesis ran, retry from the fresh detailed source rather
-  # than committing a handoff the incoming provider derived from stale data.
-  latest_summary = load_cumulative_summary(data_dir, chat_id)
-  latest_hash = (
-    hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
-    if latest_summary is not None
-    else None
-  )
-  if latest_hash != source_summary_hash:
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        "The chat summary changed while preparing the switch. Try again."
-      ),
-    )
-
-  ack = get_writer().submit(
-    SwitchProviderWithCompaction(
-      chat_id=chat_id,
-      switch_id=body.switch_id,
-      expected_provider=source_provider,
-      provider=body.provider,
-      settings_patch=settings_patch,
-      summary=summary,
-      source_messages_hash=source_messages_hash,
-      source_summary_hash=source_summary_hash,
-      data_dir=data_dir,
-      request_fingerprint=request_fingerprint,
-    )
-  )
-  try:
-    result = await await_ack(ack)
-  except Exception:
-    raise HTTPException(
-      status_code=503, detail="Could not save the provider switch; try again."
-    )
-  if result.get("status") == "conflict":
-    reason = result.get("reason")
-    if reason == "busy":
-      detail = "Chat is busy — finish or stop the turn before switching."
-    elif reason == "provider_pinned":
-      detail = (
-        "This chat runs in the background and stays on its original "
-        "provider; its provider can't be switched."
+    if result.get("status") == "committed":
+      activity.log_event(
+        "provider_switch",
+        chat_id=chat_id,
+        provider=body.provider,
+        from_provider=source_provider,
       )
-    elif reason == "request_mismatch":
-      detail = "That provider-switch request id has different settings."
-    else:
-      detail = "The chat changed while preparing the switch. Try again."
-    raise HTTPException(status_code=409, detail=detail)
 
-  # The actor used its own session. Refresh this request's identity map before
-  # mirroring the committed choice to new-chat defaults.
-  db.expire_all()
-  settings_obj = _coerce_agent_settings(result.get("agent_settings_json"))
-  _mirror_agent_defaults(
-    db,
-    data_dir=data_dir,
-    provider_id=body.provider,
-    settings_obj=settings_obj,
-  )
-  if result.get("status") == "committed":
-    activity.log_event(
-      "provider_switch",
-      chat_id=chat_id,
-      provider=body.provider,
-      from_provider=source_provider,
-    )
-
-  return {
-    "ok": True,
-    "protocol": "provider-switch-v1",
-    "switch_id": body.switch_id,
-    "summary": (result.get("stored") or {}).get("content", ""),
-    "stored": result.get("stored"),
-    "provider": body.provider,
-    "agent_settings_json": settings_obj or None,
-    "effective": providers.effective_agent_settings(
-      data_dir, settings_obj or None, provider=body.provider,
-    ),
-  }
+    return {
+      "ok": True,
+      "protocol": "provider-switch-v1",
+      "switch_id": body.switch_id,
+      "summary": (result.get("stored") or {}).get("content", ""),
+      "stored": result.get("stored"),
+      "provider": body.provider,
+      "agent_settings_json": settings_obj or None,
+      "effective": providers.effective_agent_settings(
+        data_dir, settings_obj or None, provider=body.provider,
+      ),
+    }
 
 
 @router.post(
@@ -2921,6 +2936,7 @@ async def compact_chat(
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
   )
+  from app.chat_compaction_state import compacting
   from app.compaction import (
     CompactionError, summarize_chat,
   )
@@ -2944,67 +2960,70 @@ async def compact_chat(
         status_code=409,
         detail="Chat is busy — finish or stop the current turn before compacting.",
       )
-    source_provider = chat.provider or "claude"
-    messages = list(chat.messages or [])
-    data_dir = get_settings().data_dir
-    try:
+    # Other tabs, panes and devices learn the chat is busy from this state;
+    # a send made meanwhile waits on the transition lock above.
+    with compacting(chat_id, "compact"):
+      source_provider = chat.provider or "claude"
+      messages = list(chat.messages or [])
+      data_dir = get_settings().data_dir
       try:
-        note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
-      except OSError:
-        note = ""
-      source_summary = extract_cumulative_summary(note)
-      source_messages = messages
-      source_note_hash = None
+        try:
+          note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
+        except OSError:
+          note = ""
+        source_summary = extract_cumulative_summary(note)
+        source_messages = messages
+        source_note_hash = None
+        try:
+          source_summary, source_messages = recovery_source(note, messages)
+        except ValueError:
+          # Legacy or changed notes cannot replace history. Preserve the old
+          # full-transcript backstop, including its existing work limits.
+          pass
+        else:
+          source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
+        instructions = body.instructions if body is not None else None
+        settings_obj = chat.agent_settings_json or {}
+        summary = await summarize_chat(
+          source_messages,
+          data_dir=data_dir,
+          provider_id=source_provider,
+          source_summary=source_summary,
+          model=settings_obj.get("model"),
+          effort=settings_obj.get("effort"),
+          custom_instructions=instructions,
+        )
+      except CompactionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+      except Exception as exc:
+        log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
+        raise HTTPException(
+          status_code=502, detail="The summarize turn failed; not compacting."
+        )
       try:
-        source_summary, source_messages = recovery_source(note, messages)
-      except ValueError:
-        # Legacy or changed notes cannot replace history. Preserve the old
-        # full-transcript backstop, including its existing work limits.
-        pass
-      else:
-        source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
-      instructions = body.instructions if body is not None else None
-      settings_obj = chat.agent_settings_json or {}
-      summary = await summarize_chat(
-        source_messages,
-        data_dir=data_dir,
-        provider_id=source_provider,
-        source_summary=source_summary,
-        model=settings_obj.get("model"),
-        effort=settings_obj.get("effort"),
-        custom_instructions=instructions,
-      )
-    except CompactionError as exc:
-      raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-      log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
-      raise HTTPException(
-        status_code=502, detail="The summarize turn failed; not compacting."
-      )
-    try:
-      result = await await_ack(get_writer().submit(PersistCompaction(
-        chat_id=chat_id,
-        run_token=alloc_run_token(),
-        summary=summary,
-        expected_provider=source_provider,
-        source_messages_hash=messages_fingerprint(messages),
-        source_note_hash=source_note_hash,
-      )))
-    except Exception:
-      raise HTTPException(
-        status_code=503, detail="Could not store the compaction; try again."
-      )
-    if result.get("status") == "conflict":
-      raise HTTPException(
-        status_code=409,
-        detail="The chat changed while compacting. Try again.",
-      )
-    return {
-      "ok": True,
-      "summary": summary,
-      "command": f"POST /api/chats/{chat_id}/compact",
-      "stored": result.get("stored"),
-    }
+        result = await await_ack(get_writer().submit(PersistCompaction(
+          chat_id=chat_id,
+          run_token=alloc_run_token(),
+          summary=summary,
+          expected_provider=source_provider,
+          source_messages_hash=messages_fingerprint(messages),
+          source_note_hash=source_note_hash,
+        )))
+      except Exception:
+        raise HTTPException(
+          status_code=503, detail="Could not store the compaction; try again."
+        )
+      if result.get("status") == "conflict":
+        raise HTTPException(
+          status_code=409,
+          detail="The chat changed while compacting. Try again.",
+        )
+      return {
+        "ok": True,
+        "summary": summary,
+        "command": f"POST /api/chats/{chat_id}/compact",
+        "stored": result.get("stored"),
+      }
 
 
 # An app that opens a chat ABOUT one of its dated reports passes the report's
@@ -3257,7 +3276,7 @@ def _app_chat_started(chat: models.Chat, db: Session) -> bool:
     or chat.session_id
     or is_chat_running(chat.id)
     or has_nonterminal_run(db, chat.id)
-    or (goal and goal.get("status") in {"running", "paused", "completed"})
+    or (goal and goal.get("status") in {"active", "paused", "completed", "cannot_complete", "cancelled"})
   )
 
 

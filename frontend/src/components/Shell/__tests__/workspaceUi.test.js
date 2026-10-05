@@ -207,6 +207,10 @@ test('genuine hidden failures have durable red drawer attention while restart pa
   assert.match(failureRule, /border-radius:\s*50%/)
   assert.match(failureRule, /background:\s*var\(--danger\)/)
   assert.doesNotMatch(failureRule, /transform:/)
+  assert.match(drawer, /recovery \? \([\s\S]*?className="drawer__recovery-icon"/)
+  const recoveryRule = drawerCss.match(/\.drawer__recovery-icon\s*\{[\s\S]*?\}/)?.[0] || ''
+  assert.match(recoveryRule, /border:/)
+  assert.doesNotMatch(recoveryRule, /--danger/)
 })
 
 test('post-drag click suppression is source-scoped and expires on fresh input', () => {
@@ -938,7 +942,7 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
   )
   assert.match(
     drawer,
-    /needsOwnerInput \? \([\s\S]*?drawer__owner-input-dot[\s\S]*?: streaming \? \([\s\S]*?drawer__streaming-dot[\s\S]*?: waiting \? \([\s\S]*?drawer__waiting-icon[\s\S]*?: attention \? \([\s\S]*?drawer__attention-dot/,
+    /ownerRequired \? \([\s\S]*?drawer__owner-input-dot[\s\S]*?: streaming \? \([\s\S]*?drawer__streaming-dot[\s\S]*?: waiting \? \([\s\S]*?drawer__waiting-icon[\s\S]*?: attention \? \([\s\S]*?drawer__attention-dot/,
     'owner input and active work must precede durable waiting and unseen completion',
   )
   assert.match(drawer, /drawer__attention-diamond drawer__owner-input-dot/)

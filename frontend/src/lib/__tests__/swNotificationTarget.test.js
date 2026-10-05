@@ -90,9 +90,11 @@ test('a malformed intent is dropped but the app still opens', () => {
 test('targets without an intent are unchanged', () => {
   assert.equal(safeTarget('/shell/?app=pages'), '/shell/?app=pages')
   assert.equal(safeTarget('/shell/?chat=abc'), '/shell/?chat=abc')
-  // The worker's click handler adds this focus instruction only for the
-  // answer-alert title; the generic sanitizer must not grant it to other push.
-  assert.equal(safeTarget('/shell/?chat=abc&focus=question'), '/shell/?chat=abc')
+  // An owner-input card's notification carries its focus instruction in the
+  // target itself; nothing else on a chat link survives the sanitizer.
+  assert.equal(safeTarget('/shell/?chat=abc&focus=question'), '/shell/?chat=abc&focus=question')
+  assert.equal(safeTarget('/shell/?chat=abc&focus=other'), '/shell/?chat=abc')
+  assert.equal(safeTarget('/shell/?chat=abc&intent=x'), '/shell/?chat=abc')
   assert.equal(safeTarget('/shell/'), '/shell/')
 })
 

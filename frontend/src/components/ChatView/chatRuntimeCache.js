@@ -24,18 +24,36 @@ export function normalizeBackgroundHelpers(value) {
   return { count, items }
 }
 
-export function chatHasSelfResumingHandoff({
+/** Distinguish an eligible automatic handoff from an owner barrier or recovery. */
+export function classifyChatHandoff({
   turnActive = false,
+  ownerInput = false,
   waits = [],
   backgroundHelpers = null,
   resourcePause = null,
+  autoResumeEnabled = false,
+  authoritativeHandoff = null,
 } = {}) {
-  const helpers = normalizeBackgroundHelpers(backgroundHelpers)
-  return !turnActive && (
-    (Array.isArray(waits) && waits.length > 0)
-    || helpers.count > 0
-    || !!resourcePause
+  if (ownerInput) return 'owner_input'
+  if (turnActive) return 'working'
+  if (authoritativeHandoff?.kind) return authoritativeHandoff.kind
+  const blockers = (Array.isArray(waits) ? waits : [])
+    .filter(wait => wait?.delivery_pending)
+    .map(wait => wait.resume_blocker)
+  if (blockers.includes('owner_input')) return 'owner_input'
+  if (blockers.some(blocker => ['manual_resume', 'resume_failed', 'restart'].includes(blocker))) return 'recovery'
+  const eligibleWait = (Array.isArray(waits) ? waits : []).some(wait =>
+    !wait?.delivery_pending || [
+      null, 'platform_restart', 'restoring_edits', 'provider_park', 'live_turn',
+    ].includes(wait.resume_blocker),
   )
+  const kind = resourcePause?.pause?.kind
+  const eligibleResource = ['memory', 'storage'].includes(kind)
+    || (['rate_limit', 'usage_limit', 'limit'].includes(kind) && autoResumeEnabled)
+  if (eligibleWait || normalizeBackgroundHelpers(backgroundHelpers).count > 0 || eligibleResource) {
+    return 'automatic'
+  }
+  return 'none'
 }
 
 function runtimeFieldMatches(current, field, value) {
@@ -44,6 +62,7 @@ function runtimeFieldMatches(current, field, value) {
   }
   if (
     field === 'goal'
+    || field === 'handoff'
     || field === 'chatInfo'
     || field === 'background_helpers'
   ) {

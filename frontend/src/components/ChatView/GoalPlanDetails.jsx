@@ -11,8 +11,8 @@ function taskMeta(task, tasksById) {
       : 'In progress'
   }
   if (task.status === 'completed') return 'Complete'
-  if (task.status === 'blocked') return task.note || 'Blocked'
-  if (task.status === 'failed') return task.note || 'Failed'
+  if (task.status === 'blocked') return task.note ? `Blocked · ${task.note}` : 'Blocked'
+  if (task.status === 'failed') return task.note ? `Failed · ${task.note}` : 'Failed'
   if (task.status === 'cancelled') return 'Cancelled'
   if (task.ready) return 'Ready'
   const waiting = (task.waiting_on || [])
@@ -69,9 +69,10 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
   )
 }
 
-export default function GoalPlanDetails({ plan }) {
+export default function GoalPlanDetails({ plan, holdReason = null }) {
+  const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
-  if (!tasks.length) return null
+  if (!tasks.length && !reason) return null
   const tasksById = new Map(tasks.map(task => [task.id, task]))
   const delegations = Array.isArray(plan?.delegations) ? plan.delegations : []
   // Each helper records the plan task it works on (plan_task) when it starts;
@@ -121,6 +122,7 @@ export default function GoalPlanDetails({ plan }) {
   }
   return (
     <div className="chat__goal-plan" role="region" aria-label="Goal details" tabIndex={0}>
+      {reason && <p className="chat__goal-result">{reason}</p>}
       <div className="chat__goal-plan-tasks" role="list" aria-label="Full goal todo list">
         {(childrenByParent.get(null) || []).map(task => renderBranch(task))}
         {unfiledHelpers.map(node => renderDelegation(node))}

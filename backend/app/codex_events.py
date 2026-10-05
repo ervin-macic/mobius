@@ -95,6 +95,23 @@ def _extract_rate_limit_reset(snapshot) -> tuple[int | None, bool]:
   return best_reset, reached
 
 
+_CREDITS_DEPLETED_REACHED_TYPES = frozenset({
+  "workspace_owner_credits_depleted",
+  "workspace_member_credits_depleted",
+})
+
+
+def _rate_limit_credits_depleted(snapshot) -> bool:
+  """Whether a RateLimitSnapshot says the cap reached is depleted credits.
+
+  Credits do not refill at a reset time, unlike the other reached types.
+  """
+  reached_type = getattr(snapshot, "rate_limit_reached_type", None)
+  return getattr(reached_type, "value", reached_type) in (
+    _CREDITS_DEPLETED_REACHED_TYPES
+  )
+
+
 def _model_dump(value: Any) -> Any:
   """Turns provider SDK objects into plain JSON-safe values."""
   return json_safe(value)

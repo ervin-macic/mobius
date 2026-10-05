@@ -6,21 +6,35 @@ const FRAME_CAP_H = 480
 const FRAME_VIEWPORT_FRACTION = 0.6
 const DEFAULT_VIEWPORT_H = 800
 
-export function imageDimensionsForHref(href, mediaDimensions) {
-  if (!href || typeof href !== 'string' || !mediaDimensions) return null
-  let pathname
+function mediaPathname(href) {
+  if (!href || typeof href !== 'string') return null
   try {
-    pathname = new URL(href, 'https://mobius.local').pathname
+    return new URL(href, 'https://mobius.local').pathname
   } catch {
     return null
   }
-  const value = mediaDimensions[pathname]
+}
+
+export function imageDimensionsForHref(href, mediaDimensions) {
+  const pathname = mediaDimensions ? mediaPathname(href) : null
+  const value = pathname ? mediaDimensions[pathname] : null
   if (!value || !Number.isInteger(value.width) || !Number.isInteger(value.height)) {
     return null
   }
   const { width, height } = value
   if (width <= 0 || height <= 0) return null
   return { width, height }
+}
+
+/**
+ * True only when the server looked at this image and recorded it as
+ * unreadable (an explicit null). A path missing from the map is unknown, not
+ * broken: the map belongs to the saved text, while the displayed text can be
+ * newer (live stream, promotion, joined steer replay).
+ */
+export function imageUnreadableForHref(href, mediaDimensions) {
+  const pathname = mediaDimensions ? mediaPathname(href) : null
+  return pathname != null && mediaDimensions[pathname] === null
 }
 
 /**

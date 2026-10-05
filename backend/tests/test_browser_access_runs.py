@@ -49,21 +49,21 @@ def test_run_lineage_revalidation_and_guest_steer_boundary(tmp_path):
     db.add(chat)
     db.add(models.ChatRun(
       id='run', chat_id='chat', root_run_id='run', status='running',
-      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+      browser_grant_id=grant.id,
     ))
     db.commit()
-    _require_browser_grant(db, grant.id, grant.epoch)
-    assert _root_browser_lineage(db, 'run') == (grant.id, grant.epoch)
-    guest = SimpleNamespace(browser_grant_id=grant.id, browser_grant_epoch=grant.epoch)
-    other = SimpleNamespace(browser_grant_id='other', browser_grant_epoch=0)
+    _require_browser_grant(db, grant.id)
+    assert _root_browser_lineage(db, 'run') == grant.id
+    guest = SimpleNamespace(browser_grant_id=grant.id)
+    other = SimpleNamespace(browser_grant_id='other')
     owner_principal = SimpleNamespace(browser_grant_id=None)
     assert _browser_may_steer_run(db, 'chat', guest)
     assert not _browser_may_steer_run(db, 'chat', other)
     assert _browser_may_steer_run(db, 'chat', owner_principal)
     revoke_grant(db, grant.id, owner.id)
-    with pytest.raises(HTTPException):
-      _require_browser_grant(db, grant.id, grant.epoch)
-    with pytest.raises(HTTPException):
+    with pytest.raises(_PersistFailed):
+      _require_browser_grant(db, grant.id)
+    with pytest.raises(_PersistFailed):
       _root_browser_lineage(db, 'run')
     with pytest.raises(_PersistFailed):
       _root_browser_lineage(db, 'missing')
@@ -84,11 +84,11 @@ async def test_revoke_stop_rechecks_current_run_and_preserves_queue(tmp_path, mo
     db.add(models.Chat(id='owner-chat'))
     db.add(models.ChatRun(
       id='guest-run', chat_id='guest-chat', status='running',
-      browser_grant_id='grant', browser_grant_epoch=0,
+      browser_grant_id='grant',
     ))
     db.add(models.ChatRun(
       id='old-guest-run', chat_id='owner-chat', status='completed',
-      browser_grant_id='grant', browser_grant_epoch=0,
+      browser_grant_id='grant',
     ))
     db.add(models.ChatRun(
       id='new-owner-run', chat_id='owner-chat', status='running',
@@ -148,7 +148,7 @@ def test_revoked_guest_head_is_terminal_without_blocking_owner(tmp_path):
     chat = models.Chat(id='mixed-chat', provider='claude')
     guest = {
       'role': 'user', 'content': 'guest text', 'cid': 'guest-cid', 'ts': 1,
-      '_browser_grant_id': grant.id, '_browser_grant_epoch': grant.epoch,
+      '_browser_grant_id': grant.id
     }
     owner_message = {
       'role': 'user', 'content': 'owner text', 'cid': 'owner-cid', 'ts': 2,
@@ -181,8 +181,7 @@ def test_explicit_rejection_keeps_owner_queue_bytes(tmp_path):
   models.Base.metadata.create_all(eng)
   with Session(eng) as db:
     guest = {'role': 'user', 'content': 'private attempt', 'cid': 'guest',
-             'ts': 1, '_browser_grant_id': 'revoked-grant',
-             '_browser_grant_epoch': 0}
+             'ts': 1, '_browser_grant_id': 'revoked-grant'}
     owner = {'role': 'user', 'content': 'owner must continue', 'cid': 'owner',
              'ts': 2}
     db.add(models.Chat(id='chat', pending_messages=[guest, owner]))
@@ -214,11 +213,11 @@ def test_revoked_grant_cannot_commit_start_turn_after_launch_race(tmp_path):
     grant, _ = create_invitation(db, owner, 'guest')
     revoke_grant(db, grant.id, owner.id)
     actor = ChatWriterActor(session_factory=lambda: db)
-    with pytest.raises(HTTPException):
+    with pytest.raises(_PersistFailed):
       actor._start_turn(db, StartTurn(
         chat_id='chat', run_token='late-run',
         user_msg={'role': 'user', 'content': 'late', 'ts': 1, 'cid': 'late'},
-        browser_grant_id=grant.id, browser_grant_epoch=0,
+        browser_grant_id=grant.id,
       ))
     db.rollback()
     assert db.get(models.ChatRun, 'late-run') is None
@@ -238,28 +237,27 @@ def test_guest_submitted_child_under_owner_run_retains_guest_lineage(tmp_path):
     intent = DelegationIntent(app_id=None, parent_chat_id='parent',
       parent_root_run_id='owner-run', task_key='guest-work', prompt='work',
       provider='codex', model='gpt-5', effort='medium', cwd='/data',
-      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch)
+      browser_grant_id=grant.id)
     row, attached = create_or_attach_delegation(db, intent)
     assert not attached
-    assert (row.browser_grant_id, row.browser_grant_epoch) == (grant.id, grant.epoch)
+    assert row.browser_grant_id == grant.id
     from dataclasses import replace
     observed, attached = create_or_attach_delegation(db, replace(
-      intent, browser_grant_id=None, browser_grant_epoch=None))
+      intent, browser_grant_id=None))
     assert attached and observed.browser_grant_id == grant.id
     other, _ = create_invitation(db, owner, 'other guest')
     with pytest.raises(ValueError, match='browser authority'):
-      create_or_attach_delegation(db, replace(intent, browser_grant_id=other.id,
-                                             browser_grant_epoch=other.epoch))
+      create_or_attach_delegation(db, replace(intent, browser_grant_id=other.id))
     revoke_grant(db, grant.id, owner.id)
     with pytest.raises(HTTPException):
       create_or_attach_delegation(db, intent)
 
 
 def test_guest_cannot_restart_owner_or_other_guest_child():
-  owner_child = SimpleNamespace(browser_grant_id=None, browser_grant_epoch=None)
-  other_child = SimpleNamespace(browser_grant_id='other', browser_grant_epoch=0)
-  own_child = SimpleNamespace(browser_grant_id='guest', browser_grant_epoch=1)
-  guest = SimpleNamespace(browser_grant_id='guest', browser_grant_epoch=1)
+  owner_child = SimpleNamespace(browser_grant_id=None)
+  other_child = SimpleNamespace(browser_grant_id='other')
+  own_child = SimpleNamespace(browser_grant_id='guest')
+  guest = SimpleNamespace(browser_grant_id='guest')
   for child in (owner_child, other_child):
     with pytest.raises(HTTPException) as exc:
       _require_guest_child_lineage(child, guest)
@@ -272,9 +270,8 @@ def test_guest_cannot_restart_owner_or_other_guest_child():
 @pytest.mark.parametrize("operation", ["messages", "retry"])
 async def test_guest_followup_routes_reject_foreign_lineage_before_start(monkeypatch, child_grant, operation):
   from app.routes import delegations as routes
-  row = SimpleNamespace(browser_grant_id=child_grant,
-                        browser_grant_epoch=0 if child_grant else None)
-  principal = SimpleNamespace(browser_grant_id="guest", browser_grant_epoch=0)
+  row = SimpleNamespace(browser_grant_id=child_grant)
+  principal = SimpleNamespace(browser_grant_id="guest")
   monkeypatch.setattr(routes, "_row_for_principal", lambda *args: row)
   with pytest.raises(HTTPException) as denied:
     if operation == "messages":
@@ -284,3 +281,75 @@ async def test_guest_followup_routes_reject_foreign_lineage_before_start(monkeyp
       await routes.retry_delegation("child", routes.DelegationRetry(run_token="parked"),
                                     principal=principal, db=None)
   assert denied.value.status_code == 403
+
+
+@pytest.mark.parametrize('revoked', [False, True])
+def test_exact_goal_resume_inherits_target_grant_not_intervening_owner_run(tmp_path, revoked):
+  from datetime import UTC, datetime, timedelta
+  from app.chat_writer import ChatWriterActor, StartTurn
+
+  eng = create_engine(f"sqlite:///{tmp_path / 'goal-resume.db'}")
+  models.Base.metadata.create_all(eng)
+  with Session(eng) as db:
+    owner = models.Owner(username='owner', hashed_password='unused')
+    db.add(owner)
+    db.commit()
+    grant, _ = create_invitation(db, owner, 'guest')
+    base = datetime.now(UTC)
+    db.add(models.Chat(id='chat', messages=[{'role': 'user', 'content': 'Work', 'ts': 1}]))
+    db.add(models.ChatGoal(id='goal', chat_id='chat', objective='Finish work', status='stopped', revision=3))
+    db.add(models.ChatRun(
+      id='target', chat_id='chat', root_run_id='target', status='completed',
+      goal_id='goal', goal_objective='Finish work', started_at=base,
+      browser_grant_id=grant.id,
+    ))
+    db.add(models.ChatRun(
+      id='intervening', chat_id='chat', root_run_id='intervening', status='completed',
+      started_at=base + timedelta(seconds=1),
+    ))
+    db.commit()
+    if revoked:
+      revoke_grant(db, grant.id, owner.id)
+    actor = ChatWriterActor(session_factory=lambda: db)
+    command = StartTurn(chat_id='chat', run_token='resumed',
+      user_msg={'kind': 'continuation', 'continuation_reason': 'manual', 'cid': 'resume'},
+      resume_goal_id='goal', resume_goal_revision=3)
+    if revoked:
+      with pytest.raises(_PersistFailed):
+        actor._start_turn(db, command)
+      assert db.get(models.ChatRun, 'resumed') is None
+      assert db.get(models.ChatGoal, 'goal').status == 'stopped'
+    else:
+      actor._start_turn(db, command)
+      run = db.get(models.ChatRun, 'resumed')
+      assert run.browser_grant_id == grant.id
+      assert run.root_run_id == 'target' and run.goal_id == 'goal'
+
+
+def test_guest_cannot_resume_retained_owner_goal_through_its_intervening_run(tmp_path):
+  from datetime import UTC, datetime, timedelta
+  from app.chat_writer import ChatWriterActor, StartTurn
+
+  eng = create_engine(f"sqlite:///{tmp_path / 'foreign-goal.db'}")
+  models.Base.metadata.create_all(eng)
+  with Session(eng) as db:
+    owner = models.Owner(username='owner', hashed_password='unused')
+    db.add(owner)
+    db.commit()
+    grant, _ = create_invitation(db, owner, 'guest')
+    base = datetime.now(UTC)
+    db.add(models.Chat(id='chat'))
+    db.add(models.ChatGoal(id='goal', chat_id='chat', objective='Owner work', status='stopped', revision=3))
+    db.add(models.ChatRun(id='target', chat_id='chat', root_run_id='target', status='completed',
+      goal_id='goal', goal_objective='Owner work', started_at=base))
+    db.add(models.ChatRun(id='intervening', chat_id='chat', status='completed',
+      started_at=base + timedelta(seconds=1), browser_grant_id=grant.id))
+    db.commit()
+    actor = ChatWriterActor(session_factory=lambda: db)
+    with pytest.raises(_PersistFailed, match='Browser grant cannot resume a foreign run'):
+      actor._start_turn(db, StartTurn(chat_id='chat', run_token='resumed',
+        user_msg={'kind': 'continuation', 'continuation_reason': 'manual', 'cid': 'resume'},
+        browser_grant_id=grant.id,
+        resume_goal_id='goal', resume_goal_revision=3))
+    assert db.get(models.ChatRun, 'resumed') is None
+    assert db.get(models.ChatGoal, 'goal').status == 'stopped'

@@ -13,6 +13,7 @@ import {
   mintNewChatIntentId,
   newChatIsAllocating,
   newChatPresentationIsCurrent,
+  resumedNewChatPresentation,
   readNewChatIntent,
   reconcileCreatedChatGuard,
   reconcileNewChatIntentCreate,
@@ -105,12 +106,15 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   const settle = shellSource.match(
     /async function settleDraftFirstNewChat\(presentation\) \{([\s\S]*?)\n  \}\n\n  settleDraftFirstNewChatRef\.current/,
   )?.[1] || ''
-  const rotate = settle.match(
-    /if \(decision\.action === 'rotate'\) \{([\s\S]*?)\n    \}\n\n    if \(decision\.action !== 'accept'\)/,
+  assert.match(settle,
+    /if \(decision\.action === 'rotate'\) \{\s*await rotateDraftFirstNewChat\(presentation, decision\.chatId\)\s*return/,
+    'a conflict always resolves through the one rotation path')
+  const rotate = shellSource.match(
+    /async function rotateDraftFirstNewChat\(presentation, rotatedId\) \{([\s\S]*?)\n  \}\n\n  rotateDraftFirstNewChatRef\.current/,
   )?.[1] || ''
 
   const ownerCheck = rotate.indexOf(
-    'if (!draftFirstPresentationIsCurrent(presentation)) return',
+    'if (!draftFirstPresentationIsCurrent(presentation)) {',
   )
   const intentCheck = rotate.indexOf(
     "if (String(newChatIntentRef.current?.chatId ?? '') !== intentId) return",
@@ -119,7 +123,7 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   const durableDraftRead = rotate.indexOf('await readComposerDraftAsync(intentId)')
   const draftCopy = rotate.indexOf('persistComposerDraft(')
   const pointerMove = rotate.indexOf(
-    "rememberOpenNewChatIntent({ chatId: decision.chatId, status: 'allocating' })",
+    "rememberOpenNewChatIntent({ chatId: rotatedId, status: 'allocating' })",
   )
 
   assert.ok(ownerCheck >= 0, 'rotation must claim the live presentation')
@@ -140,6 +144,68 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   assert.equal(checksBeforeRead, 1)
   assert.equal(checksAfterRead, 1,
     'rotation must reclaim presentation ownership after durable hydration')
+})
+
+test('a conflict that arrives off-screen rotates silently once the owner returns', () => {
+  const rotate = shellSource.match(
+    /async function rotateDraftFirstNewChat\(presentation, rotatedId\) \{([\s\S]*?)\n  \}\n\n  rotateDraftFirstNewChatRef\.current/,
+  )?.[1] || ''
+  const defer = rotate.match(/const deferRotation = \(\) => \{([\s\S]*?)\n    \}/)?.[1] || ''
+  assert.match(defer, /\{ \.\.\.current, rotateTo: rotatedId \}/,
+    'the background conflict remembers its rotation decision')
+  assert.doesNotMatch(defer, /failure|failedNewChatPresentation|rememberOpenNewChatIntent/,
+    'a background conflict must not surface a failure or Retry the owner never saw')
+  assert.match(shellSource,
+    /const resuming = resumedNewChatPresentation\(session,[\s\S]*?if \(!resuming\) return[\s\S]*?rotateDraftFirstNewChatRef\.current\?\.\(resuming, session\.rotateTo\)/,
+    'returning applies the remembered rotation without re-sending the conflicting id')
+})
+
+test('a remembered conflict resumes wherever its chat is visible again', () => {
+  const session = {
+    token: 7,
+    chatId: 'client-owned',
+    rotateTo: 'replacement',
+    materialized: false,
+    viewMode: 'panes',
+    paneId: 'left',
+    paneActiveKey: 'chat:client-owned',
+  }
+  const visible = {
+    viewMode: 'panes',
+    activeView: 'chat',
+    activeChatId: 'client-owned',
+    focusedPaneId: 'right',
+    paneActiveKey: 'chat:client-owned',
+  }
+
+  assert.equal(resumedNewChatPresentation(session, {
+    ...visible, activeChatId: 'other',
+  }), null, 'another chat is visible: keep remembering')
+  assert.equal(resumedNewChatPresentation(session, {
+    ...visible, activeView: 'canvas', activeChatId: null,
+  }), null)
+  assert.equal(resumedNewChatPresentation({ ...session, rotateTo: null }, visible), null,
+    'nothing remembered: nothing to resume')
+
+  // The tab moved to another pane: the rotation still applies there, and the
+  // resumed session owns that view so the rotation does not defer again.
+  const moved = resumedNewChatPresentation(session, visible)
+  assert.equal(newChatPresentationIsCurrent(session, visible), false)
+  assert.equal(moved.rotateTo, null)
+  assert.equal(moved.token, session.token)
+  assert.equal(newChatPresentationIsCurrent(moved, visible), true)
+
+  const standard = {
+    viewMode: 'single',
+    activeView: 'chat',
+    activeChatId: 'client-owned',
+    focusedPaneId: null,
+    paneActiveKey: null,
+  }
+  const switched = resumedNewChatPresentation(session, standard)
+  assert.deepEqual([switched.viewMode, switched.paneId, switched.paneActiveKey],
+    ['single', null, null])
+  assert.equal(newChatPresentationIsCurrent(switched, standard), true)
 })
 
 test('an accepted allocation activates the already-mounted canonical composer', () => {
@@ -190,20 +256,24 @@ test('a provisional Send becomes one durable handoff and retries on proven recov
   )
   assert.match(
     shellSource,
-    /stageComposerHandoff\(decision\.chatId, autoSendDraft, \{ autoSend: true \}\)/,
+    /stageComposerHandoff\(rotatedId, autoSendDraft, \{ autoSend: true \}\)/,
     'an authoritative id rotation must move the queued handoff to its new owner',
   )
 })
 
 test('a queued first Send continues in the same ChatView after allocation', () => {
-  const settle = shellSource.match(
-    /async function settleDraftFirstNewChat\(presentation\) \{([\s\S]*?)\n  \}\n\n  settleDraftFirstNewChatRef\.current/,
-  )?.[1] || ''
-  assert.match(
-    settle,
-    /const autoSendDraft = readComposerHandoff\(intentId\)\.autoSendDraft[\s\S]*current\.submitted && autoSendDraft[\s\S]*requestComposer\(intentId, \{[\s\S]*draft: autoSendDraft,[\s\S]*submit: true/,
-    'allocation resumes the verified queued send through the already-mounted view',
-  )
+  assert.match(shellSource,
+    /if \(!session\?\.materialized \|\| !session\.submitted[\s\S]*activeView !== 'chat'[\s\S]*String\(activeChatId\) !== String\(session\.chatId\)[\s\S]*readComposerHandoff\(session\.chatId\)\.autoSendDraft[\s\S]*requestComposer\(session\.chatId, \{[\s\S]*draft: autoSendDraft,[\s\S]*submit: true/,
+    'a queued send resumes when its own materialized chat becomes visible, not only at allocation completion')
+  assert.match(shellSource,
+    /requestComposer\(session\.chatId, \{\s*draft: autoSendDraft,\s*submit: true,\s*\}\)[\s\S]{0,400}?newChatPresentationRef\.current = null\s*setNewChatPresentation\(current => \(\s*current\?\.token === session\.token \? null : current/,
+    'the queued Send handoff retires the creation so a later New Chat is never swallowed by refocus')
+  assert.match(chatViewSource,
+    /if \(hidden \|\| provisionalNewChat\) return\s*const request = pendingComposerSubmit/,
+    'a restored stored handoff must not send before its chat row exists')
+  assert.match(chatViewSource,
+    /if \(loading \|\| loadError \|\| !activationSettled \|\| providerSwitching\) return[\s\S]*consumeComposerHandoff\(chatId, request\.text/,
+    'durable queued intent is not consumed before the restored runtime can accept it')
   assert.match(chatViewSource,
     /onSubmit=\{provisionalNewChat \? handleProvisionalNewChatSubmit : handleSubmit\}/,
     'the one composer switches from provisional queueing to ordinary Send without remounting')

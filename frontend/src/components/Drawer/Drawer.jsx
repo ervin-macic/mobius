@@ -75,6 +75,7 @@ import {
 } from '../Shell/useDesktopSidebar.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
+import { drawerNameMaxLength, saveDrawerRename } from './drawerRename.js'
 import './Drawer.css'
 
 const LIST_TABS = ['recents', 'archived']
@@ -637,18 +638,16 @@ export default function Drawer({
   }
 
   async function renameChat(id, title) {
-    const res = await api.chats.update(id, { title })
-    if (res.ok) refreshChats()
+    if (await saveDrawerRename(() => api.chats.update(id, { title }), onNotice)) refreshChats()
   }
 
   async function renameApp(id, name) {
-    const res = await api.apps.update(id, { name })
-    if (res.ok) refreshApps()
+    if (await saveDrawerRename(() => api.apps.update(id, { name }), onNotice)) refreshApps()
   }
 
   async function renameProject(id, name) {
     const project = projects.find(row => String(row.id) === String(id))
-    if (project) await onProjectRename?.(project, name)
+    if (project) await saveDrawerRename(() => onProjectRename?.(project, name), onNotice)
   }
 
   async function publishHostedApp(id) {
@@ -1674,7 +1673,23 @@ const DrawerRow = memo(function DrawerRow({
   const label = kind === 'chat' ? item.title : item.name
   const projectChip = recentsProjectChip(kind, item)
   const pinned = !!item.pinned_at
-  const waiting = kind === 'chat' && !!item.waiting
+  const waiting = kind === 'chat' && item.handoff?.kind === 'automatic'
+  const recovery = kind === 'chat' && item.handoff?.kind === 'recovery'
+  const onHold = kind === 'chat' && item.handoff?.kind === 'on_hold'
+  const ownerRequired = needsOwnerInput || (kind === 'chat' && item.handoff?.kind === 'owner_input')
+  const recoveryLabel = item.handoff?.reason === 'restart_required'
+    ? 'Server restart needed to load restored work'
+    : item.handoff?.reason === 'restart_manual'
+    ? 'Restart recovery needs Resume'
+    : item.handoff?.reason === 'model_retry_exhausted'
+      ? 'Model retries exhausted; choose another model and Resume'
+      : item.handoff?.reason === 'resume_failed'
+        ? 'Automatic follow-up failed; Resume to inspect saved work'
+        : item.handoff?.reason === 'app_attributed_work'
+          ? 'App-attributed work blocks automatic continuation'
+          : item.handoff?.reason === 'delegation_barrier'
+            ? 'Delegation no longer owns automatic recovery'
+            : 'Manual recovery needed'
   const slug = item.slug
   const wrapRef = useRef(null)
   const inputRef = useRef(null)
@@ -1915,6 +1930,7 @@ const DrawerRow = memo(function DrawerRow({
             ref={inputRef}
             className="drawer__rename-input"
             defaultValue={label}
+            maxLength={drawerNameMaxLength(kind)}
             onKeyDown={onInputKeyDown}
             onBlur={onRenameBlur}
             aria-label="Rename app"
@@ -1928,6 +1944,7 @@ const DrawerRow = memo(function DrawerRow({
           ref={inputRef}
           className="drawer__rename-input"
           defaultValue={label}
+          maxLength={drawerNameMaxLength(kind)}
           onKeyDown={onInputKeyDown}
           onBlur={onRenameBlur}
           aria-label={`Rename ${kind}`}
@@ -2270,7 +2287,7 @@ const DrawerRow = memo(function DrawerRow({
         {/* Status dot. Sits before the text so the user's eye
             picks it up alongside the label rather than at the row's
             edge (where the pin lives). aria-label exposes the state. */}
-        {needsOwnerInput ? (
+        {ownerRequired ? (
           <span
             className="drawer__attention-diamond drawer__owner-input-dot"
             role="img"
@@ -2292,6 +2309,18 @@ const DrawerRow = memo(function DrawerRow({
           >
             <Pause width={8} height={8} aria-hidden="true" />
           </span>
+        ) : onHold ? (
+          <span className="drawer__waiting-icon" role="img" aria-label="On hold — continue when ready"
+            title={item.handoff?.hold_reason || 'On hold — continue when ready'}>
+            <Pause width={8} height={8} aria-hidden="true" />
+          </span>
+        ) : recovery ? (
+          <span
+            className="drawer__recovery-icon"
+            role="img"
+            aria-label={recoveryLabel}
+            title={recoveryLabel}
+          ><Pause width={8} height={8} aria-hidden="true" /></span>
         ) : failed ? (
           <span
             className="drawer__failure-dot"

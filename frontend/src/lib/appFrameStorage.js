@@ -1,4 +1,4 @@
-import { currentSharedBrowserStorage, isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+import { localStore } from './workspaceStorage.js'
 
 const STORAGE_PREFIX = 'mobius:app-frame-storage:'
 const TOKEN_PREFIX = 'mobius:app-token:'
@@ -18,9 +18,7 @@ const LEGACY_KEYS_BY_SLUG = {
 }
 
 function storageOrNull(storage) {
-  if (storage) return storage
-  if (isSharedBrowserRoute()) return currentSharedBrowserStorage()
-  try { return typeof localStorage !== 'undefined' ? localStorage : null } catch { return null }
+  return storage || localStore()
 }
 
 function appPrefix(appId) {

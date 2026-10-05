@@ -559,9 +559,7 @@ def create_app_token_endpoint(
     app_nonce=app.token_nonce,
     delegation_id=delegation_id,
     delegation_chat=delegation_chat,
-    browser_grant_id=principal.browser_grant_id,
-    browser_grant_epoch=principal.browser_grant_epoch,
-    browser_session_id=principal.browser_session_id,
+    browser=principal.browser,
   )
   return {"token": token}
 

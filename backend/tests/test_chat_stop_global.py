@@ -88,7 +88,7 @@ def test_delegated_execution_bearer_cannot_stop_child_parent_foreign_or_all(
 
   calls = []
 
-  async def record_stop(chat_id, *, db=None):
+  async def record_stop(chat_id, *, db=None, actor=None, actor_id=None):
     del db
     calls.append(chat_id)
     return False, []

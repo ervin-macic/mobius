@@ -223,7 +223,11 @@ def _claim_row(db):
   return db.query(models.AgentWorkClaim).filter_by(work_key=KEY).one()
 
 
-def test_goal_completion_completes_the_claims_it_names_with_the_result(db):
+@pytest.mark.parametrize("complete, expected", [
+  (True, "Owning Goal completed."),
+  ("Merged as 0b44dc9d; CI green", "Owning Goal completed: Merged as 0b44dc9d; CI green"),
+])
+def test_goal_completion_completes_the_claims_it_names(db, complete, expected):
   from app.agent_work_claims import pending_settlement_notices
   from app.goals import update_goal_record
 
@@ -231,12 +235,12 @@ def test_goal_completion_completes_the_claims_it_names_with_the_result(db):
   run = db.get(models.ChatRun, "claim-run-first")
   goal = db.get(models.ChatGoal, "claim-goal-first")
 
-  update_goal_record(db, run, goal, 1, result="Merged as 0b44dc9d; CI green",
+  update_goal_record(db, run, goal, 1, complete=complete,
                      finished_claims=[KEY])
 
   row = _claim_row(db)
   assert row.completed_at is not None and row.released_at is None
-  assert row.outcome == "Owning Goal completed: Merged as 0b44dc9d; CI green"
+  assert row.outcome == expected
   # The follower notice is owed durably until a seam delivers it.
   [pending] = pending_settlement_notices(db, first.id)
   assert (pending.state, pending.interested_chat_ids) == (
@@ -251,9 +255,10 @@ def test_goal_completion_completes_the_claims_it_names_with_the_result(db):
 
 @pytest.mark.parametrize("run_token", ["claim-run-first", ""])
 def test_stop_releases_the_goal_claims_in_the_same_writer_commit(db, run_token):
-  from app.chat_writer import FinishRun, get_writer
+  from app.chat_writer import FinishRun, PrepareChatStop, get_writer
 
   owner, first, second = _owned_goal_claim(db, task_status="running")
+  get_writer().submit(PrepareChatStop(chat_id=first.id, actor="owner")).result(timeout=5)
   get_writer().submit(FinishRun(
     chat_id=first.id, run_token=run_token, terminal_status="stopped",
   )).result(timeout=5)
@@ -416,7 +421,7 @@ def test_goal_completion_releases_a_declined_action_it_did_not_name(db):
   update_goal_record(
     db, db.get(models.ChatRun, "claim-run-first"),
     db.get(models.ChatGoal, "claim-goal-first"), 1,
-    result="Owner declined the merge; the PR stays open for review.",
+    complete="Owner declined the merge; the PR stays open for review.",
   )
 
   row = _claim_row(db)
@@ -442,7 +447,7 @@ def test_goal_completion_refuses_to_name_a_claim_it_does_not_own(db):
     update_goal_record(
       db, db.get(models.ChatRun, "claim-run-first"),
       db.get(models.ChatGoal, "claim-goal-first"), 1,
-      result="Merged", finished_claims=[KEY + ":typo"],
+      complete="Merged", finished_claims=[KEY + ":typo"],
     )
   # The refusal shows the key the Goal really holds, so the retry is verbatim.
   assert f"Open claims held here: {KEY}." in str(refused.value)

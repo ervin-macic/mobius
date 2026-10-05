@@ -1011,6 +1011,21 @@
   background: var(--danger);
 }
 
+/* An execution needing recovery is not a failed Goal or a saved question. */
+.drawer__recovery-icon {
+  box-sizing: border-box;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
+  margin-right: 0;
+  color: var(--text);
+  border: 1px solid var(--text-dim);
+  border-radius: 2px;
+}
+
 /* Respect prefers-reduced-motion. The streaming dot no longer needs an
    override here — it is static for everyone now (see above). */
 @media (prefers-reduced-motion: reduce) {

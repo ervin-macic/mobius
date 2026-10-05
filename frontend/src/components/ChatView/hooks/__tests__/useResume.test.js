@@ -149,3 +149,74 @@ for (const outcome of ['accepted', 'network-error']) {
     h.unmount()
   })
 }
+
+test('Goal Resume survives an unrelated ended turn without a physical recovery id', async () => {
+  const requests = []
+  const h = fixture(async (...args) => { requests.push(args); return { status: 'started' } }, {
+    runId: null, goalId: 'held-goal', goalRevision: 7,
+  })
+  assert.equal(h.result.current.state.unavailable, false)
+  assert.equal(await h.result.current.resume(), true)
+  assert.deepEqual(requests[0][2], {
+    cid: requests[0][2].cid, continuation: 'manual', resumeGoalId: 'held-goal', resumeGoalRevision: 7,
+  })
+})
+
+test('ambiguous Goal Resume retries retain identity but a new revision cannot retarget the old attempt', async () => {
+  const requests = []
+  const h = fixture(async (...args) => {
+    requests.push(args)
+    throw Object.assign(new Error('network'), { outboxRetained: true })
+  }, { runId: null, goalId: 'held-goal', goalRevision: 7 })
+  await h.result.current.resume()
+  h.rerender()
+  await h.result.current.resume()
+  assert.deepEqual(requests[1], requests[0])
+  h.props.goalRevision = 8
+  h.rerender()
+  await h.result.current.resume()
+  assert.notEqual(requests[2][2].cid, requests[0][2].cid)
+  assert.equal(requests[2][2].resumeGoalRevision, 8)
+  assert.equal(requests[0][2].resumeGoalRevision, 7)
+})
+
+test('a stale Goal revision refreshes instead of pretending continuation was accepted', async () => {
+  const h = fixture(async () => {
+    throw Object.assign(new Error('stale'), { status: 409, code: 'recovery_changed' })
+  }, { runId: null, goalId: 'held-goal', goalRevision: 7 })
+  assert.equal(await h.result.current.resume(), false)
+  assert.deepEqual(h.accepted, [])
+  assert.equal(h.refreshes.length, 1)
+  assert.match(h.result.current.state.error, /Recovery state changed/)
+})
+
+for (const field of ['goalId', 'goalRevision']) {
+  test(`changed ${field} fences a late Goal Resume acknowledgement`, async () => {
+    const response = deferred()
+    const h = fixture(() => response.promise, { runId: null, goalId: 'held-goal', goalRevision: 7 })
+    const pending = h.result.current.resume()
+    h.props[field] = field === 'goalId' ? 'replacement-goal' : 8
+    h.rerender()
+    response.resolve({ status: 'started' })
+    assert.equal(await pending, false)
+    assert.deepEqual(h.accepted, [])
+    assert.equal(h.refreshes.length, 1)
+  })
+}
+
+test('Goal Resume requires its revision and never falls back to an unrelated run', async () => {
+  let sent = false
+  const h = fixture(() => { sent = true }, { goalId: 'held-goal' })
+  assert.equal(await h.result.current.resume(), false)
+  assert.equal(sent, false)
+  assert.equal(h.result.current.state.unavailable, true)
+})
+
+test('pending question and live-turn guards also block exact Goal Resume', async () => {
+  let sent = false
+  const h = fixture(() => { sent = true }, {
+    runId: null, goalId: 'held-goal', goalRevision: 7, blocked: () => true,
+  })
+  assert.equal(await h.result.current.resume(), false)
+  assert.equal(sent, false)
+})

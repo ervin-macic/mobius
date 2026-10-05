@@ -373,7 +373,8 @@ def _goal_outcome(
       "Owning Goal completed without recording this action as done"
       + (f": {text}" if text else ".")
     )
-  return False, f"Owning Goal was {status} before this action finished."
+  return False, (f"Owning Goal was {status} before this action finished"
+                 + (f": {text}" if text else "."))
 
 
 def stage_settle_goal_claims(

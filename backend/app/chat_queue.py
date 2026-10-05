@@ -120,6 +120,9 @@ class TerminalDisposition(enum.Enum):
   # Pending work was deliberately left queued because an unanswered owner
   # question is the transcript's protocol barrier. The exact run is closed as
   # interrupted without clearing that question; no continuation is scheduled.
+  GOAL_SETTLEMENT_FAILED = "goal_settlement_failed"
+  # One targeted clean-ending recovery also ended without an outcome or
+  # handoff. Intent stays open; a durable technical note offers manual recovery.
   DRAINED_FOR_RESTART = "drained_for_restart"
   # The turn was interrupted by a drain-gated restart (design §2.2), NOT by
   # Stop. Its partial blocks + a "paused for a platform update" note were
@@ -139,6 +142,10 @@ class PendingAdmissionBlocksPromotion(RuntimeError):
     self.reason = hold.reason
     self.question_id = hold.question_id
     self.wait_id = hold.wait_id
+
+
+class GoalSettlementUnfinished(RuntimeError):
+  """The writer saved an exact, bounded Goal settlement recovery note."""
 
 
 _locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
@@ -267,9 +274,11 @@ async def promote_pending_messages_locked(
   result = await await_ack(ack)
   if isinstance(result, PromotePendingBlocked):
     raise PendingAdmissionBlocksPromotion(result)
+  if result.get("settlement_error"):
+    raise GoalSettlementUnfinished(result["settlement_error"])
   if ending_status == "stopped":
-    # The superseded run's Goal was stopped in this commit, releasing its
-    # work claims; wake their followers off this locked path.
+    # Explicit Stop preparation may release exact Goal work claims; wake
+    # their followers off this locked path.
     from app.agent_coordination import schedule_claim_settlement
     schedule_claim_settlement(chat_id)
   promoted = result["promoted"]
@@ -420,6 +429,11 @@ async def drain_and_release(
           else TerminalDisposition.QUESTION_PARKED
         )
         return None, [], None, disposition
+      except GoalSettlementUnfinished:
+        await finish_run_strict(chat_id, ending_run_token, "failed")
+        discard_starting(chat_id)
+        forget_chat(chat_id)
+        return None, [], None, TerminalDisposition.GOAL_SETTLEMENT_FAILED
       if first_pending is None:
         # Clear-before-forget, all under this one lock: clear the durable
         # marker (strict — a failed ack raises and the caller leaves the

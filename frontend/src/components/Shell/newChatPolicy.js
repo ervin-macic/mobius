@@ -34,11 +34,9 @@ export function failedNewChatPresentation(current, verdict, recoveryGeneration) 
 /**
  * Whether an immediate New Chat surface still owns what the user is seeing.
  *
- * Allocation is allowed to finish only while the route generation, layout
- * world, and drawer-history ownership captured by the tap are unchanged. A
- * provisional client UUID is still allocation-owned. Once the server row is
- * accepted, the concrete chat route is the simpler authority: it owns the
- * cover until that ChatView reports a painted frame.
+ * Allocation can finish while another route is visible. These presentation
+ * hints authorize only focus and route changes, never the lifetime of the
+ * unfinished row. Drawer visibility does not change that ownership.
  */
 export function newChatPresentationIsCurrent(presentation, {
   viewMode,
@@ -60,6 +58,35 @@ export function newChatPresentationIsCurrent(presentation, {
   // still names a chat.
   return normalizedId(presentation.paneId) === normalizedId(focusedPaneId)
     && normalizedId(presentation.paneActiveKey) === normalizedId(paneActiveKey)
+}
+
+/**
+ * Resume a conflict remembered while this creation was off-screen.
+ *
+ * The decision belongs to the allocation (its client id), not to the pane or
+ * tab that first showed it: the owner may come back to the chat from a moved
+ * Builder tab or another workspace mode. Once that chat is the active
+ * destination again, re-anchor the session where it is visible now so the
+ * rotation owns this view exactly as if the conflict had arrived on-screen.
+ * Returns null while the chat is not visible or nothing is remembered.
+ */
+export function resumedNewChatPresentation(presentation, {
+  viewMode,
+  activeView,
+  activeChatId,
+  focusedPaneId,
+  paneActiveKey,
+} = {}) {
+  if (!presentation?.rotateTo || activeView !== 'chat') return null
+  if (normalizedId(activeChatId) !== normalizedId(presentation.chatId)) return null
+  const panes = viewMode === 'panes'
+  return {
+    ...presentation,
+    rotateTo: null,
+    viewMode,
+    paneId: panes ? focusedPaneId : null,
+    paneActiveKey: panes ? paneActiveKey : null,
+  }
 }
 
 /**

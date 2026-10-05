@@ -3,7 +3,7 @@ import DOMPurify from 'dompurify'
 import { getToken, isEphemeralAuth, BASE, apiFetch } from '../../../api/client.js'
 import { mediaTokenParam } from '../../../api/mediaToken.js'
 import { useMathHtml } from './math.js'
-import { imageDimensionsForHref, imageVarsFromDims } from './imageDims.js'
+import { imageDimensionsForHref, imageUnreadableForHref, imageVarsFromDims } from './imageDims.js'
 import {
   getMediaChatId,
   previewSrcForChatMedia,
@@ -286,11 +286,10 @@ export function ExpandableImage({
   const imageVars = dims
     ? imageVarsFromDims(dims.width, dims.height, viewportH)
     : null
-  const dimensionError = !!(
-    mediaChatId
-    && mediaDimensions != null
-    && !dims
-  )
+  // Only an explicit server verdict is an error. A path the map does not
+  // mention keeps the default frame until a fresher response sizes it.
+  const dimensionError = !!mediaChatId
+    && imageUnreadableForHref(rawSrc, mediaDimensions)
 
   useEffect(() => {
     if (!rawSrc || dimensionError) { setResolvedSrc(null); return }

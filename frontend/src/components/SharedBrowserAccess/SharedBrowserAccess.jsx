@@ -4,25 +4,25 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   clearSharedBrowserSession,
   redeemSharedBrowserInvite,
+  finalizeSharedBrowserAccount,
   renewSharedBrowserSession,
   leaveSharedBrowserSession,
   BASE,
 } from '../../api/client.js'
-import { watchSharedBrowserInvites } from '../../lib/sharedBrowserInvite.js'
+import { watchSharedBrowserEntries } from '../../lib/sharedBrowserInvite.js'
 import './SharedBrowserAccess.css'
 
 const Shell = lazy(() => import('../Shell/Shell.jsx'))
 
-export default function SharedBrowserAccess({ initialInvite = '' }) {
+export default function SharedBrowserAccess({ initialEntry = null }) {
   const queryClient = useQueryClient()
-  const [invite, setInvite] = useState(initialInvite)
+  const [entry, setEntry] = useState(initialEntry)
   const [grant, setGrant] = useState(null)
-  const [status, setStatus] = useState(initialInvite ? 'invited' : 'checking')
+  const [status, setStatus] = useState(initialEntry?.kind === 'invite' ? 'invited' : initialEntry?.kind === 'invalid' ? 'ended' : 'checking')
   const [logoutFailed, setLogoutFailed] = useState(false)
-  const [unsupportedBrowser, setUnsupportedBrowser] = useState(false)
   const admissionVersionRef = useRef(0)
 
-  useEffect(() => watchSharedBrowserInvites(window, nextInvite => {
+  useEffect(() => watchSharedBrowserEntries(window, nextEntry => {
     // A same-document hash navigation must be stripped before any UI update.
     // Never keep the previous grant's token or cached results under new consent.
     admissionVersionRef.current += 1
@@ -30,27 +30,25 @@ export default function SharedBrowserAccess({ initialInvite = '' }) {
     queryClient.clear()
     setGrant(null)
     setLogoutFailed(false)
-    setUnsupportedBrowser(false)
-    setInvite(nextInvite)
-    setStatus('invited')
+    setEntry(nextEntry)
+    setStatus(nextEntry.kind === 'invite' ? 'invited' : nextEntry.kind === 'invalid' ? 'ended' : 'checking')
   }), [queryClient])
 
   useEffect(() => {
-    if (initialInvite) return undefined
+    if (entry?.kind === 'invite' || entry?.kind === 'invalid') return undefined
     let live = true
     const admissionVersion = admissionVersionRef.current
-    renewSharedBrowserSession().then(data => {
+    const admission = entry?.kind === 'account'
+      ? finalizeSharedBrowserAccount(entry.value) : renewSharedBrowserSession()
+    admission.then(data => {
       if (!live || admissionVersion !== admissionVersionRef.current) return
       setGrant(data.grant)
       setStatus('active')
-    }).catch(error => {
-      if (live && admissionVersion === admissionVersionRef.current) {
-        setUnsupportedBrowser(error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED')
-        setStatus('ended')
-      }
+    }).catch(() => {
+      if (live && admissionVersion === admissionVersionRef.current) setStatus('ended')
     })
     return () => { live = false }
-  }, [initialInvite])
+  }, [entry])
 
   useEffect(() => {
     const ended = () => { setGrant(null); setStatus('ended') }
@@ -59,21 +57,18 @@ export default function SharedBrowserAccess({ initialInvite = '' }) {
   }, [])
 
   async function accept() {
-    if (!invite) return
+    if (entry?.kind !== 'invite' || !entry.value) return
     const admissionVersion = admissionVersionRef.current
     setStatus('working')
-    const secret = invite
-    setInvite('')
+    const secret = entry.value
+    setEntry({ kind: 'invite', value: '' })
     try {
       const data = await redeemSharedBrowserInvite(secret)
       if (admissionVersion !== admissionVersionRef.current) return
       setGrant(data.grant)
       setStatus('active')
-    } catch (error) {
-      if (admissionVersion === admissionVersionRef.current) {
-        setUnsupportedBrowser(error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED')
-        setStatus('ended')
-      }
+    } catch {
+      if (admissionVersion === admissionVersionRef.current) setStatus('ended')
     }
   }
 
@@ -83,9 +78,7 @@ export default function SharedBrowserAccess({ initialInvite = '' }) {
     try {
       await leaveSharedBrowserSession()
       setLogoutFailed(false)
-    } catch (error) {
-      if (error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED') clearSharedBrowserSession()
-      setUnsupportedBrowser(error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED')
+    } catch {
       setLogoutFailed(true)
     }
   }
@@ -110,12 +103,10 @@ export default function SharedBrowserAccess({ initialInvite = '' }) {
       </>}
       {status === 'working' && <p role="status">Opening shared access…</p>}
       {status === 'ended' && <>
-        <p>{unsupportedBrowser
-          ? 'This browser does not support the secure shared-session coordination needed for access. Use a current browser with Web Locks support.'
-          : logoutFailed
+        <p>{logoutFailed
           ? 'Access is closed in this tab, but server sign-out could not be confirmed. Reloading may restore access.'
-          : 'The invitation or session is no longer available.'}</p>
-        {logoutFailed && !unsupportedBrowser && <button type="button" onClick={leave}>Retry server sign-out</button>}
+          : 'This sign-in or session is no longer available. Open the instance again from Shared with me, or request a new invitation.'}</p>
+        {logoutFailed && <button type="button" onClick={leave}>Retry server sign-out</button>}
         <a href={`${BASE}/shell/`}>Sign in as the owner</a>
       </>}
     </section>

@@ -87,6 +87,7 @@ async function main() {
       type: item.type,
       fileName: item.fileName,
       isEntry: item.isEntry,
+      bytes: Buffer.byteLength(item.code, 'utf8'),
       exports: item.exports,
       imports: item.imports,
       // With code splitting disabled Rolldown records an inlined dynamic import

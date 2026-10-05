@@ -94,8 +94,8 @@ MANAGED_USER_AGENT = "mobius-managed-deployment/1"
 # favour of the baked copy instead of returning 404 for the new routes.
 # 1 = pre-/managed broker; 2 = /managed upstream-proxy routes present;
 # 3 = standalone web search endpoint; 4 = flat gateway wire for Codex web.run;
-# 5 = account review read/write routes.
-BROKER_ROUTE_EPOCH = 5
+# 5 = account review routes; 6 = shared access; 7 = recipient invitation response.
+BROKER_ROUTE_EPOCH = 7
 
 # Declarative public forwarding policy. Callers never supply a target URL,
 # audience, or arbitrary upstream path. Contribution and community routes are
@@ -430,6 +430,14 @@ def _managed_upstream_path(method: str, path: str) -> str | None:
   ):
     return None
   if (method, upstream) in MANAGED_EXACT_ROUTES:
+    return upstream
+  if (method, upstream) in {
+    ("POST", "/api/instance/v1/browser-access/grants"),
+    ("GET", "/api/instance/v1/browser-access/shared"),
+    ("POST", "/api/instance/v1/browser-access/shared/respond"),
+  } or (method == "DELETE" and re.fullmatch(
+    r"/api/instance/v1/browser-access/grants/[A-Za-z0-9_-]{20,64}", upstream
+  )):
     return upstream
   if any(
     method in methods

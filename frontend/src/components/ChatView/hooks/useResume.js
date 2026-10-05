@@ -1,8 +1,11 @@
 /* Own the acknowledged Resume transaction, independently of the composer and queue. */
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-export default function useResume({ chatId, runId, send, onAccepted, onRefresh, blocked }) {
-  const [state, setState] = useState({ pending: false, error: '', unavailable: !runId })
+export default function useResume({ chatId, runId, goalId, goalRevision, send, onAccepted, onRefresh, blocked }) {
+  const hasTarget = goalId != null
+    ? !!goalId && Number.isInteger(goalRevision)
+    : !!runId
+  const [state, setState] = useState({ pending: false, error: '', unavailable: !hasTarget })
   const attemptRef = useRef(null)
   const scopeRef = useRef(null)
 
@@ -10,13 +13,13 @@ export default function useResume({ chatId, runId, send, onAccepted, onRefresh, 
     const scope = { chatId }
     scopeRef.current = scope
     attemptRef.current = null
-    setState({ pending: false, error: '', unavailable: !runId })
+    setState({ pending: false, error: '', unavailable: !hasTarget })
     return () => { if (scopeRef.current === scope) scopeRef.current = null }
-  }, [chatId, runId])
+  }, [chatId, runId, goalId, goalRevision, hasTarget])
 
   const resume = useCallback(async () => {
     if (blocked?.() || attemptRef.current?.pending) return false
-    if (!runId && !attemptRef.current) {
+    if (!hasTarget && !attemptRef.current) {
       // A restart can briefly show a durable pause before its replacement run
       // is readable. Refresh, but do not turn that expected handoff into an
       // owner-facing error.
@@ -25,7 +28,7 @@ export default function useResume({ chatId, runId, send, onAccepted, onRefresh, 
       return false
     }
     const scope = scopeRef.current
-    const attempt = attemptRef.current || { cid: crypto.randomUUID(), runId }
+    const attempt = attemptRef.current || { cid: crypto.randomUUID(), runId, goalId, goalRevision }
     attempt.pending = true
     attemptRef.current = attempt
     setState({ pending: true, error: '', unavailable: false })
@@ -33,7 +36,9 @@ export default function useResume({ chatId, runId, send, onAccepted, onRefresh, 
       const result = await send('', undefined, {
         cid: attempt.cid,
         continuation: 'manual',
-        resumeRunId: attempt.runId || undefined,
+        ...(attempt.goalId != null
+          ? { resumeGoalId: attempt.goalId, resumeGoalRevision: attempt.goalRevision }
+          : { resumeRunId: attempt.runId || undefined }),
       })
       if (scopeRef.current !== scope) return false
       attemptRef.current = null
@@ -69,7 +74,7 @@ export default function useResume({ chatId, runId, send, onAccepted, onRefresh, 
       // still reconcile its durable marker; a chat switch/unmount must not.
       if (scopeRef.current?.chatId === chatId) onRefresh()
     }
-  }, [chatId, runId, send, onAccepted, onRefresh, blocked])
+  }, [chatId, runId, goalId, goalRevision, hasTarget, send, onAccepted, onRefresh, blocked])
 
   return { resume, state }
 }

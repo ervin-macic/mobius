@@ -222,31 +222,41 @@ def test_chat_reads_keep_goal_identity_after_a_mid_turn_question(
   assert runtime.json()["active_goal_objective"] == "finish the review"
   assert detail.json()["goal"] == {
     "id": "active-goal-run",
+    "revision": 0,
     "objective": "finish the review",
     "status": "active",
     "resumable": False,
+    "handoff": {"kind": "working", "reason": None},
   }
   assert runtime.json()["goal"] == detail.json()["goal"]
 
 
-def test_usage_limit_waiting_marks_only_latest_usage_park(chat, db):
-  from app.chat import usage_limit_waiting_chat_ids
+@pytest.mark.parametrize("reason", ["usage_limit", "restart"])
+def test_waiting_marks_only_latest_park(chat, db, monkeypatch, reason):
+  from app.chat import continuation_handoff_for_chat
 
   base = datetime.now(UTC)
-  # Latest run is a usage-limit park awaiting resume → chat is "waiting".
-  db.add(make_goal_run(db,
+  chat.auto_resume_on_limit = True
+  chat.auto_resume_on_restart = True
+  from app import restart_ledger
+  monkeypatch.setattr(restart_ledger, "authorized_restart_nonce", lambda: "approved")
+  # Only a scheduler-eligible latest park is Waiting.
+  parked = make_goal_run(db,
     id="usage-park", chat_id=chat.id, status="parked",
-    provider="claude", park_reason="usage_limit", started_at=base,
-  ))
+    provider="claude", park_reason=reason, started_at=base,
+  )
+  if reason == "restart":
+    parked.restart_nonce = "approved"
+  db.add(parked)
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == {chat.id}
+  assert continuation_handoff_for_chat(db, chat.id)["kind"] == "automatic"
 
   # resume_pending is still awaiting resume and counts.
   db.query(models.ChatRun).filter_by(id="usage-park").update(
     {"status": "resume_pending"}
   )
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == {chat.id}
+  assert continuation_handoff_for_chat(db, chat.id)["kind"] == "automatic"
 
   # A newer running row supersedes the park (latest-run-wins) → not waiting.
   db.add(make_goal_run(db,
@@ -254,20 +264,19 @@ def test_usage_limit_waiting_marks_only_latest_usage_park(chat, db):
     provider="claude", started_at=base + timedelta(seconds=1),
   ))
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == set()
+  assert continuation_handoff_for_chat(db, chat.id)["kind"] == "none"
 
 
-def test_usage_limit_waiting_ignores_non_usage_parks(chat, db):
-  from app.chat import usage_limit_waiting_chat_ids
+def test_waiting_ignores_restart_without_authorized_nonce(chat, db):
+  from app.chat import continuation_handoff_for_chat
 
-  # A restart/resource park auto-continues and must not earn the usage-limit
-  # waiting mark.
+  # A restart without its exact approved nonce cannot promise an automatic wake.
   db.add(make_goal_run(db,
     id="restart-park", chat_id=chat.id, status="parked",
     provider="claude", park_reason="restart", started_at=datetime.now(UTC),
   ))
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == set()
+  assert continuation_handoff_for_chat(db, chat.id) == {"kind": "recovery", "reason": "restart_manual"}
 
 
 @pytest.mark.parametrize("status", ["parked", "resume_pending"])
@@ -364,9 +373,12 @@ def test_chat_reads_retain_completed_and_paused_goals(client, auth, chat, db):
   assert runtime["active_goal_objective"] is None
   assert detail["goal"] == {
     "id": "paused-id",
+    "revision": 0,
     "objective": "Paused work",
     "status": "paused",
     "resumable": True,
+    "pause_reason": "unknown",
+    "handoff": {"kind": "recovery", "reason": "unknown_stop"},
   }
   assert runtime["goal"] == detail["goal"]
 
@@ -1338,3 +1350,99 @@ def test_clearing_chat_title_uses_the_same_first_message_preview_limit(
   current = db.query(models.Chat).filter_by(id=chat.id).first()
   assert current.title == first_message[:80]
   assert current.title_locked is False
+
+
+def test_handoff_projection_fired_wait_null_blocker_and_manual_barriers():
+  from app.chat_handoffs import project_handoff
+  none = {"kind": "none", "reason": None}
+  project = lambda waits: project_handoff(
+    owner_input=False, running=False, waits=waits, helper_count=0, park=none,
+  )
+  assert project([{"delivery_pending": True, "resume_blocker": None}])["kind"] == "automatic"
+  for blocker in ("manual_resume", "resume_failed", "restart"):
+    assert project([{"delivery_pending": True, "resume_blocker": blocker}])["kind"] == "recovery"
+  assert project([{"delivery_pending": True, "resume_blocker": "owner_input"}])["kind"] == "owner_input"
+  assert project_handoff(
+    owner_input=True, running=False, waits=[], helper_count=1,
+    park={"kind": "automatic", "reason": "memory"},
+  )["kind"] == "owner_input"
+
+
+def test_park_handoff_respects_paid_retry_policy_and_resource_autonomy(chat, db):
+  from app.chat import continuation_handoff_for_chat
+  parked = make_goal_run(db,
+    id="policy-park", chat_id=chat.id, status="parked", provider="codex",
+    park_reason="usage_limit", started_at=datetime.now(UTC),
+  )
+  db.add(parked)
+  db.commit()
+  assert continuation_handoff_for_chat(db, chat.id) == {
+    "kind": "recovery", "reason": "manual_resume",
+  }
+  chat.auto_resume_on_limit = True
+  db.commit()
+  assert continuation_handoff_for_chat(db, chat.id)["kind"] == "automatic"
+  parked.park_reason = "memory"
+  chat.auto_resume_on_limit = False
+  db.commit()
+  assert continuation_handoff_for_chat(db, chat.id)["kind"] == "automatic"
+
+
+def test_restart_park_handoff_requires_exact_ready_boot_authorization(chat, db, monkeypatch):
+  from app import restart_ledger
+  from app.chat import continuation_handoff_for_chat
+  chat.auto_resume_on_restart = True
+  parked = make_goal_run(db,
+    id="restart-auth-park", chat_id=chat.id, status="parked",
+    provider="codex", park_reason="restart", started_at=datetime.now(UTC),
+  )
+  parked.restart_nonce = "planned-boot"
+  db.add(parked)
+  db.commit()
+  monkeypatch.setattr(restart_ledger, "authorized_restart_nonce", lambda: None)
+  assert continuation_handoff_for_chat(db, chat.id) == {
+    "kind": "recovery", "reason": "restart_manual",
+  }
+  monkeypatch.setattr(restart_ledger, "authorized_restart_nonce", lambda: "other-boot")
+  assert continuation_handoff_for_chat(db, chat.id)["kind"] == "recovery"
+  monkeypatch.setattr(restart_ledger, "authorized_restart_nonce", lambda: "planned-boot")
+  assert continuation_handoff_for_chat(db, chat.id) == {
+    "kind": "automatic", "reason": "restart",
+  }
+
+
+def test_park_handoff_does_not_promise_wake_before_required_source_restart(chat, db, monkeypatch):
+  from app import platform_update
+  from app.chat import continuation_handoff_for_chat
+  db.add(make_goal_run(db, id="late-edits-park", chat_id=chat.id, status="parked",
+    provider="codex", park_reason="memory", started_at=datetime.now(UTC)))
+  db.commit()
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: True)
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": "new-source"})
+  assert continuation_handoff_for_chat(db, chat.id) == {
+    "kind": "recovery", "reason": "restart_required",
+  }
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": None})
+  assert continuation_handoff_for_chat(db, chat.id) == {
+    "kind": "automatic", "reason": "restoring_edits",
+  }
+
+
+def test_compact_park_handoff_never_selects_chat_transcript(chat, db):
+  from sqlalchemy import event
+  from app.chat import continuation_handoff_for_chat
+  db.add(make_goal_run(db, id="compact-park", chat_id=chat.id, status="parked",
+    provider="codex", park_reason="storage", started_at=datetime.now(UTC)))
+  db.commit()
+  chat_id = chat.id
+  queries = []
+  def capture(_conn, _cursor, statement, _parameters, _context, _many):
+    queries.append(statement)
+  event.listen(db.bind, "before_cursor_execute", capture)
+  try:
+    assert continuation_handoff_for_chat(db, chat_id)["kind"] == "automatic"
+  finally:
+    event.remove(db.bind, "before_cursor_execute", capture)
+  chat_reads = [query for query in queries if "FROM chats" in query]
+  assert chat_reads
+  assert all("chats.messages" not in query for query in chat_reads)

@@ -4,6 +4,8 @@
  * GETs. A bare 202 makes the optimistic row disappear on terminal refresh and
  * turns unrelated rerenders into deterministic false failures.
  */
+import { test } from '@playwright/test'
+
 function messageMatchesAnchor(message, index, key) {
   if (!message || key == null) return false
   const target = String(key)
@@ -64,6 +66,18 @@ export function overlayAcceptedChatDetail(detail, accepted, requestUrl) {
     total,
     requested_anchor_found: false,
   }
+}
+
+/** Register in every spec that installs mockAcceptedMessages. Its detail
+ * route proxies GETs through route.fetch(), so a background refetch can still
+ * be in flight when the test body has finished. Closing the page then fails
+ * that callback ("route.fetch: Test ended", "Response has been disposed") and
+ * Playwright reports the passed test as failed. Releasing the routes before
+ * teardown is Playwright's contract for requests no assertion is waiting on. */
+export function releaseMockRoutesAfterEach() {
+  test.afterEach(async ({ page }) => {
+    await page.unrouteAll({ behavior: 'ignoreErrors' })
+  })
 }
 
 export async function mockAcceptedMessages(page) {

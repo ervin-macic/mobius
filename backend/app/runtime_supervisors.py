@@ -97,7 +97,9 @@ class RuntimeSupervisors:
 
     Boot reconciles the platform checkout, may finish an update swap, and
     bootstraps apps before any turn exists, so no settled-turn cleanup follows
-    that git and tool I/O. One pass at readiness, off the event loop.
+    that git and tool I/O. Startup maintenance also reads much of the main
+    database file, so that one file is advised too. One pass at readiness,
+    off the event loop.
     """
     async def reclaim():
       from app.file_cache import reclaim_background_work_cache
@@ -107,6 +109,21 @@ class RuntimeSupervisors:
         )
       except Exception:
         self.log.debug("boot file cache advice failed", exc_info=True)
+      from app.database import reclaim_startup_database_file_cache
+      try:
+        result = await asyncio.to_thread(reclaim_startup_database_file_cache)
+      except Exception:
+        self.log.debug("startup database file cache advice failed", exc_info=True)
+        return
+      if result and result["files"]:
+        # Advised, not reclaimed: concurrent activity moves the cgroup figures.
+        self.log.info(
+          "startup database file cache advice: advised_bytes=%s "
+          "cgroup_file_before=%s cgroup_file_after=%s",
+          result["advised_file_bytes"],
+          result["file_cache_before_bytes"],
+          result["file_cache_after_bytes"],
+        )
 
     self._spawn("boot-file-cache-reclaim", reclaim())
 

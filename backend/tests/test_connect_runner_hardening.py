@@ -176,7 +176,8 @@ def test_output_acknowledges_server_cursor_not_attempted_last(monkeypatch):
     with closing(runner._CommandOutput()) as output:
         output.append('stdout', 'one')
         output.append('stdout', 'two')
-        record = {'request_id': 'r', 'output': output}
+        record = runner._Command('r', 1)
+        record.output = output
         replies = iter([{'ok': True, 'next': 1}, {'ok': True, 'next': 2}])
         monkeypatch.setattr(runner, '_post', lambda *a, **k: next(replies))
         assert command.flush_output(record, drain=False)
@@ -232,7 +233,7 @@ def test_blocked_first_popen_does_not_launch_expired_second_or_block_cancel(monk
 
     def wait(record):
         first_published.set()
-        command._post_result(record['request_id'], '', '', 130, 'canceled', record=record)
+        command._post_result(record, '', '', 130, 'canceled')
 
     monkeypatch.setattr(runner.subprocess, 'Popen', popen)
     monkeypatch.setattr(command, '_wait', wait)
@@ -290,9 +291,9 @@ def test_cancel_during_popen_is_seen_after_process_publication(monkeypatch):
         assert release.wait(2)
         return proc
     def wait(record):
-        assert record['proc'] is proc
-        assert record['reason'] == 'canceled'
-        command._post_result(record['request_id'], '', '', 130, 'canceled', record=record)
+        assert record.proc is proc
+        assert record.stop_reason == 'canceled'
+        command._post_result(record, '', '', 130, 'canceled')
         observed.set()
     monkeypatch.setattr(runner.subprocess, 'Popen', popen)
     monkeypatch.setattr(command, '_wait', wait)
@@ -323,8 +324,9 @@ def test_final_result_is_retained_before_output_drain(monkeypatch):
         returncode = 0
     with closing(runner._CommandOutput()) as output:
         output.append('stdout', 'hello')
-        record = {'request_id': 'r', 'proc': Proc(), 'output': output, 'input': None,
-                  'timeout': 1, 'reason': None}
+        record = runner._Command('r', 1)
+        record.proc = Proc()
+        record.output = output
         command.active['r'] = record
         monkeypatch.setattr(runner, '_supervise_process', lambda *a, **k: None)
         monkeypatch.setattr(command, 'flush_output', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('drain')))
@@ -335,7 +337,9 @@ def test_final_result_is_retained_before_output_drain(monkeypatch):
         assert result['outcome'] == 'completed'
         assert result['exit_code'] == 0
         assert result['output_seq'] == 1
-        assert command.pending_outputs['r'] is record
+        # The final result waits for its undelivered output to drain.
+        assert list(command.outbox) == [record]
+        assert record.output is output
 
 
 def test_spool_read_failure_downgrades_pending_result(monkeypatch):
@@ -343,12 +347,12 @@ def test_spool_read_failure_downgrades_pending_result(monkeypatch):
     command.live_output = True
     with closing(runner._CommandOutput()) as output:
         output.append('stdout', 'first')
-        record = {'request_id': 'r', 'output': output}
-        command.pending_outputs['r'] = record
-        message = {'type': 'result', 'request_id': 'r', 'stdout': 'first',
-                   'stderr': '', 'exit_code': 0, 'outcome': 'completed',
-                   'output_seq': 1}
-        command.outbox.append(message)
+        record = runner._Command('r', 1)
+        record.output = output
+        record.result = {'type': 'result', 'request_id': 'r', 'stdout': 'first',
+                         'stderr': '', 'exit_code': 0, 'outcome': 'completed',
+                         'output_seq': 1}
+        command.outbox.append(record)
         def fail(*_args, **_kwargs):
             output.output_error = 'disk read failed'
             return False
@@ -415,12 +419,13 @@ def test_long_inline_command_preserves_exit_and_trap(monkeypatch):
 
 @pytest.mark.skipif(os.name == 'nt', reason='POSIX shell command-file contract')
 def test_long_inline_command_keeps_stdin_inherited():
-    with runner._spawn_command('exit 0\n#' + 'x' * 150_000, None) as proc:
+    proc, command_file = runner._spawn_command('exit 0\n#' + 'x' * 150_000, None)
+    with proc:
         try:
             assert proc.stdin is None
             assert proc.wait(timeout=5) == 0
         finally:
-            os.unlink(proc._mobius_command_file)
+            os.unlink(command_file)
 
 
 def test_spool_index_stays_constant_size_and_ack_reclaims_scratch():
@@ -470,11 +475,12 @@ def test_rejected_output_cannot_be_reported_as_complete(monkeypatch, status):
     command.live_output = True
     with closing(runner._CommandOutput()) as output:
         output.append('stdout', 'known preview')
-        record = {'request_id': 'r', 'output': output}
-        command.pending_outputs['r'] = record
-        command.outbox.append({'type': 'result', 'request_id': 'r',
-                              'outcome': 'completed', 'exit_code': 0,
-                              'stdout': 'known preview', 'stderr': '', 'output_seq': 1})
+        record = runner._Command('r', 1)
+        record.output = output
+        record.result = {'type': 'result', 'request_id': 'r',
+                         'outcome': 'completed', 'exit_code': 0,
+                         'stdout': 'known preview', 'stderr': '', 'output_seq': 1}
+        command.outbox.append(record)
         sent = []
         def post(url, payload, **_kwargs):
             if url.endswith('/output'):
@@ -505,9 +511,9 @@ def test_output_scratch_lives_until_result_delivery_settles(monkeypatch, status)
     monkeypatch.setattr(command, '_wake_result_worker', lambda: None)
     with closing(runner._CommandOutput()) as output:
         output.append('stdout', 'retained')
-        record = {'request_id': 'scratch', 'output': output}
-        command._post_result('scratch', 'retained', '', 0, 'completed',
-                             record=record, output_seq=1)
+        record = runner._Command('scratch', 1)
+        record.output = output
+        command._post_result(record, 'retained', '', 0, 'completed', output_seq=1)
         assert not output.spool.closed
 
         def post(url, _payload, **_kwargs):
@@ -532,8 +538,9 @@ def test_output_without_pending_chunks_closes_before_delivery(monkeypatch):
     command = runner._CommandRunner('https://example.test', 'token')
     monkeypatch.setattr(command, '_wake_result_worker', lambda: None)
     output = runner._CommandOutput()
-    command._post_result('empty', '', '', 124, 'expired',
-                         record={'request_id': 'empty', 'output': output})
+    record = runner._Command('empty', 1)
+    record.output = output
+    command._post_result(record, '', '', 124, 'expired')
     assert output.spool.closed
     assert command.pending_messages()[0]['outcome'] == 'expired'
 
@@ -555,3 +562,28 @@ def test_pipe_reader_closes_its_own_pipe_after_eof():
         runner._pump_stream(pipe, 'stdout', output)
         assert pipe.closed
         assert output.final_streams() == ('last bytes', '', False)
+
+
+@pytest.mark.parametrize('base', ['https://controller.example', 'https://192.0.2.42:8443'])
+def test_pair_success_names_granted_instance_not_machine_alias(monkeypatch, capsys, base):
+    saved = []
+    monkeypatch.setattr(runner, '_post', lambda *_args, **_kwargs: {
+        'host_id': 'test-host', 'token': 'private-host-token', 'name': 'Mac',
+    })
+    monkeypatch.setattr(runner, '_add_connection', saved.append)
+    connection = runner._pair(base + '/', 'private-pair-code')
+    assert capsys.readouterr().out == 'Granted command access to %s.\n' % base
+    assert connection['name'] == 'Mac'
+    assert saved == [connection]
+
+
+def test_pair_does_not_announce_access_when_saving_fails(monkeypatch, capsys):
+    monkeypatch.setattr(runner, '_post', lambda *_args, **_kwargs: {
+        'host_id': 'test-host', 'token': 'private-host-token', 'name': 'Mac',
+    })
+    def failed_save(_connection):
+        raise OSError('Disk full')
+    monkeypatch.setattr(runner, '_add_connection', failed_save)
+    with pytest.raises(OSError, match='Disk full'):
+        runner._pair('https://controller.example', 'private-pair-code')
+    assert capsys.readouterr().out == ''

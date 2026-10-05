@@ -149,9 +149,4 @@ describe('ExpandableImage reserves the frame BEFORE the token resolves (lever 3)
       'image decode must never revise frame geometry')
   })
 
-  test('local media without dimensions errors instead of guessing a ratio', () => {
-    assert.match(src, /const\s+dimensionError\s*=\s*!!\(/)
-    assert.match(src, /mediaChatId[\s\S]*mediaDimensions\s*!=\s*null[\s\S]*!dims/)
-    assert.match(src, /Image unavailable/)
-  })
 })

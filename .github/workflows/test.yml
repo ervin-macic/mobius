@@ -128,9 +128,12 @@ jobs:
         # First boot only logs a failed default-app install, so a platform
         # contract change, or an app `main` that no longer installs on this platform,
         # would otherwise ship silently. This step fetches the apps from GitHub.
+        # Shared runners exhaust the unauthenticated API rate limit; the
+        # read-only workflow token lifts it for api.github.com requests.
         working-directory: backend
         env:
           MOBIUS_LIVE_BOOTSTRAP: '1'
+          GITHUB_TOKEN: ${{ github.token }}
         run: pytest -q tests/test_bootstrap_live.py
       - name: Validate bundled Caddy policy
         # Caddy expands these placeholders inside its container. Keep the

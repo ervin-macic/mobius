@@ -285,7 +285,7 @@ for (const [continuationWait, title, explanation] of [
       message: 'Selected model is at capacity.',
       pause: { kind: 'model_capacity', resets_at: '2026-09-04T09:00:00Z' },
     }] }
-    const props = { msg, isLastMsg: true, onResume() {}, continuationWait }
+    const props = { msg, isLastMsg: true, onResume() {}, continuationWait, handoff: { kind: 'automatic', reason: 'model_capacity' } }
     const blocked = renderToStaticMarkup(createElement(MsgContent, props))
     assert.ok(blocked.includes(title))
     assert.ok(blocked.includes(explanation))
@@ -381,7 +381,11 @@ test('the rate-limit card keeps automatic recovery and an explicit early retry',
     'a future reset names the persistent chat policy')
   assert.match(msgContent, /Turn off auto-continue/,
     'an enabled policy stays reversible without a competing retry')
-  assert.match(msgContent, /manualResumeAvailable = recoveryOwner && !resourceWait/,
+  const earlyRetry = renderToStaticMarkup(createElement(MsgContent, {
+    msg: { role: 'assistant', blocks: [{ type: 'error', resumable: true, pause: { kind: 'usage_limit' } }] },
+    isLastMsg: true, onResume() {}, handoff: { kind: 'automatic' },
+  }))
+  assert.match(earlyRetry, /class="chat__resume chat__recovery-action"/,
     'manual continuation remains available when credits restore usage early')
   assert.match(errorCard, /Continuing now may use it/,
     'paid recovery makes potential provider charges explicit')
@@ -500,16 +504,14 @@ test('a benign pause (no reset time) renders the calm "Paused" family, not red E
 test('resource parks appear in the standard Waiting surface', () => {
   assert.match(chatView, /const resourcePause = isResourcePause\(pendingResumeBlock\)/,
     'the durable tail pause must drive the live waiting presentation')
-  assert.match(chatView, /chatHasSelfResumingHandoff\(\{[\s\S]*resourcePause,[\s\S]*\}\)/,
+  assert.match(chatView, /classifyChatHandoff\(\{[\s\S]*resourcePause: pendingResumeBlock,[\s\S]*authoritativeHandoff: serverHandoff,[\s\S]*\}\)/,
     'resource waits must share the self-resuming handoff visibility rule')
-  assert.match(chatView, /<WaitingChip[\s\S]*resourcePause=\{resourcePause\}/,
+  assert.match(chatView, /<WaitingChip[\s\S]*resourcePause=\{resourcePause \|\| \(modelCapacityPause/,
     'the standard Waiting component must receive the resource handoff')
   assert.match(waitingChip, /function ResourceCard/,
     'the shared Waiting surface should explain resource ownership and wake-up')
   assert.match(chatView, /const hasPendingResume = !!pendingResumeBlock[\s\S]*&& !resourcePause/,
     'an automatically managed resource wait must not advertise a manual resume nudge')
-  assert.match(msgContent, /manualResumeAvailable = recoveryOwner && !resourceWait/,
-    'an automatically managed resource wait must not offer a retry that simply re-parks')
   assert.match(chatView, /Waiting for storage headroom\. This chat will resume automatically\./,
     'the screen-reader status must describe the actual automatic handoff')
 })
@@ -572,6 +574,7 @@ for (const [continuationWait, expected] of [
     }] }
     const html = renderToStaticMarkup(createElement(MsgContent, {
       msg, isLastMsg: true, onResume() {}, continuationWait,
+      handoff: { kind: 'automatic', reason: 'restart' },
     }))
     assert.match(html, expected)
     assert.doesNotMatch(html, /chat__recovery-title[^>]*>Error/)
@@ -599,3 +602,42 @@ test('continuation blocker changes survive mounted and cached runtime reconcilia
     assert.ok(chatView.includes(`continuationWait: ${source}.continuation_wait || null`))
   }
 })
+
+test('manual resource recovery retains the existing Resume action while automatic waits do not compete', () => {
+  for (const kind of ['memory', 'storage', 'model_capacity']) {
+    const props = {
+      msg: { role: 'assistant', blocks: [{ type: 'error', resumable: true, pause: { kind } }] },
+      isLastMsg: true, onResume() {}, resumeState: {},
+    }
+    const manual = renderToStaticMarkup(createElement(MsgContent, { ...props, handoff: { kind: 'recovery' } }))
+    assert.match(manual, /class="chat__resume chat__recovery-action"/)
+    assert.doesNotMatch(manual, /will continue automatically|Trying again shortly/)
+    const unknown = renderToStaticMarkup(createElement(MsgContent, props))
+    assert.doesNotMatch(unknown, /class="chat__resume chat__recovery-action"/)
+    const automatic = renderToStaticMarkup(createElement(MsgContent, { ...props, handoff: { kind: 'automatic', reason: kind } }))
+    assert.doesNotMatch(automatic, /class="chat__resume chat__recovery-action"/)
+    const answered = renderToStaticMarkup(createElement(MsgContent, {
+      ...props,
+      msg: { ...props.msg, blocks: [{ type: 'question', question_id: 'open-question', questions: [] }, ...props.msg.blocks] },
+      liveQuestionId: 'open-question', onQuestionAnswer() {}, handoff: { kind: 'recovery' },
+    }))
+    assert.doesNotMatch(answered, /class="chat__resume chat__recovery-action"/)
+  }
+})
+
+for (const kind of ['memory', 'storage', 'model_capacity', 'restart']) {
+  for (const [name, props] of [
+    ['historical', { isLastMsg: false, handoff: { kind: 'recovery' } }],
+    ['awaiting runtime', { isLastMsg: true }],
+    ['stale active snapshot', { isLastMsg: true, handoff: { kind: 'working' } }],
+  ]) {
+    test(`${name} ${kind} pause does not invent a manual recovery failure`, () => {
+      const html = renderToStaticMarkup(createElement(MsgContent, {
+        msg: { role: 'assistant', content: '', blocks: [{ type: 'error', resumable: true, pause: { kind } }] },
+        onResume() {}, ...props,
+      }))
+      assert.doesNotMatch(html, /recovery is unavailable|recovery needs attention|This restart needs manual recovery|Recovery needed/)
+      assert.match(html, /Trying again|continue automatically/)
+    })
+  }
+}

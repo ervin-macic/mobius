@@ -48,6 +48,12 @@ def goal_identity_for_run_start(db, chat_id, message):
     return objective, str(uuid.uuid4())
   reason = continuation_reason(message)
   kind = message.get("kind")
+  if is_continuation_message(message) and "goal_id" in message:
+    goal = db.get(models.ChatGoal, message["goal_id"]) if message["goal_id"] else None
+    allowed = {"open", "stopped"} if reason == "manual" else {"open"}
+    if goal is not None and goal.chat_id == chat_id and goal.status in allowed:
+      return goal.objective, goal.id
+    return None, None
   exact_goal_id = None
   if kind == DELEGATION_RESULT_MESSAGE_KIND:
     exact_goal_id = message.get("source_work_id")

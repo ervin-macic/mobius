@@ -69,12 +69,17 @@ export function newestGoalPlan(current, incoming) {
   return incoming
 }
 
+export function planForGoal(plan, goal) {
+  if (!plan || !goal?.id) return null
+  return String(plan.goal_id || plan.root_run_id) === String(goal.id) ? plan : null
+}
+
 function isContinue(text) {
   return typeof text === 'string' && text.trim().toLowerCase() === 'continue'
 }
 
 const GOAL_PRESENTATION_STATUSES = new Set([
-  'active', 'paused', 'completed', 'failed',
+  'active', 'paused', 'completed', 'cannot_complete', 'cancelled',
 ])
 
 /** Normalize the durable Goal presentation shared by detail/runtime reads. */
@@ -84,10 +89,46 @@ export function normalizeGoalPresentation(goal) {
   if (!objective || !GOAL_PRESENTATION_STATUSES.has(goal.status)) return null
   return {
     id: goal.id == null ? null : String(goal.id),
+    ...(Number.isInteger(goal.revision) ? { revision: goal.revision } : {}),
     objective,
     status: goal.status,
     resumable: goal.status === 'paused',
+    ...(goal.status === 'paused' && ['owner', 'agent', 'unknown', 'deferred'].includes(goal.pause_reason)
+      ? { pause_reason: goal.pause_reason } : {}),
+    ...(goal.status === 'paused' && goal.pause_reason === 'deferred' && typeof goal.hold_reason === 'string'
+      ? { hold_reason: goal.hold_reason } : {}),
+    ...(goal.handoff?.kind ? { handoff: goal.handoff } : {}),
+    ...(goal.result ? { result: goal.result } : {}),
   }
+}
+
+/** One status vocabulary for the Goal rail and its accessible announcement.
+ * Only the exact Goal's handoff may describe who moves next; chat cards cannot.
+ */
+export function goalStatusLabel(goal) {
+  if (!goal) return null
+  const terminal = {
+    completed: 'Completed', cannot_complete: 'Cannot complete', cancelled: 'Cancelled',
+  }[goal.status]
+  if (terminal) return terminal
+  if (goal.status === 'paused') {
+    const paused = {
+      owner: 'Paused by you', agent: 'Paused by agent', unknown: 'Interrupted', deferred: 'On hold',
+    }[goal.pause_reason]
+    if (paused) return paused
+  }
+  if (goal.handoff?.kind === 'owner_input') return 'Waiting for you'
+  if (goal.handoff?.kind === 'automatic') return 'Waiting'
+  return goal.status === 'paused' ? 'Interrupted' : null
+}
+
+/** Pause provenance never removes manual recovery; actual chat conflicts do. */
+export function canResumeGoal(goal, { turnActive, hasPendingQuestion, chatHandoff } = {}) {
+  return goal?.status === 'paused'
+    && !turnActive
+    && !hasPendingQuestion
+    && !['automatic', 'owner_input'].includes(goal.handoff?.kind)
+    && !['automatic', 'owner_input'].includes(chatHandoff)
 }
 
 /** Resolve a server runtime snapshot, with one rolling-server fallback. */
@@ -181,7 +222,8 @@ export function goalPresentationAtRunStart(text, messages, current = null) {
   }
   const normalizedCurrent = normalizeGoalPresentation(current)
   if (isContinue(text) && normalizedCurrent?.status === 'paused') {
-    return { ...normalizedCurrent, status: 'active', resumable: false }
+    const { pause_reason: _pauseReason, hold_reason: _holdReason, handoff: _handoff, ...continuingGoal } = normalizedCurrent
+    return { ...continuingGoal, status: 'active', resumable: false }
   }
   return normalizedCurrent
 }
@@ -261,36 +303,19 @@ export function progressRailViewModel(
   goal,
   buildPhases,
   goalPlan = null,
-  waitState = null,
 ) {
   const items = []
   const presentation = typeof goal === 'string'
     ? normalizeGoalPresentation({ objective: goal, status: 'active' })
     : normalizeGoalPresentation(goal)
-  const actionable = presentation && ['active', 'paused'].includes(presentation.status)
-    ? presentation
-    : null
-  const goalObjective = actionable?.objective || ''
+  const goalObjective = presentation?.objective || ''
   if (goalObjective) {
     const completed = goalPlan?.summary?.completed
     const total = goalPlan?.summary?.total
     const planned = Number.isInteger(completed) && Number.isInteger(total)
     const activeTasks = visibleGoalTasks(goalPlan)
     const activeLabels = activeTasks.map(progressLabel).filter(Boolean)
-    // The Goal lifecycle says only whether a turn is working on it. Who moves
-    // next comes from the chat itself: an open card, or a Wait/helper that
-    // will resume it. Anything else idle is simply the owner's turn.
-    const ownerActionRequired = waitState?.ownerActionRequired === true
-    const waiting = !ownerActionRequired && waitState?.monitoring === true
-    const statusLabel = ownerActionRequired
-      ? 'Needs your answer'
-      : waiting
-        ? 'Waiting'
-        : {
-            paused: 'Your turn',
-            completed: 'Completed',
-            failed: 'Needs attention',
-          }[actionable.status]
+    const statusLabel = goalStatusLabel(presentation)
     const progressSummary = planned ? `${completed}/${total}` : goalObjective
     items.push({
       key: 'goal',
@@ -300,7 +325,7 @@ export function progressRailViewModel(
           : ''
       }`,
       expandable: true,
-      tone: actionable.status,
+      tone: presentation.status,
       ...(goalPlan ? {
         title: `Goal: ${goalObjective}`,
         ariaLabel: `Goal: ${goalObjective}. ${statusLabel || 'Working'}; ${completed} of ${total} complete`,

@@ -1452,3 +1452,127 @@ def test_manual_note_compaction_retains_existing_work_limits(
     assert calls == []
     assert row.session_id == "previous-session"
     assert row.messages == messages
+
+
+def test_manual_compaction_is_visible_to_every_viewer_while_it_runs(
+  client, auth, db, monkeypatch,
+):
+  """Other panes, reloads and devices must see the rebuild window.
+
+  Sends wait behind the transition lock during compaction, so a view that
+  cannot see the window shows an idle chat whose message silently waits.
+  """
+  from app import chat_compaction_state
+
+  published = []
+  monkeypatch.setattr(
+    chat_compaction_state,
+    "get_system_broadcast",
+    lambda: SimpleNamespace(publish=published.append),
+  )
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "keep this context"},
+    {"role": "assistant", "content": "I will."},
+  ])
+  during = {}
+
+  async def _stub(_messages, **_kwargs):
+    during["kind"] = chat_compaction_state.compaction_kind(chat_id)
+    return "briefing"
+
+  monkeypatch.setattr(compaction, "summarize_chat", _stub)
+  assert client.get(
+    f"/api/chats/{chat_id}", headers=auth,
+  ).json()["compacting"] is None
+
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert during["kind"] == "compact"
+  assert published == [
+    {"type": "chat_compaction_changed", "chatId": chat_id, "compacting": "compact"},
+    {"type": "chat_compaction_changed", "chatId": chat_id, "compacting": None},
+  ]
+  assert chat_compaction_state.compaction_kind(chat_id) is None
+  assert client.get(
+    f"/api/chats/{chat_id}", headers=auth,
+  ).json()["compacting"] is None
+
+
+def test_only_a_running_provider_switch_is_visible_to_viewers(
+  client, auth, db, monkeypatch,
+):
+  """Refused or replayed switches must not flash the notice in every view."""
+  from app import chat_compaction_state
+
+  _connect_codex(monkeypatch)
+  published = []
+  monkeypatch.setattr(
+    chat_compaction_state,
+    "get_system_broadcast",
+    lambda: SimpleNamespace(publish=published.append),
+  )
+  during = {}
+
+  async def _stub(_messages, **_kwargs):
+    during["kind"] = chat_compaction_state.compaction_kind(chat_id)
+    return "handoff"
+
+  monkeypatch.setattr(compaction, "summarize_chat", _stub)
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "hi"},
+    {"role": "assistant", "content": "hello"},
+  ])
+
+  missing = client.post(
+    "/api/chats/no-such-chat/provider-switch", headers=auth, json=_payload(),
+  )
+  same = client.post(
+    f"/api/chats/{chat_id}/provider-switch",
+    headers=auth,
+    json=_payload(provider="claude"),
+  )
+  assert missing.status_code == 404
+  assert same.status_code == 409
+  assert published == []
+
+  first = client.post(
+    f"/api/chats/{chat_id}/provider-switch", headers=auth, json=_payload(),
+  )
+  assert first.status_code == 200, first.text
+  assert during["kind"] == "provider_switch"
+  assert published == [
+    {
+      "type": "chat_compaction_changed",
+      "chatId": chat_id,
+      "compacting": "provider_switch",
+    },
+    {"type": "chat_compaction_changed", "chatId": chat_id, "compacting": None},
+  ]
+
+  published.clear()
+  replay = client.post(
+    f"/api/chats/{chat_id}/provider-switch", headers=auth, json=_payload(),
+  )
+  assert replay.status_code == 200, replay.text
+  assert published == []
+  assert chat_compaction_state.compaction_kind(chat_id) is None
+
+
+def test_failed_compaction_clears_the_visible_window(
+  client, auth, db, monkeypatch,
+):
+  from app import chat_compaction_state
+
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "keep this context"},
+  ])
+
+  async def _boom(_messages, **_kwargs):
+    raise RuntimeError("provider down")
+
+  monkeypatch.setattr(compaction, "summarize_chat", _boom)
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+
+  assert response.status_code == 502
+  assert chat_compaction_state.compaction_kind(chat_id) is None

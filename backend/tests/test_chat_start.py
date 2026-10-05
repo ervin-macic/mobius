@@ -1,12 +1,111 @@
 """Programmatic chat starts share one durable lifecycle protocol."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from app import chat_start
 from app.chat_writer import StartTurn, StartTurnBlockedByPendingQuestion
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("activity", [False, True], ids=["continuation", "activity"])
+async def test_continuation_observes_shutdown_after_waiting_for_its_lock(
+  monkeypatch, activity,
+):
+  from app import chat as chat_mod, chat_queue
+
+  monkeypatch.setattr(chat_mod, "draining", False)
+
+  @asynccontextmanager
+  async def lock_that_crosses_shutdown():
+    monkeypatch.setattr(chat_mod, "draining", True)
+    yield
+
+  monkeypatch.setattr(chat_queue, "get_lock", lambda _id: lock_that_crosses_shutdown())
+  monkeypatch.setattr(
+    chat_start, "get_writer",
+    lambda: pytest.fail("Shutdown must not start or retire a continuation"),
+  )
+  common = dict(chat_id="draining-chat", root_run_id="root", run_token="physical")
+  if activity:
+    started = await chat_start.start_programmatic_activity_continuation(
+      **common, source_work_id="root", activity_id="helper-result",
+    )
+  else:
+    started = await chat_start.start_programmatic_chat_continuation(
+      **common, content="Continue", continuation_id="saved", reason="wait",
+    )
+  assert started is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("activity", [False, True], ids=["continuation", "activity"])
+@pytest.mark.parametrize("draining", [False, True], ids=["crash", "planned-restart"])
+async def test_orphan_cleanup_preserves_planned_restart_but_fails_ambiguous_crash(
+  db, monkeypatch, activity, draining,
+):
+  from app import chat as chat_mod, models
+
+  chat_id, run_id = "restart-parent", "restart-physical"
+  messages = [{"role": "user", "content": "Finish the saved work."}]
+  pending = [{"role": "user", "content": "Keep this queued.", "ts": 1}]
+  db.add(models.Chat(
+    id=chat_id, title="Restart parent", provider="codex",
+    auto_resume_on_restart=True, messages=messages, pending_messages=pending,
+    live_assistant={
+      "id": run_id, "role": "assistant",
+      "blocks": [{"type": "text", "content": "Already working."}],
+    },
+  ))
+  db.flush()
+  db.add(models.ChatRun(
+    id=run_id, root_run_id="root-work", chat_id=chat_id, status="running",
+    provider="codex", provider_execution_admitted=True,
+    restart_nonce="accepted-planned-restart",
+  ))
+  db.commit()
+  # The runner has stopped, but the drain has not yet parked its exact row.
+  monkeypatch.setattr(chat_mod, "draining", draining)
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: False)
+  monkeypatch.setattr(
+    chat_mod, "_schedule_continuation",
+    lambda **_kwargs: pytest.fail("An admitted orphan must not replay tools"),
+  )
+  common = dict(chat_id=chat_id, root_run_id="root-work", run_token=run_id)
+  if activity:
+    started = await chat_start.start_programmatic_activity_continuation(
+      **common, source_work_id="root-work", activity_id="helper-result",
+    )
+  else:
+    started = await chat_start.start_programmatic_chat_continuation(
+      **common, content="Continue", continuation_id="saved-continuation",
+      reason="wait", hidden=True,
+    )
+
+  assert started is False
+  db.expire_all()
+  physical = db.get(models.ChatRun, run_id)
+  assert physical.status == ("running" if draining else "failed")
+  assert physical.restart_nonce == ("accepted-planned-restart" if draining else None)
+  assert db.get(models.Chat, chat_id).messages == messages
+  assert db.get(models.Chat, chat_id).pending_messages == pending
+
+  if draining:
+    # Authenticated boot recovery must still find the exact unfinished run.
+    monkeypatch.setattr(chat_mod, "draining", False)
+    result = chat_mod.reconcile_startup_chats(
+      db, restart_authorization="accepted-planned-restart",
+    )
+    assert result.restart_parks == [chat_id]
+    assert result.manual == []
+    db.expire_all()
+    physical = db.get(models.ChatRun, run_id)
+    assert physical.status == "parked"
+    assert physical.park_reason == "restart"
+    assert db.get(models.Chat, chat_id).pending_messages == pending
 
 
 class _Writer:

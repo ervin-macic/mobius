@@ -51,7 +51,7 @@ function useElapsed(startedAt, running) {
 
 // What a settled helper's row says in place of its live step.
 const SETTLED = {
-  completed: ['done', 'Finished'],
+  completed: ['done', 'Helper finished'],
   failed: ['failed', 'Failed'],
   needs_review: ['failed', 'Needs review'],
   interrupted: ['failed', 'Interrupted'],

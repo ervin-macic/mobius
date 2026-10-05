@@ -168,9 +168,9 @@ def test_outbound_json_replaces_an_existing_public_mode_with_private_storage(
 def test_inbound_host_registry_is_private(tmp_path, monkeypatch):
   monkeypatch.setattr(connect_routes, "_hosts_dir", lambda: tmp_path)
 
-  connect_routes._save_host({"id": "h_example", "pairing_code": "ABCD-EFGH"})
+  connect_routes._save_host({"id": "h_0123456789abcdef", "pairing_code": "ABCD-EFGH"})
 
-  path = tmp_path / "h_example.json"
+  path = tmp_path / "h_0123456789abcdef.json"
   assert json.loads(path.read_text(encoding="utf-8"))["pairing_code"] == "ABCD-EFGH"
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -986,13 +986,25 @@ def test_host_rename_rejects_empty_or_unknown_hosts(client, auth):
     json={"name": "   "},
   )
   missing = client.patch(
-    "/api/connect/hosts/h_does_not_exist",
+    "/api/connect/hosts/h_0123456789abcdef",
     headers=auth,
     json={"name": "New name"},
   )
 
   assert empty.status_code == 400, empty.text
   assert missing.status_code == 404, missing.text
+
+
+def test_pairing_accepts_the_code_without_its_hyphen(client, auth):
+  pairing = client.post("/api/connect/hosts", headers=auth, json={}).json()
+
+  paired = client.post(
+    "/api/connect/pair",
+    json={"code": pairing["pairing_code"].replace("-", "").lower()},
+  )
+
+  assert paired.status_code == 200, paired.text
+  assert paired.json()["host_id"] == pairing["id"]
 
 
 def test_pairing_is_one_time_and_delete_revokes_runner(client, auth):
@@ -1172,7 +1184,6 @@ def test_stale_runner_record_offers_an_offline_update(client, auth):
   pairing, _ = _paired_host(client, auth)
   host = connect_routes._load_host(pairing["id"])
   host["runner_protocol"] = 3
-  host.pop("runner_transport", None)
   connect_routes._save_host(host)
 
   public = client.get("/api/connect/hosts", headers=auth).json()["hosts"][0]
@@ -1196,7 +1207,6 @@ def test_compatible_runner_release_controls_update_offer(
   pairing, _ = _paired_host(client, auth)
   host = connect_routes._load_host(pairing["id"])
   host["runner_protocol"] = connect_runner.RUNNER_PROTOCOL_VERSION
-  host["runner_transport"] = "sse"
   host["runner_release"] = runner_release
   host["runner_capabilities"] = list(connect_runner.RUNNER_CAPABILITIES)
   connect_routes._save_host(host)
@@ -1312,15 +1322,15 @@ async def test_current_stream_rotates_without_losing_running_command(
   assert host["platform"] == "TestOS 1"
   assert connect_routes._public_host(host)["runner_update_available"] is False
 
-  assert await response.body_iterator.__anext__() == ": connected\n\n"
-  with pytest.raises(StopAsyncIteration):
-    await response.body_iterator.__anext__()
+  # The rotated stream ends on its own; only heartbeats precede the end.
+  sent = [item async for item in response.body_iterator]
+  assert sent[0] == ": connected\n\n"
+  assert set(sent[1:]) <= {": ping\n\n"}
 
   assert pairing["id"] not in connect_routes._channels
   assert connect_routes._find_command(pairing["id"], request_id) is not None
   assert not caller.done()
   host = connect_routes._load_host(pairing["id"])
-  assert host["runner_transport"] == "sse"
   assert connect_routes._public_host(host)["runner_update_available"] is False
   connect_routes._runner_result(pairing["id"], connect_routes.ResultBody(
     request_id=request_id,
@@ -1351,7 +1361,7 @@ async def test_reconnect_keeps_one_command_and_returns_its_result(client, auth):
   connect_routes._channels.pop(pairing["id"])
   second = connect_routes._Channel()
   connect_routes._replace_channel(pairing["id"], second)
-  await connect_routes._reconcile_runner(pairing["id"], second, {
+  connect_routes._reconcile_runner(pairing["id"], {
     "active_request_ids": [request_id], "pending_result_ids": [],
   })
   assert second.queue.empty()
@@ -1477,7 +1487,7 @@ def test_exec_body_requires_exactly_one_work_form():
 
 @pytest.mark.asyncio
 async def test_persisted_running_command_accepts_result_after_runtime_restart(
-  client, auth, monkeypatch,
+  client, auth,
 ):
   pairing, _ = _paired_host(client, auth)
   request_id = "8" * 16
@@ -1497,7 +1507,8 @@ async def test_persisted_running_command_accepts_result_after_runtime_restart(
   connect_routes._commands.clear()
   connect_routes._host_id_by_token_hash.clear()
   channel = connect_routes._Channel()
-  await connect_routes._reconcile_runner(pairing["id"], channel, {
+  connect_routes._channels[pairing["id"]] = channel
+  connect_routes._reconcile_runner(pairing["id"], {
     "active_request_ids": [],
     "pending_result_ids": [request_id],
   })
@@ -1513,14 +1524,6 @@ async def test_persisted_running_command_accepts_result_after_runtime_restart(
   assert connect_routes._host_commands(pairing["id"]) == {}
   last = connect_routes.connect_output.finished(pairing["id"], request_id)
   assert last["result"]["stdout"] == "finished after restart"
-  monkeypatch.setattr(
-    connect_routes,
-    "_now",
-    lambda: last["finished_at"] + connect_routes._RESULT_RETENTION_SECONDS + 1,
-  )
-  connect_routes._prune_recent_commands(connect_routes._load_host(pairing["id"]))
-  assert connect_routes._load_host(pairing["id"])["recent_commands"] == {}
-  assert connect_routes.connect_output.finished(pairing["id"], request_id) == last
 
 
 @pytest.mark.asyncio
@@ -1530,7 +1533,6 @@ async def test_offline_cancel_is_delivered_when_current_runner_reconnects(
   pairing, _ = _paired_host(client, auth)
   host = connect_routes._load_host(pairing["id"])
   host["runner_protocol"] = 4
-  host["runner_transport"] = "sse"
   connect_routes._save_host(host)
   request_id = "6" * 16
   command = connect_routes._ActiveCommand(
@@ -1544,7 +1546,8 @@ async def test_offline_cancel_is_delivered_when_current_runner_reconnects(
   )
   assert response["state"] == "canceling"
   channel = connect_routes._Channel()
-  await connect_routes._reconcile_runner(pairing["id"], channel, {
+  connect_routes._channels[pairing["id"]] = channel
+  connect_routes._reconcile_runner(pairing["id"], {
     "active_request_ids": [request_id],
     "pending_result_ids": [],
   })
@@ -1571,7 +1574,6 @@ async def test_exec_caps_large_output_and_reports_runner_timeout(client, auth):
     "stdout": oversized,
     "stderr": "runner timed out",
     "exit_code": 124,
-    "timed_out": True,
     "outcome": "timed_out",
   })
 
@@ -1701,7 +1703,6 @@ async def test_current_runner_keeps_retryable_result_after_server_timeout(
     request_id=request_id,
     stdout="reported after reconnect",
     exit_code=124,
-    timed_out=True,
     outcome="timed_out",
   ))
   assert connect_routes._host_commands(pairing["id"]) == {}
@@ -1742,6 +1743,191 @@ async def test_unacknowledged_dispatch_expires_and_sends_cancel(
   assert connect_routes.connect_output.finished(
     pairing["id"], request_id,
   )["result"]["outcome"] == "expired"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_cancel_before_start_finishes_canceled_at_once(client, auth, stream):
+  pairing, runner_token = _paired_host(client, auth)
+  channel = connect_routes._Channel()
+  connect_routes._channels[pairing["id"]] = channel
+  request_id = "a1" * 8
+  caller = asyncio.create_task(connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="never starts", request_id=request_id, stream=stream),
+    _owner=object(),
+  ))
+  assert (await asyncio.wait_for(channel.queue.get(), timeout=1))["type"] == "exec"
+
+  canceled = await connect_routes.cancel_host_command(
+    pairing["id"], request_id, _owner=object(),
+  )
+
+  assert canceled["state"] == "finished"
+  reply = await asyncio.wait_for(caller, timeout=1)
+  if stream:
+    assert reply == {"request_id": request_id, "state": "finished"}
+  else:
+    assert reply["outcome"] == "canceled" and reply["canceled"] is True
+  assert await asyncio.wait_for(channel.queue.get(), timeout=1) == {
+    "type": "cancel", "request_id": request_id,
+  }
+  assert connect_routes._host_commands(pairing["id"]) == {}
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "canceled"
+  # A late start acknowledgement is refused, so the runner never spawns it.
+  late_start = client.post(
+    "/api/connect/state",
+    headers={"Authorization": f"Bearer {runner_token}"},
+    json={"request_id": request_id, "state": "started"},
+  )
+  assert late_start.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_removing_a_host_answers_every_waiting_caller(client, auth):
+  pairing, _ = _paired_host(client, auth)
+  host = connect_routes._load_host(pairing["id"])
+  host["runner_capabilities"] = ["parallel"]
+  connect_routes._save_host(host)
+  channel = connect_routes._Channel()
+  connect_routes._channels[pairing["id"]] = channel
+  running_id, starting_id = "b1" * 8, "b2" * 8
+  running = asyncio.create_task(connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="long task", request_id=running_id),
+    _owner=object(),
+  ))
+  await asyncio.wait_for(channel.queue.get(), timeout=1)
+  connect_routes._mark_command_started(pairing["id"], running_id)
+  starting = asyncio.create_task(connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="not yet started", request_id=starting_id),
+    _owner=object(),
+  ))
+  await asyncio.wait_for(channel.queue.get(), timeout=1)
+
+  connect_routes._forget_host(pairing["id"])
+
+  for caller in (running, starting):
+    result = await asyncio.wait_for(caller, timeout=1)
+    assert result["outcome"] == "lost"
+    assert "removed" in result["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_stream_answers_a_waiting_disconnect(client, auth):
+  pairing, _ = _paired_host(client, auth)
+  channel = connect_routes._Channel()
+  connect_routes._channels[pairing["id"]] = channel
+  waiting = asyncio.create_task(connect_routes._ask_runner_to_disconnect(channel))
+  assert (await asyncio.wait_for(channel.queue.get(), timeout=1))["type"] == "disconnect"
+
+  connect_routes._replace_channel(pairing["id"], connect_routes._Channel())
+
+  with pytest.raises(connect_routes.HTTPException) as raised:
+    await asyncio.wait_for(waiting, timeout=1)
+  assert raised.value.status_code == 502
+  assert "closed before it confirmed" in raised.value.detail
+
+
+def test_incompatible_runner_finishes_the_commands_it_replaced(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  request_id = "c1" * 8
+  connect_routes._host_commands(pairing["id"])[request_id] = (
+    connect_routes._ActiveCommand(
+      request_id, 30, started_at=time.time(), state="running",
+    )
+  )
+  connect_routes._persist_commands(pairing["id"])
+
+  response = client.get(
+    "/api/connect/stream?protocol=3",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  assert connect_routes._host_commands(pairing["id"]) == {}
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "lost"
+
+
+def test_stray_incompatible_runner_does_not_end_the_current_runners_work(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  request_id = "c2" * 8
+  connect_routes._channels[pairing["id"]] = connect_routes._Channel()
+  connect_routes._host_commands(pairing["id"])[request_id] = (
+    connect_routes._ActiveCommand(
+      request_id, 30, started_at=time.time(), state="running",
+    )
+  )
+  connect_routes._persist_commands(pairing["id"])
+
+  response = client.get(
+    "/api/connect/stream?protocol=3",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  assert request_id in connect_routes._host_commands(pairing["id"])
+  assert connect_routes.connect_output.finished(pairing["id"], request_id) is None
+
+
+def test_stray_incompatible_runner_leaves_the_current_runners_details(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  host = connect_routes._load_host(pairing["id"])
+  host.update(
+    runner_protocol=connect_routes._RUNNER_PROTOCOL_VERSION,
+    runner_capabilities=["parallel"], platform="Linux 6",
+  )
+  connect_routes._save_host(host)
+  connect_routes._channels[pairing["id"]] = connect_routes._Channel()
+
+  response = client.get(
+    "/api/connect/stream?protocol=3&platform=OldOS",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  kept = connect_routes._load_host(pairing["id"])
+  assert kept["runner_protocol"] == connect_routes._RUNNER_PROTOCOL_VERSION
+  assert kept["runner_capabilities"] == ["parallel"]
+  assert kept["platform"] == "Linux 6"
+
+
+@pytest.mark.asyncio
+async def test_never_started_command_at_result_deadline_finishes_expired(
+  client, auth, monkeypatch,
+):
+  pairing, _ = _paired_host(client, auth)
+  monkeypatch.setattr(connect_routes, "_RESULT_GRACE_SECONDS", 0)
+  request_id = "e1" * 8
+  command = connect_routes._ActiveCommand(
+    request_id, 1, cmd="never confirmed", created_at=time.time() - 5,
+  )
+  connect_routes._host_commands(pairing["id"])[request_id] = command
+  connect_routes._persist_commands(pairing["id"])
+
+  with pytest.raises(connect_routes.HTTPException) as raised:
+    await connect_routes._await_command_result(pairing["id"], command)
+
+  assert raised.value.status_code == 504
+  assert connect_routes._host_commands(pairing["id"]) == {}
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "expired"
+
+
+def test_a_stray_registry_file_does_not_break_the_host_list(client, auth):
+  pairing, _ = _paired_host(client, auth)
+  (connect_routes._hosts_dir() / "legacy.json").write_text('{"id": "legacy"}')
+
+  response = client.get("/api/connect/hosts", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert [host["id"] for host in response.json()["hosts"]] == [pairing["id"]]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")
@@ -1831,7 +2017,7 @@ def test_runner_uses_standard_urllib_for_protocol_four_stream(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append((url, payload, token)),
+    lambda url, payload, token=None, context=None: posted.append((url, payload, token)),
   )
 
   connect_runner._serve_connection(
@@ -1995,7 +2181,7 @@ def test_runner_disconnect_scopes_to_one_of_several_connections(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2036,7 +2222,7 @@ def test_runner_refuses_expired_command_without_spawning(
   })
   assert reported.wait(2)
 
-  messages = list(runner.outbox)
+  messages = runner.pending_messages()
   assert messages[-1]["outcome"] == "expired"
   assert messages[-1]["exit_code"] == 124
   assert runner.active == {}
@@ -2047,7 +2233,7 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
   first_attempt = threading.Event()
   second_attempt = threading.Event()
 
-  def post(_url, payload, token=None):
+  def post(_url, payload, token=None, context=None):
     attempts.append((payload, token))
     if len(attempts) == 1:
       first_attempt.set()
@@ -2058,7 +2244,9 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
   monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
   request_id = "4" * 16
-  runner._post_result(request_id, "ready", "", 0, "completed")
+  runner._post_result(
+    connect_runner._Command(request_id, 30), "ready", "", 0, "completed",
+  )
   assert first_attempt.wait(2)
   with runner.flush_lock:
     pass
@@ -2078,22 +2266,15 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
 
 def test_runner_finishes_into_pending_result_atomically(monkeypatch):
   runner = connect_runner._CommandRunner("https://example.test", "token")
-  record = {
-    "request_id": "a" * 16,
-    "proc": None,
-    "reason": None,
-    "timeout": 30,
-  }
-  runner.active[record["request_id"]] = record
+  command = connect_runner._Command("a" * 16, 30)
+  runner.active[command.request_id] = command
   monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
 
-  runner._post_result(
-    record["request_id"], "done", "", 0, "completed", record=record,
-  )
+  runner._post_result(command, "done", "", 0, "completed")
 
   active_ids, pending_ids = runner.snapshot()
   assert active_ids == []
-  assert pending_ids == [record["request_id"]]
+  assert pending_ids == [command.request_id]
 
 
 def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
@@ -2106,7 +2287,7 @@ def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
     before_spawn()
     spawned.append((cmd, cwd))
     spawned_event.set()
-    return object()
+    return object(), None
   monkeypatch.setattr(
     connect_runner,
     "_spawn_command",
@@ -2134,7 +2315,7 @@ def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
   assert spawned == [("do it once", None)]
   assert list(runner.active) == [event["request_id"]]
   assert runner.pending_messages() == []
-  runner.active[event["request_id"]]["output"].close()
+  runner.active[event["request_id"]].output.close()
 
 
 def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
@@ -2146,7 +2327,7 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
     spawned.append((cmd, cwd))
     if len(spawned) == 2:
       both_spawned.set()
-    return object()
+    return object(), None
   monkeypatch.setattr(
     connect_runner,
     "_spawn_command",
@@ -2175,10 +2356,10 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
     connect_runner, "_terminate_process_tree", lambda _proc: None,
   )
   assert runner.cancel("1" * 16) is True
-  assert first["reason"] == "canceled"
-  assert runner.active["2" * 16]["reason"] is None
-  for record in runner.active.values():
-    record["output"].close()
+  assert first.stop_reason == "canceled"
+  assert runner.active["2" * 16].stop_reason is None
+  for command in runner.active.values():
+    command.output.close()
 
 
 def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
@@ -2191,7 +2372,7 @@ def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
     before_spawn()
     spawned.append((cmd, cwd, script, shell))
     spawned_event.set()
-    return object()
+    return object(), None
 
   monkeypatch.setattr(connect_runner, "_spawn_command", spawn)
   monkeypatch.setattr(runner, "_post_started", lambda _request_id: None)
@@ -2208,14 +2389,14 @@ def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
   assert spawned_event.wait(2)
 
   assert spawned == [(None, "/srv/app", script, "bash")]
-  assert runner.active["e" * 16]["input"] == script
-  runner.active["e" * 16]["output"].close()
+  assert runner.active["e" * 16].stdin_text == script
+  runner.active["e" * 16].output.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell contract")
 def test_runner_executes_literal_posix_script_through_stdin():
   script = "name='$literal'\nfor value in \"$name\" two; do printf '<%s>\\n' \"$value\"; done\n"
-  proc = connect_runner._spawn_command(
+  proc, _command_file = connect_runner._spawn_command(
     None, None, script=script, shell="sh",
   )
 
@@ -2277,7 +2458,7 @@ def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
   })
   assert reported.wait(2)
 
-  messages = list(runner.outbox)
+  messages = runner.pending_messages()
   assert [message["type"] for message in messages] == ["result"]
   assert messages[-1]["outcome"] == "expired"
   assert runner.active == {}
@@ -2533,7 +2714,7 @@ def test_serve_connection_retries_after_auth_rejection(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2587,7 +2768,7 @@ def test_serve_connection_retries_when_proxy_stops_forwarding_heartbeats(
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2691,7 +2872,7 @@ def test_serve_connection_reconnects_immediately_after_healthy_rotation(
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection({

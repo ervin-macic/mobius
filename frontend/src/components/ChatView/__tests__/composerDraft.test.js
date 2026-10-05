@@ -277,3 +277,14 @@ test('quota recovery sacrifices only transient cache and keeps every owner draft
     else delete globalThis.sessionStorage
   }
 })
+
+
+test('only one stored-handoff consumer may deliver the same queued Send', () => {
+  const storage = storageStub()
+  stageComposerHandoff('chat-a', 'One send', { autoSend: true, storage })
+  assert.equal(consumeComposerHandoff('chat-b', 'One send', { autoSend: true, storage }), false)
+  assert.equal(consumeComposerHandoff('chat-a', 'Different text', { autoSend: true, storage }), false)
+  assert.equal(consumeComposerHandoff('chat-a', 'One send', { autoSend: true, storage }), true)
+  assert.equal(consumeComposerHandoff('chat-a', 'One send', { autoSend: true, storage }), false)
+  assert.equal(readComposerDraft('chat-a', storage).input, 'One send', 'claiming delivery does not delete the recoverable draft')
+})

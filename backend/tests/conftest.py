@@ -128,6 +128,22 @@ def _test_secret_key_in_environment():
 
 
 @pytest.fixture(autouse=True)
+def real_end_orphaned_hosts(monkeypatch):
+  """Keep the app lifespan's boot sweep from ending processes outside the test.
+
+  ``end_orphaned_hosts`` scans every process on the machine. Tests that enter
+  the real lifespan would otherwise end helper hosts that a parallel xdist
+  worker's test has just staged as orphans, failing that test intermittently.
+  The sweep's own test requests this fixture and calls the real function on a
+  scan limited to its processes.
+  """
+  from app import helper_hosts
+  real = helper_hosts.end_orphaned_hosts
+  monkeypatch.setattr(helper_hosts, "end_orphaned_hosts", lambda: 0)
+  return real
+
+
+@pytest.fixture(autouse=True)
 def _isolate_git_env(monkeypatch, tmp_path, tmp_path_factory):
   """Keep the per-app-git tests' `git` subprocesses hermetic.
 

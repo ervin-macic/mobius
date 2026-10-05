@@ -86,6 +86,13 @@
     "0078_browser_access_tables": "3239e635c60b7c42d97427c24146599185e8c62b953499c1506da0abd64b1814",
     "0079_chat_run_browser_lineage": "4b7b8175b039f23d048fbb56b35958a9ffba512706ffd7923842d03622e17217",
     "0080_embed_browser_lineage": "3b300c865a5a6a4742ca676f29776cb179d665655f76431977305a41850cb9c1",
-    "0078_agent_write_journal": "fb8e95d93687d85b99b308c32f5f987f28ba60a13214b73cfd4a80d9a8d980ed"
+    "0078_agent_write_journal": "fb8e95d93687d85b99b308c32f5f987f28ba60a13214b73cfd4a80d9a8d980ed",
+    "0081_browser_account_grants": "a8d80a2a6f38f5096e51f7aa08ad794b03efd6f8984852fb294f8d5146051950",
+    "0081_goal_hold": "ef656443434b13fed7bd22b99fa1903eef7a1ba86cd24b09967566cf1ed273d8",
+    "0082_run_owner_input_at": "5571a283b567cd3279688869d7ca79a7043d7d4f346548ecdf58f901ebc340ba",
+    "0082_drop_agent_write_journal": "ed5d1c08e9bea530937b32e6499da60c211971ea7962fabf1b9dc78ae819a74f",
+    "0083_retire_quiet_write_sessions": "81fa40a76702bed2e83413c0732196bc74e48b0baac31cd49f764cc65eeb50be",
+    "0084_chat_media_directory": "885e4751cab6638c3f0dddcb8b70f69f281e77defd7df2e0079c0ef6af8c8f60",
+    "0085_app_shell_shortcuts": "7a48e55ad4e1e00dcd643847f489ee4fde6557be968414f13336917d5495db19"
   }
 }

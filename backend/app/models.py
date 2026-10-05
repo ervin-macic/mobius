@@ -344,6 +344,7 @@ class ChatGoal(Base):
   objective = Column(Text, nullable=False)
   status = Column(String(16), nullable=False, default="open", server_default="open")
   plan_json = Column(JSON, nullable=True)
+  hold_json = Column(JSON, nullable=True)
   revision = Column(Integer, nullable=False, default=0, server_default="0")
   checkpoint = Column(Text, nullable=True)
   next_action = Column(Text, nullable=True)
@@ -385,8 +386,8 @@ class ChatRun(Base):
     String(64), ForeignKey("chats.id"), nullable=False, index=True
   )
   # "running" while in flight; terminal outcomes are "completed" for a clean
-  # turn, "failed" for a provider/setup error, "stopped" for an explicit user
-  # Stop, and "interrupted" for crash/supersession/watchdog recovery. Provider
+  # turn, "failed" for a provider/setup error, "stopped" for process Stop
+  # (not proof of Goal intent), and "interrupted" for crash/supersession recovery. Provider
   # limits additionally use the parked/resume_pending/parked_notified states.
   # A successfully drained planned restart reuses that retry path with
   # park_reason="restart"; an unplanned crash remains "interrupted".
@@ -398,8 +399,8 @@ class ChatRun(Base):
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   # Inclusive boundary of the peer-message page injected into this provider
   # admission. Both fields are NULL when no peer message was delivered. The
   # pair advances only after the provider call returns successfully. Admission
@@ -424,6 +425,9 @@ class ChatRun(Base):
   # Claimed before note-based size recovery makes any model call. This is
   # independent of continuation provenance: a direct owner run remains direct.
   note_recovery_attempted = Column(Boolean, nullable=False, default=False, server_default="0")
+  # When direct owner input was accepted. Exact physical recovery inherits it;
+  # automatic work and legacy runs have no evidence to override a later hold.
+  owner_input_at = Column(DateTime, nullable=True, default=None)
   provider = Column(String(32), nullable=True, default=None)
   # Objective shown by the shell while this exact run is attached to a Goal.
   # This belongs to the run rather than the transcript tail: mid-turn owner
@@ -539,8 +543,8 @@ class Delegation(Base):
   parent_root_run_id = Column(String(64), nullable=False, index=True)
   # Snapshot the spawning physical run's browser initiator. A logical Goal can
   # span later physical turns with different human participants.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   task_key = Column(String(128), nullable=False)
   # The parent Goal plan task this helper works on, recorded at spawn. The
   # helper's name is free; this is what places it under its task.
@@ -604,43 +608,6 @@ class Delegation(Base):
   source_work_result = Column(Text, nullable=True, default=None)
   source_work_active_chat_id = Column(
     String(64), nullable=True, unique=True, index=True
-  )
-
-
-
-class AgentWriteStream(Base):
-  """One physical run's quiet-write admission fence and bounded diagnostics."""
-  __tablename__ = "agent_write_streams"
-  run_id = Column(String(64), ForeignKey("chat_runs.id", ondelete="CASCADE"), primary_key=True)
-  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
-  sealed = Column(Boolean, nullable=False, default=False)
-  accepted_count = Column(Integer, nullable=False, default=0)
-  accepted_bytes = Column(Integer, nullable=False, default=0)
-  diagnostics = Column(JSON, nullable=False, default=list)
-  item_receipts = Column(JSON, nullable=False, default=dict)
-  failure_delivered_by = Column(String(64), nullable=True)
-
-
-class AgentWriteIntent(Base):
-  """Explicit write identity survives physical-run recovery; effects are not retried."""
-  __tablename__ = "agent_write_intents"
-  root_run_id = Column(String(64), primary_key=True)
-  operation_id = Column(String(100), primary_key=True)
-  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
-  source_run_id = Column(String(64), ForeignKey("chat_runs.id", ondelete="CASCADE"), nullable=False)
-  ordinal = Column(Integer, nullable=False)
-  item_id = Column(String(256), nullable=False)
-  item_fingerprint = Column(String(64), nullable=False)
-  tool = Column(String(100), nullable=False)
-  arguments_json = Column(Text, nullable=False)
-  status = Column(String(16), nullable=False)
-  stage = Column(String(32), nullable=False)
-  reason = Column(String(500), nullable=True)
-  created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-  updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-  __table_args__ = (
-    Index("ix_agent_write_run_order", "source_run_id", "status", "ordinal"),
-    Index("ix_agent_write_item", "source_run_id", "item_id"),
   )
 
 
@@ -773,6 +740,11 @@ class ChatSessionLink(Base):
   # are set explicitly by record_session_link; these defaults are the safety net.
   first_seen_at = Column(DateTime, default=lambda: now_naive_utc())
   last_seen_at = Column(DateTime, default=lambda: now_naive_utc())
+  # Set once Möbius must never resume this session: its own provider history
+  # teaches an instruction the platform has since withdrawn, so resuming it
+  # would keep the model following that instruction. The chat's next turn
+  # starts a fresh session instead (see ``session_links.resume_retired``).
+  resume_retired_at = Column(DateTime, nullable=True)
 
 
 class ProviderAvailability(Base):
@@ -935,8 +907,9 @@ class ChatEmbedGrant(Base):
   )
   instance_id = Column(String(160), nullable=False, index=True)
   owner_epoch = Column(Integer, nullable=False)
+  # The opener's browser lineage (browser_access.BrowserLineage). Upgraded
+  # databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   browser_session_id = Column(String(64), nullable=True)
   role = Column(String(32), nullable=False, default="participant")
   operations_json = Column(JSON, nullable=False, default=list)
@@ -1192,6 +1165,10 @@ class App(Base):
   # — the store + drawer surface a small "agent" badge so the owner knows
   # which apps drive a sub-agent. Not a permission.
   embeds_agent = Column(Boolean, nullable=False, default=False)
+  # Shell keyboard commands (search, new chat, back...) keep working while
+  # focus is inside this app's frame. An app that needs those chords for its
+  # own UI declares `"shell_shortcuts": false` in its manifest.
+  shell_shortcuts = Column(Boolean, nullable=False, default=True)
   # Chat-log read tier this app's token may request against
   # GET /api/chat-logs. Read at request time (not baked into the JWT)
   # so flipping it revokes access on the very next request — the

@@ -1601,6 +1601,24 @@ async def delete_link(
   link = _linked_row(db, owner.id)
   if link is None:
     return Response(status_code=204)
+  # Unlink is a local sharing-policy event. One local transaction ends every
+  # account grant before the remote token is destroyed and before any slower
+  # cleanup can fail; legacy link invitations remain untouched.
+  from app import browser_access as shared_access
+  cleanup_pending = stop_pending = credential_lost = False
+  for grant in shared_access.revoke_account_grants(db, owner.id):
+    # A rejected link credential cannot clean the directory; stop trying it,
+    # but do not strand local unlink forever.
+    ended = await shared_access.end_grant(db, grant, contact_directory=not credential_lost)
+    stop_pending = stop_pending or ended.stop_pending
+    cleanup_pending = cleanup_pending or ended.directory_cleanup_pending
+    credential_lost = credential_lost or ended.directory_credential_rejected
+  if (cleanup_pending and not credential_lost) or stop_pending:
+    raise HTTPException(502, "Shared access ended locally, but cleanup is pending. Retry unlink.")
+  if credential_lost:
+    db.delete(link)
+    db.commit()
+    return Response(status_code=204)
   try:
     token = _open(link.access_token_encrypted)
   except HTTPException:

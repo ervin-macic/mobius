@@ -8,7 +8,7 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session, load_only
 
 from app import models
@@ -307,53 +307,85 @@ def helper_plan_task(
   return leaves[0] if len(leaves) == 1 else None
 
 
+def _presented_goal_attempts(db: Session, chat_ids):
+  """Shared exact retained-Goal selection, independent of execution liveness.
+
+  Rank before applying visibility: clearing the latest identity (or a latest
+  attempt without an objective) must not uncover an older Goal. Ordinary
+  non-Goal turns do not displace the retained Goal.
+  """
+  ranked = db.query(
+    models.ChatRun.id.label("run_id"),
+    func.row_number().over(
+      partition_by=models.ChatRun.chat_id,
+      order_by=(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()),
+    ).label("position"),
+  ).filter(
+    models.ChatRun.chat_id.in_(list(chat_ids)),
+    or_(models.ChatRun.goal_id.isnot(None), models.ChatRun.goal_objective.isnot(None)),
+  ).subquery()
+  return db.query(models.ChatRun).join(
+    ranked, ranked.c.run_id == models.ChatRun.id,
+  ).join(models.Chat, models.Chat.id == models.ChatRun.chat_id).filter(
+    ranked.c.position == 1,
+    models.ChatRun.goal_objective.isnot(None),
+    or_(models.ChatRun.goal_id.is_(None), models.Chat.dismissed_goal_id.is_(None),
+        models.ChatRun.goal_id != models.Chat.dismissed_goal_id),
+  )
+
+
 def presented_goal_rows(
   db: Session, chat_id: str,
 ) -> tuple[models.ChatRun, models.ChatGoal] | None:
-  """Return the latest Goal that remains visible until an explicit clear.
+  """Latest Goal remains visible until its exact identity is explicitly cleared."""
+  physical = _presented_goal_attempts(db, [chat_id]).first()
+  return _goal_rows_for_physical(db, physical) if physical is not None else None
 
-  ``Chat.dismissed_goal_id`` suppresses only the exact Goal the owner cleared;
-  later ordinary turns cannot revive it, while a genuinely new Goal has a new
-  identity and naturally becomes visible. Execution liveness is deliberately
-  absent from this query so completed and paused Goals survive reloads.
+
+def presented_deferred_goals(db: Session, chat_ids) -> dict[str, dict]:
+  """Tiny batch hold projection: no plans, transcripts, or per-chat reads.
+
+  Uses the same retained-attempt selection as the full Goal presentation; a
+  newer terminal or cleared Goal must never expose an older deferred Goal.
   """
-  physical = (
-    db.query(models.ChatRun)
-    .filter(
-      models.ChatRun.chat_id == chat_id,
-      or_(
-        models.ChatRun.goal_id.isnot(None),
-        models.ChatRun.goal_objective.isnot(None),
-      ),
-    )
-    .order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc())
-    .first()
-  )
-  if physical is None or physical.goal_objective is None:
-    return None
-  dismissed_goal_id = db.query(models.Chat.dismissed_goal_id).filter(
-    models.Chat.id == chat_id,
-  ).scalar()
-  if physical.goal_id is not None and physical.goal_id == dismissed_goal_id:
-    return None
-  return _goal_rows_for_physical(db, physical)
+  from app.goals import goal_hold
+  ids = list(chat_ids)
+  if not ids:
+    return {}
+  rows = _presented_goal_attempts(db, ids).join(
+    models.ChatGoal,
+    (models.ChatGoal.id == models.ChatRun.goal_id)
+    & (models.ChatGoal.chat_id == models.ChatRun.chat_id),
+  ).filter(models.ChatGoal.status == "stopped").with_entities(
+    models.ChatRun.chat_id, models.ChatGoal.id, models.ChatGoal.hold_json,
+  ).all()
+  result = {}
+  for row in rows:
+    hold = goal_hold(row)
+    if hold and hold["cause"] == "deferred":
+      result[row.chat_id] = {"id": row.id, "pause_reason": "deferred",
+                             "hold_reason": hold["reason"]}
+  return result
+
+
+def goal_attempt_root_ids(db: Session, chat_id: str, goal_id: str) -> set[str]:
+  """Exact helper-owning roots across all attempts of one durable Goal."""
+  return {goal_id} | {
+    str(root_id or run_id)
+    for root_id, run_id in db.query(models.ChatRun.root_run_id, models.ChatRun.id).filter(
+      models.ChatRun.chat_id == chat_id, models.ChatRun.goal_id == goal_id,
+    ).all()
+  }
 
 
 def _delegation_tree(
   db: Session, physical: models.ChatRun, root: models.ChatGoal,
+  *, all_attempts: bool = False,
 ) -> list[dict[str, Any]]:
   """Project durable immediate-child ownership without copying transcripts."""
-  from app.delegations import derived_status
+  from app.delegations import delegation_statuses
 
-  run_ids = {root.id}
-  if physical.goal_id:
-    run_ids.add(physical.goal_id)
-    run_ids.update(
-      str(value) for (value,) in db.query(models.ChatRun.root_run_id).filter(
-        models.ChatRun.chat_id == physical.chat_id,
-        models.ChatRun.goal_id == physical.goal_id,
-      ).all() if value
-    )
+  run_ids = goal_attempt_root_ids(db, physical.chat_id, root.id)
   root_rows = db.query(models.Delegation).filter(
     models.Delegation.parent_chat_id == physical.chat_id,
     models.Delegation.parent_root_run_id.in_(run_ids),
@@ -363,7 +395,7 @@ def _delegation_tree(
   # Workflows history rather than appearing twice (or disagreeing with the
   # compact rail) in the Goal tree.
   roots_by_task = {row.task_key: row for row in root_rows}
-  roots = list(roots_by_task.values())
+  roots = root_rows if all_attempts else list(roots_by_task.values())
   children_by_parent: dict[str, list[models.Delegation]] = {}
   frontier = [row.child_chat_id for row in roots]
   seen_rows = {row.id for row in roots}
@@ -375,24 +407,27 @@ def _delegation_tree(
     latest_by_owner_and_task = {
       (child.parent_chat_id, child.task_key): child for child in child_rows
     }
-    for child in latest_by_owner_and_task.values():
+    for child in (child_rows if all_attempts else latest_by_owner_and_task.values()):
       if child.id in seen_rows:
         continue
       seen_rows.add(child.id)
       children_by_parent.setdefault(child.parent_chat_id, []).append(child)
       frontier.append(child.child_chat_id)
 
+  statuses = delegation_statuses(db, roots + [
+    child for children in children_by_parent.values() for child in children
+  ])
+
   def project(row: models.Delegation, seen: set[str]) -> dict[str, Any]:
     if row.id in seen:
       return {"id": row.id, "task_key": row.task_key, "status": "failed", "children": []}
-    status, _run, _result = derived_status(db, row, load_result=False)
     children = children_by_parent.get(row.child_chat_id, [])
     return {
       "id": row.id,
       "task_key": row.task_key,
       "plan_task": row.goal_task_id,
       "provider": row.provider,
-      "status": status,
+      "status": statuses[row.id],
       "children": [project(child, seen | {row.id}) for child in children],
     }
 
@@ -449,7 +484,9 @@ def active_goal_helpers(
   """Task keys of this Goal's helpers still working, with or without a plan."""
   return [
     _helper_key(node)
-    for node in _active_helper_nodes(_delegation_tree(db, physical, root))
+    # Presentation folds superseded attempts, but settlement cannot abandon
+    # an older child merely because a newer attempt used the same task key.
+    for node in _active_helper_nodes(_delegation_tree(db, physical, root, all_attempts=True))
   ]
 
 
@@ -557,27 +594,89 @@ def _goal_presentation(
   root: models.ChatGoal,
   plan: dict[str, Any] | None,
 ) -> dict[str, Any]:
-  """Project only the Goal's own lifecycle: active, paused, or completed.
+  """Project only the Goal's own lifecycle: active, paused, or terminal.
 
-  "Paused" means unfinished with no turn running. Who moves next is chat
-  state the client already has (an open card, armed Waits, running helpers),
-  so it is not re-derived per Goal here; an idle Goal is simply the owner's
-  turn.
+  Chat-wide work cannot masquerade as this Goal's executor or owner question.
+  Exact attempt, Wait and helper ownership supplies its read-only handoff.
   """
-  if root.status == "completed":
-    status = "completed"
+  if root.status in {"completed", "cannot_complete", "cancelled"}:
+    status = root.status
   elif root.status in {"stopped", "dismissed"}:
     status = "paused"
   elif physical.status == "running":
     status = "active"
   else:
     status = "paused"
-  return {
+  presentation = {
     "id": physical.goal_id or root.id,
+    "revision": int(root.revision or 0),
     "objective": root.objective,
     "status": status,
     "resumable": status == "paused",
   }
+  if status in {"completed", "cannot_complete", "cancelled"}:
+    presentation["result"] = root.result
+  if root.status == "stopped":
+    from app.goals import goal_hold
+    hold = goal_hold(root)
+    if hold and hold["cause"] == "deferred":
+      presentation.update(pause_reason="deferred", hold_reason=hold["reason"])
+    else:
+      presentation["pause_reason"] = hold["actor"] if hold else "unknown"
+  presentation["handoff"] = _goal_handoff(db, physical, root)
+  return presentation
+
+
+def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) -> dict:
+  from app.chat_handoffs import project_handoff
+  none = {"kind": "none", "reason": None}
+  if goal.status == "stopped":
+    from app.goals import goal_hold
+    hold = goal_hold(goal)
+    if hold and hold["cause"] == "deferred":
+      return none
+    actor = hold["actor"] if hold else "unknown"
+    if actor == "owner":
+      return {"kind": "owner_hold", "reason": "owner"}
+    return {"kind": "recovery", "reason": "agent_pause" if actor == "agent" else "unknown_stop"}
+  if goal.status != "open":
+    return none
+  latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(
+    models.ChatRun.chat_id == goal.chat_id,
+  ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
+  owns_chat_attempt = latest is not None and latest.goal_id == goal.id
+  from app import questions
+  pending = questions.get(goal.chat_id)
+  pending_id = db.query(models.Chat.pending_question_id).filter(
+    models.Chat.id == goal.chat_id,
+  ).scalar()
+  # Saved-card admission prevents a successor until this marker is answered or
+  # cancelled. Its current physical attempt is therefore the exact owner;
+  # native in-turn questions additionally carry their explicit run identity.
+  owner_input = bool(owns_chat_attempt and (
+    pending_id or (pending is not None and pending.run_token == latest.id)
+  ))
+  if owner_input:
+    return {"kind": "owner_input", "reason": "saved_card"}
+  if owns_chat_attempt and latest.status == "running":
+    return {"kind": "working", "reason": None}
+  from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED, serialize_wait
+  waits = [serialize_wait(row, db=db) for row in _goal_waits(db, goal.chat_id, goal.id).filter(
+    (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
+  ).all()]
+  if any(wait.get("resume_blocker") == "owner_input" for wait in waits):
+    return {"kind": "blocked", "reason": "other_work"}
+  from app.delegations import _self_resuming_helper_rows
+  roots = goal_attempt_root_ids(db, goal.chat_id, goal.id)
+  helper_count = sum(row.parent_root_run_id in roots
+    for row, _status in _self_resuming_helper_rows(db, {goal.chat_id}))
+  from app.chat import continuation_handoff_for_chat
+  park = continuation_handoff_for_chat(db, goal.chat_id) if owns_chat_attempt else none
+  handoff = project_handoff(owner_input=False, running=False, waits=waits,
+    helper_count=helper_count, park=park)
+  if handoff["kind"] == "none" and owns_chat_attempt and latest.status in {"failed", "interrupted"}:
+    return {"kind": "recovery", "reason": "execution"}
+  return handoff
 
 
 def presented_goal(db: Session, chat_id: str) -> dict[str, Any] | None:
@@ -595,14 +694,15 @@ def paused_goal_run(db: Session, chat_id: str) -> models.ChatRun | None:
   return rows[0]
 
 
-def _goal_completion_anchor(messages, run_ids, result):
-  """Locate the successful completion receipt, never a refused attempt.
+def _goal_completion_anchor(messages, run_ids, result, status="completed"):
+  """Locate the successful terminal receipt, never a refused attempt.
 
   Modern tool rows carry exact execution identity. Historical provider input
   summaries clip arguments, so their successful receipt supplies the verdict.
   Goal state still owns completion; this only locates its transcript position.
   """
-  if not isinstance(result, str) or not result:
+  from app.goals import cannot_complete_result
+  if status != "completed" and (not isinstance(result, str) or not result):
     return None
   for index in range(len(messages) - 1, -1, -1):
     message = messages[index]
@@ -625,11 +725,21 @@ def _goal_completion_anchor(messages, run_ids, result):
       except ValueError:
         # Summarized arguments cannot prove the exact result; the successful
         # server receipt can. A plain read must never become the anchor.
-        if (re.search(r"(?:^|, )complete=", raw)
-            and "Goal completed, revision " in str(block.get("output") or "")):
+        field = {"completed": "complete", "cannot_complete": "cannot_complete",
+                 "cancelled": "cancel"}.get(status)
+        if (field and re.search(rf"(?:^|, ){field}=", raw)
+            and f"Goal {status}, revision " in str(block.get("output") or "")):
           return index, block["tool_use_id"]
       else:
-        if isinstance(args, dict) and args.get("complete") == result:
+        terminal_value = (args.get("complete") if status == "completed" else
+                          args.get("cancel") if status == "cancelled" else
+                          args.get("cannot_complete")) if isinstance(args, dict) else None
+        if ((status == "completed" and terminal_value is True and result is None)
+            or (isinstance(terminal_value, str) and terminal_value == result)
+            or (status == "cannot_complete" and isinstance(terminal_value, dict)
+                and all(isinstance(terminal_value.get(key), str) for key in
+                        ("reason", "efforts", "unmet_outcome"))
+                and result == cannot_complete_result(terminal_value))):
           return index, block["tool_use_id"]
   return None
 
@@ -642,7 +752,7 @@ def terminal_goal_summaries_by_message_index(
   message_start: int = 0,
   message_end: int | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
-  """Project terminal Goals at their completion receipt, or legacy final answer.
+  """Project terminal Goals at their outcome receipt, or legacy final answer.
 
   Goal history already belongs to ``ChatGoal`` and its attempt rows; copying it into
   ``Chat.messages`` would create a second persistence mechanism and make plan
@@ -724,8 +834,8 @@ def terminal_goal_summaries_by_message_index(
       ), None)
     physical, root = _goal_rows_for_physical(db, latest)
     anchor = _goal_completion_anchor(
-      messages, {row.id for row in rows}, root.result,
-    ) if root.status == "completed" else None
+      messages, {row.id for row in rows}, root.result, root.status,
+    ) if root.status in {"completed", "cannot_complete", "cancelled"} else None
     if anchor is not None:
       candidate_index = anchor[0]
     if (
@@ -736,7 +846,7 @@ def terminal_goal_summaries_by_message_index(
       continue
     plan = serialize_plan(db, physical, root)
     presentation = _goal_presentation(db, physical, root, plan)
-    if presentation["status"] not in {"completed", "failed"}:
+    if presentation["status"] not in {"completed", "cannot_complete", "cancelled"}:
       continue
     projected.setdefault(candidate_index, []).append({
       **presentation,
@@ -821,25 +931,10 @@ def replace_plan(
   return plan
 
 
-TASK_EDIT_FIELDS = frozenset({
-  "title", "status", "depends_on", "parent_id", "completion_condition",
-  "note", "result", "progress",
-})
+def staged_task_edits(root: models.ChatGoal, edits: list[dict[str, Any]]) -> dict[str, Any]:
+  """Build a validated plan document without committing it.
 
-
-def edit_plan(
-  db: Session,
-  *,
-  physical: models.ChatRun,
-  root: models.ChatGoal,
-  edits: list[dict[str, Any]],
-) -> dict[str, Any]:
-  """Apply several task edits as one validated plan revision.
-
-  An edit naming an existing id changes only the fields it carries; a new id
-  adds a task (its title is then required). The whole result is validated
-  once, so finishing one task and starting its dependant is a single edit
-  regardless of the order they are listed in.
+  Goal outcome writes use this document in their single revision/CAS update.
   """
   saved = root.plan_json.get("tasks") if isinstance(root.plan_json, dict) else None
   tasks = [dict(task) for task in saved if isinstance(task, dict)] if isinstance(saved, list) else []
@@ -849,16 +944,18 @@ def edit_plan(
       raise GoalPlanError(f"task edit {position + 1} needs a string id")
     unknown = set(edit) - TASK_EDIT_FIELDS - {"id"}
     if unknown:
-      raise GoalPlanError(
-        f"unknown fields for {edit['id']}: {', '.join(sorted(unknown))}"
-      )
+      raise GoalPlanError(f"unknown fields for {edit['id']}: {', '.join(sorted(unknown))}")
     target = by_id.get(edit["id"])
     if target is None:
       target = {"id": edit["id"]}
       tasks.append(target)
       by_id[edit["id"]] = target
     target.update({key: value for key, value in edit.items() if key != "id"})
-  return replace_plan(
-    db, physical=physical, root=root,
-    expected_revision=root.revision, tasks=tasks,
-  )
+  normalized = normalize_tasks(tasks)
+  return {"version": 1, "updated_at": datetime.now(UTC).isoformat(), "tasks": normalized}
+
+
+TASK_EDIT_FIELDS = frozenset({
+  "title", "status", "depends_on", "parent_id", "completion_condition",
+  "note", "result", "progress",
+})

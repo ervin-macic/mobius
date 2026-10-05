@@ -1,15 +1,22 @@
-/* Consume a shared-browser invitation from a fragment without persisting it. */
-export function consumeSharedBrowserInvite(location, history) {
+/* Consume shared-browser admission hints without persisting them or retaining URL fragments. */
+export function consumeSharedBrowserEntry(location, history) {
   const fragment = location.hash?.replace(/^#/, '') || ''
-  const invite = new URLSearchParams(fragment).get('invite') || ''
+  const params = new URLSearchParams(fragment)
   if (fragment) history.replaceState(history.state, '', location.pathname + location.search)
-  return invite
+  const invitation = params.has('invite')
+  const account = params.has('account-finalize')
+  if (!invitation && !account) return null
+  if (invitation && account) return { kind: 'invalid' }
+  const key = invitation ? 'invite' : 'account-finalize'
+  const value = params.get(key)
+  if (!value || params.getAll(key).length !== 1) return { kind: 'invalid' }
+  return { kind: invitation ? 'invite' : 'account', value }
 }
 
-export function watchSharedBrowserInvites(win, onInvite) {
+export function watchSharedBrowserEntries(win, onEntry) {
   const admit = () => {
-    const invite = consumeSharedBrowserInvite(win.location, win.history)
-    if (invite) onInvite(invite)
+    const entry = consumeSharedBrowserEntry(win.location, win.history)
+    if (entry) onEntry(entry)
   }
   win.addEventListener('hashchange', admit)
   return () => win.removeEventListener('hashchange', admit)

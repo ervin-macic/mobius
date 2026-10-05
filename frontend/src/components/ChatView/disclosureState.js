@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { currentSharedBrowserGrantId, currentSharedBrowserStorage, isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
+import { sessionStore } from '../../lib/workspaceStorage.js'
 
 
 // Disclosure state is screen state, not transcript data. Keep it for the
@@ -7,48 +7,48 @@ import { currentSharedBrowserGrantId, currentSharedBrowserStorage, isSharedBrows
 // thought, and tool rows the reader opened without writing presentation state
 // into the durable conversation.
 const STORAGE_PREFIX = 'chat-disclosures:'
+// The memory cache mirrors exactly one store. A different store (another
+// shared grant) starts from that store's own contents.
 const cache = new Map()
+let cachedStore = null
 
-function disclosureStorage() {
-  if (isSharedBrowserRoute()) return currentSharedBrowserStorage()
-  try { return globalThis.sessionStorage ?? null } catch { return null }
-}
-
-function cacheKey(chatId) {
-  if (!isSharedBrowserRoute()) return `owner:${chatId}`
-  const grant = currentSharedBrowserGrantId()
-  return grant ? `shared:${grant}:${chatId}` : null
+function disclosureCache(store) {
+  if (store !== cachedStore) {
+    cache.clear()
+    cachedStore = store
+  }
+  return cache
 }
 
 function storageKey(chatId) {
   return `${STORAGE_PREFIX}${chatId}`
 }
 
-function readOpenKeys(chatId) {
+function readOpenKeys(chatId, store = sessionStore()) {
   const id = String(chatId || '')
   if (!id) return new Set()
-  const scopedId = cacheKey(id)
-  if (!scopedId) return new Set()
-  if (cache.has(scopedId)) return cache.get(scopedId)
+  const openKeysByChat = disclosureCache(store)
+  if (openKeysByChat.has(id)) return openKeysByChat.get(id)
   let keys = []
   try {
-    const parsed = JSON.parse(disclosureStorage()?.getItem(storageKey(id)) || '[]')
+    const parsed = JSON.parse(store?.getItem(storageKey(id)) || '[]')
     if (Array.isArray(parsed)) keys = parsed.filter(key => typeof key === 'string')
   } catch {}
   const openKeys = new Set(keys)
-  cache.set(scopedId, openKeys)
+  openKeysByChat.set(id, openKeys)
   return openKeys
 }
 
 export function persistDisclosureOpen(chatId, disclosureKey, open) {
   const id = String(chatId || '')
   const key = String(disclosureKey || '')
-  if (!id || !key || !cacheKey(id)) return
-  const openKeys = readOpenKeys(id)
+  if (!id || !key) return
+  const store = sessionStore()
+  const openKeys = readOpenKeys(id, store)
   if (open) openKeys.add(key)
   else openKeys.delete(key)
   try {
-    disclosureStorage()?.setItem(storageKey(id), JSON.stringify([...openKeys]))
+    store?.setItem(storageKey(id), JSON.stringify([...openKeys]))
   } catch {}
 }
 

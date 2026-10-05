@@ -106,13 +106,13 @@ async def test_agent_turn_closes_preflight_session_before_provider_wait(
 
   def fake_connector_plan(
     turn_db, *, include_owner_connectors, owner_id, owner_epoch,
-    browser_grant_id, browser_grant_epoch,
+    browser_grant_id,
   ):
     assert turn_db is turn_sessions[0]
     assert turn_db.close_calls == 0
     assert include_owner_connectors is True
     assert type(owner_id) is int and type(owner_epoch) is int
-    assert browser_grant_id is None and browser_grant_epoch is None
+    assert browser_grant_id is None
     # Prove the registry snapshot can still read at the preflight boundary.
     turn_db.query(models.Chat).filter(models.Chat.id == chat.id).one()
     return connector_plan

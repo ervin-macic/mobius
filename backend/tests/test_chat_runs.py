@@ -315,6 +315,8 @@ def test_stopped_goal_does_not_leak_into_a_later_question_answer():
     },
     title_source="goal", default_provider="codex",
   )).result(timeout=5)
+  from app.chat_writer import PrepareChatStop
+  get_writer().submit(PrepareChatStop(chat_id="r-stopped-goal", actor="owner")).result(timeout=5)
   get_writer().submit(FinishRun(
     chat_id="r-stopped-goal",
     run_token="rt-stopped-goal",

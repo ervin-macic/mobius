@@ -7,7 +7,7 @@ from app import models, schemas
 from app.chat import stop_chat
 from app.database import get_db
 from app.deps import (
-  Principal, get_owner_or_chat_embed_principal, reject_cross_site,
+  Principal, get_owner_or_chat_embed_principal, reject_cross_site, is_owner_input_principal,
   require_chat_embed_operation, require_nondelegated_owner_control,
 )
 from app.resource_access import require_active_chat_access
@@ -36,7 +36,11 @@ async def chat_stop(
     raise HTTPException(status_code=403, detail="Embedded chat id is required.")
   if body.chat_id:
     require_active_chat_access(db, body.chat_id, principal)
-  stopped, cleared_pending_cids = await stop_chat(body.chat_id or None, db=db)
+  stopped, cleared_pending_cids = await stop_chat(
+    body.chat_id or None, db=db,
+    actor="owner" if is_owner_input_principal(principal) else "agent",
+    actor_id=principal.run_id or principal.chat_id or principal.embed_session_id,
+  )
   cancelled_delegations = []
   if body.chat_id and stopped:
     # This route is the owner's explicit Stop. Planned restart draining bypasses

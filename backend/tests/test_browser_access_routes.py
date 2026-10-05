@@ -27,6 +27,10 @@ def invite(client, owner_headers, label="Alice"):
   secret = parse_qs(urlsplit(result["join_url"]).fragment)["invite"][0]
   response = client.post(ROOT + "/session/redeem", json={"invite": secret})
   assert response.status_code == 200, response.text
+  # Only signing in writes the refresh cookie; its lifetime is fixed and long.
+  cookie = response.headers["set-cookie"].lower()
+  assert "httponly" in cookie and "secure" in cookie and "samesite=strict" in cookie
+  assert "max-age=34560000" in cookie
   return result["grant"]["id"], response.json()["access_token"], secret
 
 
@@ -37,8 +41,8 @@ def test_invite_session_and_descendant_app_credentials_revoke_together(https, au
   renewed = https.post(ROOT + "/session")
   assert renewed.status_code == 200
   assert renewed.headers["cache-control"] == "no-store"
-  cookie = renewed.headers["set-cookie"].lower()
-  assert "httponly" in cookie and "secure" in cookie and "samesite=strict" in cookie
+  # A late renewal response can never overwrite a newer sign-in's cookie.
+  assert "set-cookie" not in renewed.headers
   app = models.App(name="Example", slug="example", source_dir=str(__import__("pathlib").Path(get_settings().data_dir) / "example"))
   db.add(app); db.commit()
   child = https.post("/api/auth/app-token", json={"app_id": app.id}, headers=guest)
@@ -60,6 +64,10 @@ def test_guest_cannot_create_grants_or_launder_install_or_job_credentials(https,
   _, token, _ = invite(https, auth)
   guest = {"Authorization": "Bearer " + token}
   assert https.post(ROOT, json={"label": "Another"}, headers=guest).status_code == 403
+  assert https.get(ROOT + "/shared", headers=guest).status_code == 403
+  assert https.post(ROOT + "/shared/respond", headers=guest, json={
+    "origin": "https://other.example", "grant_id": "g" * 32, "action": "accept",
+  }).status_code == 403
   assert https.post("/api/auth/install-pass", json={"slug": "example"}, headers=guest).status_code == 403
   assert https.post("/api/auth/app-job-token", json={"app_id": 1}, headers=guest).status_code == 403
   assert https.post("/api/admin/sign-out-everywhere", headers=guest).status_code == 403
@@ -102,9 +110,8 @@ def test_logout_revokes_minted_frame_and_media_tokens(https, auth, db):
   db.add(app); db.commit()
   frame = https.post("/api/auth/app-token", json={"app_id": app.id}, headers={"Authorization": "Bearer " + token}).json()["token"]
   media = tokens.create_media_token("demo", principal.owner.username, principal.owner.token_epoch,
-    browser_grant_id=principal.browser_grant_id, browser_grant_epoch=principal.browser_grant_epoch,
-    browser_session_id=principal.browser_session_id)
-  assert tokens.decode_access_token(frame)["browser_session"] == principal.browser_session_id
+    browser=principal.browser)
+  assert tokens.decode_access_token(frame)["browser_session"] == principal.browser.session_id
   assert https.post(ROOT + "/session/logout", json={"grant_id": principal.browser_grant_id}).status_code == 204
   from app.deps import _resolve_owner
   from fastapi import HTTPException
@@ -116,14 +123,18 @@ def test_logout_revokes_minted_frame_and_media_tokens(https, auth, db):
 
 @pytest.mark.asyncio
 async def test_open_browser_event_stream_stops_before_next_revoked_event(db):
-  from app.browser_access import create_invitation, redeem_invitation, revoke_grant
+  from app.browser_access import BrowserLineage, create_invitation, redeem_invitation, revoke_grant
+  from app.database import SessionLocal
   from app.deps import Principal, revocable_browser_stream
   owner = models.Owner(username="stream-owner", hashed_password="unused")
   db.add(owner); db.commit()
   grant, secret = create_invitation(db, owner, "Guest")
   _, session, _, _ = redeem_invitation(db, secret)
-  principal = Principal(owner=owner, app_id=None, browser_grant_id=grant.id,
-    browser_grant_epoch=grant.epoch, browser_session_id=session.id)
+  # The request's ORM session commits and closes before the stream runs.
+  request_db = SessionLocal()
+  request_owner = request_db.get(models.Owner, owner.id)
+  principal = Principal(owner=request_owner, app_id=None,
+    browser=BrowserLineage(grant.id, session.id))
   closed = []
   async def events():
     try:
@@ -132,23 +143,86 @@ async def test_open_browser_event_stream_stops_before_next_revoked_event(db):
       yield "must not escape"
     finally:
       closed.append(True)
-  chunks = [chunk async for chunk in revocable_browser_stream(events(), principal)]
+  stream = revocable_browser_stream(events(), principal)
+  request_db.commit()
+  request_db.close()
+  chunks = [chunk async for chunk in stream]
   assert chunks == ["before"]
   assert closed == [True]
+
+
+def _guest_stream_fixture(db, name):
+  from app.browser_access import BrowserLineage, create_invitation, redeem_invitation
+  from app.deps import Principal
+  owner = models.Owner(username=name, hashed_password="unused")
+  db.add(owner); db.commit()
+  grant, invitation = create_invitation(db, owner, "Guest")
+  secret, session, _, _ = redeem_invitation(db, invitation)
+  principal = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id, session.id))
+  return owner, grant, secret, principal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["logout", "revoke"])
+async def test_idle_guest_stream_closes_promptly_when_access_ends(db, ending):
+  import asyncio
+  from app.browser_access import logout_session, revoke_grant
+  from app.deps import revocable_browser_stream
+  owner, grant, secret, principal = _guest_stream_fixture(db, "idle-" + ending)
+  closed = []
+  async def events():
+    try:
+      yield "first"
+      await asyncio.Event().wait()  # nothing more to send for a long time
+    finally:
+      closed.append(True)
+  stream = revocable_browser_stream(events(), principal)
+  assert await anext(stream) == "first"
+  waiting = asyncio.create_task(anext(stream))
+  await asyncio.sleep(0.05)
+  assert not waiting.done()
+  if ending == "logout":
+    logout_session(db, secret)
+  else:
+    revoke_grant(db, grant.id, owner.id)
+  with pytest.raises(StopAsyncIteration):
+    await asyncio.wait_for(waiting, timeout=2)
+  assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_busy_guest_stream_does_not_query_per_event(db, monkeypatch):
+  import threading
+  from app import browser_access
+  from app.deps import revocable_browser_stream
+  _, _, _, principal = _guest_stream_fixture(db, "busy-owner")
+  checks = []
+  real = browser_access.is_live
+  def counted(*args, **kwargs):
+    checks.append(threading.current_thread() is threading.main_thread())
+    return real(*args, **kwargs)
+  monkeypatch.setattr(browser_access, "is_live", counted)
+  async def events():
+    for index in range(200):
+      yield index
+  chunks = [chunk async for chunk in revocable_browser_stream(events(), principal)]
+  assert chunks == list(range(200))
+  # One check when the stream opens, off the event loop; none per event.
+  assert checks == [False]
 
 
 def test_private_service_bearer_retains_browser_attribution(https, auth, db):
   from app.app_services import service_environment
   from app.deps import _resolve_owner
-  from app.browser_access import revoke_grant
+  from app.browser_access import BrowserLineage, revoke_grant
   from fastapi import HTTPException
   grant, token, _ = invite(https, auth)
   claims = tokens.decode_access_token(token)
+  assert "browser_grant_epoch" not in claims
   owner = db.query(models.Owner).one()
   app = models.App(id=42, name="Example", slug="example", token_nonce="nonce", source_dir=get_settings().data_dir)
   environment = service_environment(app, owner, {"access": "self"}, public=False,
-    browser_grant_id=grant, browser_grant_epoch=claims["browser_grant_epoch"],
-    browser_session_id=claims["browser_session"])
+    browser=BrowserLineage(grant, claims["browser_session"]))
   issued = tokens.decode_access_token(environment["APP_TOKEN"])
   assert issued["browser_grant"] == grant
   assert issued["browser_session"] == claims["browser_session"]
@@ -231,7 +305,7 @@ async def test_revocation_cancels_only_attributed_service_queue(db, monkeypatch)
   released = []
   monkeypatch.setattr(app_services, "hold_runtime", lambda *_: SimpleNamespace(close=lambda: released.append(True)))
   task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), owner,
-    {"actor": {"browser_grant_id": grant.id, "browser_grant_epoch": grant.epoch}}))
+    {"actor": {"browser_grant_id": grant.id}}))
   await asyncio.wait_for(queued.wait(), 1)
   revoke_grant(db, grant.id, owner.id)
   await app_services.cancel_browser_grant_calls(grant.id)

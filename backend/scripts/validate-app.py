@@ -41,19 +41,12 @@ from app.app_compile_contract import (  # noqa: E402
 )
 from app.build_admission import build_lease  # noqa: E402
 from app.manifest_contract import (  # noqa: E402
-  ENTRY_MAX_BYTES,
-  ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES,
-  SEED_MAX_BYTES,
-  SEEDS_COUNT_MAX,
-  SEEDS_TOTAL_MAX,
+  PACKAGE_MAX_BYTES,
   SKILL_MAX_BYTES,
-  SOURCE_FILES_TOTAL_MAX,
-  STATIC_ASSET_MAX_BYTES,
-  STATIC_ASSETS_COUNT_MAX,
-  STATIC_ASSETS_TOTAL_MAX,
   SYSTEM_PROMPT_MAX_BYTES,
   ManifestContractError,
+  package_bytes_on_disk,
   static_asset_entries,
   validate_manifest_contract,
 )
@@ -172,11 +165,6 @@ def _referenced_file_findings(
       errors.append(
         f"manifest icon {icon!r} is missing; local apply rejects the revision"
       )
-    elif icon_path.stat().st_size > ICON_MAX_BYTES:
-      errors.append(
-        f"manifest icon {icon!r} exceeds {ICON_MAX_BYTES} bytes; "
-        "local apply rejects the revision"
-      )
   for source in static_assets.values():
     if _symlink_component(root, source) is None and not (root / source).is_file():
       errors.append(f"static asset source {source!r} is missing")
@@ -193,57 +181,28 @@ def _referenced_file_findings(
 def _package_size_errors(root: Path, manifest_path: Path, manifest: dict) -> list[str]:
   errors: list[str] = []
 
-  def size(path: Path, label: str, maximum: int) -> int:
-    try:
-      value = path.stat().st_size
-    except OSError:
-      return 0
-    if value > maximum:
-      errors.append(f"{label} exceeds {maximum} bytes")
-    return value
+  def size(rel: str) -> int:
+    path = root / rel
+    return path.stat().st_size if path.is_file() else 0
 
-  size(manifest_path, "manifest", MANIFEST_MAX_BYTES)
-  size(root / manifest["entry"], "entry", ENTRY_MAX_BYTES)
-  schedule = manifest.get("schedule") or {}
-  job = schedule.get("job")
-  if isinstance(job, str) and (root / job).is_file():
-    size(root / job, f"scheduled job {job!r}", ENTRY_MAX_BYTES)
-  source_total = sum(
-    size(root / path, f"source file {path!r}", ENTRY_MAX_BYTES)
-    for path in (manifest.get("source_files") or [])
-    if isinstance(path, str) and (root / path).is_file()
-  )
-  if source_total > SOURCE_FILES_TOTAL_MAX:
-    errors.append(f"source_files exceed {SOURCE_FILES_TOTAL_MAX} bytes total")
+  if manifest_path.stat().st_size > MANIFEST_MAX_BYTES:
+    errors.append(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
 
-  static = static_asset_entries(manifest.get("static_assets") or {})
-  if len(static) > STATIC_ASSETS_COUNT_MAX:
-    errors.append(f"static_assets exceed {STATIC_ASSETS_COUNT_MAX} files")
-  static_total = sum(
-    size(root / source, f"static asset {source!r}", STATIC_ASSET_MAX_BYTES)
-    for source in static.values() if (root / source).is_file()
-  )
-  if static_total > STATIC_ASSETS_TOTAL_MAX:
-    errors.append(f"static_assets exceed {STATIC_ASSETS_TOTAL_MAX} bytes total")
-
-  seeds = manifest.get("storage_seeds") or {}
-  if len(seeds) > SEEDS_COUNT_MAX:
-    errors.append(f"storage_seeds exceed {SEEDS_COUNT_MAX} entries")
-  seed_total = 0
-  for destination, value in seeds.items():
-    if isinstance(value, str) and (root / value).is_file():
-      seed_total += size(root / value, f"storage seed {value!r}", SEED_MAX_BYTES)
-    elif not isinstance(value, str):
-      seed_total += len(json.dumps(value).encode("utf-8"))
-  if seed_total > SEEDS_TOTAL_MAX:
-    errors.append(f"storage_seeds exceed {SEEDS_TOTAL_MAX} bytes total")
+  package_total = package_bytes_on_disk(root, manifest)
+  if package_total > PACKAGE_MAX_BYTES:
+    errors.append(
+      f"app package is {package_total} bytes; installs and the Store accept "
+      f"at most {PACKAGE_MAX_BYTES}"
+    )
 
   for skill in manifest.get("skills") or []:
-    if isinstance(skill, str) and (root / skill).is_file():
-      size(root / skill, f"skill {skill!r}", SKILL_MAX_BYTES)
+    if isinstance(skill, str) and size(skill) > SKILL_MAX_BYTES:
+      errors.append(f"skill {skill!r} exceeds {SKILL_MAX_BYTES} bytes")
   prompt = manifest.get("system_prompt")
-  if isinstance(prompt, str) and (root / prompt).is_file():
-    size(root / prompt, f"system_prompt {prompt!r}", SYSTEM_PROMPT_MAX_BYTES)
+  if isinstance(prompt, str) and size(prompt) > SYSTEM_PROMPT_MAX_BYTES:
+    errors.append(
+      f"system_prompt {prompt!r} exceeds {SYSTEM_PROMPT_MAX_BYTES} bytes"
+    )
   return errors
 
 

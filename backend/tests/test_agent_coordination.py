@@ -1713,7 +1713,7 @@ def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
   delivered = _record_deliveries(monkeypatch)
 
   async def stop_then_drain_settlement():
-    await chat_mod._finish_run("claim-owner", "", "stopped")
+    await chat_mod.stop_chat("claim-owner", actor="owner")
     await asyncio.gather(*list(coordination._SETTLEMENT_TASKS))
 
   asyncio.run(stop_then_drain_settlement())
@@ -1722,6 +1722,30 @@ def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
   assert claim.released_at is not None
   assert "You may claim it now" in notice.body
   assert delivered == [(["claim-follower"], "interrupt")]
+
+
+@pytest.mark.parametrize("terminal_status", ["stopped", "interrupted", "failed"])
+def test_process_termination_does_not_release_goal_claims_without_stop_intent(
+  client, auth, db, monkeypatch, terminal_status,
+):
+  import asyncio
+
+  import app.agent_coordination as coordination
+  from app import chat as chat_mod
+
+  _claim_owner_and_follower(db)
+  delivered = _record_deliveries(monkeypatch)
+
+  async def terminate_then_drain():
+    await chat_mod._finish_run("claim-owner", "claim-owner-run", terminal_status)
+    await asyncio.gather(*list(coordination._SETTLEMENT_TASKS))
+
+  asyncio.run(terminate_then_drain())
+
+  claim, notices = _claim_and_notices(db)
+  assert claim.released_at is None
+  assert notices == [] and delivered == []
+  assert db.get(models.ChatGoal, "claim-owner-goal").status == "open"
 
 
 def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
@@ -1737,7 +1761,7 @@ def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
   # Completion commits, then the process "dies" before any notice is sent.
   update_goal_record(
     db, db.get(models.ChatRun, "claim-owner-run"),
-    db.get(models.ChatGoal, "claim-owner-goal"), 0, result="Merged",
+    db.get(models.ChatGoal, "claim-owner-goal"), 0, complete="Merged",
   )
   claim, notices = _claim_and_notices(db)
   assert claim.notification_revision < claim.revision and notices == []

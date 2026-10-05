@@ -58,7 +58,7 @@ async def test_full_output_survives_memory_reset_and_pages(client, auth):
 
 
 @pytest.mark.asyncio
-async def test_late_upload_and_archived_retry(client, auth, monkeypatch):
+async def test_late_upload_and_archived_retry(client, auth):
   host_id, token, ch = host(client, auth)
   rid = 'b' * 16
   task = asyncio.create_task(connect.exec_on_host(
@@ -77,8 +77,6 @@ async def test_late_upload_and_archived_retry(client, auth, monkeypatch):
       {'seq': 1, 'stream': 'stdout', 'text': 'b'}]})
   assert r.status_code == 200 and r.json()['next'] == 2
   assert client.get(endpoint, headers=auth).json()['output_complete'] is True
-  monkeypatch.setattr(connect, '_now', lambda: time.time() + 3600)
-  connect._prune_recent_commands(connect._load_host(host_id))
   connect._channels.clear()
   retry = await connect.exec_on_host(
     host_id, connect.ExecBody(cmd='true', request_id=rid, stream=True),
@@ -111,8 +109,8 @@ def test_ledger_is_host_scoped_and_exact_seq(tmp_path, monkeypatch):
   connect_output.append(a, rid, [{'seq': 0, 'stream': 'stdout', 'text': 'first'}])
   with pytest.raises(ValueError):
     connect_output.append(a, rid, [{'seq': 0, 'stream': 'stdout', 'text': 'changed'}])
-  assert connect_output.page(a, rid, 0)['chunks'][0]['text'] == 'first'
-  assert connect_output.page(b, rid, 0)['chunks'] == []
+  assert connect_output.view(a, rid, 0)[1]['chunks'][0]['text'] == 'first'
+  assert connect_output.view(b, rid, 0)[1]['chunks'] == []
   assert (tmp_path / 'shared/connect/output' / f'{a}.sqlite3').stat().st_mode & 0o777 == 0o600
 
 
@@ -132,13 +130,11 @@ async def test_unknown_cross_host_and_disk_failure_do_not_ack(client, auth, monk
   monkeypatch.setattr(connect_output, 'append', lambda *args: (_ for _ in ()).throw(OSError('full')))
   failed = client.post('/api/connect/output', headers=token_a, json=payload)
   assert failed.status_code == 503
-  assert connect_output.page(host_a, rid, 0)['chunks'] == []
+  assert connect_output.view(host_a, rid, 0)[1]['chunks'] == []
 
 
 @pytest.mark.asyncio
-async def test_recent_history_survives_cache_expiry_without_storing_command_text(
-  client, auth, monkeypatch,
-):
+async def test_recent_history_survives_without_storing_command_text(client, auth):
   host_id, _token, ch = host(client, auth)
   rid = 'f' * 16
   task = asyncio.create_task(connect.exec_on_host(
@@ -148,10 +144,6 @@ async def test_recent_history_survives_cache_expiry_without_storing_command_text
   connect._mark_command_started(host_id, rid)
   await task
   connect._runner_result(host_id, connect.ResultBody(request_id=rid))
-  assert connect._load_host(host_id).get('recent_commands', {}) == {}
-  monkeypatch.setattr(connect, '_now', lambda: time.time() + 3600)
-  connect._prune_recent_commands(connect._load_host(host_id))
-  assert connect._load_host(host_id)['recent_commands'] == {}
   host_view = connect._public_host(connect._load_host(host_id))
   listed = await connect.list_host_commands(host_id, _owner=object())
   assert [item['id'] for item in host_view['recent_commands']] == [rid]
@@ -159,26 +151,7 @@ async def test_recent_history_survives_cache_expiry_without_storing_command_text
   assert host_view['recent_commands'][0]['label'] is None
   db_bytes = connect_output._path(host_id).read_bytes()
   assert b'private-token' not in db_bytes
-  assert connect._load_host(host_id).get('recent_commands', {}) == {}
-
-
-def test_legacy_registry_history_migrates_once_without_expiring_ledger(client, auth):
-  host_id, _token, _ch = host(client, auth)
-  saved = connect._load_host(host_id)
-  rid = '2' * 16
-  saved['recent_commands'] = {rid: {
-    'fingerprint': 'legacy-identity', 'finished_at': time.time() - 3600,
-    'result': {'request_id': rid, 'stdout': 'legacy preview', 'outcome': 'completed'},
-  }}
-  saved.pop('recent_ledger_migrated', None)
-  connect._save_host(saved)
-  connect._prune_recent_commands(connect._load_host(host_id))
-  migrated = connect_output.finished(host_id, rid)
-  assert migrated['fingerprint'] == 'legacy-identity'
-  assert migrated['result']['stdout'] == 'legacy preview'
-  assert connect._load_host(host_id)['recent_commands'] == {}
-  connect._prune_recent_commands(connect._load_host(host_id))
-  assert connect_output.finished(host_id, rid) == migrated
+  assert b'private-token' not in connect._host_path(host_id).read_bytes()
 
 
 def test_conflicting_seq_replay_is_rejected_without_partial_append(tmp_path, monkeypatch):
@@ -193,7 +166,7 @@ def test_conflicting_seq_replay_is_rejected_without_partial_append(tmp_path, mon
     connect_output.append(host_id, rid, [
       {'seq': 1, 'stream': 'stdout', 'text': 'later'},
       {'seq': 0, 'stream': 'stdout', 'text': 'changed'}])
-  assert [c['seq'] for c in connect_output.page(host_id, rid, 0)['chunks']] == [0]
+  assert [c['seq'] for c in connect_output.view(host_id, rid, 0)[1]['chunks']] == [0]
 
 
 @pytest.mark.asyncio
@@ -207,7 +180,7 @@ async def test_ledger_read_failure_is_explicit_503(client, auth, monkeypatch):
   await ch.queue.get()
   connect._mark_command_started(host_id, rid)
   await task
-  monkeypatch.setattr(connect_output, 'page',
+  monkeypatch.setattr(connect_output, 'view',
                       lambda *args: (_ for _ in ()).throw(sqlite3.OperationalError('disk')))
   response = client.get(f'/api/connect/hosts/{host_id}/commands/{rid}/output',
                         headers=auth)
@@ -228,8 +201,28 @@ def test_output_page_does_not_materialize_unread_text(monkeypatch):
           yield (seq,'stdout','x'*65536)
       return rows()
     def close(self):pass
-  monkeypatch.setattr(connect_output,'_open',lambda host_id:DB())
-  page=connect_output.page('h_'+'e'*16,'f'*16,0)
+  page=connect_output._page(DB(),'f'*16,0)
   assert len(loaded)<=9
   assert sum(len(c['text']) for c in page['chunks'])<=connect_output.PAGE_CHARS
   assert page['has_more'] and page['next']<page['available_next']
+
+
+def test_reading_history_creates_no_empty_ledger(client, auth):
+  host_id, _token, _ch = host(client, auth)
+  assert client.get('/api/connect/hosts', headers=auth).status_code == 200
+  listed = client.get(f'/api/connect/hosts/{host_id}/commands', headers=auth)
+  assert listed.json() == {'running': [], 'recent': []}
+  assert not connect_output._path(host_id).exists()
+
+
+def test_reader_treats_a_not_yet_initialized_ledger_as_empty(tmp_path, monkeypatch):
+  # A writer creates the private file before its schema commits; a concurrent
+  # history read in that window must not fail the whole host listing.
+  class Settings:
+    data_dir = str(tmp_path)
+  monkeypatch.setattr(connect_output, 'get_settings', lambda: Settings())
+  host_id = 'h_' + 'c' * 16
+  connect_output._create_private(connect_output._path(host_id))
+  assert connect_output.recent(host_id) == []
+  assert connect_output.finished(host_id, 'e' * 16) is None
+  assert connect_output.view(host_id, 'e' * 16, 0)[0] is None

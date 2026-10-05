@@ -1056,6 +1056,205 @@ test.describe('Touch navigation', () => {
     })
   }
 
+  for (const outcome of ['success', 'error']) {
+    for (const settleWhileAway of [false, true]) {
+      test(`unfinished New Chat survives shortcut Back/Forward (${outcome}, away=${settleWhileAway})`, async ({ page }) => {
+        await setup(page, { width: 1280, height: 900 })
+        const originalId = await newChatSurface(page).getAttribute('data-chat-id')
+        await newChatSurface(page).getByRole('textbox', { name: 'Message Möbius…', exact: true })
+          .fill('Draft belonging only to the original chat')
+        let releaseCreation
+        const gate = new Promise(resolve => { releaseCreation = resolve })
+        const requestedIds = []
+        let committed = false
+        let prematureReads = 0
+        await page.route(/\/api\/chats(?:\?.*)?$/, async route => {
+          if (route.request().method() !== 'POST') return route.fallback()
+          const id = route.request().postDataJSON().id
+          requestedIds.push(id)
+          if (requestedIds.length === 1) await gate
+          if (outcome === 'error' && requestedIds.length === 1) {
+            return route.fulfill({ status: 503, json: { detail: 'Temporary failure' } })
+          }
+          committed = true
+          return route.fulfill({ status: 200, json: createdChat(id) })
+        })
+        await page.route(/\/api\/chats\/([0-9a-f-]+)(?:\?.*)?$/, route => {
+          const id = new URL(route.request().url()).pathname.split('/').pop()
+          if (route.request().method() !== 'GET' || id !== requestedIds[0]) return route.fallback()
+          if (!committed) prematureReads += 1
+          return route.fulfill({
+            status: committed ? 200 : 404,
+            json: committed ? emptyChatDetail() : { detail: 'Chat not found.' },
+          })
+        })
+        await page.keyboard.press('ControlOrMeta+n')
+        await expect.poll(() => requestedIds.length).toBe(1)
+        const id = requestedIds[0]
+        const draft = 'This draft belongs to the unfinished chat'
+        const composer = () => newChatSurface(page, id)
+          .getByRole('textbox', { name: 'Message Möbius…', exact: true })
+        await expect(composer()).toHaveValue('')
+        await composer().fill(draft)
+        await page.keyboard.press('ControlOrMeta+,')
+        await expect(newChatSurface(page, originalId)).toBeVisible()
+        await expect(newChatSurface(page, originalId)
+          .getByRole('textbox', { name: 'Message Möbius…', exact: true }))
+          .toHaveValue('Draft belonging only to the original chat')
+        if (settleWhileAway) {
+          releaseCreation()
+          await expect.poll(() => page.evaluate(() =>
+            JSON.parse(sessionStorage.getItem('new-chat-intent'))?.status,
+          )).toBe(outcome === 'success' ? 'materialized' : 'failed')
+          await expect(newChatSurface(page, originalId)).toBeVisible()
+        }
+        await page.keyboard.press('ControlOrMeta+.')
+        await expect(composer()).toBeVisible()
+        await expect(composer()).toHaveValue(draft)
+        expect(prematureReads).toBe(0)
+        if (!settleWhileAway) releaseCreation()
+        if (outcome === 'error') {
+          await expect(page.getByText('Couldn’t start a new chat — your draft is safe.')).toBeVisible()
+          await page.getByRole('button', { name: 'Retry', exact: true }).click()
+          await expect.poll(() => requestedIds.length).toBe(2)
+          expect(requestedIds).toEqual([id, id])
+        }
+        await expect.poll(() => page.evaluate(() =>
+          JSON.parse(sessionStorage.getItem('new-chat-intent'))?.status,
+        )).toBe('materialized')
+        await expect(composer()).toHaveValue(draft)
+        // A second round trip proves neither a late result nor the cleanup
+        // replaced this entry with another empty chat.
+        await page.keyboard.press('ControlOrMeta+,')
+        await expect(newChatSurface(page, originalId)).toBeVisible()
+        await page.keyboard.press('ControlOrMeta+.')
+        await expect(composer()).toHaveValue(draft)
+        expect(requestedIds.length).toBe(outcome === 'success' ? 1 : 2)
+        expect(prematureReads).toBe(0)
+      })
+    }
+  }
+
+  test('a queued first Send survives Back and resumes once after creation on Forward', async ({ page }) => {
+    await setup(page, { width: 1280, height: 900 })
+    let releaseCreation
+    const gate = new Promise(resolve => { releaseCreation = resolve })
+    let id
+    let created = false
+    const sends = []
+    await page.route(/\/api\/chats(?:\?.*)?$/, async route => {
+      if (route.request().method() !== 'POST') return route.fallback()
+      id = route.request().postDataJSON().id
+      await gate
+      created = true
+      return route.fulfill({ status: 200, json: createdChat(id) })
+    })
+    await page.route(/\/api\/chats\/[0-9a-f-]+\/messages$/, route => {
+      sends.push({ created, body: route.request().postDataJSON() })
+      // Fail locally rather than inventing a server lifecycle. The assertion
+      // is exactly one delivery attempt, not an actual provider invocation.
+      return route.fulfill({ status: 503, json: { detail: 'Test delivery failure' } })
+    })
+    await page.keyboard.press('ControlOrMeta+n')
+    await expect.poll(() => id).toBeTruthy()
+    const surface = newChatSurface(page, id)
+    await surface.getByRole('textbox', { name: 'Message Möbius…', exact: true })
+      .fill('Send only in my new chat')
+    await surface.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect(page.getByText('Queued — starting this chat…')).toBeVisible()
+    await page.keyboard.press('ControlOrMeta+,')
+    await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+    // Returning BEFORE allocation must not consume the durable send either.
+    await page.keyboard.press('ControlOrMeta+.')
+    await expect(surface).toBeVisible()
+    expect(sends).toEqual([])
+    await page.keyboard.press('ControlOrMeta+,')
+    await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+    releaseCreation()
+    await expect.poll(() => page.evaluate(() =>
+      JSON.parse(sessionStorage.getItem('new-chat-intent'))?.status,
+    )).toBe('materialized')
+    expect(sends).toEqual([])
+    await page.keyboard.press('ControlOrMeta+.')
+    await expect.poll(() => sends.length).toBe(1)
+    expect(sends[0].created).toBe(true)
+    await page.keyboard.press('ControlOrMeta+,')
+    await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+    await page.keyboard.press('ControlOrMeta+.')
+    await expect(surface).toBeVisible()
+    expect(sends.length).toBe(1)
+  })
+
+  test('a creation conflict while away rotates silently once its chat is visible again', async ({ page }) => {
+    await setup(page, { width: 1280, height: 900 })
+    let releaseConflict
+    const gate = new Promise(resolve => { releaseConflict = resolve })
+    const ids = []
+    await page.route(/\/api\/chats(?:\?.*)?$/, async route => {
+      if (route.request().method() !== 'POST') return route.fallback()
+      const id = route.request().postDataJSON().id
+      ids.push(id)
+      if (ids.length === 1) await gate
+      if (id === ids[0]) return route.fulfill({ status: 409, json: { detail: 'Tombstoned' } })
+      return route.fulfill({ status: 200, json: createdChat(id) })
+    })
+    const intentStatus = () => page.evaluate(() =>
+      JSON.parse(sessionStorage.getItem('new-chat-intent'))?.status,
+    )
+    await page.keyboard.press('ControlOrMeta+n')
+    await expect.poll(() => ids.length).toBe(1)
+    const draft = 'Keep my draft through the conflict'
+    await newChatSurface(page, ids[0]).getByRole('textbox', { name: 'Message Möbius…', exact: true }).fill(draft)
+    await page.keyboard.press('ControlOrMeta+,')
+    await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+    const conflict = page.waitForResponse(response => (
+      response.request().method() === 'POST' && response.status() === 409
+    ))
+    releaseConflict()
+    await conflict
+    // The conflict is remembered, not surfaced: the owner stays where they
+    // are, no replacement id is spent, and nothing is marked failed.
+    await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+    expect(ids.length).toBe(1)
+    expect(await intentStatus()).toBe('allocating')
+    await page.keyboard.press('ControlOrMeta+.')
+    await expect.poll(() => ids.length).toBe(2)
+    expect(ids[1]).not.toBe(ids[0])
+    await expect(newChatSurface(page, ids[1]).getByRole('textbox', { name: 'Message Möbius…', exact: true }))
+      .toHaveValue(draft)
+    await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0)
+    await expect.poll(intentStatus).not.toBe('failed')
+    expect(ids.length).toBe(2)
+  })
+
+  for (const navigationApi of [true, false]) {
+    test(`history shortcuts retain both directions after reload (Navigation API=${navigationApi})`, async ({ page }) => {
+      if (!navigationApi) await page.addInitScript(() => {
+        Object.defineProperty(window, 'navigation', { value: undefined, configurable: true })
+      })
+      await setup(page, { width: 1280, height: 900 })
+      await openDrawer(page)
+      await navigateToChat(page, 1)
+      await page.keyboard.press('ControlOrMeta+,')
+      await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+      await page.keyboard.press('ControlOrMeta+.')
+      await expect(newChatSurface(page, NAV_CHATS[1].id)).toBeVisible()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await expect(newChatSurface(page, NAV_CHATS[1].id)).toBeVisible()
+      await page.keyboard.press('ControlOrMeta+,')
+      await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+      await page.keyboard.press('ControlOrMeta+.')
+      await expect(newChatSurface(page, NAV_CHATS[1].id)).toBeVisible()
+      await page.keyboard.press('ControlOrMeta+,')
+      await openDrawer(page)
+      await navigateToChat(page, 2)
+      await page.keyboard.press('ControlOrMeta+.')
+      await expect(newChatSurface(page, NAV_CHATS[2].id)).toBeVisible()
+    })
+  }
+
   test('a fast allocation waits for its IDB-only draft before handoff', async ({ page }) => {
     const intentId = '10000000-0000-4000-8000-000000000098'
     const durableInput = 'Hydrate this before the fast destination takes focus'

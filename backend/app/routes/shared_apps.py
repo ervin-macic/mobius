@@ -81,7 +81,7 @@ class SharedAppMemberUpdate(BaseModel):
 def _require_membership_administration(principal: SharedAppPrincipal) -> None:
   # Existing shared-app owners keep their resource-confined member powers.
   # Browser guests cannot create independent access that escapes their grant.
-  if principal.browser_grant_id is not None:
+  if principal.browser is not None:
     raise HTTPException(403, "Only the installation owner can change shared access.")
 
 

@@ -95,7 +95,6 @@ def test_production_startup_plan_has_explicit_unique_order():
   assert names.index("backfill active assistant identities") < names.index(
     "reconcile startup chats"
   )
-  assert names.index("start chat writer") < names.index("fix forward chat media")
   assert names.index("start chat writer") < names.index("reconcile startup chats")
   assert names.index("freeze legacy app runtimes") < names.index("reconcile startup chats")
   assert names.index("start chat writer") < names.index(

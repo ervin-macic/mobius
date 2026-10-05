@@ -67,7 +67,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable
+from typing import BinaryIO, Callable, Iterable, Iterator
 
 from app import managed_paths
 
@@ -394,6 +394,7 @@ def _run(
   *args: str,
   check: bool = True,
   read_only: bool = False,
+  timeout: int = _GIT_TIMEOUT,
 ) -> subprocess.CompletedProcess:
   """Runs `git -C <repo> <args>` with the fixed Mobius identity.
 
@@ -412,7 +413,7 @@ def _run(
     *args,
   ]
   return subprocess.run(
-    cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+    cmd, capture_output=True, text=True, timeout=timeout,
     check=check, env=_git_env(repo, read_only=read_only),
   )
 
@@ -423,6 +424,7 @@ def _run_with_index(
   *args: str,
   check: bool = True,
   read_only: bool = False,
+  input: str | None = None,
 ) -> subprocess.CompletedProcess:
   """Run Git against a temporary index while sharing this repo's object DB."""
   env = _git_env(repo, read_only=read_only)
@@ -436,7 +438,40 @@ def _run_with_index(
   ]
   return subprocess.run(
     cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-    check=check, env=env,
+    check=check, env=env, input=input,
+  )
+
+
+def merge_trees_into_worktree(
+  repo: Path, *trees: str, dry_run: bool = False, check: bool = True,
+  timeout: int = _GIT_TIMEOUT,
+) -> subprocess.CompletedProcess:
+  """Git's native ``read-tree -m -u`` on the real index and worktree.
+
+  Two trees are Git's branch switch (carry unrelated uncommitted work, refuse
+  to overwrite an edited path); three are a merge from an explicit base. Every
+  merging ``read-tree -m -u`` goes through here, because it is plumbing:
+  unlike checkout, merge or status it never refreshes the index, and it
+  rejects any entry whose cached stat data differs as "not uptodate" even when
+  the bytes are unchanged. A metadata-only change such as an ownership or mode
+  repair (which updates ctime) would otherwise refuse a transition with no
+  local edit to protect, and repeat that refusal on every attempt.
+
+  The refresh re-hashes only stat-dirty entries: unchanged bytes become clean,
+  real edits stay dirty, so read-tree's own overwrite checks still refuse
+  genuine local work. ``--unmerged`` leaves an unmerged index for read-tree
+  itself to refuse. A dry run (``-n``) refreshes too; that changes no content.
+  With ``check=False`` the first failing step's result is returned.
+  """
+  refreshed = _run(
+    repo, "update-index", "-q", "--unmerged", "--refresh",
+    check=check, timeout=timeout,
+  )
+  if refreshed.returncode:
+    return refreshed
+  return _run(
+    repo, "read-tree", *(["-n"] if dry_run else []), "-m", "-u", *trees,
+    check=check, timeout=timeout,
   )
 
 
@@ -3370,19 +3405,46 @@ def merge_upstream(
   return equivalent or ordinary
 
 
-def read_merged_tree(source_dir: str | Path, tree_oid: str) -> dict[str, bytes]:
-  """Read EVERY file of a merged tree oid into {repo_relative_path: bytes}.
+@dataclass(frozen=True)
+class GitTreeBlob:
+  """A binary range owned by an open Git-tree spool, without retained bytes.
 
-  The single source-tree path: every clean-merge caller (app install + the
-  platform layer) materialises the WHOLE merged tree from
-  `MergeResult.merged_tree_oid` here and writes it back, so one and many files
-  share one path. Paths are repo-relative POSIX; bytes are read binary-faithful
-  (no text decode). `-z` keeps paths NUL-separated so names with spaces or
-  newlines survive. All blobs stream through one `cat-file --batch` process
-  (update checks and installs read several trees each, and one process per
-  file dominated their cost), spooled to a temporary file so each blob is held
-  in memory once. Only blobs are files: gitlinks are skipped, and an object
-  missing from the database is omitted so callers treat the tree as incomplete.
+  The spool must outlive consumption. Digest callers traverse in bounded
+  chunks; materialization callers explicitly request the complete bytes.
+  """
+
+  _stream: BinaryIO
+  _offset: int
+  size: int
+
+  def read_bytes(self) -> bytes:
+    self._stream.seek(self._offset)
+    value = self._stream.read(self.size)
+    if len(value) != self.size:
+      raise RuntimeError("Git tree spool is truncated")
+    return value
+
+  def chunks(self) -> Iterable[bytes]:
+    position = 0
+    while position < self.size:
+      self._stream.seek(self._offset + position)
+      value = self._stream.read(min(64 * 1024, self.size - position))
+      if not value:
+        raise RuntimeError("Git tree spool is truncated")
+      position += len(value)
+      yield value
+
+
+@contextmanager
+def _spooled_git_tree(
+  source_dir: str | Path, tree_oid: str,
+) -> Iterator[dict[str, GitTreeBlob | None]]:
+  """One binary-faithful batch reader for full trees and bounded comparisons.
+
+  Names are NUL-separated; gitlinks are skipped. Missing blobs remain None
+  so comparisons distinguish absence from unavailable declared content.
+  The disk spool avoids a pipe producer/consumer deadlock on large trees and
+  closes on success or failure. Its index holds paths/ranges, not blob bodies.
   """
   repo = Path(source_dir)
   listing = subprocess.run(
@@ -3397,9 +3459,9 @@ def read_merged_tree(source_dir: str | Path, tree_oid: str) -> dict[str, bytes]:
     _mode, kind, oid = meta.split()
     if kind == b"blob":
       entries.append((rel.decode(), oid.decode()))
-  files: dict[str, bytes] = {}
   if not entries:
-    return files
+    yield {}
+    return
   with tempfile.TemporaryFile() as out:
     subprocess.run(
       ["git", "-C", str(repo), "cat-file", "--batch"],
@@ -3408,15 +3470,47 @@ def read_merged_tree(source_dir: str | Path, tree_oid: str) -> dict[str, bytes]:
       timeout=_GIT_TIMEOUT, check=True, env=_git_env(repo),
     )
     out.seek(0)
+    blobs: dict[str, GitTreeBlob | None] = {}
     for rel, oid in entries:
       header = out.readline().split()
       if header[:1] != [oid.encode()]:
         raise RuntimeError(f"git cat-file --batch lost its place at {rel}")
       if header[1:] == [b"missing"]:
+        blobs[rel] = None
         continue
-      files[rel] = out.read(int(header[2]))
-      out.read(1)
-  return files
+      if len(header) != 3 or header[1] != b"blob":
+        raise RuntimeError(f"Invalid Git blob header at {rel}")
+      size = int(header[2])
+      if size < 0:
+        raise RuntimeError(f"Invalid Git blob size at {rel}")
+      blobs[rel] = GitTreeBlob(out, out.tell(), size)
+      out.seek(size, os.SEEK_CUR)
+      if out.read(1) != b"\n":
+        raise RuntimeError(f"Truncated Git blob at {rel}")
+    yield blobs
+
+
+@contextmanager
+def open_ref_tree(
+  source_dir: str | Path, ref: str,
+) -> Iterator[dict[str, GitTreeBlob | None]]:
+  """Open immutable ref contents for bounded binary consumption in this scope."""
+  repo = Path(source_dir)
+  tree_oid = _run(repo, "rev-parse", f"{ref}^{{tree}}").stdout.strip()
+  with _spooled_git_tree(repo, tree_oid) as tree:
+    yield tree
+
+
+def read_merged_tree(source_dir: str | Path, tree_oid: str) -> dict[str, bytes]:
+  """Materialize EVERY file, preserving the install/merge full-tree contract.
+
+  The same batch/spool owns binary transport as bounded comparisons, but a
+  merge deliberately needs the complete bytes rather than a package digest.
+  """
+  with _spooled_git_tree(source_dir, tree_oid) as tree:
+    return {
+      rel: blob.read_bytes() for rel, blob in tree.items() if blob is not None
+    }
 
 
 def read_ref_tree(source_dir: str | Path, ref: str) -> dict[str, bytes]:
@@ -3576,10 +3670,7 @@ def start_conflict_merge(
       # conflicts as staged 1/2/3 entries. The follow-up checkout writes the
       # familiar markers without collapsing the unmerged index, so binary
       # conflicts stay unresolved until someone explicitly stages a side.
-      _run(
-        repo, "read-tree", "-m", "-u",
-        merge_base, local_branch, upstream_branch,
-      )
+      merge_trees_into_worktree(repo, merge_base, local_branch, upstream_branch)
       # read-tree prepares the exact three-stage index but deliberately does
       # only trivial whole-blob resolution. Run Git's standard content driver
       # so disjoint hunks inside one file merge cleanly; a nonzero result is

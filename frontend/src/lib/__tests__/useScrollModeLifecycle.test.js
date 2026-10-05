@@ -426,7 +426,7 @@ test('a live-tail disclosure keeps following as its current response grows', asy
       getAttribute(name) { return name === 'aria-expanded' ? 'false' : null },
       closest(selector) {
         if (selector.startsWith('button.chat__')) return this
-        if (selector === '[data-active-assistant="true"]') return assistant
+        if (selector === '[data-current-response="true"]') return assistant
         if (selector === '.chat__msg[data-key]') return assistant
         return null
       },

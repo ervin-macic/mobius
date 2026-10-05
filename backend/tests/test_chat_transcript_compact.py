@@ -831,6 +831,7 @@ def test_runtime_route_does_not_select_transcript_json(
   assert runtime.status_code == 200
   assert runtime.json() == {
     "running": True,
+    "compacting": None,
     "restart_observation_key": "[[],null]",
     "run_id": None,
     "run_status": None,
@@ -840,6 +841,7 @@ def test_runtime_route_does_not_select_transcript_json(
     "continuation_wait": None,
     "active_goal_objective": None,
     "goal": None,
+    "handoff": {"kind": "working", "reason": None},
     "pending_messages": [],
     "pending_question_id": None,
     "updated_at": created.json()["updated_at"],

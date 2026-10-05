@@ -18,8 +18,9 @@ from urllib.parse import urlencode
 
 import httpx
 
+from app.runtime_identity import broker_async_transport, broker_socket_path
 
-DEFAULT_SOCKET = "/run/mobius-identity-broker.sock"
+
 COMMUNITY_PREFIX = "/v1/community"
 COMMUNITY_BASE_URL = os.environ.get(
   "MOBIUS_COMMUNITY_REGISTRY_URL", "https://www.mobius.you",
@@ -107,9 +108,7 @@ class CommunityBrokerClient:
     socket_path: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
   ) -> None:
-    self.socket_path = socket_path or os.environ.get(
-      "MOBIUS_IDENTITY_BROKER_SOCKET", DEFAULT_SOCKET,
-    )
+    self.socket_path = socket_path or broker_socket_path()
     self.transport = transport
 
   async def request(
@@ -148,9 +147,7 @@ class CommunityBrokerClient:
       headers["Content-Type"] = "application/json"
     if idempotency_key:
       headers["Idempotency-Key"] = idempotency_key
-    broker_transport = self.transport or httpx.AsyncHTTPTransport(
-      uds=self.socket_path,
-    )
+    broker_transport = self.transport or broker_async_transport(self.socket_path)
     try:
       async with _client(broker_transport, "http://mobius-identity-broker") as client:
         response = await client.request(
