@@ -70,7 +70,9 @@ start() {  # <image>
 
 probe() {  # <command>: runs in the tree the server runs; any error fails at once
   local backend output
-  backend=$(docker exec "$name" sh -c 'readlink "/proc/$(pgrep -n -f "/bin/uvicorn app\.main:app")/cwd"') \
+  # As the server's own user: the container has no CAP_SYS_PTRACE, so root
+  # cannot read another user's /proc/<pid>/cwd.
+  backend=$(docker exec -u mobius "$name" sh -c 'readlink "/proc/$(pgrep -n -u mobius -f "/bin/uvicorn app\.main:app")/cwd"') \
     && [ -n "$backend" ] || fail "cannot locate the serving uvicorn process"
   if ! output=$(docker exec -u mobius -e "PROBE_ROUND=${round:-1}" -w "$backend" -e PYTHONPATH="$backend" \
       "$name" python3 /tmp/probe.py "$1" 2>"$work/probe.err"); then

@@ -169,7 +169,9 @@ chmod 0600 "$ENV_FILE"
 # serving release's own code; waits poll observable state only.
 TPROOF=$(mktemp -d /tmp/mobius-transcript-proof.XXXXXX)
 served_backend() {  # the serving uvicorn process's working directory
-  docker exec mobius sh -c 'readlink "/proc/$(pgrep -n -f "/bin/uvicorn app\.main:app")/cwd"'
+  # As the server's own user: the container has no CAP_SYS_PTRACE, so root
+  # cannot read another user's /proc/<pid>/cwd.
+  docker exec -u mobius mobius sh -c 'readlink "/proc/$(pgrep -n -u mobius -f "/bin/uvicorn app\.main:app")/cwd"'
 }
 tprobe() {  # <command>: runs in the code the server runs; any error fails at once
   local backend output
