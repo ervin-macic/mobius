@@ -24,6 +24,11 @@ from app.theme import get_bg_color
 from test_app_fixtures import create_local_app
 
 
+
+def _theme_colors(html):
+  """Every theme-color value the standalone document declares."""
+  return set(re.findall(r'<meta name="theme-color"[^>]*\scontent="([^"]*)"', html))
+
 def _create_app(client, owner_token, name):
   return create_local_app(
     client, {"Authorization": f"Bearer {owner_token}"}, name=name,
@@ -141,7 +146,7 @@ def test_manifest_and_loading_shell_use_app_declared_colors(client, owner_token)
 
   shell = client.get(f"/apps/{app['slug']}/")
   assert shell.status_code == 200
-  assert '<meta name="theme-color" content="#101820" />' in shell.text
+  assert _theme_colors(shell.text) == {"#101820"}
 
 
 def test_manifest_colors_fall_back_to_theme_not_icon(client, owner_token):
@@ -158,7 +163,7 @@ def test_manifest_colors_fall_back_to_theme_not_icon(client, owner_token):
   assert manifest["theme_color"] != "#0c0f14"
 
   shell = client.get(f"/apps/{app['slug']}/")
-  assert f'<meta name="theme-color" content="{theme_bg}" />' in shell.text
+  assert _theme_colors(shell.text) == {theme_bg}
 
 
 def test_manifest_display_defaults_to_standalone(client, owner_token):
