@@ -67,7 +67,9 @@ class RunPolicy:
     return (
       "You are a delegated subagent running as a durable child task inside "
       "Möbius. Complete only the bounded user task in this child conversation "
-      "and return a clear result to the parent. When parallelism or local "
+      "and return a clear result to the parent. The parent receives only your "
+      "final message, so write your complete report last, after any tool "
+      "calls. When parallelism or local "
       "decomposition materially helps, start your own helpers with the Möbius "
       "spawn_agent tool with stable names; you remain responsible for checking your own "
       "completion condition after they settle, and their results reach you by "
@@ -585,26 +587,28 @@ def parent_root_run_id(
 
 
 def _assistant_result(chat: models.Chat) -> str:
-  """Return the latest child assistant outcome as plain text."""
-  parts: list[str] = []
+  """Return the latest child assistant outcome as plain text.
+
+  The outcome is the message's last text block (the report; earlier text
+  blocks are progress narration split off by tools or provider items) plus
+  its latest error, so a failed or stopped helper stays actionable.
+  """
   for message in reversed(list(chat.messages or [])):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
+    blocks = message.get("blocks")
+    blocks = blocks if isinstance(blocks, list) else []
+    texts = [b["content"].strip() for b in blocks if isinstance(b, dict)
+             and b.get("type") == "text" and isinstance(b.get("content"), str)
+             and b["content"].strip()]
+    errors = [b["message"].strip() for b in blocks if isinstance(b, dict)
+              and b.get("type") == "error" and isinstance(b.get("message"), str)
+              and b["message"].strip()]
+    if texts or errors:
+      return "\n\n".join(texts[-1:] + errors[-1:])
     content = message.get("content")
     if isinstance(content, str) and content.strip():
       return content.strip()
-    blocks = message.get("blocks")
-    if not isinstance(blocks, list):
-      continue
-    for block in blocks:
-      if not isinstance(block, dict):
-        continue
-      if block.get("type") == "text" and isinstance(block.get("content"), str):
-        parts.append(block["content"])
-      elif block.get("type") == "error" and isinstance(block.get("message"), str):
-        parts.append(block["message"])
-    if parts:
-      return "\n".join(part.strip() for part in parts if part.strip()).strip()
   return ""
 
 

@@ -1299,6 +1299,16 @@ or completed Finalize, the result is owed. Stop drops a queued carrier, because
 the Delegation row still owes the result and the next owner turn's context
 carries it.
 
+A helper's delivered result is its latest assistant message's last text block,
+plus that message's latest error so a failed or stopped helper stays actionable.
+Earlier text blocks in the same message are progress narration, split off by
+tool calls or by separate provider items; they stay in the child transcript as
+evidence but are not replayed to the parent. As with Claude Code and Codex
+subagents, a helper's final message is its report, and the helper system
+prompt tells it to write that report last, after any tool calls. One status still reads
+report content: a failed run whose text carries the write-review marker
+projects as `needs_review`.
+
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
 interrupting peer message: the urgent turn can run now, and the independent
