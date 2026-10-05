@@ -61,7 +61,7 @@ from app.memory_observability import record_memory_checkpoint_once
 from app.goal_commands import goal_clear_requested
 from app.owner_input import publish_owner_input_changed
 from app.routes.uploads import sweep_expired_uploads
-from app.upload_lifecycle import attachment_names
+from app.upload_lifecycle import attachment_names, is_draft
 from app.deps import (
   Principal, get_chat_view_principal, get_owner_or_chat_embed_principal,
   get_current_owner, reject_cross_site,
@@ -264,8 +264,10 @@ def _content_with_uploads(
 ) -> str:
   """Returns message content with the session upload notice appended.
 
-  Files carried by this message's own `attachments` are marked, so the agent
-  can tell what a message or answer refers to among the session's files.
+  It lists the files already sent in this chat plus this message's own
+  `attachments`, which it marks, so the agent can tell what a message or
+  answer refers to. Unsent drafts (another card's or the composer's) stay out
+  until a message carrying them is admitted.
   """
   settings = get_settings()
   # Force-steer resends the exact canonical pending-message content. Pending
@@ -276,11 +278,11 @@ def _content_with_uploads(
   if "[Files in this session:" in content:
     return content
   if chat.uploads:
-    own = {
-      a.get("name") for a in (attachments or []) if isinstance(a, dict)
-    }
+    own = attachment_names(attachments)
     safe_entries = []
     for f in chat.uploads:
+      if is_draft(f) and f.get("name") not in own:
+        continue
       safe = _safe_upload_path(f['path'], settings.data_dir)
       if safe is not None:
         safe_entries.append(

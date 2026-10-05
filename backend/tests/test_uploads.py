@@ -501,18 +501,24 @@ def test_upload_reads_outside_admission_then_commits_under_lock(db, chat):
   assert [p.name for p in upload_dir.iterdir()] == ["outside.txt"]
 
 
-def test_session_file_notice_marks_this_messages_attachments(client, db, auth, chat):
-  """The agent can tell which session files a message or answer carries."""
+def test_session_file_notice_marks_own_files_and_hides_unsent_drafts(client, db, auth, chat):
+  """The agent sees sent files and this message's own (marked), never drafts."""
   from app.routes.chats_stream import _content_with_uploads
 
   _upload(client, auth, chat, "report.pdf")
-  _upload(client, auth, chat, "other.pdf")
+  _upload(client, auth, chat, "sent.pdf")
+  _upload(client, auth, chat, "draft.pdf")
   db.refresh(chat)
+  chat.uploads = [
+    {**u, "claimed": True} if u["name"] == "sent.pdf" else u for u in chat.uploads
+  ]
+  db.commit()
 
   lines = _content_with_uploads(chat, "see attached", [{"name": "report.pdf"}]).splitlines()
 
   assert any("report.pdf" in line and "attached to this message" in line for line in lines)
-  assert any("other.pdf" in line and "attached to this message" not in line for line in lines)
+  assert any("sent.pdf" in line and "attached to this message" not in line for line in lines)
+  assert not any("draft.pdf" in line for line in lines)
 
 
 def test_pending_edit_keeps_the_rows_attachment_mark(client, db, auth, chat):
