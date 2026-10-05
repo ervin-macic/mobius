@@ -4711,3 +4711,67 @@ def test_worktree_merges_all_go_through_the_index_refreshing_primitive():
         if {"read-tree", "-m", "-u"} <= words:
           offenders.append(f"{source.relative_to(app_dir)}:{call.lineno}")
   assert offenders == []
+
+
+def _bare_origin(tmp_path: Path) -> Path:
+  fixture = tmp_path / "origin-work"
+  bare = tmp_path / "origin.git"
+  identity = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid"]
+  env = app_git._git_env(fixture)
+  subprocess.run(["git", "init", "-q", "-b", "main", str(fixture)], check=True)
+  _write(fixture, "export default function App() { return null; }\n")
+  subprocess.run(["git", *identity, "-C", str(fixture), "add", "."], check=True, env=env)
+  subprocess.run(
+    ["git", *identity, "-C", str(fixture), "commit", "-q", "-m", "fixture"],
+    check=True, env=env,
+  )
+  subprocess.run(
+    ["git", "clone", "-q", "--bare", str(fixture), str(bare)], check=True, env=env,
+  )
+  return bare
+
+
+def test_network_git_is_bounded_by_progress_not_a_wall_clock(tmp_path, monkeypatch):
+  """A large or slow repository must not fail a 30-second local-op timeout."""
+  bare = _bare_origin(tmp_path)
+  real_run = subprocess.run
+  seen: list[tuple[list[str], object]] = []
+
+  def recording(cmd, *args, **kwargs):
+    seen.append((list(cmd), kwargs.get("timeout")))
+    return real_run(cmd, *args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "run", recording)
+  source = tmp_path / "source"
+  app_git.clone_upstream(source, bare.as_uri(), "main")
+  app_git.fetch_upstream(source, "main")
+
+  network = [
+    (cmd, timeout) for cmd, timeout in seen
+    if "clone" in cmd or "fetch" in cmd
+  ]
+  assert {"clone", "fetch"} <= {
+    word for cmd, _ in network for word in cmd if word in ("clone", "fetch")
+  }
+  for cmd, timeout in network:
+    assert "http.lowSpeedLimit=1000" in cmd
+    assert "http.lowSpeedTime=60" in cmd
+    assert timeout == app_git._GIT_NETWORK_TIMEOUT > app_git._GIT_TIMEOUT
+  local = {timeout for cmd, timeout in seen if (cmd, timeout) not in network}
+  assert local == {app_git._GIT_TIMEOUT}
+
+
+@pytest.mark.parametrize("outcome", ["stalled", "overlong"])
+def test_stalled_network_git_surfaces_as_a_timeout(tmp_path, monkeypatch, outcome):
+  def fake_run(cmd, *args, **kwargs):
+    if outcome == "overlong":
+      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+    return subprocess.CompletedProcess(
+      cmd, 128, "",
+      "error: RPC failed; curl 28 Operation too slow. Less than 1000 "
+      "bytes/sec transferred the last 60 seconds\nfatal: early EOF\n",
+    )
+
+  monkeypatch.setattr(app_git.subprocess, "run", fake_run)
+  with pytest.raises(app_git.GitTransferTimeout):
+    app_git._run_network(tmp_path, "fetch", "--unshallow", "origin", check=False)

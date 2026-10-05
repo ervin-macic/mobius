@@ -103,10 +103,28 @@ _EXCLUDE_END = "# END MOBIUS MANAGED IGNORE RULES"
 _GIT_NAME = "Mobius"
 _GIT_EMAIL = "mobius@localhost"
 
-# Subprocess timeout. App repos are tiny (one source file plus a couple
-# of scripts), so any git op that runs longer than this is wedged, not
-# slow.
+# Timeout for local git subprocesses. They read and write only the app's own
+# repository, so one that runs longer than this is wedged, not slow.
 _GIT_TIMEOUT = 30
+
+# Network transfers (clone, fetch, unshallow) scale with the repository and the
+# connection, so a wall-clock limit would be a hidden package-size limit.
+# Instead, an HTTP transfer is abandoned when it moves fewer than
+# lowSpeedLimit bytes/second for lowSpeedTime seconds; the long overall ceiling
+# only catches transports curl does not bound, such as a hung SSH remote.
+_GIT_NETWORK_OPTIONS = (
+  "-c", "http.lowSpeedLimit=1000",
+  "-c", "http.lowSpeedTime=60",
+)
+_GIT_NETWORK_TIMEOUT = 30 * 60
+_STALLED_TRANSFER = re.compile(
+  r"curl 28|operation too slow|timed out", re.IGNORECASE,
+)
+
+
+class GitTransferTimeout(RuntimeError):
+  """A network Git transfer stalled or exceeded its overall ceiling."""
+
 
 # Contribute records a reviewed change as a Git object in the repository that
 # owns the live source.  The pending ref proves the reviewed diff came from a
@@ -415,6 +433,52 @@ def _run(
   return subprocess.run(
     cmd, capture_output=True, text=True, timeout=timeout,
     check=check, env=_git_env(repo, read_only=read_only),
+  )
+
+
+def _run_network_command(
+  cmd: list[str], env: dict[str, str], *, check: bool = True,
+) -> subprocess.CompletedProcess:
+  """Run one network git command bounded by transfer progress.
+
+  ``cmd`` starts with ``git``; the low-speed options are inserted as global
+  options. A stalled or overlong transfer raises ``GitTransferTimeout`` (even
+  with ``check=False``) so callers can tell the owner it timed out rather than
+  that the source is missing.
+  """
+  cmd = [cmd[0], *_GIT_NETWORK_OPTIONS, *cmd[1:]]
+  try:
+    result = subprocess.run(
+      cmd, capture_output=True, text=True, timeout=_GIT_NETWORK_TIMEOUT,
+      check=False, env=env,
+    )
+  except subprocess.TimeoutExpired as exc:
+    raise GitTransferTimeout(
+      f"it ran longer than {_GIT_NETWORK_TIMEOUT // 60} minutes"
+    ) from exc
+  if result.returncode != 0 and _STALLED_TRANSFER.search(result.stderr or ""):
+    raise GitTransferTimeout("the remote stopped sending data")
+  if check and result.returncode != 0:
+    raise subprocess.CalledProcessError(
+      result.returncode, cmd, output=result.stdout, stderr=result.stderr,
+    )
+  return result
+
+
+def _run_network(
+  repo: Path, *args: str, check: bool = True,
+) -> subprocess.CompletedProcess:
+  """``_run`` for a git subcommand that transfers objects from a remote."""
+  return _run_network_command(
+    [
+      "git",
+      "-c", f"user.name={_GIT_NAME}",
+      "-c", f"user.email={_GIT_EMAIL}",
+      "-C", str(repo),
+      *args,
+    ],
+    _git_env(repo),
+    check=check,
   )
 
 
@@ -2112,7 +2176,7 @@ def fetch_origin_commit(
   fetch_args = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"]
   if depth is not None:
     fetch_args.extend(("--depth", str(depth)))
-  _run(repo, *fetch_args, "origin", requested)
+  _run_network(repo, *fetch_args, "origin", requested)
   fetched = _resolve_commit(repo, requested)
   if fetched != requested:
     raise RuntimeError("origin returned a different commit")
@@ -2152,7 +2216,7 @@ def fetch_origin_ref(
       raise ValueError("invalid origin ref")
   if origin_url(repo) is None:
     raise RuntimeError("source repository has no origin")
-  _run(
+  _run_network(
     repo, "fetch", "--quiet", "--no-tags", "--depth", str(depth),
     "origin", immutable or requested,
   )
@@ -2708,10 +2772,7 @@ def clone_upstream(
         repo_url,
         str(clone_dir),
       ]
-      subprocess.run(
-        cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-        check=True, env=_git_env(repo),
-      )
+      _run_network_command(cmd, _git_env(repo))
       remote_ref = f"origin/{ref}"
       _run(clone_dir, "rev-parse", "--verify", remote_ref)
     # Keep later checkouts under the same safety policy as clone's first
@@ -2766,7 +2827,7 @@ def fetch_upstream(
     The fetched commit and any trusted equal-tree adoption proof.
   """
   repo = Path(source_dir)
-  _run(repo, "fetch", "--depth", "1", "origin", ref)
+  _run_network(repo, "fetch", "--depth", "1", "origin", ref)
   # A branch/tag fetch updates ``origin/<ref>``.  Fetching an immutable commit
   # oid does not create that remote-tracking name; Git records the exact fetched
   # commit only in FETCH_HEAD.  Store updates are commonly review-bound to a
@@ -3330,7 +3391,7 @@ def _restore_shallow_history_if_needed(
     raise RuntimeError(
       f"no merge base between {left} and {right} in shallow repo without origin"
     )
-  fetched = _run(
+  fetched = _run_network(
     repo, "fetch", "--unshallow", "--no-tags", "origin", check=False,
   )
   if fetched.returncode != 0:

@@ -40,6 +40,7 @@ from app.app_compile_contract import (  # noqa: E402
   rolldown_report_contract_error,
 )
 from app.build_admission import build_lease  # noqa: E402
+from app.icon_assets import InvalidIcon, normalize_icon  # noqa: E402
 from app.manifest_contract import (  # noqa: E402
   MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES,
@@ -165,6 +166,14 @@ def _referenced_file_findings(
       errors.append(
         f"manifest icon {icon!r} is missing; local apply rejects the revision"
       )
+    else:
+      try:
+        normalize_icon(icon_path.read_bytes())
+      except InvalidIcon as exc:
+        errors.append(
+          f"manifest icon {icon!r}: {exc} Local apply and Store publication "
+          "reject it, and installs skip it."
+        )
   for source in static_assets.values():
     if _symlink_component(root, source) is None and not (root / source).is_file():
       errors.append(f"static asset source {source!r} is missing")

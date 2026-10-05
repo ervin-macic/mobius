@@ -813,7 +813,7 @@ async def _http_get(
         next_url = None
         if r.status_code == 404:
           raise HTTPException(404, f"Not found: {url}")
-        if r.status_code == 429:
+        if _is_rate_limited(r.status_code, r.headers):
           raise HTTPException(429, _rate_limit_detail(url, r.headers))
         if r.status_code >= 400:
           raise HTTPException(
@@ -941,10 +941,26 @@ def _wait_label(seconds: int) -> str:
   return f"about {minutes} minute{'s' if minutes != 1 else ''}"
 
 
+def _is_rate_limited(status_code: int, headers) -> bool:
+  """True for 429, and for the 403 GitHub uses for its rate limits.
+
+  GitHub answers an exhausted primary limit with 403 and
+  ``x-ratelimit-remaining: 0``, and a secondary limit with 403 and
+  ``retry-after``; both are a wait, not a permission problem.
+  """
+  return status_code == 429 or (
+    status_code == 403
+    and (
+      _header(headers, "x-ratelimit-remaining") == "0"
+      or _header(headers, "retry-after") is not None
+    )
+  )
+
+
 def _rate_limit_detail(url: str, headers) -> str:
   host = urlparse(url).hostname or "upstream"
   service = "GitHub" if "github" in host.lower() else host
-  detail = f"{service} rate-limited this app update."
+  detail = f"{service} rate-limited this app request."
   retry_after = _header(headers, "retry-after")
   if retry_after:
     try:
@@ -1551,12 +1567,13 @@ def package_content_digest_from_tree(
   icon_processed = None
   icon_name = manifest.get("icon")
   if icon_name:
+    icon_bytes = _package_input_bytes(required_bytes(icon_name, "icon"))
     try:
-      icon_processed = icon_assets.normalize_icon(
-        _package_input_bytes(required_bytes(icon_name, "icon")),
-      )
-    except icon_assets.InvalidIcon as exc:
-      raise PackageContentError("invalid declared icon") from exc
+      icon_processed = icon_assets.normalize_icon(icon_bytes)
+    except icon_assets.InvalidIcon:
+      # Install skips a refused icon with a warning and digests the package
+      # without it; digest it the same way so update checks stay comparable.
+      pass
 
   static_assets = {
     destination: required_bytes(relative, "static asset")
@@ -2633,6 +2650,22 @@ def read_git_package_summary(
       source_digest=inputs.content_digest(),
       icon_warning=inputs.icon_warning,
     )
+
+
+def _git_source_error(
+  code: str, failure: str, outcome: str, exc: BaseException,
+) -> HTTPException:
+  """The owner-facing 409 for a Git source that could not be used.
+
+  A stalled or overlong transfer is reported as a timeout: retrying on a
+  better connection can fix it, whereas a missing or unverifiable source
+  needs the source itself to change.
+  """
+  if isinstance(exc, app_git.GitTransferTimeout):
+    code = "git_transfer_timeout"
+    failure = f"The app's Git transfer timed out: {exc}."
+    outcome = f"{outcome} Retrying on a steadier connection may help."
+  return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}"})
 
 
 def _fetch_git_package_commit(source_dir: str | Path, source_url: str) -> str:
@@ -4429,15 +4462,11 @@ async def _install_candidate(
                 trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-            raise HTTPException(
-              409,
-              detail={
-                "code": "git_update_unavailable",
-                "message": (
-                  "The reviewed Git update could not be applied. "
-                  "The installed version was left unchanged."
-                ),
-              },
+            raise _git_source_error(
+              "git_update_unavailable",
+              "The reviewed Git update could not be applied.",
+              "The installed version was left unchanged.",
+              exc,
             ) from exc
           app.upstream_commit = promoted.sha
           allow_unrelated_histories = (
@@ -4469,15 +4498,11 @@ async def _install_candidate(
                 git_source_dir, fetched_sha, candidate,
               )
             except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise HTTPException(
-                409,
-                detail={
-                  "code": "git_update_unavailable",
-                  "message": (
-                    "The app's Git update could not be fetched or verified. "
-                    "The installed version was left unchanged."
-                  ),
-                },
+              raise _git_source_error(
+                "git_update_unavailable",
+                "The app's Git update could not be fetched or verified.",
+                "The installed version was left unchanged.",
+                exc,
               ) from exc
             await asyncio.to_thread(
               app_git.replace_upstream_ref,
@@ -4500,15 +4525,11 @@ async def _install_candidate(
                 ),
               )
             except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise HTTPException(
-                409,
-                detail={
-                  "code": "git_update_unavailable",
-                  "message": (
-                    "The app's Git update could not be fetched or verified. "
-                    "The installed version was left unchanged."
-                  ),
-                },
+              raise _git_source_error(
+                "git_update_unavailable",
+                "The app's Git update could not be fetched or verified.",
+                "The installed version was left unchanged.",
+                exc,
               ) from exc
             app.upstream_commit = fetched_upstream.sha
             allow_unrelated_histories = (
@@ -4742,15 +4763,12 @@ async def _install_candidate(
           except (
             OSError, subprocess.SubprocessError, RuntimeError, ValueError,
           ) as exc:
-            raise HTTPException(
-              409,
-              detail={
-                "code": "git_install_unavailable",
-                "message": (
-                  "The app's Git repository could not be cloned or verified. "
-                  "Nothing was installed; retry when its source is available."
-                ),
-              },
+            raise _git_source_error(
+              "git_install_unavailable",
+              "The app's Git repository could not be cloned or verified; "
+              "retry when its source is available.",
+              "Nothing was installed.",
+              exc,
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the

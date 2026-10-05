@@ -1066,6 +1066,35 @@ def test_commit_pinned_install_clones_exact_reviewed_commit(
 
 
 
+def test_git_clone_timeout_reads_as_a_timeout_not_a_missing_source(
+  client, auth, db, bypass_url_validation,
+):
+  base = "https://raw.githubusercontent.com/acme/slow-git/main/"
+  manifest = {
+    "id": "slow-git", "name": "Slow Git", "version": "1.0.0",
+    "description": "Git lineage is required", "entry": "index.jsx",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ), patch(
+    "app.install.app_git.clone_upstream",
+    side_effect=app_git.GitTransferTimeout("the remote stopped sending data"),
+  ):
+    failed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert failed.status_code == 409, failed.text
+  detail = failed.json()["detail"]
+  assert detail["code"] == "git_transfer_timeout"
+  assert "timed out: the remote stopped sending data" in detail["message"]
+  assert "Nothing was installed." in detail["message"]
+  assert db.query(models.App).filter_by(slug="slow-git").first() is None
+
+
 def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   client, auth, db, tmp_path, bypass_url_validation,
 ):
@@ -2001,6 +2030,46 @@ def test_install_surfaces_github_rate_limit_as_429(client, auth, bypass_url_vali
   assert "GitHub rate-limited" in r.json()["detail"]
   assert "minute" in r.json()["detail"]
 
+
+
+@pytest.mark.parametrize("headers", [
+  {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1783620000"},
+  {"retry-after": "60"},
+])
+def test_install_surfaces_github_403_rate_limit_as_429(
+  client, auth, bypass_url_validation, headers,
+):
+  """GitHub reports exhausted rate limits as 403, not as a permission error."""
+  base = "https://raw.githubusercontent.com/mobius-os/app-test/main/"
+  responses = {base + "mobius.json": (403, b"API rate limit exceeded", headers)}
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client(responses),
+  ):
+    r = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert r.status_code == 429, r.text
+  assert "GitHub rate-limited" in r.json()["detail"]
+  assert "Upstream 403" not in r.json()["detail"]
+
+
+def test_install_keeps_an_ordinary_403_as_an_upstream_error(
+  client, auth, bypass_url_validation,
+):
+  base = "https://raw.githubusercontent.com/mobius-os/app-test/main/"
+  responses = {
+    base + "mobius.json": (403, b"forbidden", {"x-ratelimit-remaining": "42"}),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client(responses),
+  ):
+    r = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert r.status_code == 502, r.text
+  assert "Upstream 403" in r.json()["detail"]
 
 # --- Update path rolls back compiled bundle (fix 4) -----------------
 

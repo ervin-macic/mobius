@@ -455,3 +455,22 @@ def test_validator_does_not_require_informational_offline_precache_files(tmp_pat
 
   result = _run(tmp_path)
   assert result.returncode == 0, result.stderr
+
+
+def test_validator_applies_the_icon_rule_apply_and_publication_use(tmp_path):
+  from PIL import Image
+
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  manifest = json.loads((tmp_path / "mobius.json").read_text())
+  manifest["icon"] = "icon.png"
+  (tmp_path / "mobius.json").write_text(json.dumps(manifest))
+
+  Image.new("RGB", (5000, 4800), (40, 90, 180)).save(tmp_path / "icon.png")
+  accepted = _run(tmp_path)
+  assert accepted.returncode == 0, accepted.stderr
+
+  Image.new("1", (6000, 6000)).save(tmp_path / "icon.png")
+  refused = _run(tmp_path)
+  assert refused.returncode == 1
+  assert "manifest icon 'icon.png'" in refused.stderr
+  assert "32 million pixels" in refused.stderr
