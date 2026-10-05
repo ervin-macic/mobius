@@ -4,6 +4,8 @@ Reads are the common case. Mutations are deliberately narrow: Codex reset
 redemption rides its official app-server client, while Claude's guarded
 extra-usage and limit-reset controls mirror private routes used by Claude Code.
 Every irreversible reset claim is revalidated against a fresh provider offer.
+Allowance mutations invalidate readings at their owning boundary, not when a
+particular view happens to reopen.
 """
 
 from __future__ import annotations
@@ -102,11 +104,25 @@ _claude_reset_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 
 def forget_provider_usage(provider_id: str, data_dir: str) -> None:
-  """Drop readings from the previous sign-in before this account is shown."""
+  """Discard superseded allowance readings, including probes still in flight."""
   key = _cache_key(provider_id, data_dir)
   _provider_usage_generation[key] = _provider_usage_generation.get(key, 0) + 1
   _provider_usage_cache.pop(key, None)
   _last_reading_path(data_dir, provider_id).unlink(missing_ok=True)
+
+
+def provider_allowance_changed(provider_id: str, data_dir: str) -> None:
+  """Discard superseded readings before asking every open display to reread.
+
+  A provider can commit an allowance change before its response is lost.
+  Mutation callers use this boundary even on uncertain outcomes; it refreshes
+  observations, never repeats an account action or erases reset receipts.
+  """
+  forget_provider_usage(provider_id, data_dir)
+  from app.broadcast import get_system_broadcast
+  get_system_broadcast().publish({
+    "type": "provider_usage_changed", "provider": provider_id,
+  })
 
 
 class ClaudeResetOfferChanged(RuntimeError):
@@ -615,16 +631,18 @@ async def set_claude_extra_usage(
     "anthropic-beta": "oauth-2025-04-20",
     "Content-Type": "application/json",
   }
-  async with httpx.AsyncClient(timeout=12.0) as client:
-    response = await client.put(
-      _CLAUDE_EXTRA_USAGE_URL.format(
-        organization_uuid=organization_uuid,
-      ),
-      headers=headers,
-      json={"is_enabled": enabled},
-    )
-    response.raise_for_status()
-  _provider_usage_cache.pop((str(Path(data_dir).resolve()), "claude"), None)
+  try:
+    async with httpx.AsyncClient(timeout=12.0) as client:
+      response = await client.put(
+        _CLAUDE_EXTRA_USAGE_URL.format(
+          organization_uuid=organization_uuid,
+        ),
+        headers=headers,
+        json={"is_enabled": enabled},
+      )
+      response.raise_for_status()
+  finally:
+    provider_allowance_changed("claude", data_dir)
   return await read_provider_usage("claude", data_dir)
 
 
@@ -913,6 +931,8 @@ async def redeem_claude_reset(
       return _unknown_claude_reset()
     except (httpx.RequestError, ValueError):
       return _unknown_claude_reset()
+    finally:
+      provider_allowance_changed("claude", data_dir)
 
     if result is None:
       return _unknown_claude_reset()
@@ -938,7 +958,6 @@ async def redeem_claude_reset(
       # These outcomes are definitive no-ops: no reset was spent by this
       # request, so the same offer may be evaluated again from fresh state.
       _clear_claude_reset_intent(intent_path)
-    _provider_usage_cache.pop((str(Path(data_dir).resolve()), "claude"), None)
     return result
 
 
@@ -1123,11 +1142,14 @@ async def redeem_codex_reset(
   ``alreadyRedeemed``). Redeeming is immediate and irreversible, so the caller
   must have already confirmed intent.
   """
-  return await _run_on_codex_client(
-    data_dir,
-    _consume_codex_reset(credit_id),
-    timeout_error="codex reset redeem timed out",
-  )
+  try:
+    return await _run_on_codex_client(
+      data_dir,
+      _consume_codex_reset(credit_id),
+      timeout_error="codex reset redeem timed out",
+    )
+  finally:
+    provider_allowance_changed("codex", data_dir)
 
 
 async def _fetch_mobius_usage() -> dict[str, Any]:

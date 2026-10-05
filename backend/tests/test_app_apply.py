@@ -11,7 +11,6 @@ import pytest
 from app import app_apply, app_git, icon_assets, models
 from app.config import get_settings
 from app.database import SessionLocal
-from app.manifest_contract import STATIC_ASSETS_COUNT_MAX
 
 
 def _source(slug: str = "demo") -> Path:
@@ -151,6 +150,56 @@ def test_new_app_compile_does_not_hold_sqlite_write_lock(
     verify.close()
 
 
+@pytest.mark.parametrize("mode", ["created", "updated"])
+def test_apply_holds_no_sqlite_write_lock_across_its_awaits(
+  client, auth, monkeypatch, mode,
+):
+  """No awaited apply phase may run inside the row's write transaction.
+
+  An async route that commits waits on SQLite inside the event loop, so a
+  write lock held across an await stalls both requests until the busy timeout
+  fails the unrelated one. Environment preparation is the last awaited phase,
+  after compilation, the Git commit and runtime staging.
+  """
+  source = _source()
+  if mode == "updated":
+    assert _apply(client, auth, source).status_code == 200
+    (source / "index.jsx").write_text(
+      "export default function App() { return <div>second</div> }\n"
+    )
+  concurrent_chat_id = f"chat-created-during-app-{mode}"
+  prepare_env = app_apply.app_python_env.prepare_env
+  write_errors = []
+
+  def prepare_env_while_chat_is_created(*args, **kwargs):
+    concurrent = SessionLocal()
+    try:
+      # Fail promptly instead of waiting out the live five-second timeout.
+      concurrent.connection().exec_driver_sql("PRAGMA busy_timeout=50")
+      concurrent.add(create_chat(
+        id=concurrent_chat_id,
+        title="Concurrent chat",
+        messages=[],
+        pending_messages=[],
+      ))
+      concurrent.commit()
+    except Exception as exc:  # recorded so the assertion names the lock
+      write_errors.append(repr(exc))
+    finally:
+      concurrent.close()
+    return prepare_env(*args, **kwargs)
+
+  monkeypatch.setattr(
+    app_apply.app_python_env, "prepare_env", prepare_env_while_chat_is_created,
+  )
+
+  response = _apply(client, auth, source)
+
+  assert response.status_code == 200, response.text
+  assert response.json()["mode"] == mode
+  assert write_errors == []
+
+
 def test_apply_updates_multifile_revision_once(client, auth, db):
   source = _source()
   created = _apply(client, auth, source)
@@ -189,6 +238,37 @@ def test_apply_updates_multifile_revision_once(client, auth, db):
       "chatId": "editing-chat",
     }),
   ]
+
+
+def test_shell_shortcuts_are_on_unless_the_manifest_opts_out(client, auth, db):
+  source = _source()
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  assert created.json()["app"]["shell_shortcuts"] is True
+  app_id = created.json()["app"]["id"]
+
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["shell_shortcuts"] = False
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  opted_out = _apply(client, auth, source)
+  assert opted_out.status_code == 200, opted_out.text
+  assert opted_out.json()["app"]["shell_shortcuts"] is False
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.shell_shortcuts is False
+
+  # Removing the declaration restores the default rather than keeping the
+  # previous value.
+  del manifest["shell_shortcuts"]
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  restored = _apply(client, auth, source)
+  assert restored.status_code == 200, restored.text
+  assert restored.json()["app"]["shell_shortcuts"] is True
+
+  manifest["shell_shortcuts"] = "no"
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  rejected = _apply(client, auth, source)
+  assert rejected.status_code >= 400
+  assert "shell_shortcuts" in rejected.text
 
 
 def test_apply_probes_the_implicit_service_identity_it_will_keep(
@@ -258,15 +338,16 @@ def test_local_apply_materializes_versioned_static_assets(client, auth):
   assert not served.exists()
 
 
-def test_local_apply_enforces_static_asset_count_before_materialization(
-  client, auth,
-):
+def test_local_apply_has_no_static_asset_count_cap(client, auth):
+  """Local apply once capped static assets at 256 files. The manifest's byte
+  cap already bounds how many can be listed, and the package byte bound limits
+  their size."""
   source = _source()
   asset_sources = source / "listing-assets"
   asset_sources.mkdir()
   manifest = json.loads((source / "mobius.json").read_text())
   manifest["static_assets"] = {}
-  for index in range(STATIC_ASSETS_COUNT_MAX):
+  for index in range(300):
     name = f"item-{index}.txt"
     (asset_sources / name).write_text(str(index))
     manifest["static_assets"][f"listing/{name}"] = f"listing-assets/{name}"
@@ -275,30 +356,35 @@ def test_local_apply_enforces_static_asset_count_before_materialization(
   accepted = _apply(client, auth, source)
 
   assert accepted.status_code == 200, accepted.text
-  served = source / "static" / "listing"
-  assert len(list(served.iterdir())) == STATIC_ASSETS_COUNT_MAX
-  accepted_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  assert len(list((source / "static" / "listing").iterdir())) == 300
 
-  extra_name = "item-over-limit.txt"
-  (asset_sources / extra_name).write_text("must not publish")
-  manifest["static_assets"][f"listing/{extra_name}"] = (
-    f"listing-assets/{extra_name}"
-  )
+
+def test_local_apply_refuses_an_oversized_package_before_reading_it(
+  client, auth, monkeypatch,
+):
+  """Local apply bounds the same declared files install downloads, from their
+  sizes on disk, before it materializes anything."""
+  from app import app_apply
+  from app.manifest_contract import package_bytes_on_disk
+
+  source = _source()
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  accepted_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  (source / "data.bin").write_bytes(b"x" * 64)
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["static_assets"] = {"data.bin": "data.bin"}
   (source / "mobius.json").write_text(json.dumps(manifest))
+  monkeypatch.setattr(
+    app_apply, "PACKAGE_MAX_BYTES", package_bytes_on_disk(source, manifest) - 1,
+  )
 
   rejected = _apply(client, auth, source)
 
   assert rejected.status_code == 422, rejected.text
-  assert rejected.json()["detail"] == {
-    "code": "manifest_invalid",
-    "message": (
-      "Manifest has too many static_assets "
-      f"(max {STATIC_ASSETS_COUNT_MAX})."
-    ),
-  }
+  assert rejected.json()["detail"]["code"] == "package_too_large"
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == accepted_head
-  assert len(list(served.iterdir())) == STATIC_ASSETS_COUNT_MAX
-  assert not (served / extra_name).exists()
+  assert not (source / "static" / "data.bin").exists()
 
 
 @pytest.mark.parametrize("symlink_component", ["source", "parent"])

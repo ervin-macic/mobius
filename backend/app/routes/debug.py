@@ -101,9 +101,6 @@ def debug_status(
   operator should investigate and restart. The field is absent (or
   False) when reconciliation succeeded.
 
-  `media_migration_failed` follows the same absent-when-healthy contract. When
-  present, old chat image paths may require recovery before they render.
-
   Runtime payload sizing is deliberately omitted from this cheap endpoint.
   The response says so under ``runtime_memory.payload_sizing`` and points to
   ``/api/debug/memory``; query options do not turn the status probe into the
@@ -131,9 +128,6 @@ def debug_status(
   # startup reconciliation throws. Absent (getattr default False)
   # when reconciliation succeeded so the field is stable to check.
   reconciliation_failed = getattr(request.app.state, "reconciliation_failed", False)
-  media_migration_failed = getattr(
-    request.app.state, "media_migration_failed", False,
-  )
 
   # Provider-limit parks (design §2.4). A parked chat has NO live handle and
   # NO broadcast — its turn ended — so it appears in none of the lists above;
@@ -194,8 +188,6 @@ def debug_status(
     result["public_apps"] = {}
   if reconciliation_failed:
     result["reconciliation_failed"] = True
-  if media_migration_failed:
-    result["media_migration_failed"] = True
 
   # Surface the SECRET_KEY drift flag written by entrypoint.sh.
   # Present (with the detection timestamp as a string) when the key changed
@@ -230,16 +222,15 @@ def debug_status(
     except OSError:
       result["platform_pre_clone_active"] = True
 
+  # Chats whose rows are not yet authoritative (written by the previous
+  # release). Absent once every chat is converted, so the golden shape holds.
+  from app import transcript_rows
+  from app.chat_writer import transcript_conversion_status
+  pending = transcript_rows.unconverted_count(db)
+  if (pending or transcript_conversion_status.get("error")
+      or transcript_conversion_status.get("failed")):
+    result["transcript_conversion"] = {"pending": pending, **transcript_conversion_status}
 
-  try:
-    from app import one_way_upgrades
-    from app.database import engine
-    upgrades = one_way_upgrades.upgrade_status(engine.url.database)
-  except Exception:
-    # Database diagnostics must remain usable when the database is damaged.
-    upgrades = None
-  if upgrades:
-    result["one_way_upgrades"] = upgrades
   return result
 
 

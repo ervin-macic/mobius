@@ -27,13 +27,6 @@ from app.allocator import limit_glibc_arenas
 
 limit_glibc_arenas()
 
-# Refuse this source on an image whose baked fallback is older than it needs,
-# before anything can open the database. The entrypoint's import probe runs
-# exactly this import, so a refusal takes its revert/baked-fallback path.
-from app.one_way_upgrades import assert_source_supported
-
-assert_source_supported()
-
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -43,6 +36,7 @@ from sqlalchemy import inspect as inspect_database
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from app.chat_logging import get_logger as get_chat_logger
 from app.config import get_settings
 from app.database import (
   Base,
@@ -52,7 +46,9 @@ from app.database import (
   reset_database_request_label,
   set_database_request_label,
 )
-from app.schema_migrations import mapped_schema_gaps, run_migrations
+from app.schema_migrations import (
+  ensure_transcript_triggers, mapped_schema_gaps, run_migrations,
+)
 from app.http_caching import strip_range
 from app.frontend_assets import (
   baked_frontend_dir,
@@ -75,7 +71,9 @@ from app.response_policy import (
   static_embed_csp,
 )
 from app.storage_io import ParentIsFile, atomic_write
+from app.account_browser_access import SharedAccessError
 from app import activity, models
+from app.transcript_rows import TranscriptUnavailable
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
 # uvicorn boot. See the
@@ -139,7 +137,7 @@ def _database_degraded_payload() -> dict | None:
   if result is None or result.serviceable:
     return None
   if result.failure_reason:
-    return {"reason": result.failure_reason, **dict(result.failure_detail)}
+    return {"reason": result.failure_reason}
   if result.schema_gaps:
     return {
       "reason": "schema_mismatch",
@@ -232,46 +230,15 @@ def _init_db():
   mutates existing tables, so column upgrades remain owned by
   ``run_migrations``.
   """
-  from app import compat, one_way_upgrades
   from app.startup import DatabaseBootResult
 
-  # The import-time check honoured an update validator's candidate level; a
-  # served boot must hold against the real baked image, before any database
-  # access. See app/compat.py.
-  image_refusal = compat.serve_time_image_verdict()
-  if image_refusal is not None:
-    print("CRITICAL: " + image_refusal["message"])
-    return DatabaseBootResult(
-      failure_reason="image_below_source",
-      failure_detail=tuple(image_refusal.items()),
-    )
-
-  preflight = None
   for attempt in range(10):
     try:
-      # Read the floor and snapshot the tables before anything writes. The
-      # snapshot is kept across retries so a partially applied first attempt
-      # can never make a new database look pre-existing.
-      if preflight is None:
-        preflight = one_way_upgrades.preflight(engine)
-      refusal = one_way_upgrades.boot_refusal(preflight)
-      if refusal is not None:
-        reason, detail = refusal
-        print("CRITICAL: " + dict(detail)["message"])
-        return DatabaseBootResult(failure_reason=reason, failure_detail=detail)
-      one_way_upgrades.ensure_compat_record(engine.url.database, preflight)
       Base.metadata.create_all(bind=engine)
       run_migrations(engine)
+      # The previous release's change detection depends on these triggers.
+      ensure_transcript_triggers(engine)
       gaps = mapped_schema_gaps(engine)
-      # A legacy database still has chats.messages until the one-way gate
-      # renames it. The new mapper names only messages_v1, so that one missing
-      # column is expected *before* activation. Do not waive any other gap:
-      # converting a database with an unrelated broken mapped column would
-      # raise its floor before this release can safely serve it.
-      if "chats.messages_v1" in gaps and _legacy_transcript_transition_pending(
-        preflight.existing_tables,
-      ):
-        gaps = [gap for gap in gaps if gap != "chats.messages_v1"]
       if gaps:
         # A mapped column with no migration fails at first query, not at
         # boot. Surface it loudly here and through /api/health(+/strict)
@@ -280,10 +247,7 @@ def _init_db():
           "CRITICAL: database is missing ORM-declared schema: "
           + ", ".join(gaps)
         )
-      return DatabaseBootResult(
-        schema_gaps=tuple(gaps),
-        existing_tables=preflight.existing_tables,
-      )
+      return DatabaseBootResult(schema_gaps=tuple(gaps))
     except OperationalError as e:
       if attempt < 9 and _database_init_error_is_transient(e):
         delay = min(2 ** attempt, 10)
@@ -291,34 +255,6 @@ def _init_db():
         time.sleep(delay)
       else:
         raise
-
-
-def _legacy_transcript_transition_pending(existing_tables: frozenset[str]) -> bool:
-  """Only the exact pre-activation legacy shape may defer one mapped gap.
-
-  This is a read-only physical-schema check, not an ORM query: the mapper's
-  messages_v1 column is necessarily absent here. An already-ACTIVE step with
-  a restored old chats table must fail closed rather than run another upgrade.
-  """
-  if "chats" not in existing_tables:
-    return False
-  with engine.connect() as conn:
-    columns = {
-      row[1] for row in conn.exec_driver_sql("PRAGMA table_info(chats)")
-    }
-    if "messages" not in columns or "messages_v1" in columns:
-      return False
-    tables = {
-      row[0] for row in conn.exec_driver_sql(
-        "SELECT name FROM sqlite_master WHERE type = 'table'"
-      )
-    }
-    if "platform_upgrades" not in tables:
-      return True
-    state = conn.exec_driver_sql(
-      "SELECT state FROM platform_upgrades WHERE level = 1"
-    ).scalar()
-    return state is None or state == "preparing"
 
 
 def _assert_provider_defaults(provider_names) -> None:
@@ -460,9 +396,30 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
+@app.exception_handler(TranscriptUnavailable)
+async def _transcript_unavailable_handler(_request: Request, exc: TranscriptUnavailable):
+  # One answer for every route, sync or async, whose chat could not be
+  # converted while serving it. The chat's legacy value stays authoritative.
+  logging.getLogger(__name__).warning("%s", exc)
+  detail = (
+    "This chat is being prepared; please try again."
+    if exc.in_progress else
+    "This chat couldn't be prepared; the error is recorded in diagnostics."
+  )
+  return JSONResponse(status_code=503, content={"detail": detail})
+
+
 @app.exception_handler(IntegerOutOfRange)
 async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
   return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(SharedAccessError)
+async def _shared_access_error_handler(_request: Request, exc: SharedAccessError):
+  # Shared-access failures the Connect app branches on carry a stable code.
+  return JSONResponse(
+    status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code},
+  )
 
 
 @app.exception_handler(ParentIsFile)
@@ -816,6 +773,10 @@ class _DatabaseRequestContextMiddleware:
       reset_database_request_label(token)
 
 
+def _matched_route(scope) -> str:
+  return getattr(scope.get("route"), "path", None) or "<unmatched>"
+
+
 class _RequestErrorTelemetryMiddleware:
   """Aggregate failed responses by matched route without retaining raw URLs.
 
@@ -824,10 +785,31 @@ class _RequestErrorTelemetryMiddleware:
   so a retry loop remains observable without amplifying its CPU or disk cost.
   FastAPI leaves the matched route template and path params in the ASGI scope;
   those templates contain no user paths or query values.
+
+  Unhandled exceptions also leave their traceback in the chat log (uvicorn's
+  own report reaches only the container's stdout), once per route and
+  exception type per window so a crash loop cannot flood the log.
   """
+
+  _TRACEBACK_WINDOW_SEC = 60
+  _TRACEBACK_KEY_CAP = 512
 
   def __init__(self, app):
     self.app = app
+    self._traceback_logged_at: dict[tuple[str, str], float] = {}
+
+  def _log_traceback(self, route: str, exc: Exception) -> None:
+    key = (route, type(exc).__qualname__)
+    now = time.monotonic()
+    last = self._traceback_logged_at.get(key)
+    if last is not None and now - last < self._TRACEBACK_WINDOW_SEC:
+      return
+    if len(self._traceback_logged_at) >= self._TRACEBACK_KEY_CAP:
+      self._traceback_logged_at.clear()
+    self._traceback_logged_at[key] = now
+    get_chat_logger().error(
+      "unhandled exception in route %s", route, exc_info=exc,
+    )
 
   async def __call__(self, scope, receive, send):
     if scope["type"] != "http":
@@ -842,13 +824,15 @@ class _RequestErrorTelemetryMiddleware:
 
     try:
       return await self.app(scope, receive, _send)
-    except Exception:
+    except Exception as exc:
       status = status or 500
+      self._log_traceback(
+        f"{scope.get('method', '?')} {_matched_route(scope)}", exc,
+      )
       raise
     finally:
       if status is not None and status >= 400:
-        matched = scope.get("route")
-        route = getattr(matched, "path", None) or "<unmatched>"
+        route = _matched_route(scope)
         raw_app_id = (scope.get("path_params") or {}).get("app_id")
         try:
           app_id = int(raw_app_id) if raw_app_id is not None else None
@@ -1131,10 +1115,6 @@ def health(response: Response):
   # offers a container-only upgrade to a runtime that reports none: its image
   # predates the boot transaction and cannot take a package-changing release.
   payload["boot_protocol"] = BOOT_PROTOCOL if image_activates_updates() else None
-  # The database's compatibility floor (None when unknown). A deployment
-  # controller must never roll back to an image whose level is below it.
-  from app.one_way_upgrades import reported_floor
-  payload["compat_floor"] = reported_floor()
   if degraded:
     # Still HTTP 200: database failure must never masquerade as device offline.
     # The strict and readiness variants below carry the 5xx service verdict.
@@ -1190,10 +1170,6 @@ def service_readiness() -> dict:
   )
   if degraded:
     return {"ready": False, **degraded}
-  from app import one_way_upgrades
-  pending_upgrade = one_way_upgrades.readiness_verdict()
-  if pending_upgrade:
-    return {"ready": False, **pending_upgrade}
   from app.chat_writer import writer_readiness
   is_ready, reason = writer_readiness()
   if not is_ready:

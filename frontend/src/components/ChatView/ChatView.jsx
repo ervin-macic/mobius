@@ -1,4 +1,10 @@
 import { LocalAnswersContext } from './localAnswersContext.js'
+import {
+  chatCompactingKind,
+  compactionNotice,
+  setChatCompacting,
+  subscribeChatCompaction,
+} from './chatCompactionStore.js'
 import { questionAnswerPatch } from './questionSubmission.js'
 import { usePeerTimeline, PeerTimelineRows } from './PeerTimeline.jsx'
 import { PeerTimelineContext } from './peerTimelineContext.js'
@@ -12,6 +18,7 @@ import {
   useCallback,
   useMemo,
   useReducer,
+  useSyncExternalStore,
 } from 'react'
 import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -699,6 +706,11 @@ export default function ChatView({
   // context instead of asking the model anything.
   const [compactingChat, setCompactingChat] = useState(false)
   const compactingChatRef = useRef(false)
+  // The server's view of the same window, shared by every pane and device.
+  const serverCompactingKind = useSyncExternalStore(
+    subscribeChatCompaction,
+    () => chatCompactingKind(chatId),
+  )
   const [embeddedRunActive, setEmbeddedRunActive] = useState(false)
   // A counter is only a render wake-up; deadline elapsed is derived directly
   // from the current card's reset timestamp below, so a newly loaded card can
@@ -1519,6 +1531,7 @@ export default function ChatView({
       setLiveQuestionId(data.pending_question_id || null)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
       setServerHandoff(data.handoff || null)
+      if (!staleSnapshot) setChatCompacting(chatId, data.compacting || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
         running: !!data.running,
@@ -1725,6 +1738,7 @@ export default function ChatView({
       setLiveQuestionId(pendingQuestionId)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
       setServerHandoff(data.handoff || null)
+      setChatCompacting(chatId, data.compacting || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
         running: !!data.running,
@@ -3857,10 +3871,12 @@ export default function ChatView({
   ])
 
   useEffect(() => {
-    if (hidden) return
+    if (hidden || provisionalNewChat) return
     const request = pendingComposerSubmit
     if (!request || submittedComposerRequestTokenRef.current === request.token) return
-    if (loading || loadError) return
+    // Do not consume durable intent until doSend can accept it. A restored
+    // chat can have cached content while its activation is still pending.
+    if (loading || loadError || !activationSettled || providerSwitching) return
     const text = request.text.trim()
     if (!text) {
       setPendingComposerSubmit(null)
@@ -3872,7 +3888,13 @@ export default function ChatView({
     if (request.storedHandoff) {
       // Consume before sending so a failed/reloaded attempt becomes a visible
       // recoverable draft, never an automatic retry loop.
-      consumeComposerHandoff(chatId, request.text, { autoSend: true })
+      if (!consumeComposerHandoff(chatId, request.text, { autoSend: true })) {
+        // A remounted draft and a retained-composer request can name the
+        // same intent with different UI tokens. Only its durable claimant
+        // may send; acknowledging the other request must not duplicate it.
+        onComposerRequestHandled?.(request.token)
+        return
+      }
     }
     doSend(text)
     // A stored handoff can also be an explicit Shell request from the still-
@@ -3882,6 +3904,9 @@ export default function ChatView({
     onComposerRequestHandled?.(request.token)
   }, [
     pendingComposerSubmit,
+    provisionalNewChat,
+    activationSettled,
+    providerSwitching,
     loading,
     loadError,
     doSend,
@@ -5892,7 +5917,6 @@ export default function ChatView({
     displayedMessages,
     !hidden && transcriptPaintable,
     streamItems,
-    showActiveAssistantSurface ? activeMirrorMsgIdx : -1,
   )
   const replyGroups = useMemo(() => assistantReplyGroups(
     showActiveAssistantSurface && activeMirrorMsgIdx < 0
@@ -6397,7 +6421,10 @@ export default function ChatView({
           canRequestSteer={canRequestSteer}
           canSubmitSteer={canSubmitSteer}
           sendFailure={sendFailure}
-          notice={compactingChat ? 'Compacting this chat’s context…' : null}
+          notice={compactionNotice(
+            serverCompactingKind || (compactingChat ? 'compact' : null),
+            { sendBlockedBySwitch: providerSwitching },
+          )}
           submissionBlocked={
             (!activationSettled && !activationFailed)
             || providerSwitching

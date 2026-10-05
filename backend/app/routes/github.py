@@ -54,6 +54,7 @@ from app import (
   github_auth,
   models,
   providers,
+  transcript_rows,
 )
 from app.config import get_settings
 from app.broadcast import get_system_broadcast
@@ -2673,7 +2674,7 @@ def _source_chat_metadata(app_id: int, source_root: str) -> list[dict]:
     ), selectinload(models.Chat.live_snapshot)).filter(
       models.Chat.deleted_at.is_(None),
       or_(models.Chat.id.in_(db.query(models.ChatMessage.chat_id).filter(
-        models.ChatMessage.flags.op("&")(1) != 0,
+        models.ChatMessage.flags.op("&")(transcript_rows.EDIT_PREVIEW) != 0,
       )),
           models.Chat.live_snapshot.has(
             cast(models.ChatLiveAssistant.snapshot, Text).contains('"edit_preview"'))),
@@ -3091,6 +3092,7 @@ async def start_contribution_work(
     ).first()
     if row is None:
       raise HTTPException(status_code=409, detail="Contribution work is unavailable.")
+    await transcript_rows.ensure_converted_async(row.child_chat_id, response_db)
     work = serialize_source_work(response_db, row)
   return {"attached": attached, "work": work}
 
@@ -3140,6 +3142,7 @@ async def stop_contribution_work(
     ).first()
     if row is None:
       raise HTTPException(status_code=404, detail="Contribution work was not found.")
+    await transcript_rows.ensure_converted_async(row.child_chat_id, response_db)
     work = serialize_source_work(response_db, row)
     publish_source_work_changed(row, work["status"])
   return {"stopped": work["status"] in {"stopped", "cancelled"}, "work": work}
@@ -3277,6 +3280,8 @@ async def contributions_for_chat(
   autopilot_default = app_settings.get("autopilot_default")
   with SessionLocal() as work_db:
     work_row = latest_source_work(work_db, chat_id, app_id)
+    if work_row is not None:
+      await transcript_rows.ensure_converted_async(work_row.child_chat_id, work_db)
     work = serialize_source_work(work_db, work_row) if work_row else None
     work_history_count = work_db.query(models.Delegation).filter(
       models.Delegation.parent_chat_id == chat_id,

@@ -1,5 +1,7 @@
 """Normalized persistence protects positions, atomicity and bounded reads."""
 
+import json
+
 import pytest
 from sqlalchemy import event, text
 
@@ -48,20 +50,21 @@ def test_append_and_update_never_rewrite_other_rows(db):
   updates = [(sql, params) for sql, params in statements if sql.startswith("UPDATE chat_messages")]
   assert len(updates) == 1
   assert "edited" in str(updates[0][1])
-  assert not any("messages_v1" in sql for sql, _ in statements if sql.startswith("UPDATE"))
+  # The commit's one mirror statement rewrites the legacy value in SQLite.
+  assert sum(sql.startswith("UPDATE chats SET messages") for sql, _ in statements) == 1
   assert rows.at(db, chat, 0)["content"] == "x" * 200_000
 
 
-def test_changed_rows_state_and_flags_rollback_together(db):
+def test_changed_rows_mirror_and_flags_rollback_together(db):
   chat = seed(db, messages=[{"role": "user", "content": "before"}])
-  revision = chat.transcript_state.revision
   rows.update_at(db, chat, 0, {"role": "assistant", "blocks": [{"type": "question"}]})
   rows.append(db, chat, {"role": "user", "content": "not committed"})
   db.flush()
   db.rollback()
   assert rows.count(db, chat) == 1
   assert rows.at(db, chat, 0) == {"role": "user", "content": "before"}
-  assert chat.transcript_state.revision == revision
+  assert db.execute(text("SELECT messages FROM chats WHERE id = :id"), {"id": chat.id}).scalar() \
+    == '[{"role": "user", "content": "before"}]'
 
 
 def test_duplicate_ids_and_trailing_adoption_keep_old_matching_rules(db):
@@ -126,7 +129,7 @@ def test_metadata_does_not_decode_normal_message_bodies(db):
 
 def test_page_metadata_and_bodies_share_a_snapshot_during_concurrent_append(db):
   chat = seed(db, messages=[{"role": "user", "ts": 1}])
-  rows.pin_read_snapshot(db)
+  rows.pin_read_snapshot(db, chat.id)
   view = rows.history(chat)
   assert len(view) == 1
   with SessionLocal() as other:
@@ -144,6 +147,10 @@ def test_scalar_metadata_preserves_exact_json_type_after_session_reload(db, valu
   db.expire_all()
   projected = rows.metadata(db, chat)[0]
   for key in ("id", "cid", "ts"):
+    if key == "cid" and not value:
+      # The writers' identity (cid_of) treats a falsy cid as absent.
+      assert "cid" not in projected
+      continue
     actual = projected.get(key)
     assert actual == value
     assert type(actual) is type(value)
@@ -183,21 +190,19 @@ def test_in_turn_steer_uses_identity_metadata_not_historical_bodies(db, provider
   assert not any("chat_messages.body" in sql for sql in statements if sql.lstrip().startswith("select"))
   assert len([sql for sql in statements if sql.lstrip().startswith("insert into chat_messages")]) == 1
   db.expire_all()
-  assert rows.window(db, chat, 0, 130) == original
+  assert rows.history(db.get(models.Chat, chat.id))[0:130] == original
 
 
 def test_generic_reads_do_not_trust_cached_rows_after_external_writer_ack(db):
   chat = seed(db, messages=[{"role": "user", "content": "before"}])
-  assert db.get(models.ChatTranscriptState, chat.id).message_count == 1
-  assert db.get(models.ChatMessage, (chat.id, 0)).body["content"] == "before"
+  assert rows.count(db, chat) == 1
   with SessionLocal() as writer:
     rows.update_at(writer, writer.get(models.Chat, chat.id), 0,
                    {"role": "user", "content": "after"})
     rows.append(writer, writer.get(models.Chat, chat.id), {"role": "assistant", "content": "added"})
     writer.commit()
-  # No implicit snapshot is held and the external ack owns fresh authority.
-  # Expiring only Chat need not discover/expire its row/state identity map.
-  db.expire(chat)
+  # No implicit snapshot is held and the external ack owns fresh authority;
+  # rows are read with statements, never from an identity map.
   assert rows.count(db, chat) == 2
   assert rows.at(db, chat, 0)["content"] == "after"
 
@@ -224,11 +229,11 @@ def test_surrogate_identity_lookup_preserves_first_matching_message(db):
 
 
 @pytest.mark.parametrize("key", ["a" * 256, "long" * 1000, "\ud800" * 256])
-def test_arbitrary_legacy_ids_have_bounded_lookup_hints_without_changing_identity(db, key):
+def test_arbitrary_legacy_ids_keep_exact_lookup_keys_and_identity(db, key):
   chat = create_chat(id="bounded-id", title="test", messages=[
     {"role": "assistant", "id": key, "content": "original"}], agent_settings_json={"model": "test"})
   db.add(chat)
   db.commit()
-  assert len(rows.identity_key(key)) == 64
+  assert db.query(models.ChatMessage.message_key).filter_by(chat_id=chat.id).scalar() == json.dumps(key)
   assert rows.assistant_index(db, chat, {"id": key}) == 0
   assert rows.at(db, chat, 0)["id"] == key

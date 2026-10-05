@@ -11,7 +11,7 @@
 import { test, expect } from '@playwright/test'
 import { attachCleanup } from './_chatTracker.mjs'
 import { createChat, sendMessage, waitForChatShell } from './_chatSession.mjs'
-import { mockAcceptedMessages } from './_mockAcceptedMessages.mjs'
+import { mockAcceptedMessages, releaseMockRoutesAfterEach } from './_mockAcceptedMessages.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
 
@@ -19,6 +19,7 @@ const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
 // file is bulk-deleted after the last test. Keeps the chat list from
 // piling up across workers + runs. See tests/_chatTracker.mjs.
 attachCleanup()
+releaseMockRoutesAfterEach()
 
 // ---------------------------------------------------------------------------
 // Helpers

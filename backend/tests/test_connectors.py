@@ -19,7 +19,7 @@ from app.routes import connectors as connector_routes
 
 _UNBOUND_TEST_PLAN = dict(
   owner_id=None, owner_epoch=None,
-  browser_grant_id=None, browser_grant_epoch=None,
+  browser_grant_id=None,
 )
 
 

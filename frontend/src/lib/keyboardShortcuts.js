@@ -216,6 +216,9 @@ export function resolveShellCommands(overrides = readShortcutOverrides()) {
 
 export function shortcutMatches(event, binding) {
   if (!event || !binding || event.isComposing || event.repeat) return false
+  // AltGr reports Ctrl+Alt on Windows; it types characters (such as @ on a
+  // German layout), so it never matches a Ctrl+Alt binding.
+  if (event.getModifierState?.('AltGraph')) return false
   const eventKey = typeof event.key === 'string' ? event.key.toLocaleLowerCase() : ''
   const bindingKey = String(binding.key || '').toLocaleLowerCase()
   if (!bindingKey || eventKey !== bindingKey) return false
@@ -243,6 +246,14 @@ export function frameShortcutBindings(commands, { reserveUnavailable = false } =
       ? command.bindings.map(binding => ({ actionId: command.id, binding }))
       : []
   ))
+}
+
+// Shell chords reach every app frame unless the app's manifest declares
+// `"shell_shortcuts": false` because it needs those chords for its own UI.
+const NO_FRAME_SHORTCUTS = Object.freeze([])
+
+export function appFrameShortcutBindings(app, bindings) {
+  return app?.shell_shortcuts === false ? NO_FRAME_SHORTCUTS : bindings
 }
 
 export function shouldReserveShellShortcut(handled, standalone, command = null) {

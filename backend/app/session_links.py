@@ -105,6 +105,24 @@ def backfill_current_session_links(db) -> int:
   return added
 
 
+def resume_retired(db, session_id: str | None) -> bool:
+  """Whether Möbius has retired this provider session from being resumed.
+
+  A retired session's history still teaches the model something the platform
+  has withdrawn (for example an instruction that is no longer sent), and a
+  model follows its own history. The caller starts a fresh session instead,
+  reseeded from the chat's own transcript like a lost session. Session ids are
+  provider-unique tokens, so any retired link for the id counts, whichever
+  provider name recorded it (runner or startup backfill).
+  """
+  if db is None or not session_id:
+    return False
+  return db.query(models.ChatSessionLink.session_id).filter(
+    models.ChatSessionLink.session_id == session_id,
+    models.ChatSessionLink.resume_retired_at.isnot(None),
+  ).first() is not None
+
+
 async def record_session_link_async(
   provider: str, session_id: str, chat_id: str
 ) -> None:

@@ -152,6 +152,73 @@
     subscriptions.clear();
   }, { once: true });
 })();</script>
+      <!-- Shell shortcuts. The browser delivers a key only to the focused
+           document, so while focus is inside this app the shell never sees
+           its own commands. The shell advertises its current chords here
+           (an empty list when the app's manifest sets "shell_shortcuts":
+           false); this document captures exactly those chords and forwards
+           the named action. Raw keystrokes never cross the frame boundary,
+           and every other key, including in text fields, stays with the app.
+           Direct child frames of the app (embedded chat, authored previews)
+           receive the same list and may forward the same message for any
+           advertised action, exactly what the app document itself can post;
+           the shell itself still accepts only advertised actions. -->
+      <script data-mobius-shell-shortcuts>(function () {
+  var shortcuts = [];
+
+  function isChildFrame(source) {
+    for (var i = 0; i < window.frames.length; i += 1) {
+      if (window.frames[i] === source) return true;
+    }
+    return false;
+  }
+
+  function advertise(target) {
+    target.postMessage({ type: 'moebius:frame-shortcuts', shortcuts: shortcuts }, '*');
+  }
+
+  function forward(actionId) {
+    if (!shortcuts.some(function (item) { return item.actionId === actionId; })) return;
+    window.parent.postMessage({ type: 'moebius:shell-shortcut', actionId: actionId }, window.location.origin);
+  }
+
+  function matches(event, binding) {
+    if (event.isComposing || event.repeat) return false;
+    // AltGr reports Ctrl+Alt on Windows; it types characters, never a chord.
+    if (event.getModifierState && event.getModifierState('AltGraph')) return false;
+    if (String(event.key || '').toLowerCase() !== String(binding.key || '').toLowerCase()) return false;
+    return Boolean(event.metaKey || event.ctrlKey) === Boolean(binding.mod)
+      && Boolean(event.shiftKey) === Boolean(binding.shift)
+      && Boolean(event.altKey) === Boolean(binding.alt);
+  }
+
+  window.addEventListener('message', function (event) {
+    var msg = event.data;
+    if (!msg || typeof msg !== 'object') return;
+    if (event.source === window.parent && event.origin === window.location.origin) {
+      if (msg.type !== 'moebius:frame-shortcuts') return;
+      shortcuts = (Array.isArray(msg.shortcuts) ? msg.shortcuts : []).filter(function (item) {
+        return item && typeof item.actionId === 'string'
+          && item.binding && typeof item.binding.key === 'string';
+      });
+      for (var i = 0; i < window.frames.length; i += 1) advertise(window.frames[i]);
+      return;
+    }
+    if (!isChildFrame(event.source)) return;
+    if (msg.type === 'moebius:frame-shortcuts-request') advertise(event.source);
+    // Any direct child frame may trigger an advertised shell action, the same
+    // ones the app document can post itself; forward() drops the rest.
+    if (msg.type === 'moebius:shell-shortcut') forward(msg.actionId);
+  });
+
+  document.addEventListener('keydown', function (event) {
+    var shortcut = shortcuts.find(function (item) { return matches(event, item.binding); });
+    if (!shortcut) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    forward(shortcut.actionId);
+  }, true);
+})();</script>
       <!-- Pre-paint theme: identical IIFE to index.html (PREPAINT_SRC in
            src/lib/applyTheme.js). The frame reads its injected theme slot and
            may read the safe compatibility storage snapshot when available;
@@ -572,7 +639,6 @@
     let initialized = false;
     let currentToken = null;
     let currentCapabilityContract = null;
-    let shellShortcuts = [];
     let tokenRefreshPromise = null;
     let tokenRefreshResolve = null;
     let mountedRoot = null;
@@ -601,39 +667,6 @@
     ]);
     let screenControlRefs = new Map();
     let latestOwnerScreenInputAt = 0;
-
-    function setShellShortcuts(value) {
-      shellShortcuts = (Array.isArray(value) ? value : []).slice(0, 64).filter(function (item) {
-        return item && typeof item.actionId === 'string'
-          && item.binding && typeof item.binding.key === 'string';
-      });
-    }
-
-    function frameShortcutMatches(event, binding) {
-      if (!event || !binding || event.isComposing || event.repeat) return false;
-      const eventKey = typeof event.key === 'string' ? event.key.toLocaleLowerCase() : '';
-      const bindingKey = String(binding.key || '').toLocaleLowerCase();
-      if (!bindingKey || eventKey !== bindingKey) return false;
-      if (Boolean(event.metaKey || event.ctrlKey) !== Boolean(binding.mod)) return false;
-      if (Boolean(event.shiftKey) !== Boolean(binding.shift)) return false;
-      if (Boolean(event.altKey) !== Boolean(binding.alt)) return false;
-      return true;
-    }
-
-    // App code retains every ordinary/editor shortcut. Only the exact global
-    // chords advertised by the shell are captured and forwarded as named
-    // actions; raw keystrokes never cross the iframe boundary.
-    document.addEventListener('keydown', function (event) {
-      const shortcut = shellShortcuts.find(function (item) {
-        return frameShortcutMatches(event, item.binding);
-      });
-      if (!shortcut) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      window.parent.postMessage({
-        type: 'moebius:shell-shortcut', actionId: shortcut.actionId
-      }, window.location.origin);
-    }, true);
 
     ['pointerdown', 'keydown', 'input', 'wheel', 'touchstart'].forEach(function (type) {
       document.addEventListener(type, function (event) {
@@ -1435,10 +1468,6 @@
         setFrameInteractivity(msg.interactive === true, msg.suspendScrolling === true);
         return;
       }
-      if (msg.type === 'moebius:frame-shortcuts') {
-        setShellShortcuts(msg.shortcuts);
-        return;
-      }
       if (msg.type === 'moebius:frame-font-check') {
         const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
         if (!requestId || requestId.length > 160) return;
@@ -1506,7 +1535,6 @@
         currentCapabilityContract = msg.capabilityContract || null;
         acceptToken(msg.token);
         if (initialized) return;
-        setShellShortcuts(msg.shellShortcuts);
         initialized = true;
         if (typeof window.__mobiusHydrateLocalStorage === 'function') {
           window.__mobiusHydrateLocalStorage(msg.storage);

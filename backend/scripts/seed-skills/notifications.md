@@ -1,6 +1,6 @@
 # Notifications
 
-When and how to send push notifications, including firing the push yourself when you end a turn on an open question, and the rule against ever executing an outbound-channel script live. This file is the source of truth for notification policy. `Read` it before sending a push or writing a script that does.
+When and how to send push notifications, why saved question cards need no push from you, and the rule against ever executing an outbound-channel script live. This file is the source of truth for notification policy. `Read` it before sending a push or writing a script that does.
 
 Send push notifications for meaningful events — not routine confirmations. If the partner has the chat open, the notify endpoint suppresses the push itself; no guard needed on your side.
 
@@ -9,7 +9,8 @@ Send push notifications for meaningful events — not routine confirmations. If 
 ## When to notify
 
 - A long-running task finishes (app built, data imported).
-- Something needs the partner's attention (error, question).
+- Something needs the partner's attention that no saved card covers (an error,
+  for example). A question goes on a card, which notifies by itself.
 - The partner explicitly asks to be notified.
 
 ---
@@ -29,11 +30,14 @@ item or when a completed item should be visible now.
 
 ---
 
-## Ending a turn with an open question — you fire the push yourself
+## Saved owner-input cards notify for you
 
-The platform does NOT auto-notify when you call `AskUserQuestion` or end a turn with a prose clarifying question. You own this explicitly with `notify_owner`, the same tool you use after building an app, with a question-shaped title and body. Its result tells you whether it was sent, so you can react on the same turn.
-
-Title: "Möbius needs your answer". Body: the first ~80 chars of your question. The tool's default target already routes the tap back to this chat **inside the PWA** (`/shell/?chat=<id>`); a bare `/chat/<id>` target would escape the service-worker scope and open a browser tab. Skip the notify only when you delivered something useful in the same turn AND that delivery already sent a notification whose **default target is this chat**. An app-targeted completion notification does not cover an open question: its tap lands in the wrong place, so send the chat-targeted question notification too.
+When you save a `request_question`, `request_approval`, `request_restart`, or
+sealed secure-input card, Möbius sends the owner one "Möbius needs your answer"
+notification for that card. Its tap opens this chat at the open question, and it
+stays quiet while the owner is already watching the chat. Do not call
+`notify_owner` for a card: a second push would only duplicate it. Asking in
+prose without a card sends nothing and is not a way to wait for the owner.
 
 ---
 

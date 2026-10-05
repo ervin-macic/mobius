@@ -40,23 +40,6 @@ if ! DATA_DIR=/data python3 -P /app/runtime/restart_ledger.py \
   echo "WARNING: planned-restart ledger could not begin this boot; automatic restart continuation is disabled." >&2
 fi
 
-# The host's ACTIVE worker, not a stale status mirror or trial, owns recovery.
-# Its private state is mounted read-only outside writable /data. Verify as root
-# on every container boot, before imports or database changes; publish only the
-# capability proof for the unprivileged gate. No installed Host means no proof.
-rm -f /run/mobius-rebuild-active.json
-case "${MOBIUS_HOST_RECOVERY_REQUIRED:-0}" in
-  1|true|True)
-    if ! python3 -I -S /app/platform-baked/scripts/mobius-rebuild-host.py \
-      verify-mounted-active > /run/mobius-rebuild-active.json; then
-      rm -f /run/mobius-rebuild-active.json
-      echo "Host recovery worker is missing or outdated; refusing boot before storage conversion." >&2
-      exit 1
-    fi
-    chmod 0644 /run/mobius-rebuild-active.json
-    ;;
-esac
-
 # /data/agent-browser-profiles holds PER-CHAT Chrome user-data dirs
 # (chat-<chat_id>/...) for agent-browser. The path is set per-chat by
 # `app.chat._build_subprocess_env` so the agent's repeated screenshots
@@ -80,8 +63,19 @@ esac
 # serving the clean baked fallback.
 # -----------------------------------------------------------------------
 
-if ! chown -R mobius:mobius /data 2>/dev/null; then
-  echo "WARNING: chown -R mobius:mobius /data failed (likely a managed-volume platform like Railway)." >&2
+# Repair ownership without rewriting it. chown and chmod update a file's ctime
+# even when the owner or mode is already right, and Git's index caches ctime:
+# an unconditional recursive sweep marks every tracked file in /data/platform
+# and in each app repository stat-dirty on every boot, which plumbing such as
+# read-tree then rejects as "not uptodate". Touch only what is actually wrong.
+# find never follows symlinks here, and -h changes a link itself, exactly as
+# chown -R does. Its status is nonzero when any chown fails.
+_own_as_mobius() {
+  find "$@" \( ! -user mobius -o ! -group mobius \) -exec chown -h mobius:mobius {} +
+}
+
+if ! _own_as_mobius /data 2>/dev/null; then
+  echo "WARNING: ownership repair of /data failed (likely a managed-volume platform like Railway)." >&2
   echo "WARNING: Falling back to chmod 1777 /data + 777 on subdirs so the mobius user can traverse" >&2
   echo "WARNING: AND create files at the /data top level. .secret-key and service-token.txt get an" >&2
   echo "WARNING: explicit 600 later in this script; cli-auth/ credential files (Claude + GitHub) are" >&2
@@ -92,7 +86,8 @@ if ! chown -R mobius:mobius /data 2>/dev/null; then
   echo "WARNING: /data/service-token.txt — POST /api/auth/setup writes it as the mobius user, and" >&2
   echo "WARNING: it needs to be able to create files in /data, not just traverse." >&2
   chmod 1777 /data 2>/dev/null || true
-  chmod -R 777 /data/db /data/apps /data/compiled /data/shared /data/logs /data/cron-logs /data/cli-auth /data/run 2>/dev/null || true
+  find /data/db /data/apps /data/compiled /data/shared /data/logs /data/cron-logs /data/cli-auth /data/run \
+    ! -type l ! -perm 777 -exec chmod 777 {} + 2>/dev/null || true
 fi
 
 # The compatibility chown above necessarily traverses the root-owned restart
@@ -241,11 +236,8 @@ _served_sha="${BUILD_SHA:-unknown}"
 # (app_git, platform_update, the /data repo) at the wrong repository, and a
 # stray PYTHONPATH could shadow app.main. SECRET_KEY/DATABASE_URL/DATA_DIR are
 # preserved (env -u removes only the named vars) so `import app.main` still
-# resolves settings exactly as the served process does. The update
-# validators' candidate-image variables (app/compat.py) exist only in their own
-# child processes; a boot probe or the served process must never honour one, so
-# they are dropped here too.
-_env_scrub="env -u PYTHONPATH -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u MOBIUS_SSO_CLIENT_SECRET -u MOBIUS_COMPUTE_INSTANCE_TOKEN -u MOBIUS_IDENTITY_BOOTSTRAP -u MOBIUS_CANDIDATE_VALIDATION -u MOBIUS_CANDIDATE_IMAGE_LEVEL"
+# resolves settings exactly as the served process does.
+_env_scrub="env -u PYTHONPATH -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u MOBIUS_SSO_CLIENT_SECRET -u MOBIUS_COMPUTE_INSTANCE_TOKEN -u MOBIUS_IDENTITY_BOOTSTRAP"
 
 _platform_git_valid() {
   [ -d /data/platform/.git ] || return 1
@@ -290,9 +282,7 @@ _platform_import_probe() {
 # decides what may run on it. `activate` swaps in an update prepared for this
 # exact image (or reverts one swapped in for another image) and merges late
 # edits back; `revert` returns a swapped-in update that failed its probe to
-# its saved previous state, compare-and-swap under the reconcile lock (it
-# refuses, touching nothing, unless the checkout is exactly the update this
-# boot left); `guard` is the fail-closed clean-tree check.
+# its saved previous state; `guard` is the fail-closed clean-tree check.
 _platform_boot() {
   su -s /bin/sh mobius -c \
     "cd /app/platform-baked/backend && $_env_scrub PYTHONDONTWRITEBYTECODE=1 timeout 900 python3 -m app.platform_boot $1"
@@ -530,18 +520,14 @@ elif [ -n "${MOBIUS_TEST_PLATFORM_SOURCE:-}" ]; then
   exit 1
 fi
 
-chown -R mobius:mobius /data/platform 2>/dev/null || true
+_own_as_mobius /data/platform 2>/dev/null || true
 
 # One boot transaction, in this order, so the probe and uvicorn see the same
 # bytes, and no served code runs before the probe: the image settles the source
-# it may run (checkout recovery of an interrupted transition, then the update
-# record, activation bookkeeping and trusted hooks), the fail-closed guard, then
-# the one authoritative probe on that final tree. Nothing moves the checkout
-# after it. A probe failure returns a swapped-in update to its saved previous
-# state only through the CAS-safe revert, then guards and probes that tree the
-# same way; a refused revert or a second failure serves the baked platform with
-# /data/platform left as it is. A fresh seed takes the same path, so every
-# served boot publishes the transaction.
+# it may run (and its activation bookkeeping and trusted hooks), the fail-closed
+# guard, then the decisive probe. A probe failure returns a swapped-in update
+# to its saved previous state and checks that tree the same way. A fresh seed
+# takes the same path, so every served boot publishes the transaction.
 _platform_serve_checkout() {
   if ! _platform_boot activate 2>&1; then
     echo "Platform layer: this image could not establish a platform state it may run; refusing to start." >&2
@@ -590,8 +576,10 @@ fi
 # as mobius through su, whose login policy grants group write to user-private
 # groups. A served module writable by group or other fails validation below and
 # forces the baked floor on every boot, so keep the served tree owner-writable
-# only before anything validates or serves it.
-chmod -R go-w /data/platform 2>/dev/null || true
+# only before anything validates or serves it. Like ownership repair, change
+# only modes that are wrong (chmod updates ctime even when nothing changes) and
+# never follow a symlink, which chmod -R also skips.
+find /data/platform ! -type l -perm /022 -exec chmod go-w {} + 2>/dev/null || true
 
 # Privileged served source belongs to the same boot choice as the FastAPI
 # process. Validate it before publishing the source marker: an invalid broker
@@ -670,7 +658,7 @@ chown root:mobius "$_fp_file" 2>/dev/null || true
 # root-run docker exec (the classic /data poisoning trap) can't
 # permanently block mobius appends to an existing log.
 mkdir -p /data/cron-logs
-chown -R mobius:mobius /data/cron-logs
+_own_as_mobius /data/cron-logs
 
 # Trim runaway cron logs at boot. App job scripts append here forever
 # and rotation can't be imposed on agent-authored scripts, so the
@@ -777,7 +765,7 @@ fi
 # leave it root-owned and uvicorn (mobius) could not subsequently
 # write. Source of any specific occurrence is hard to pin down after
 # the fact — this chown costs nothing and closes the class.
-chown -R mobius:mobius /data/db /data/logs 2>/dev/null || true
+_own_as_mobius /data/db /data/logs 2>/dev/null || true
 
 # --- enforce protected file permissions ---
 # Two categories of protected files (see protected-files.txt header):
@@ -911,7 +899,7 @@ chown mobius:mobius /data/.gitignore 2>/dev/null || true
 # A recreated managed volume can leave an existing repository root-owned. Git
 # correctly rejects cross-owner index writes, so hand it back before the
 # non-root reconciliation. No-op on a fresh volume; reconcile initializes it.
-chown -R mobius:mobius /data/.git 2>/dev/null || true
+_own_as_mobius /data/.git 2>/dev/null || true
 su -s /bin/sh mobius -c \
   "python3 /app/scripts/init_data_repo.py reconcile /data"
 

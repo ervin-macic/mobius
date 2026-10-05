@@ -2038,6 +2038,193 @@ WEEKLY_READY = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['reset', 'extra_usage'])
+@pytest.mark.parametrize('response_lost', [False, True])
+async def test_claude_allowance_mutations_clear_all_old_readings_and_notify(
+  monkeypatch, tmp_path, action, response_lost,
+):
+  from app import broadcast, provider_usage
+
+  data_dir = str(tmp_path)
+  mutations = []
+  events = []
+  percent = 100
+  offer = {
+    'redeemable': True, 'next_credit_id': 'grant-next',
+    'credits': [{'id': 'grant-next', 'resets_left': 2}],
+  }
+
+  async def snapshot(provider_id, _data_dir):
+    return {**WEEKLY_READY, 'reset_credits': offer, 'windows': [{
+      **WEEKLY_READY['windows'][0],
+      'used_percent': percent if provider_id == 'claude' else 80,
+    }]}
+
+  async def mutation(method):
+    nonlocal percent
+    mutations.append(method)
+    percent = 7
+    if response_lost:
+      raise httpx.ReadError('response lost')
+    return SimpleNamespace(
+      raise_for_status=lambda: None,
+      json=lambda: {'result': 'reset', 'resets_left': 1},
+    )
+
+  class Client:
+    def __init__(self, **_kwargs):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      return None
+
+    async def post(self, *_args, **_kwargs):
+      return await mutation('post')
+
+    async def put(self, *_args, **_kwargs):
+      return await mutation('put')
+
+  async def token(_data_dir):
+    return 'test-only-token'
+
+  key = provider_usage._cache_key('claude', data_dir)
+
+  def publish(event):
+    assert key not in provider_usage._provider_usage_cache
+    assert not provider_usage._last_reading_path(data_dir, 'claude').exists()
+    events.append(event)
+
+  monkeypatch.setattr(provider_usage, '_provider_snapshot', snapshot)
+  monkeypatch.setattr(provider_usage.httpx, 'AsyncClient', Client)
+  monkeypatch.setattr(provider_usage.providers, 'claude_access_token', token)
+  monkeypatch.setattr(provider_usage.providers, 'claude_organization_uuid', lambda _dir: 'test-account')
+  monkeypatch.setattr(broadcast, 'get_system_broadcast', lambda: SimpleNamespace(publish=publish))
+  await provider_usage.read_provider_usage('claude', data_dir)
+  other = await provider_usage.read_provider_usage('codex', data_dir)
+  generation = provider_usage._provider_usage_generation.get(key, 0)
+
+  if action == 'reset':
+    result = await provider_usage.redeem_claude_reset(
+      data_dir, credit_id='grant-next', expected_resets_left=2,
+    )
+    assert result['outcome'] == ('unknown' if response_lost else 'reset')
+    # Reading invalidation never erases the receipt that prevents double spend.
+    assert provider_usage._claude_reset_intent_path(data_dir, 'test-account').exists()
+  elif response_lost:
+    with pytest.raises(httpx.ReadError, match='response lost'):
+      await provider_usage.set_claude_extra_usage(data_dir, enabled=True)
+  else:
+    await provider_usage.set_claude_extra_usage(data_dir, enabled=True)
+
+  assert events == [{'type': 'provider_usage_changed', 'provider': 'claude'}]
+  assert provider_usage._provider_usage_generation[key] == generation + 1
+  assert mutations == [('post' if action == 'reset' else 'put')]
+  refreshed = await provider_usage.read_provider_usage('claude', data_dir)
+  assert refreshed['windows'][0]['used_percent'] == 7
+  assert await provider_usage.read_provider_usage('codex', data_dir) == other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', [
+  'reset', 'nothingToReset', 'noCredit', 'alreadyRedeemed', 'response_lost',
+])
+async def test_codex_reset_discards_old_readings_before_notifying_open_chats(
+  monkeypatch, tmp_path, outcome,
+):
+  from app import broadcast, provider_usage
+
+  data_dir = str(tmp_path)
+  probes = []
+  redemptions = []
+  events = []
+  reading = {**WEEKLY_READY, 'windows': [{
+    **WEEKLY_READY['windows'][0], 'used_percent': 100,
+  }]}
+
+  async def snapshot(provider_id, _data_dir):
+    probes.append(provider_id)
+    return reading
+
+  async def redeem(_data_dir, _work, *, timeout_error):
+    redemptions.append(_data_dir)
+    if outcome == 'response_lost':
+      raise RuntimeError(timeout_error)
+    return {'outcome': outcome}
+
+  def publish(event):
+    # An event can immediately trigger a read in another browser.
+    assert provider_usage._cache_key('codex', data_dir) not in provider_usage._provider_usage_cache
+    assert not provider_usage._last_reading_path(data_dir, 'codex').exists()
+    events.append(event)
+
+  monkeypatch.setattr(provider_usage, '_provider_snapshot', snapshot)
+  monkeypatch.setattr(provider_usage, '_run_on_codex_client', redeem)
+  monkeypatch.setattr(broadcast, 'get_system_broadcast', lambda: SimpleNamespace(publish=publish))
+  await provider_usage.read_provider_usage('codex', data_dir)
+  claude = await provider_usage.read_provider_usage('claude', data_dir)
+  assert provider_usage._last_reading_path(data_dir, 'codex').exists()
+
+  if outcome == 'response_lost':
+    with pytest.raises(RuntimeError, match='codex reset redeem timed out'):
+      await provider_usage.redeem_codex_reset(data_dir, 'confirmed-credit')
+  else:
+    assert await provider_usage.redeem_codex_reset(data_dir, 'confirmed-credit') == {'outcome': outcome}
+
+  assert redemptions == [data_dir]  # Refresh never repeats the irreversible consume.
+  assert events == [{'type': 'provider_usage_changed', 'provider': 'codex'}]
+  # Use the provider's actual new reading, not an invented zero.
+  reading = {**WEEKLY_READY, 'windows': [{
+    **WEEKLY_READY['windows'][0], 'used_percent': 7,
+  }]}
+  after = await provider_usage.read_provider_usage('codex', data_dir)
+  assert after['windows'][0]['used_percent'] == 7
+  assert probes == ['codex', 'claude', 'codex']
+  assert await provider_usage.read_provider_usage('claude', data_dir) == claude
+
+
+@pytest.mark.asyncio
+async def test_codex_reset_during_usage_probe_cannot_restore_pre_reset_allowance(
+  monkeypatch, tmp_path,
+):
+  from app import broadcast, provider_usage
+
+  started = asyncio.Event()
+  finish_old = asyncio.Event()
+  probes = 0
+
+  async def snapshot(_provider_id, _data_dir):
+    nonlocal probes
+    probes += 1
+    if probes == 1:
+      started.set()
+      await finish_old.wait()
+    return {**WEEKLY_READY, 'windows': [{
+      **WEEKLY_READY['windows'][0], 'used_percent': 100 if probes == 1 else 7,
+    }]}
+
+  async def redeem(*args, **kwargs):
+    return {'outcome': 'reset'}
+
+  monkeypatch.setattr(provider_usage, '_provider_snapshot', snapshot)
+  monkeypatch.setattr(provider_usage, '_run_on_codex_client', redeem)
+  monkeypatch.setattr(broadcast, 'get_system_broadcast', lambda: SimpleNamespace(publish=lambda _event: None))
+  read = asyncio.create_task(provider_usage.read_provider_usage('codex', str(tmp_path)))
+  await started.wait()
+  try:
+    await provider_usage.redeem_codex_reset(str(tmp_path))
+  finally:
+    finish_old.set()
+  after = await read
+  assert probes == 2
+  assert after['windows'][0]['used_percent'] == 7
+  saved = json.loads(provider_usage._last_reading_path(str(tmp_path), 'codex').read_text())
+  assert saved['snapshot']['windows'][0]['used_percent'] == 7
+
+
+@pytest.mark.asyncio
 async def test_account_switch_during_usage_probe_cannot_restore_old_allowance(
   monkeypatch, tmp_path,
 ):

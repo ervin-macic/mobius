@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from sqlalchemy.orm import object_session
+
 from app import transcript_rows
 from app.events import tool_output_exit_code
 from app.memory_recall import (
@@ -164,7 +166,7 @@ def materialized_messages(chat):
 
 def materialized_metadata(chat, view=None):
   """Cheap stable coordinates for Goal, Wait and recovery placement."""
-  rows = transcript_rows.metadata(transcript_rows.history(chat).db, chat)
+  rows = transcript_rows.metadata(object_session(chat), chat)
   view = view if view is not None else materialized_messages(chat)
   if view.live is not None:
     if view.live_index < 0:
@@ -172,16 +174,6 @@ def materialized_metadata(chat, view=None):
     else:
       rows[view.live_index] = view.live
   return rows
-
-
-def tail_visible(chat, n):
-  visible = []
-  for message in reversed(materialized_messages(chat)):
-    if isinstance(message, dict) and not message.get("hidden"):
-      visible.append(message)
-      if len(visible) >= n:
-        break
-  return list(reversed(visible))
 
 
 def project_messages_for_detail(

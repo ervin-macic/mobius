@@ -24,8 +24,18 @@ RUN npm ci --ignore-scripts && rm -rf /root/.npm
 COPY frontend/ .
 RUN npm run build && rm -rf /root/.npm
 
+# Build the fixed SQLite library for the same target architecture and libc as
+# the runtime. Compiler and parser-generation tools stay out of the final image.
+FROM python:3.12-slim-trixie AS python-runtime
+FROM python-runtime AS sqlite-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gcc libc6-dev libreadline-dev make tcl unzip zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY backend/sqlite_runtime/build.sh /tmp/build-sqlite.sh
+RUN bash /tmp/build-sqlite.sh /sqlite-runtime
+
 # -- Stage 2: backend + everything ------------------------------------
-FROM python:3.12-slim-trixie
+FROM python-runtime
 
 # Copy Node.js binary from the frontend stage instead of installing via
 # apt.  The debian nodejs/npm packages pull in ~200MB of system node
@@ -53,7 +63,7 @@ ARG CODEX_VERSION=0.159.0
 ARG CODEX_SDK_VERSION=0.159.0
 ARG AGENT_BROWSER_VERSION=0.38.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    age ca-certificates cron curl git jq procps ripgrep sqlite3 sudo tini unzip util-linux xxd \
+    age ca-certificates cron curl git jq procps ripgrep sudo tini unzip util-linux xxd \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
@@ -73,6 +83,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git_version="$(git --version | awk '{print $3}')" \
     && [ "$(printf '%s\n' "2.38" "$git_version" | sort -V | head -n1)" = "2.38" ] \
     && rm -rf /root/.npm /var/lib/apt/lists/*
+
+# Use the pinned library for Python and other dynamically linked consumers,
+# not just the CLI. Keep Debian's package for its dependency metadata.
+COPY --from=sqlite-runtime /sqlite-runtime/usr/local/lib/libsqlite3.so* /usr/local/lib/
+COPY --from=sqlite-runtime /sqlite-runtime/usr/local/bin/sqlite3 /usr/local/bin/sqlite3
+COPY backend/sqlite_runtime/verify.py /tmp/verify-sqlite.py
+RUN ldconfig && python /tmp/verify-sqlite.py && rm /tmp/verify-sqlite.py
 
 # tectonic is a server-side subprocess; CSP connect-src 'self' applies only to
 # browser fetches from the mini-app iframe, not OS-level subprocesses — tectonic's
@@ -258,6 +275,7 @@ COPY Dockerfile /tmp/test-image-inputs/Dockerfile
 COPY backend/app/platform_activation.py /tmp/test-image-inputs/backend/app/platform_activation.py
 COPY backend/requirements.txt backend/requirements.lock /tmp/test-image-inputs/backend/
 COPY backend/legacy_runtime/ /tmp/test-image-inputs/backend/legacy_runtime/
+COPY backend/sqlite_runtime/build.sh backend/sqlite_runtime/verify.py /tmp/test-image-inputs/backend/sqlite_runtime/
 COPY frontend/package.json frontend/package-lock.json /tmp/test-image-inputs/frontend/
 RUN MOBIUS_TEST_IMAGE_INPUT_ROOT=/tmp/test-image-inputs \
       /tmp/test-image-inputs/scripts/test-image-fingerprint.sh \
@@ -413,24 +431,6 @@ COPY backend/runtime ./runtime/
 COPY skill/ ./skill/
 COPY protected-files.txt ./protected-files.txt
 
-# One-way storage steps (ONE_WAY_UPGRADES_DESIGN.md): runtime/ comes from the
-# build context while the baked fallback is the checkout at BUILD_SHA. A step
-# release advances both together; refuse a build whose context claims a
-# different level than the baked fallback actually understands.
-# The image label below declares the same level to deployment controllers
-# that inspect the image without running it (the account service's rollback).
-ARG MOBIUS_COMPAT_LEVEL=1
-RUN python3 -P -c 'import importlib.util, json, os; \
-spec = importlib.util.spec_from_file_location("compat", "/app/app/compat.py"); \
-compat = importlib.util.module_from_spec(spec); spec.loader.exec_module(compat); \
-claimed = json.load(open("/app/runtime/one_way_capability.json"))["level"]; \
-baked = compat.baked_image_level(); \
-assert type(claimed) is int and claimed == baked, \
-  f"runtime/one_way_capability.json level {claimed!r} != baked COMPAT_LEVEL {baked}"; \
-labelled = os.environ["MOBIUS_COMPAT_LEVEL"]; \
-assert labelled == str(baked), \
-  f"MOBIUS_COMPAT_LEVEL label {labelled!r} != baked COMPAT_LEVEL {baked}"'
-
 # The restart supervisor imports no mutable platform code.
 RUN chmod -R a-w /app/runtime
 RUN chmod +x ./scripts/entrypoint.sh
@@ -446,8 +446,7 @@ ENV BUILD_SHA=${BUILD_SHA}
 # /app/build-info.json, written above, so Settings can still show a date.
 ENV BUILD_DATE=${BUILD_DATE}
 LABEL org.opencontainers.image.source="https://github.com/mobius-os/mobius" \
-      org.opencontainers.image.revision="${BUILD_SHA}" \
-      you.mobius.compat-level="${MOBIUS_COMPAT_LEVEL}"
+      org.opencontainers.image.revision="${BUILD_SHA}"
 
 EXPOSE 8000
 

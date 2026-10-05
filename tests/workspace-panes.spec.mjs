@@ -20,7 +20,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { createTaggedChat, attachCleanup } from './_chatTracker.mjs'
-import { mockAcceptedMessages } from './_mockAcceptedMessages.mjs'
+import { mockAcceptedMessages, releaseMockRoutesAfterEach } from './_mockAcceptedMessages.mjs'
 import * as paneModel from '../frontend/src/components/Shell/paneModel.js'
 import { DRAG_HOLD_HAPTIC_MS, PRESS_MENU_HOLD_MS } from '../frontend/src/components/Shell/dragController.js'
 import { settledBox } from './_geometry.mjs'
@@ -34,6 +34,7 @@ const PHONE = { width: 412, height: 760 }
 
 test.use({ serviceWorkers: 'block' })
 attachCleanup()
+releaseMockRoutesAfterEach()
 
 function builderSeed(tabs) {
   return paneModel.setViewMode(paneModel.seedFromFlatTabs(tabs), 'panes')
@@ -225,6 +226,12 @@ function twoChatPanes(chatA, chatB) {
 async function waitTiled(page) {
   await expect(page.locator('.workspace__chrome')).toHaveCount(1, { timeout: 8000 })
   await expect(page.locator('.workspace__divider').first()).toBeVisible({ timeout: 8000 })
+  // A chat tab reads "Chat" until the chat list names it, then widens to its
+  // title and pushes every later tab sideways. The strip can sit still for many
+  // frames before the list arrives, so a frame settle alone can hand out
+  // placeholder geometry; wait for every fixture chat to carry its title.
+  await expect(page.locator('[data-pane-strip] .shell__tab-open[title="Chat"]'))
+    .toHaveCount(0, { timeout: 8000 })
   await page.evaluate(() => new Promise(r =>
     requestAnimationFrame(() => requestAnimationFrame(r))))
   await waitStripSettled(page)

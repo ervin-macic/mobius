@@ -203,16 +203,17 @@ class Chat(Base):
   # then never overwrites it. A clear-title PATCH resets it to false so the name
   # drops back to the agent summary / first message and gets re-derived.
   title_locked = Column(Boolean, nullable=False, default=False)
-  # Recovery-only legacy values must never load with ordinary chat metadata.
-  # The upgrade archives and clears these; message rows own current history.
-  legacy_messages = deferred(Column("messages_v1", JSON, nullable=False, default=list))
-  transcript_state = relationship(
-    "ChatTranscriptState", uselist=False, cascade="all, delete-orphan",
-  )
-  transcript_rows = relationship(
-    "ChatMessage", cascade="all, delete-orphan", lazy="raise",
-    order_by="ChatMessage.seq",
-  )
+  # The previous release's whole-transcript JSON. Message rows are the
+  # authority; while this column exists, transcript_rows rewrites it from the
+  # rows in the same transaction as every row change, so the previous image
+  # can be rolled back to at any time. Never loaded or ORM-updated. It has no
+  # default of either kind: the legacy NOT NULL column is supplied by
+  # chat_writer.create_chat while it exists, and a database whose column the
+  # next release dropped must never see it in an INSERT (or its RETURNING).
+  # See TRANSCRIPT_STORAGE_DESIGN.md.
+  legacy_messages = deferred(Column(
+    "messages", JSON, nullable=False, info={"legacy_transcript": True},
+  ))
   # Drawer/list reads need only to know whether a transcript is empty. Keeping
   # that fact beside scalar metadata avoids transcript reads in chat lists.
   # Row mutations update this flag through chat_writer's domain commands.
@@ -405,8 +406,8 @@ class ChatRun(Base):
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   # Inclusive boundary of the peer-message page injected into this provider
   # admission. Both fields are NULL when no peer message was delivered. The
   # pair advances only after the provider call returns successfully. Admission
@@ -549,8 +550,8 @@ class Delegation(Base):
   parent_root_run_id = Column(String(64), nullable=False, index=True)
   # Snapshot the spawning physical run's browser initiator. A logical Goal can
   # span later physical turns with different human participants.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   task_key = Column(String(128), nullable=False)
   # The parent Goal plan task this helper works on, recorded at spawn. The
   # helper's name is free; this is what places it under its task.
@@ -614,43 +615,6 @@ class Delegation(Base):
   source_work_result = Column(Text, nullable=True, default=None)
   source_work_active_chat_id = Column(
     String(64), nullable=True, unique=True, index=True
-  )
-
-
-
-class AgentWriteStream(Base):
-  """One physical run's quiet-write admission fence and bounded diagnostics."""
-  __tablename__ = "agent_write_streams"
-  run_id = Column(String(64), ForeignKey("chat_runs.id", ondelete="CASCADE"), primary_key=True)
-  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
-  sealed = Column(Boolean, nullable=False, default=False)
-  accepted_count = Column(Integer, nullable=False, default=0)
-  accepted_bytes = Column(Integer, nullable=False, default=0)
-  diagnostics = Column(JSON, nullable=False, default=list)
-  item_receipts = Column(JSON, nullable=False, default=dict)
-  failure_delivered_by = Column(String(64), nullable=True)
-
-
-class AgentWriteIntent(Base):
-  """Explicit write identity survives physical-run recovery; effects are not retried."""
-  __tablename__ = "agent_write_intents"
-  root_run_id = Column(String(64), primary_key=True)
-  operation_id = Column(String(100), primary_key=True)
-  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
-  source_run_id = Column(String(64), ForeignKey("chat_runs.id", ondelete="CASCADE"), nullable=False)
-  ordinal = Column(Integer, nullable=False)
-  item_id = Column(String(256), nullable=False)
-  item_fingerprint = Column(String(64), nullable=False)
-  tool = Column(String(100), nullable=False)
-  arguments_json = Column(Text, nullable=False)
-  status = Column(String(16), nullable=False)
-  stage = Column(String(32), nullable=False)
-  reason = Column(String(500), nullable=True)
-  created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-  updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-  __table_args__ = (
-    Index("ix_agent_write_run_order", "source_run_id", "status", "ordinal"),
-    Index("ix_agent_write_item", "source_run_id", "item_id"),
   )
 
 
@@ -783,6 +747,11 @@ class ChatSessionLink(Base):
   # are set explicitly by record_session_link; these defaults are the safety net.
   first_seen_at = Column(DateTime, default=lambda: now_naive_utc())
   last_seen_at = Column(DateTime, default=lambda: now_naive_utc())
+  # Set once Möbius must never resume this session: its own provider history
+  # teaches an instruction the platform has since withdrawn, so resuming it
+  # would keep the model following that instruction. The chat's next turn
+  # starts a fresh session instead (see ``session_links.resume_retired``).
+  resume_retired_at = Column(DateTime, nullable=True)
 
 
 class ProviderAvailability(Base):
@@ -945,8 +914,9 @@ class ChatEmbedGrant(Base):
   )
   instance_id = Column(String(160), nullable=False, index=True)
   owner_epoch = Column(Integer, nullable=False)
+  # The opener's browser lineage (browser_access.BrowserLineage). Upgraded
+  # databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   browser_session_id = Column(String(64), nullable=True)
   role = Column(String(32), nullable=False, default="participant")
   operations_json = Column(JSON, nullable=False, default=list)
@@ -1202,6 +1172,10 @@ class App(Base):
   # — the store + drawer surface a small "agent" badge so the owner knows
   # which apps drive a sub-agent. Not a permission.
   embeds_agent = Column(Boolean, nullable=False, default=False)
+  # Shell keyboard commands (search, new chat, back...) keep working while
+  # focus is inside this app's frame. An app that needs those chords for its
+  # own UI declares `"shell_shortcuts": false` in its manifest.
+  shell_shortcuts = Column(Boolean, nullable=False, default=True)
   # Chat-log read tier this app's token may request against
   # GET /api/chat-logs. Read at request time (not baked into the JWT)
   # so flipping it revokes access on the very next request — the
@@ -2140,31 +2114,16 @@ class ChatActivityPosition(Base):
   position = Column(JSON, nullable=True)
 
 
-def transcript_values_equal(left, right):
-  """JSON equality retains bool/int/float and signed-zero distinctions."""
-  from sqlalchemy.orm.attributes import NO_VALUE
-  if left is NO_VALUE or right is NO_VALUE:
-    return left is right
-  return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
-
-
-class TranscriptJSON(JSON):
-  def compare_values(self, left, right):
-    return transcript_values_equal(left, right)
-
-
 class TranscriptJSONText(TypeDecorator):
-  """Preserve JSON scalar types in transcripts and their projections.
+  """Exact JSON text for transcript bodies.
 
-  SQLite gives a column named JSON numeric affinity: 1.0 becomes integer 1
-  and large integers lose precision. TEXT keeps these exact JSON encodings;
-  objects/arrays are unchanged. PostgreSQL can retain its native JSON type.
+  SQLite gives a column declared JSON numeric affinity, which turns 1.0 into
+  1 and loses large-integer precision. TEXT keeps the encoder's exact bytes;
+  the legacy mirror concatenates these bytes, so they must be default
+  ``json.dumps`` output (a JSON null body is the text ``null``).
   """
   impl = Text
   cache_ok = True
-
-  def compare_values(self, left, right):
-    return transcript_values_equal(left, right)
 
   def process_bind_param(self, value, _dialect):
     return json.dumps(value)
@@ -2173,137 +2132,65 @@ class TranscriptJSONText(TypeDecorator):
     return json.loads(value) if value is not None else None
 
 
+class TranscriptJSONProjection(TranscriptJSONText):
+  """An exact JSON scalar projection; absent (or JSON null) is SQL NULL."""
+  cache_ok = True
+
+  def process_bind_param(self, value, _dialect):
+    return None if value is None else json.dumps(value)
+
+
 class ChatMessage(Base):
-  """One unchanged transcript item; position, not optional identity, is its key."""
+  """One unchanged transcript item; position, not optional identity, is its key.
+
+  Projections are lookup hints derived from ``body`` by
+  ``transcript_rows.attributes``. ``body`` stays the last column so scans of
+  the small projections never read a large body's overflow pages. Deleting a
+  chat removes its rows through the ``chats_deleted`` trigger (both images).
+  """
   __tablename__ = "chat_messages"
-  __table_args__ = (Index("ix_chat_messages_key", "chat_id", "message_key"),)
+  __table_args__ = (
+    Index("ix_chat_messages_message_key", "chat_id", "message_key"),
+    Index("ix_chat_messages_client_id", "chat_id", "client_id"),
+  )
   chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True)
   seq = Column(Integer, primary_key=True)
-  message_key = Column(String(256), nullable=True)
-  message_id = Column(TranscriptJSONText, nullable=True)
-  client_id = Column(TranscriptJSONText, nullable=True)
-  role = Column(TranscriptJSONText, nullable=True)
-  ts = Column(TranscriptJSONText, nullable=True)
+  # json.dumps(str(body["id"])): the indexed equality key for id lookups.
+  message_key = Column(Text, nullable=True)
+  # The exact id value (any JSON type) for identity coordinates.
+  message_id = Column(TranscriptJSONProjection, nullable=True)
+  # The exact cid, or for a cid-less legacy user row its derived legacy-<ts>
+  # identity (chat_writer.cid_of, flagged DERIVED_CID): one equality lookup.
+  client_id = Column(TranscriptJSONProjection, nullable=True)
+  role = Column(Text, nullable=True)
+  ts = Column(TranscriptJSONProjection, nullable=True)
   flags = Column(Integer, nullable=False, default=0)
-  body = Column(TranscriptJSON().with_variant(TranscriptJSONText(), "sqlite"), nullable=False)
+  body = Column(TranscriptJSONText, nullable=False)
 
 
 class ChatTranscriptState(Base):
-  """Count and revision advance atomically with the owning writer's row edits."""
+  """Release-1 conversion marker: a row means this chat's rows are authoritative.
+
+  While the previous release's ``chats.messages`` exists, the schema trigger
+  ``chats_messages_written`` deletes the row whenever any writer updates that
+  column, and transcript_rows re-inserts it after its own mirror update. A
+  chat without a row is converted from ``chats.messages`` before its rows are
+  used. Unused once the column is gone (the next release drops this table).
+  """
   __tablename__ = "chat_transcript_state"
   chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True)
-  message_count = Column(Integer, nullable=False, default=0)
-  revision = Column(Integer, nullable=False, default=0)
 
 
-# The compatibility floor table, ``platform_compat``, is deliberately not an
-# ORM model: create_all would create it empty, and an empty floor table must
-# read as damage. app.one_way_upgrades.ensure_compat_record creates it together
-# with its single row in one transaction.
+class ChatTranscriptDamage(Base):
+  """Exact bytes of a legacy transcript that was not a JSON message list.
 
-
-class PlatformUpgrade(Base):
-  """One registered one-way step's durable state.
-
-  ``preparing``: the legacy data is still authoritative and untouched.
-  ``active``: the new form is authoritative and the floor has been raised.
-  ``completed_at`` is set once every post-activation task has verified.
+  Written in the same transaction that replaces the chat's rows with a visible
+  recovery placeholder, so the original is never lost. Removed only with its
+  chat.
   """
-
-  __tablename__ = "platform_upgrades"
-  __table_args__ = (
-    CheckConstraint(
-      "state IN ('preparing', 'active')", name="ck_platform_upgrades_state",
-    ),
-  )
-
-  level = Column(Integer, primary_key=True)
-  name = Column(String(64), nullable=False)
-  state = Column(String(16), nullable=False)
-  started_at = Column(DateTime, nullable=False, default=now_naive_utc)
-  activated_at = Column(DateTime, nullable=True)
-  completed_at = Column(DateTime, nullable=True)
-  detail = Column(JSON, nullable=True)
-
-
-class UpgradeTask(Base):
-  """Durable progress for one post-activation task of a one-way step.
-
-  The completion contract: owner-visible progress, bounded retries with the
-  last error, and a step counts as complete only when every task is done.
-  """
-
-  __tablename__ = "upgrade_tasks"
-  __table_args__ = (
-    CheckConstraint(
-      "status IN ('pending', 'running', 'done', 'failed')",
-      name="ck_upgrade_tasks_status",
-    ),
-  )
-
-  level = Column(Integer, primary_key=True)
-  task = Column(String(64), primary_key=True)
-  status = Column(String(16), nullable=False, default="pending")
-  done_units = Column(Integer, nullable=False, default=0)
-  remaining_units = Column(Integer, nullable=True)
-  retries = Column(Integer, nullable=False, default=0)
-  last_error = Column(Text, nullable=True)
-  updated_at = Column(DateTime, nullable=False, default=now_naive_utc)
-  completed_at = Column(DateTime, nullable=True)
-
-
-class UpgradeQuarantine(Base):
-  """Raw bytes of a unit a one-way step could not convert.
-
-  Kept independently of the step's archive and of any later retirement of the
-  legacy structure, so a damaged original is never lost. For clearing a hot
-  legacy value, a verified quarantine copy stands in for the archive entry.
-  """
-
-  __tablename__ = "upgrade_quarantine"
-  __table_args__ = (
-    UniqueConstraint("level", "unit_id", name="uq_upgrade_quarantine_unit"),
-  )
-
+  __tablename__ = "chat_transcript_damage"
   id = Column(Integer, primary_key=True, autoincrement=True)
-  level = Column(Integer, nullable=False)
-  unit_id = Column(String(128), nullable=False)
+  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
   raw = Column(LargeBinary, nullable=False)
-  raw_length = Column(Integer, nullable=False)
-  sha256 = Column(String(64), nullable=False)
   error = Column(Text, nullable=False)
-  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
-
-
-class UpgradeUnit(Base):
-  """A one-way step's fingerprint of each unit's raw legacy value.
-
-  Written while PREPARING; the activation re-check compares the current raw
-  value's SHA-256 and length against it, so a legacy write by older code
-  (even one that never bumps ``updated_at``) is always reconverted.
-  """
-
-  __tablename__ = "upgrade_units"
-
-  level = Column(Integer, primary_key=True)
-  unit_id = Column(String(128), primary_key=True)
-  sha256 = Column(String(64), nullable=False)
-  raw_length = Column(Integer, nullable=False)
-  damaged = Column(Boolean, nullable=False, default=False)
-  converted_at = Column(DateTime, nullable=False, default=now_naive_utc)
-
-
-class UpgradeArchive(Base):
-  """The compressed raw legacy value of each converted unit.
-
-  Kept outside the hot legacy row so clearing that row later loses nothing;
-  a damaged unit's quarantine copy stands in for its archive entry.
-  """
-
-  __tablename__ = "upgrade_archive"
-
-  level = Column(Integer, primary_key=True)
-  unit_id = Column(String(128), primary_key=True)
-  zlib_raw = Column(LargeBinary, nullable=False)
-  raw_length = Column(Integer, nullable=False)
-  sha256 = Column(String(64), nullable=False)
+  recorded_at = Column(DateTime, nullable=False, default=now_naive_utc)

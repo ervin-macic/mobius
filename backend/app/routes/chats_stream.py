@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.responses import Response
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app import transcript_rows
 from app import activity, chat_archive, models, questions, schemas
@@ -73,7 +73,11 @@ from app.resource_access import (
   require_active_chat_access,
 )
 
-router = APIRouter(prefix="/api/chats", tags=["chats"])
+from app.routes.chats import converted_path_chat
+
+router = APIRouter(
+  prefix="/api/chats", tags=["chats"], dependencies=[Depends(converted_path_chat)],
+)
 
 log = logging.getLogger(__name__)
 
@@ -176,7 +180,7 @@ def _next_execution_provider(db: Session, chat: models.Chat) -> str:
   # durable provider, so the model check must evaluate against that same value.
   if (
     chat.created_by_app_id is None
-    and not (transcript_rows.history(chat) or [])
+    and not chat.has_messages
     and not (chat.pending_messages or [])
     and not is_chat_running(chat.id)
     and not is_draining()
@@ -286,7 +290,7 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
 async def _append_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
   *, initiated_by_app_id: int | None = None, owner_input: bool = False,
-  browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
+  browser_grant_id: str | None = None,
   front: bool = False,
   require_answer_match: bool = False,
   restore_archived: bool = False,
@@ -314,7 +318,7 @@ async def _append_to_pending(
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       selected_options=body.selected_options, question_id=body.question_id,
       initiated_by_app_id=initiated_by_app_id,
-      browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
+      browser_grant_id=browser_grant_id,
       owner_input=owner_input,
       front=front, require_answer_match=require_answer_match,
       restore_archived=restore_archived,
@@ -326,7 +330,7 @@ async def _append_to_pending(
 async def _append_restart_feedback_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
   *, initiated_by_app_id: int | None = None, owner_input: bool = False,
-  browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
+  browser_grant_id: str | None = None,
   restore_archived: bool = False,
 ) -> dict:
   """Settle a Restart card and queue its written response as one command."""
@@ -335,7 +339,7 @@ async def _append_restart_feedback_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       question_id=body.question_id, initiated_by_app_id=initiated_by_app_id,
-      browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
+      browser_grant_id=browser_grant_id,
       restore_archived=restore_archived,
       owner_input=owner_input,
     ),
@@ -430,18 +434,19 @@ def _duplicate_send_response(
       # idle queue into exactly one run. A preflight acknowledgement here
       # would leave durable work parked until some later user action.
       return None
-  for row in list(transcript_rows.history(chat) or []):
-    if row.get("role") == "user" and cid_of(row) == cid:
-      return JSONResponse(
-        status_code=200,
-        content={
-          "status": "duplicate",
-          "message": row,
-          # A retry can race a later turn. The client must not tear down that
-          # unrelated live stream while reconciling this durable message.
-          "running": is_chat_running(chat_id),
-        },
-      )
+  db = object_session(chat)
+  seq = transcript_rows.client_message_seq(db, chat, cid)
+  if seq is not None:
+    return JSONResponse(
+      status_code=200,
+      content={
+        "status": "duplicate",
+        "message": transcript_rows.at(db, chat, seq),
+        # A retry can race a later turn. The client must not tear down that
+        # unrelated live stream while reconciling this durable message.
+        "running": is_chat_running(chat_id),
+      },
+    )
   return None
 
 
@@ -547,9 +552,7 @@ def _browser_may_steer_run(db: Session, chat_id: str, principal: Principal) -> b
     models.ChatRun.chat_id == chat_id,
     models.ChatRun.status == "running",
   ).order_by(models.ChatRun.started_at.desc()).first()
-  return run is not None and (
-    run.browser_grant_id, run.browser_grant_epoch
-  ) == (principal.browser_grant_id, principal.browser_grant_epoch)
+  return run is not None and run.browser_grant_id == principal.browser_grant_id
 
 
 def _steer_enabled(chat: models.Chat) -> bool:
@@ -766,7 +769,6 @@ async def _send_message_impl(
             append_result = await _append_restart_feedback_to_pending(
               chat, body, db, initiated_by_app_id=principal.app_id,
               browser_grant_id=principal.browser_grant_id,
-              browser_grant_epoch=principal.browser_grant_epoch,
               restore_archived=restore_archived,
               owner_input=is_owner_input_principal(principal),
             )
@@ -1091,7 +1093,6 @@ async def _send_message_impl(
         stored = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
           browser_grant_id=principal.browser_grant_id,
-          browser_grant_epoch=principal.browser_grant_epoch,
           restore_archived=restore_archived,
           owner_input=is_owner_input_principal(principal),
           front=True, require_answer_match=True,
@@ -1230,7 +1231,6 @@ async def _send_message_impl(
           db,
           initiated_by_app_id=principal.app_id,
           browser_grant_id=principal.browser_grant_id,
-          browser_grant_epoch=principal.browser_grant_epoch,
           restore_archived=restore_archived,
           owner_input=is_owner_input_principal(principal),
           front=True,
@@ -1427,7 +1427,6 @@ async def _send_message_locked(
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
       owner_input=is_owner_input_principal(principal),
     )
@@ -1447,7 +1446,6 @@ async def _send_message_locked(
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
       owner_input=is_owner_input_principal(principal),
     )
@@ -1468,7 +1466,6 @@ async def _send_message_locked(
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
       owner_input=is_owner_input_principal(principal),
     )
@@ -1519,9 +1516,8 @@ async def _send_message_locked(
       and (
         principal.browser_grant_id is None
         or not body.force_steer
-        or all((row.get("_browser_grant_id"), row.get("_browser_grant_epoch")) == (
-          principal.browser_grant_id, principal.browser_grant_epoch,
-        ) for row in (selected_force_pending or []))
+        or all(row.get("_browser_grant_id") == principal.browser_grant_id
+               for row in (selected_force_pending or []))
       )
     ):
       # Every provider delivery names a row already durable in pending.
@@ -1537,7 +1533,6 @@ async def _send_message_locked(
         reserved = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
           browser_grant_id=principal.browser_grant_id,
-          browser_grant_epoch=principal.browser_grant_epoch,
           restore_archived=restore_archived,
           owner_input=is_owner_input_principal(principal),
         )
@@ -1591,7 +1586,6 @@ async def _send_message_locked(
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
       owner_input=is_owner_input_principal(principal),
     )
@@ -1675,7 +1669,6 @@ async def _send_message_locked(
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
       owner_input=is_owner_input_principal(principal),
     )
@@ -1726,7 +1719,6 @@ async def _send_message_locked(
         default_provider=default_provider,
         initiated_by_app_id=principal.app_id,
         browser_grant_id=principal.browser_grant_id,
-        browser_grant_epoch=principal.browser_grant_epoch,
         restore_archived=restore_archived,
         owner_input=is_owner_input_principal(principal),
         resume_run_id=body.resume_run_id,

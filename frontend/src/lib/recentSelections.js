@@ -1,19 +1,10 @@
 /* Recent selections are one bounded MRU list shared by shell navigation and search. */
-import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+// The shared shell has its own session-scoped navigation; owner MRU must not
+// be read or amended by a guest (including the search modal's default read).
+import { ownerStore } from './workspaceStorage.js'
 
 export const RECENT_SELECTION_LIMIT = 12
 const RECENT_SELECTIONS_STORAGE_KEY = 'mobius:global-search:recent-selections:v1'
-
-function browserStorage() {
-  // The shared shell has its own session-scoped navigation; owner MRU must not
-  // be read or amended by a guest (including the search modal's default read).
-  if (isSharedBrowserRoute()) return null
-  try {
-    return globalThis.localStorage || null
-  } catch (_) {
-    return null
-  }
-}
 
 function normalizedRecentSelections(selections) {
   const seen = new Set()
@@ -33,7 +24,7 @@ function normalizedRecentSelections(selections) {
 
 // History stores only stable item references. Titles and other presentation
 // data stay in their owning queries and are resolved afresh when search opens.
-export function readRecentSelections(storage = browserStorage()) {
+export function readRecentSelections(storage = ownerStore()) {
   try {
     return normalizedRecentSelections(JSON.parse(
       storage?.getItem(RECENT_SELECTIONS_STORAGE_KEY) || '[]',
@@ -43,7 +34,7 @@ export function readRecentSelections(storage = browserStorage()) {
   }
 }
 
-export function rememberRecentSelection(selection, storage = browserStorage()) {
+export function rememberRecentSelection(selection, storage = ownerStore()) {
   const next = normalizedRecentSelections([
     selection,
     ...readRecentSelections(storage),
@@ -59,7 +50,7 @@ export function rememberRecentSelection(selection, storage = browserStorage()) {
 
 export function rememberRecentDestination(
   { view, chatId, appId },
-  storage = browserStorage(),
+  storage = ownerStore(),
 ) {
   if (view === 'chat' && chatId != null) {
     return rememberRecentSelection({ kind: 'chat', id: chatId }, storage)
@@ -70,7 +61,7 @@ export function rememberRecentDestination(
   return null
 }
 
-export function clearRecentSelections(storage = browserStorage()) {
+export function clearRecentSelections(storage = ownerStore()) {
   try {
     storage?.removeItem(RECENT_SELECTIONS_STORAGE_KEY)
   } catch (_) {

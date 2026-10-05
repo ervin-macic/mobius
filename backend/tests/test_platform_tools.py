@@ -27,6 +27,17 @@ def test_goal_copy_guidance_separates_owner_text_from_verification_evidence():
   assert 'maxLength' not in complete
 
 
+def test_notify_owner_leaves_owner_input_cards_to_their_own_notification():
+  """A saved card already notifies the owner; the tool must not invite a
+  duplicate push for a question."""
+  control = _control_module()
+  description = control._TOOL_DEFINITIONS["notify_owner"]["description"]
+  assert "question that needs them" not in description
+  assert "not for a saved question, approval, restart or secure-input card" in description
+  assert "the card sends its own notification" in description
+  assert "a finished long task" in description
+
+
 @pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])
 def test_helpers_are_builtin_without_subagents_app(monkeypatch, top_level, coordination):
   monkeypatch.delenv("MOBIUS_SUBAGENT_HELPER", raising=False)
@@ -385,9 +396,7 @@ def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
   )
   # The meta is added to the listing, not baked into the shared definition.
   assert "_meta" not in control._TOOL_DEFINITIONS[control.PROMOTE_GOAL_TOOL]
-  quiet = [tool["name"] for tool in tools
-           if tool["_meta"].get("mobius/resultIndependent")]
-  assert quiet == ["checkpoint_chat"]
+  assert all(set(tool["_meta"]) == {"anthropic/alwaysLoad"} for tool in tools)
 
 
 def test_promote_goal_tool_preserves_helper_rejection(monkeypatch):
@@ -448,11 +457,15 @@ def test_control_protocol_advertises_every_run_bound_tool(monkeypatch):
     "delay_secs",
     "interval_secs",
     "deadline_secs",
+    "github_checks",
   }
   assert "question card" in (
     wait_schema["properties"]["condition_owner"]["description"]
   )
   assert wait_schema["additionalProperties"] is False
+  assert wait_schema["properties"]["github_checks"]["required"] == [
+    "repository", "pull_request", "head_sha",
+  ]
   # Expose the owning route's existing limits before an agent spends a call
   # discovering them in a 422 (condition_owner was previously unbounded here).
   for name, length in (("description", 500), ("condition_owner", 160), ("command", 4000)):
@@ -713,6 +726,7 @@ def test_control_protocol_declares_wait_through_the_canonical_client(monkeypatch
     "description": "CI becomes green",
     "condition_owner": "GitHub checks",
     "kind": "command",
+    "github_checks": None,
     "command": "gh pr checks 123 --watch=false >/dev/null",
     "delay_secs": None,
     "interval_secs": 120,
@@ -854,6 +868,27 @@ def test_coordination_tools_validate_discovery_and_send(monkeypatch):
   })
   assert invalid_broadcast["isError"] is True
   assert "cannot interrupt" in invalid_broadcast["content"][0]["text"]
+
+
+def test_send_agent_message_reports_wrong_keys_and_target_shape_without_echoing_values():
+  control = _control_module()
+  with pytest.raises(ValueError) as wrong:
+    control._call_send_agent_message({"helper": "secret-helper", "message": "secret-body"})
+  assert "invalid keys: helper, message" in str(wrong.value)
+  assert "recipients (agent/chat ids), body" in str(wrong.value)
+  assert "message_agent(helper, message)" in str(wrong.value)
+  assert "secret-helper" not in str(wrong.value)
+  assert "secret-body" not in str(wrong.value)
+
+  with pytest.raises(ValueError) as target:
+    control._call_send_agent_message({"recipients": "secret-peer", "body": "note"})
+  assert "list of at most 24 agent/chat ids" in str(target.value)
+  assert "secret-peer" not in str(target.value)
+
+  send = control._TOOL_DEFINITIONS["send_agent_message"]
+  followup = control._TOOL_DEFINITIONS["message_agent"]
+  assert "finished helper's follow-up" in send["description"]
+  assert "live helper" in followup["description"]
 
 
 def test_mcp_send_passes_through_backend_compact_receipt(monkeypatch):

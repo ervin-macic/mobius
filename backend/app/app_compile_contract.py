@@ -7,6 +7,12 @@ from pathlib import Path
 
 ROLLDOWN_TIMEOUT_SECS = 30
 
+# The largest compiled module the shell will load: it refuses anything bigger
+# (`APP_MODULE_MAX_BYTES` in frontend/src/lib/appModuleBroker.js; keep them
+# equal). Enforcing it at compile time fails install, apply and validation
+# with a reason instead of installing an app that cannot open.
+COMPILED_MODULE_MAX_BYTES = 8 * 1024 * 1024
+
 # Bare imports supported by the platform's self-contained app compiler. These
 # packages are resolved from the frontend runtime installation and bundled into
 # every app that uses them; an opaque frame must never need a network import.
@@ -181,7 +187,7 @@ def rolldown_command(
 
 
 def rolldown_report_contract_error(report: Mapping) -> str | None:
-  """Return a single-module/default-export error from Rolldown's report.
+  """Return the first compile-contract error in Rolldown's report, if any.
 
   Rolldown's generated chunks, rather than a source regex, are authoritative.
   This recognizes default re-exports and cannot be fooled by comments or string
@@ -229,4 +235,14 @@ def rolldown_report_contract_error(report: Mapping) -> str | None:
     "default" in (details.get("exports") or []) for details in entry_outputs
   ):
     return NO_DEFAULT_EXPORT_ERROR
+  size = entry_output.get("bytes")
+  if not isinstance(size, int):
+    return "Rolldown did not report the entry module size."
+  if size > COMPILED_MODULE_MAX_BYTES:
+    return (
+      f"The compiled app is {size} bytes, more than the "
+      f"{COMPILED_MODULE_MAX_BYTES // (1024 * 1024)} MiB the shell can load. "
+      "Serve large data through `static_assets` and fetch it at runtime "
+      "instead of importing it."
+    )
   return None

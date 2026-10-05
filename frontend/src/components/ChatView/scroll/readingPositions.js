@@ -1,4 +1,4 @@
-import { currentSharedBrowserGrantId, isSharedBrowserRoute } from '../../../lib/sharedBrowserWorkspace.js'
+import { localStore } from '../../../lib/workspaceStorage.js'
 
 /**
  * Durable reading-position storage for chat scroll.
@@ -11,25 +11,20 @@ import { currentSharedBrowserGrantId, isSharedBrowserRoute } from '../../../lib/
 export const READING_POSITION_KEY = 'chat-reading-position'
 const READING_POSITION_LIMIT = 300
 
-const ownerPositions = (() => {
-  // Shared-browser access must not hydrate owner-local scroll history. Its
-  // reading positions are document-memory only, like its bearer token.
-  if (isSharedBrowserRoute()) return {}
-  try {
-    const parsed = JSON.parse(localStorage.getItem(READING_POSITION_KEY) || '{}')
-    return (parsed && typeof parsed === 'object') ? parsed : {}
-  }
-  catch { return {} }
-})()
-
-const guestPositions = new Map()
-const emptyGuestPositions = Object.freeze({})
+// The memory copy mirrors exactly one store. A different store (another
+// shared grant) starts from that store's own positions.
+let cachedStore = null
+let cachedPositions = null
 function positions() {
-  if (!isSharedBrowserRoute()) return ownerPositions
-  const grant = currentSharedBrowserGrantId()
-  if (!grant) return emptyGuestPositions
-  if (!guestPositions.has(grant)) guestPositions.set(grant, {})
-  return guestPositions.get(grant)
+  const store = localStore()
+  if (cachedPositions && store === cachedStore) return cachedPositions
+  cachedStore = store
+  try {
+    const parsed = JSON.parse(store?.getItem(READING_POSITION_KEY) || '{}')
+    cachedPositions = (parsed && typeof parsed === 'object') ? parsed : {}
+  }
+  catch { cachedPositions = {} }
+  return cachedPositions
 }
 
 // Logout is a terminal owner-session boundary. React/page lifecycle callbacks
@@ -39,16 +34,15 @@ let writesEnabled = true
 
 function persist() {
   if (!writesEnabled) return
-  if (isSharedBrowserRoute()) return
   try {
-    const entries = Object.entries(ownerPositions)
+    const entries = Object.entries(cachedPositions)
     if (entries.length > READING_POSITION_LIMIT) {
       const expired = entries
         .sort((a, b) => (b[1]?.at || 0) - (a[1]?.at || 0))
         .slice(READING_POSITION_LIMIT)
-      for (const [chatId] of expired) delete ownerPositions[chatId]
+      for (const [chatId] of expired) delete cachedPositions[chatId]
     }
-    localStorage.setItem(READING_POSITION_KEY, JSON.stringify(ownerPositions))
+    cachedStore?.setItem(READING_POSITION_KEY, JSON.stringify(cachedPositions))
   }
   catch { /* best-effort position storage must never break scrolling */ }
 }
@@ -63,7 +57,6 @@ export function hasReadingPosition(chatId) {
 
 export function writeReadingPosition(chatId, mode) {
   const id = String(chatId || '')
-  if (isSharedBrowserRoute() && !currentSharedBrowserGrantId()) return
   const scopedPositions = positions()
   if (!id || !mode || mode.kind === 'INITIAL') {
     if (id) delete scopedPositions[id]
@@ -116,6 +109,7 @@ export const retireSavedReadingPosition = forgetReadingPosition
 
 export function clearReadingPositions() {
   writesEnabled = false
-  for (const key of Object.keys(ownerPositions)) delete ownerPositions[key]
-  try { localStorage.removeItem(READING_POSITION_KEY) } catch {}
+  cachedPositions = {}
+  cachedStore = localStore()
+  try { cachedStore?.removeItem(READING_POSITION_KEY) } catch {}
 }

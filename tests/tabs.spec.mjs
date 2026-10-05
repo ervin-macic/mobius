@@ -15,7 +15,7 @@
 import { test, expect } from '@playwright/test'
 import { createTaggedChat, attachCleanup } from './_chatTracker.mjs'
 import { sendMessage } from './_chatSession.mjs'
-import { mockAcceptedMessages } from './_mockAcceptedMessages.mjs'
+import { mockAcceptedMessages, releaseMockRoutesAfterEach } from './_mockAcceptedMessages.mjs'
 import * as paneModel from '../frontend/src/components/Shell/paneModel.js'
 import { settledBox } from './_geometry.mjs'
 import { runtimeSnapshot } from './_chatTestPrerequisites.mjs'
@@ -25,6 +25,7 @@ const APP_ID = 990001
 
 test.use({ serviceWorkers: 'block' })
 attachCleanup()
+releaseMockRoutesAfterEach()
 
 /** Mock agent routes, boot the shell (so localStorage/auth is reachable on
  *  the app origin), and create a worker-tagged chat. Returns the chat. */

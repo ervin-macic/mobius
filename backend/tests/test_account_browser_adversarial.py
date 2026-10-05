@@ -23,7 +23,7 @@ def account_flow(client, db, auth, monkeypatch):
     db.add(models.IdentityAccountLink(owner_id=owner.id, access_token_encrypted='synthetic-link-generation', scopes_json=[]))
     db.commit()
     grant = access.BrowserAccessGrant(
-        id='account-grant-fixture-0001', owner_id=owner.id, label='Sam', epoch=0,
+        id='account-grant-fixture-0001', owner_id=owner.id, label='Sam',
         kind='account', issuer='https://identity.example', subject='user-sam',
         grantor_binding=access.account_binding(db, owner.id),
         recipient_handle='sam-person', origin='https://shared.example', remote_status='active',
@@ -121,11 +121,11 @@ def test_account_recipient_handle_uses_existing_issuer_hyphen_contract(client, d
     monkeypatch.setattr(get_settings(), 'frontend_origin', 'https://shared.example')
     async def remote(db, owner_id, method, suffix, payload=None):
         return httpx.Response(200, json={
-            'issuer': account.issuer_origin(), 'subject': 'stable-user',
+            'issuer': access.issuer_origin(), 'subject': 'stable-user',
             'handle': payload['recipient_handle'], 'grant_id': payload['grant_id'],
             'origin': 'https://shared.example',
         })
-    monkeypatch.setattr(routes, '_issuer_request', remote)
+    monkeypatch.setattr(account, 'issuer_request', remote)
     owner = db.query(models.Owner).one()
     db.add(models.IdentityAccountLink(owner_id=owner.id, access_token_encrypted='synthetic-link-generation', scopes_json=[]))
     db.commit()
@@ -144,7 +144,7 @@ def test_cross_site_callback_defers_cookie_switch_until_same_origin_finalization
     verified = callback()
     assert verified.status_code == 303, verified.text
     assert 'mobius_shared_browser=' not in verified.headers.get('set-cookie', '')
-    access.validate_session(db, previous_session.id, previous_grant.id, owner.id)
+    assert access.is_live(db, access.BrowserLineage(previous_grant.id, previous_session.id), owner.id)
     pending_id = verified.headers['location'].split('=', 1)[1]
     client.cookies.set('mobius_shared_browser', previous_secret,
         domain='shared.example', path=ROOT + '/session')
@@ -156,9 +156,7 @@ def test_cross_site_callback_defers_cookie_switch_until_same_origin_finalization
     assert foreign_origin.status_code == 403
     final = client.post(ROOT + '/session/account/finalize', json={'pending_id': pending_id})
     assert final.status_code == 200, final.text
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException):
-        access.validate_session(db, previous_session.id, previous_grant.id, owner.id)
+    assert not access.is_live(db, access.BrowserLineage(previous_grant.id, previous_session.id), owner.id)
     assert client.post(ROOT + '/session/account/finalize', json={'pending_id': pending_id}).status_code == 401
 
 
@@ -187,12 +185,12 @@ def test_unlink_retains_retry_until_remote_command_stop_is_confirmed(client, aut
         access_token_encrypted="fixture-only", scopes_json=[]))
     db.commit()
     grant = access.BrowserAccessGrant(id="unconfirmed-stop-grant", owner_id=owner.id,
-        label="Test", kind="account", remote_status="active", epoch=0)
+        label="Test", kind="account", remote_status="active")
     db.add(grant)
     db.commit()
     async def cleanup(*args, **kwargs):
         return httpx.Response(directory_status)
-    monkeypatch.setattr(routes, "_issuer_request", cleanup)
+    monkeypatch.setattr(account, "issuer_request", cleanup)
     monkeypatch.setattr(connect, "cancel_browser_grant_commands",
         lambda grant_id: [{"request_id": "pending-test-command", "remote_confirmed": False}])
     response = client.delete("/api/identity/link", headers=auth)

@@ -7,7 +7,10 @@
 #   sudo scripts/test-host-helper.sh <previous-sha> <target-sha>
 #
 # Set MOBIUS_RELEASE_REPLAY=1 to also prove automatic dependency restoration
-# with a strictly newer worker. No live host may be used for either mode.
+# with a strictly newer worker. Set MOBIUS_TRANSCRIPT_PROOF=1 to also prove
+# that per-message transcript storage survives the real worker's round trip:
+# <target> converts and writes, <previous> serves every chat exactly and
+# writes, and <target>, requested once more, re-converts without loss. No live host may be used for either mode.
 # Both SHAs must have published official images. Run on a disposable systemd
 # host with Docker Compose (a CI runner); it installs root-owned units there.
 #
@@ -27,6 +30,7 @@ TARGET="${2:?target sha}"
 [[ $PREVIOUS =~ ^[0-9a-f]{40}$ && $TARGET =~ ^[0-9a-f]{40}$ && $PREVIOUS != "$TARGET" ]] \
   || { echo "two distinct full release SHAs are required" >&2; exit 2; }
 REPLAY=${MOBIUS_RELEASE_REPLAY:-0}
+TRANSCRIPTS=${MOBIUS_TRANSCRIPT_PROOF:-0}
 [[ $REPLAY == 0 || $REPLAY == 1 ]] || { echo "MOBIUS_RELEASE_REPLAY must be 0 or 1" >&2; exit 2; }
 IMAGE=ghcr.io/mobius-os/mobius
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -128,6 +132,30 @@ fi
 printf 'SECRET_KEY=host-helper-regression-key-0123456789abcdef\nDOMAIN=localhost\n' >"$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 
+
+# Transcript proof helpers (MOBIUS_TRANSCRIPT_PROOF=1). The probe runs the
+# serving release's own code; waits poll observable state only.
+TPROOF=$(mktemp -d /tmp/mobius-transcript-proof.XXXXXX)
+tprobe() {  # <command>
+  docker cp "$ROOT/scripts/transcript_rollback_probe.py" mobius:/tmp/probe.py
+  docker exec -u mobius -w /data/platform/backend -e PYTHONPATH=/data/platform/backend \
+    mobius python3 /tmp/probe.py "$1"
+}
+tconverge() {
+  until [[ $(tprobe pending) == '{"pending": 0}' ]]; do sleep 1; done
+}
+tsame() {  # <label> <expected.json> <actual.json>: the damaged chat may become its placeholder
+  python3 - "$2" "$3" "$1" <<'PY' || fail "transcripts differ"
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+a.pop("damaged", None); damaged = b.pop("damaged", None)
+assert damaged is None or damaged["messages"][0].get("transcript_damage") is True, damaged
+# Canonical text, so 1 / 1.0 / True, -0.0 / 0.0 and NaN are distinguished.
+a, b = ({k: json.dumps(v, sort_keys=True) for k, v in d.items()} for d in (a, b))
+assert a == b, f"{sys.argv[3]}: {sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))[:5]}"
+PY
+}
+
 echo "1. the previous release runs as an owner deploys it"
 cd "$SEED"
 MOBIUS_IMAGE="$IMAGE:sha-$PREVIOUS" docker compose --env-file "$ENV_FILE" \
@@ -147,6 +175,10 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 docker exec mobius test -s /data/service-token.txt || fail "the instance has no service token"
+if [[ $TRANSCRIPTS == 1 ]]; then
+  tprobe seed >/dev/null
+  tprobe dump >"$TPROOF/seeded.json"
+fi
 
 echo "2. the owner installs the helper once, from that checkout"
 scripts/install-rebuild-helper.sh || fail "the installer failed"
@@ -186,6 +218,15 @@ nonce=$(queue "$TARGET")
 wait_status "$nonce" succeeded
 replaced_with "$TARGET"
 [[ $(docker inspect -f '{{.Id}}' mobius) != "$before" ]] || fail "container was not replaced"
+if [[ $TRANSCRIPTS == 1 ]]; then
+  tconverge
+  tprobe dump >"$TPROOF/converted.json"
+  tsame "the target converted every chat exactly" "$TPROOF/seeded.json" "$TPROOF/converted.json"
+  [[ $(tprobe mirror-exact) == '{"differ": []}' ]] || fail "a converted chat's legacy bytes are not its rows"
+  tprobe write-new >/dev/null
+  [[ $(tprobe mirror-exact) == '{"differ": []}' ]] || fail "a mirror after target writes is not byte-exact"
+  tprobe dump >"$TPROOF/target.json"
+fi
 if [[ $REPLAY == 1 ]]; then
   # Never call setup/rerun here: startup alone must restore the declarations.
   for _ in $(seq 1 120); do
@@ -249,5 +290,20 @@ assert active["sha256"] == sys.argv[1], "active worker is not the reviewed relea
 assert hashlib.sha256((root / "workers" / active["file"]).read_bytes()).hexdigest() == sys.argv[1]
 print("release replay: active worker bytes match the published target source")
 WORKER_VERIFY
+fi
+if [[ $TRANSCRIPTS == 1 ]]; then
+  tprobe dump >"$TPROOF/previous.json"
+  tsame "the previous release serves the target's transcripts" "$TPROOF/target.json" "$TPROOF/previous.json"
+  tprobe write-old >/dev/null
+  tprobe dump >"$TPROOF/previous-wrote.json"
+  echo "5. the app requests the target release once more"
+  nonce=$(queue "$TARGET")
+  wait_status "$nonce" succeeded
+  replaced_with "$TARGET"
+  tconverge
+  tprobe dump >"$TPROOF/final.json"
+  [[ $(tprobe mirror-exact) == '{"differ": []}' ]] || fail "a re-converted chat's legacy bytes are not its rows"
+  tsame "the target re-converted the previous release's writes" "$TPROOF/previous-wrote.json" "$TPROOF/final.json"
+  echo "host helper: transcripts survived target -> previous -> target through the real worker"
 fi
 echo "host helper: worker revision $seeded -> $expected arrived with the image, replaced the container, and is active"

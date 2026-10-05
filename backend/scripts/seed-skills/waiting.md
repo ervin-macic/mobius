@@ -54,10 +54,32 @@ returns a failure. Both arm the same wait.
 }
 ```
 
-A pull request works the same way: `gh pr view 123 --repo owner/repo --json
-state -q .state | grep -qx MERGED` waits for a merge, and
-`/data/platform/scripts/pr-checks.sh owner/repo PR SHA` waits for that exact
-commit's checks to finish.
+For GitHub checks, prefer the standard operation instead of composing a shell
+command. Give exactly one of `github_checks`, `command`, or `delay_secs`:
+
+```json
+{
+  "description": "The published change's checks finish",
+  "github_checks": {"repository": "owner/repo", "pull_request": 123,
+                    "head_sha": "0123456789abcdef0123456789abcdef01234567"},
+  "interval_secs": 120,
+  "deadline_secs": 1800
+}
+```
+
+This uses the existing GitHub connection, follows the checks GitHub shows on
+the pull request at that exact published head (manual workflow dispatches on
+the same commit are not included), and records a bounded progress summary
+that the wake-up result carries. **Finished does not mean passed**: failed,
+cancelled, or skipped checks still wake the chat for review. A replaced head or unreadable result is
+a failed monitor, not an ordinary pending check. No checks yet stays pending.
+The existing `/data/platform/scripts/pr-checks.sh owner/repo PR SHA` entry point uses the same
+checker while preserving its 0/1/error contract for previously saved commands.
+
+A custom command remains the escape hatch for other observable conditions.
+For example, `gh pr view 123 --repo owner/repo --json state -q .state |
+grep -qx MERGED` observes a merge. It cannot report normal pending progress
+through stdout: the silent-unmet/error contract below remains unchanged.
 
 - The check command must be **read-only** and exit **0 exactly when the
   condition is met**. An ordinary unmet result is **exit 1 with no diagnostic
@@ -77,7 +99,7 @@ commit's checks to finish.
   monitor proves only that someone will check; it never proves that work is
   happening. For internal work, do not declare the wait until that executor has
   explicitly accepted the handoff.
-- `deadline_secs` / `--deadline` is required for command waits (max 7 days):
+- `deadline_secs` / `--deadline` is required for command and GitHub waits (max 7 days):
   use roughly 2–3× the expected duration. At the deadline, the same chat wakes
   to inspect the owner and real state before deciding whether safe takeover,
   reassignment, a longer wait, or a blocker report is correct.

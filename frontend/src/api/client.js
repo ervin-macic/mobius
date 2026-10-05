@@ -38,30 +38,18 @@ let ephemeralToken = null
 let ephemeralInstanceId = null
 let ephemeralSessionGeneration = 0
 // A shared-browser session is not an owner or an opaque chat embed. Its bearer
-// lives only in this document; the renewal cookie is HttpOnly and server scoped.
+// lives only in this document. The HttpOnly cookie behind renewal changes only
+// when this browser redeems an invitation or finalizes an account sign-in, and
+// renewal never rewrites it. Tabs therefore need no shared coordination: the
+// last sign-in wins and every other tab sees SHARED_ACCESS_GRANT_CHANGED on its
+// next renewal.
 let sharedBrowserEnabled = false
 let sharedBrowserToken = null
 let sharedBrowserGrantId = null
 let sharedBrowserExpiresAt = 0
-let sharedBrowserGeneration = 0
-let sharedBrowserAuthorityGeneration = 0
-// Web Locks are origin-scoped: while documents remain alive, each tab finishes
-// its cookie response (and stale-success cleanup) before the next tab starts.
-// No document-only fallback may falsely claim ownership of that shared cookie.
-const SHARED_BROWSER_COOKIE_LOCK = 'mobius:shared-browser-session-cookie:v1'
-let sharedBrowserRedeemIntent = 0
-function sharedBrowserCookieLocks() {
-  const locks = globalThis.navigator?.locks
-  if (typeof locks?.request !== 'function') throw new Error('SHARED_ACCESS_BROWSER_UNSUPPORTED')
-  return locks
-}
-function withSharedBrowserCookieOwner(operation) {
-  try {
-    return sharedBrowserCookieLocks().request(SHARED_BROWSER_COOKIE_LOCK, { mode: 'exclusive' }, operation)
-  } catch (error) {
-    return Promise.reject(error)
-  }
-}
+// Changes whenever this tab starts a sign-in or ends its session. Work begun
+// under one authority never installs a session or sends a request under another.
+let sharedBrowserAuthority = 0
 let sharedBrowserRenewal = null
 let sharedBrowserAccountFinalization = null
 let pendingSharedBrowserLogoutGrantId = null
@@ -88,71 +76,59 @@ function acceptSharedBrowserSession(data, { renewal = false } = {}) {
   sharedBrowserGrantId = String(data.grant.id)
   setActiveSharedBrowserGrantId(sharedBrowserGrantId)
   sharedBrowserExpiresAt = Date.now() + Math.min(900, Number(data.expires_in)) * 1000
-  sharedBrowserGeneration += 1
-  if (!renewal) sharedBrowserAuthorityGeneration += 1
   return data
 }
 
-export function clearSharedBrowserSession({ invalidateRedeem = true } = {}) {
-  if (invalidateRedeem) sharedBrowserRedeemIntent += 1
+function endSharedBrowserAuthority() {
+  sharedBrowserAuthority += 1
   sharedBrowserClosed = true
   sharedBrowserToken = null
   sharedBrowserGrantId = null
   setActiveSharedBrowserGrantId(null)
   sharedBrowserExpiresAt = 0
-  sharedBrowserGeneration += 1
-  sharedBrowserAuthorityGeneration += 1
+  sharedBrowserRenewal = null
+  sharedBrowserAccountFinalization = null
+}
+
+export function clearSharedBrowserSession() {
+  endSharedBrowserAuthority()
   try { window.dispatchEvent(new CustomEvent('mobius:shared-browser-auth-ended')) } catch {}
 }
 
-function sharedBrowserSessionRequest(path, body, redeemIntent) {
-  const generationAtStart = sharedBrowserGeneration
-  return withSharedBrowserCookieOwner(async () => {
-    if (path === 'session' && sharedBrowserGeneration !== generationAtStart) throw new Error('SHARED_ACCESS_SUPERSEDED')
-    if (redeemIntent && redeemIntent !== sharedBrowserRedeemIntent) throw new Error('SHARED_ACCESS_SUPERSEDED')
-    const response = await fetch(`${BASE}/api/connect/browser-access/${path}`, {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    })
-    if (!response.ok) throw new Error('SHARED_ACCESS_ENDED')
-    const data = await response.json()
-    if (redeemIntent && redeemIntent !== sharedBrowserRedeemIntent) {
-      // The response may already have installed a cookie. Retire exactly its
-      // grant before the next queued redemption starts; never install its bearer.
-      const grantId = data?.grant?.id
-      if (grantId) {
-        const logout = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ grant_id: String(grantId) }),
-        })
-        if (!logout.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
-      }
-      throw new Error('SHARED_ACCESS_SUPERSEDED')
-    }
-    if (path === 'session' && sharedBrowserGeneration !== generationAtStart) throw new Error('SHARED_ACCESS_SUPERSEDED')
-    return acceptSharedBrowserSession(data, { renewal: path === 'session' })
+async function sharedBrowserSessionRequest(path, body) {
+  const authority = sharedBrowserAuthority
+  const response = await fetch(`${BASE}/api/connect/browser-access/${path}`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
   })
+  if (!response.ok) throw new Error('SHARED_ACCESS_ENDED')
+  const data = await response.json()
+  if (authority !== sharedBrowserAuthority) throw new Error('SHARED_ACCESS_SUPERSEDED')
+  return acceptSharedBrowserSession(data, { renewal: path === 'session' })
+}
+
+// A sign-in replaces this tab's current session before it starts, so nothing
+// can be sent with the previous grant while the new one is being established.
+function signInSharedBrowser(path, body) {
+  endSharedBrowserAuthority()
+  return sharedBrowserSessionRequest(path, body)
 }
 
 export function redeemSharedBrowserInvite(invite) {
   if (!sharedBrowserEnabled || !invite) throw new Error('SHARED_ACCESS_INVALID_INVITE')
-  return sharedBrowserSessionRequest('session/redeem', { invite }, ++sharedBrowserRedeemIntent)
+  return signInSharedBrowser('session/redeem', { invite })
 }
 
 export function finalizeSharedBrowserAccount(pendingId) {
   if (!sharedBrowserEnabled || !pendingId) throw new Error('SHARED_ACCESS_INVALID_ACCOUNT_FLOW')
-  if (sharedBrowserAccountFinalization?.id === pendingId
-      && sharedBrowserAccountFinalization.intent === sharedBrowserRedeemIntent) {
+  // The pending sign-in is one-use. React's repeated effect setup must observe
+  // the same operation instead of spending it twice.
+  if (sharedBrowserAccountFinalization?.id === pendingId) {
     return sharedBrowserAccountFinalization.promise
   }
-  // Unlike the cross-site callback, this same-origin request receives the
-  // previous Strict cookie and participates in the existing browser-wide lock.
-  // React's repeated effect setup observes the same one-use operation.
-  const intent = ++sharedBrowserRedeemIntent
-  const operation = { id: pendingId, intent }
-  operation.promise = sharedBrowserSessionRequest('session/account/finalize', { pending_id: pendingId }, intent)
+  const operation = { id: pendingId }
+  operation.promise = signInSharedBrowser('session/account/finalize', { pending_id: pendingId })
     .finally(() => {
       if (sharedBrowserAccountFinalization === operation) sharedBrowserAccountFinalization = null
     })
@@ -164,15 +140,14 @@ export function renewSharedBrowserSession() {
   if (!sharedBrowserEnabled) throw new Error('SHARED_ACCESS_NOT_ENABLED')
   if (sharedBrowserClosed) throw new Error('SHARED_ACCESS_ENDED')
   if (!sharedBrowserRenewal) {
-    const authority = sharedBrowserAuthorityGeneration
+    const authority = sharedBrowserAuthority
     const renewal = sharedBrowserSessionRequest('session').catch(error => {
-      if (sharedBrowserAuthorityGeneration === authority) clearSharedBrowserSession({ invalidateRedeem: false })
+      if (sharedBrowserAuthority === authority) clearSharedBrowserSession()
       throw error
+    }).finally(() => {
+      if (sharedBrowserRenewal === renewal) sharedBrowserRenewal = null
     })
-    sharedBrowserRenewal = renewal.finally(() => {
-      if (sharedBrowserRenewal === ownedRenewal) sharedBrowserRenewal = null
-    })
-    const ownedRenewal = sharedBrowserRenewal
+    sharedBrowserRenewal = renewal
   }
   return sharedBrowserRenewal
 }
@@ -180,19 +155,16 @@ export function renewSharedBrowserSession() {
 export async function leaveSharedBrowserSession() {
   const grantId = sharedBrowserGrantId || pendingSharedBrowserLogoutGrantId
   if (!grantId) throw new Error('SHARED_ACCESS_LOGOUT_UNAVAILABLE')
-  sharedBrowserCookieLocks()
   pendingSharedBrowserLogoutGrantId = grantId
   clearSharedBrowserSession()
-  return withSharedBrowserCookieOwner(async () => {
-    const response = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ grant_id: grantId }),
-    })
-    if (!response.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
-    if (pendingSharedBrowserLogoutGrantId === grantId) pendingSharedBrowserLogoutGrantId = null
-    return true
+  const response = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_id: grantId }),
   })
+  if (!response.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
+  if (pendingSharedBrowserLogoutGrantId === grantId) pendingSharedBrowserLogoutGrantId = null
+  return true
 }
 
 export function beginEphemeralAuth() {
@@ -223,7 +195,7 @@ export function clearEphemeralAuthSession() {
 // its per-chat cache entry atomically when that session changes, without
 // exposing or decoding the bearer itself.
 export function getAuthSessionCacheKey() {
-  return sharedBrowserEnabled ? `shared:${sharedBrowserGeneration}`
+  return sharedBrowserEnabled ? `shared:${sharedBrowserAuthority}`
     : ephemeralAuthEnabled ? `embed:${ephemeralSessionGeneration}` : 'owner'
 }
 
@@ -468,9 +440,9 @@ export async function apiFetch(path, options = {}) {
   if (sharedBrowserEnabled) {
     // An API operation belongs to the authority that initiated it, even if
     // renewal rotates its bearer. Never send its body with a later grant.
-    const authority = sharedBrowserAuthorityGeneration
+    const authority = sharedBrowserAuthority
     const assertAuthority = () => {
-      if (authority !== sharedBrowserAuthorityGeneration || !sharedBrowserToken) {
+      if (authority !== sharedBrowserAuthority || !sharedBrowserToken) {
         throw new Error('SHARED_ACCESS_SUPERSEDED')
       }
     }
@@ -501,7 +473,7 @@ export async function apiFetch(path, options = {}) {
       response = await send()
       assertAuthority()
       if (response.status === 401) {
-        clearSharedBrowserSession({ invalidateRedeem: false })
+        clearSharedBrowserSession()
         throw new Error('SHARED_ACCESS_ENDED')
       }
     }
@@ -668,6 +640,26 @@ async function listAffectingMutation(kind, path, options) {
     await invalidateShellListCache(kind)
   }
   return response
+}
+
+/**
+ * A list-affecting write whose repeat is harmless (the server leaves an
+ * already-applied state unchanged), resent once if the connection fails.
+ *
+ * A phone returning from the background often sends its first request on a
+ * connection the network has already dropped; fetch then rejects with a
+ * TypeError before any response. One immediate resend opens a fresh
+ * connection. Only transport failures repeat: an HTTP status is the server's
+ * answer, and aborts or expired sessions are deliberate. Use only for
+ * operations that are safe to apply twice.
+ */
+async function repeatableListMutation(kind, path, options) {
+  try {
+    return await listAffectingMutation(kind, path, options)
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error
+    return await listAffectingMutation(kind, path, options)
+  }
 }
 
 async function pinnedMutation(path, {
@@ -1022,10 +1014,10 @@ export const api = {
     // Archiving files a chat under Archived without touching its history or
     // work; restoring returns it to Recents. Both answer the persisted
     // `{ archived_at, pinned_at }` so the drawer can settle its rows.
-    archive: (chatId) => listAffectingMutation(
+    archive: (chatId) => repeatableListMutation(
       'chats', `/chats/${encodeURIComponent(chatId)}/archive`, { method: 'POST' },
     ),
-    unarchive: (chatId) => listAffectingMutation(
+    unarchive: (chatId) => repeatableListMutation(
       'chats', `/chats/${encodeURIComponent(chatId)}/unarchive`, { method: 'POST' },
     ),
     remove: (chatId) => listAffectingMutation(

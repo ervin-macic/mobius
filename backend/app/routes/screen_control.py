@@ -28,7 +28,7 @@ from app.screen_control import registry
 def _installation_screen(principal: Principal = Depends(get_principal)):
   # Shared navigation is not consent to view/control the installation owner’s
   # browser. Preserve existing agent/human gates within this separate feature.
-  if principal.browser_grant_id is not None:
+  if principal.browser is not None:
     raise HTTPException(403, "Screen sharing requires the installation owner.")
 
 

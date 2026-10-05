@@ -175,6 +175,7 @@ async def submit_secure_input(
   """Move submitted fields into process memory without logging or persistence."""
   require_chat_embed_operation(principal, "chat:send")
   require_active_chat_access(db, chat_id, principal)
+  await transcript_rows.ensure_converted_async(chat_id, db)
   chat = _active_owner_chat(db, chat_id)
   saved = _saved_request(db, chat_id, request_id)
   if saved is not None:
@@ -188,7 +189,7 @@ async def submit_secure_input(
       raise HTTPException(410, detail="Secure input request is no longer open.")
     if saved.status != "pending":
       return {"status": saved.status}
-    card = next((block.get("secure_input") for message in reversed(transcript_rows.history(chat) or [])
+    card = next((block.get("secure_input") for message in reversed(transcript_rows.history(chat))
                  for block in message.get("blocks") or []
                  if block.get("question_id") == request_id), None)
     if not isinstance(card, dict):

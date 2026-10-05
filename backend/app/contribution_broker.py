@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from app.runtime_identity import broker_async_transport, broker_socket_path
 
-DEFAULT_SOCKET = "/run/mobius-identity-broker.sock"
+
 CONTRIBUTION_PREFIX = "/v1/contributions"
 MAX_REQUEST_BYTES = 3_000_000
 MAX_RESPONSE_BYTES = 1_000_000
@@ -55,9 +55,7 @@ class ContributionBrokerClient:
     socket_path: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
   ) -> None:
-    self.socket_path = socket_path or os.environ.get(
-      "MOBIUS_IDENTITY_BROKER_SOCKET", DEFAULT_SOCKET,
-    )
+    self.socket_path = socket_path or broker_socket_path()
     self.transport = transport
 
   @staticmethod
@@ -107,7 +105,7 @@ class ContributionBrokerClient:
       headers["Content-Type"] = "application/json"
     if idempotency_key:
       headers["Idempotency-Key"] = idempotency_key
-    transport = self.transport or httpx.AsyncHTTPTransport(uds=self.socket_path)
+    transport = self.transport or broker_async_transport(self.socket_path)
     try:
       async with httpx.AsyncClient(
         transport=transport,

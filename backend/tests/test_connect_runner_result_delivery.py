@@ -19,6 +19,12 @@ def _http_error(code):
     )
 
 
+def _pending_result(runner, request_id):
+    command = connect_runner._Command(request_id, 60)
+    command.result = {"type": "result", "request_id": request_id}
+    runner.outbox.append(command)
+
+
 def test_cap_output_truncates_keeping_head_and_tail():
     big = "A" * 500_000 + "B" * 800_000
     capped, truncated = connect_runner._cap_output(big)
@@ -37,10 +43,10 @@ def test_cap_output_leaves_small_output_untouched():
 
 def test_flush_drops_a_permanently_rejected_result(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
-    runner.outbox.append({"type": "result", "request_id": "r1"})
+    _pending_result(runner, "r1")
     attempts = []
 
-    def fake_post(url, payload, token=None):
+    def fake_post(url, payload, token=None, context=None):
         attempts.append(payload["request_id"])
         raise _http_error(422)
 
@@ -57,9 +63,9 @@ def test_flush_drops_a_permanently_rejected_result(monkeypatch):
 
 def test_flush_keeps_a_transiently_failed_result(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
-    runner.outbox.append({"type": "result", "request_id": "r1"})
+    _pending_result(runner, "r1")
 
-    def fake_post(url, payload, token=None):
+    def fake_post(url, payload, token=None, context=None):
         raise _http_error(503)
 
     monkeypatch.setattr(connect_runner, "_post", fake_post)
@@ -67,34 +73,34 @@ def test_flush_keeps_a_transiently_failed_result(monkeypatch):
     # A server-side or rate-limit failure is recoverable, so the result is
     # retained for the next reconnect rather than discarded.
     assert runner.flush_pending_results() is False
-    assert [m["request_id"] for m in runner.outbox] == ["r1"]
+    assert runner.snapshot()[1] == ["r1"]
     assert runner.take_reconcile_request() is False
 
 
 def test_flush_retries_a_transient_client_status(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
-    runner.outbox.append({"type": "result", "request_id": "r1"})
+    _pending_result(runner, "r1")
     monkeypatch.setattr(
         connect_runner, "_post",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(_http_error(425)),
     )
 
     assert runner.flush_pending_results() is False
-    assert [m["request_id"] for m in runner.outbox] == ["r1"]
+    assert runner.snapshot()[1] == ["r1"]
     assert runner.take_reconcile_request() is False
 
 
 def test_flush_keeps_a_result_through_a_network_error(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
-    runner.outbox.append({"type": "result", "request_id": "r1"})
+    _pending_result(runner, "r1")
 
-    def fake_post(url, payload, token=None):
+    def fake_post(url, payload, token=None, context=None):
         raise urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(connect_runner, "_post", fake_post)
 
     assert runner.flush_pending_results() is False
-    assert [m["request_id"] for m in runner.outbox] == ["r1"]
+    assert runner.snapshot()[1] == ["r1"]
 
 
 def test_post_result_marks_runner_truncation(monkeypatch):
@@ -102,8 +108,8 @@ def test_post_result_marks_runner_truncation(monkeypatch):
     monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
 
     runner._post_result(
-        "r1", "x" * (connect_runner._MAX_RESULT_STREAM + 1), "", 0,
-        "completed",
+        connect_runner._Command("r1", 60),
+        "x" * (connect_runner._MAX_RESULT_STREAM + 1), "", 0, "completed",
     )
 
     [message] = runner.pending_messages()

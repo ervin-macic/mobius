@@ -28,6 +28,7 @@ from fastapi import HTTPException
 
 from app import app_python_env, auth, models, service_preload
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
+from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
 from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES
 
@@ -104,10 +105,9 @@ def request_actor(db, principal, caller=None) -> dict:
     "delegated": principal.delegation_id is not None,
     "access": access,
   }
-  if principal.browser_grant_id is not None:
-    actor.update(browser_grant_id=principal.browser_grant_id,
-                 browser_grant_epoch=principal.browser_grant_epoch,
-                 browser_session_id=principal.browser_session_id)
+  if principal.browser is not None:
+    actor.update(browser_grant_id=principal.browser.grant_id,
+                 browser_session_id=principal.browser.session_id)
   return actor
 
 
@@ -134,7 +134,7 @@ def service_python_env(app, entry: Path) -> Path | None:
     raise HTTPException(503, str(exc)) from exc
 
 
-def service_environment(app, owner, service: dict, *, public: bool, browser_grant_id=None, browser_grant_epoch=None, browser_session_id=None) -> dict[str, str]:
+def service_environment(app, owner, service: dict, *, public: bool, browser: BrowserLineage | None = None) -> dict[str, str]:
   """The environment of one invocation; its APP_TOKEN's authority follows the caller.
 
   A public invocation acts for an anonymous visitor, so its token has the narrow
@@ -164,9 +164,7 @@ def service_environment(app, owner, service: dict, *, public: bool, browser_gran
       app_nonce=app.token_nonce,
       expires_delta=timedelta(minutes=5),
       service="public" if public else "private",
-      browser_grant_id=browser_grant_id,
-      browser_grant_epoch=browser_grant_epoch,
-      browser_session_id=browser_session_id,
+      browser=browser,
     ),
   })
   return env
@@ -292,15 +290,15 @@ async def _run_spawned(
 _browser_calls: dict[str, set[asyncio.Task]] = {}
 
 
-def _validate_browser_call(owner, actor):
-  grant_id = actor.get("browser_grant_id")
-  if grant_id is not None:
+def _actor_browser(actor: dict) -> BrowserLineage | None:
+  return BrowserLineage.of(actor.get("browser_grant_id"), actor.get("browser_session_id"))
+
+
+def _validate_browser_call(owner, browser: BrowserLineage | None):
+  if browser is not None:
     from app.database import SessionLocal
-    from app.browser_access import validate_grant, validate_session
     with SessionLocal() as db:
-      validate_grant(db, grant_id, actor.get("browser_grant_epoch"), owner.id)
-      if actor.get("browser_session_id") is not None:
-        validate_session(db, actor["browser_session_id"], grant_id, owner.id)
+      require_live(db, browser, owner.id)
 
 
 def browser_grant_has_active_calls(grant_id: str) -> bool:
@@ -356,16 +354,16 @@ async def invoke_service(
   # waiting for that app's serialized request. Count only executable requests.
   # Queued requests already own an accepted revision. Pin before admission so
   # pruning or a migration drain cannot overlook a request waiting to run.
-  actor = request_envelope.get("actor") or {}
-  _validate_browser_call(owner, actor)
-  grant_id = actor.get("browser_grant_id")
+  browser = _actor_browser(request_envelope.get("actor") or {})
+  _validate_browser_call(owner, browser)
+  grant_id = browser.grant_id if browser is not None else None
   task = asyncio.current_task()
   pin = hold_runtime(app.id)
   if grant_id is not None:
     _browser_calls.setdefault(grant_id, set()).add(task)
   try:
     async with slot, _global_slots[lane]:
-      _validate_browser_call(owner, actor)
+      _validate_browser_call(owner, browser)
       entry = service_entry(app, service)
       python_env = service_python_env(app, entry)
       python = app_python_env.python_for(python_env)
@@ -373,9 +371,7 @@ async def invoke_service(
       environment = app_python_env.activated_environment(
         service_environment(
           app, owner, service, public=public,
-          browser_grant_id=actor.get("browser_grant_id"),
-          browser_grant_epoch=actor.get("browser_grant_epoch"),
-          browser_session_id=actor.get("browser_session_id"),
+          browser=browser,
         ), python_env,
       )
       outcome = None

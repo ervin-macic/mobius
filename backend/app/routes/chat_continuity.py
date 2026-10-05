@@ -42,7 +42,7 @@ def _save_note(data_dir: str, chat_id: str, body: CheckpointBody, run_token: str
       existing, name=chat.title or "",
       digest=(body.digest or "").strip() or None,
       summary=(body.summary or "").strip() or None,
-      coverage=checkpoint_coverage(list(transcript_rows.history(chat) or []), run_token),
+      coverage=checkpoint_coverage(list(transcript_rows.history(chat)), run_token),
     ))
     return renamed_event(chat)
 

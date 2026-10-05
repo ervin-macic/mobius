@@ -35,42 +35,6 @@ def test_live_overlay_and_bounded_page(db):
   assert [r["content"] for r in page] == ["old", "tail"]
 
 
-def test_search_v2_initial_batch_and_revision_freshness(db):
-  from app import chat_search
-  chat_search.create_schema_v2(db.connection())
-  db.execute(chat_search.sql("UPDATE upgrade_tasks SET status='pending' WHERE level=1 AND task='index_messages'"))
-  chat = chat_writer.create_chat(
-    id="reader-search", title="Field notes",
-    messages=[{"role": "user", "content": "wombat trail", "ts": 1}],
-  )
-  db.add(chat)
-  db.commit()
-  assert chat_search.search(db, "wombat") == []  # initial build is background-only
-  assert chat_search.index_batch(db.connection()) == (1, 0)
-  db.commit()
-  assert chat_search.search(db, "wombat")[0]["anchor_key"] == "user-1"
-  transcript_rows.append(db, chat, {"role": "assistant", "content": "platypus creek", "ts": 2})
-  db.commit()
-  # A stale generation cannot leak the old snippet even before reconcile runs.
-  assert chat_search._rank_results(chat_search._candidate_rows(db, ["wombat"]), ["wombat"], 20) == []
-  assert chat_search.search(db, "platypus")[0]["anchor_key"] == "assistant-2"
-
-
-def test_raw_sqlite_search_callbacks_share_gate_connection(db):
-  from app import chat_search
-  raw = db.connection().connection.driver_connection
-  chat_search.create_schema_v2(raw)
-  chat = chat_writer.create_chat(
-    id="reader-raw-index", title="Raw indexing",
-    messages=[{"role": "user", "content": "capybara bank", "ts": 12}],
-  )
-  db.add(chat)
-  db.flush()
-  assert chat_search.index_batch(raw, batch_size=1) == (1, 0)
-  assert db.execute(chat_search.sql("SELECT indexed_revision FROM chat_search_state_v2 "
-                                    "WHERE chat_id='reader-raw-index'")).scalar_one() >= 1
-
-
 def test_anchor_first_match_across_id_and_cid(db):
   from app.chat_transcript import materialized_metadata
   chat = chat_writer.create_chat(id="reader-anchors", title="Anchors", messages=[
@@ -89,34 +53,9 @@ def test_anchor_first_match_across_id_and_cid(db):
     assert page[-1]["content"] == "third"
 
 
-def test_raw_index_byte_budget_oversized_unit_and_resume(db):
-  from app import chat_search
-  raw = db.connection().connection.driver_connection
-  chat_search.create_schema_v2(raw)
-  for cid, size in (("a-giant", 600), ("b-small", 70), ("c-small", 70)):
-    db.add(chat_writer.create_chat(id=cid, title=cid, messages=[
-      {"role": "user", "content": "Z" * size, "ts": 1},
-    ]))
-  db.commit()
-  raw = db.connection().connection.driver_connection
-  # Source bytes include JSON envelope, so the 200-byte budget admits one
-  # oversized unit but never combines it with a second chat.
-  reserve = chat_search.index_batch_space_bytes(raw)
-  assert reserve >= 40 * 1024 * 1024
-  assert chat_search.index_batch(raw, byte_budget=200) == (1, 2)
-  indexed = {row[0] for row in raw.execute("SELECT chat_id FROM chat_search_state_v2")}
-  assert "a-giant" in indexed and "b-small" not in indexed
-  assert chat_search.index_batch(raw, byte_budget=200) == (1, 1)
-  assert chat_search.index_batch(raw, byte_budget=200) == (1, 0)
-  assert chat_search.index_batch(raw, byte_budget=200) == (0, 0)
-  db.commit()
-
-
-def test_raw_initial_index_uses_legacy_string_visibility_policy(db):
+def test_search_applies_legacy_string_visibility_at_query_time(db):
   import json
   from app import chat_search, models
-  raw = db.connection().connection.driver_connection
-  chat_search.create_schema_v2(raw)
   db.add(models.App(id=789, name="Index visibility", slug="index-visibility",
                     source_dir="/tmp/index-visibility"))
   db.add_all([
@@ -129,21 +68,16 @@ def test_raw_initial_index_uses_legacy_string_visibility_policy(db):
                             messages=[{"role": "user", "content": "publicquokka", "ts": 1}]),
   ])
   db.commit()
-  raw = db.connection().connection.driver_connection
-  assert chat_search.index_batch(raw) == (2, 0)
-  db.commit()
   assert chat_search.search(db, "secretquokka") == []
   assert [r["id"] for r in chat_search.search(db, "publicquokka")] == ["visible-legacy"]
+  # Visibility is read when searching, so a chat that becomes visible is found
+  # without reindexing.
+  db.get(models.Chat, "hidden-legacy").agent_settings_json = json.dumps({"drawer_hidden": False})
+  db.commit()
+  assert [r["id"] for r in chat_search.search(db, "secretquokka")] == ["hidden-legacy"]
 
 
-def test_search_index_reserve_scales_for_one_giant_unit(monkeypatch):
-  from app import chat_search
-  monkeypatch.setattr(chat_search, "_raw_batch_plan",
-                      lambda _conn, _count, _budget: (["giant"], 5 * 1024 * 1024))
-  assert chat_search.index_batch_space_bytes(None) >= 76 * 1024 * 1024
-
-
-def test_whole_materialized_iteration_uses_bounded_pages_not_per_row_queries(db):
+def test_whole_materialized_iteration_streams_one_statement_not_per_row_queries(db):
   from sqlalchemy import event
   chat = chat_writer.create_chat(id="reader-streaming", messages=[
     {"role": "user", "content": str(i)} for i in range(130)
@@ -159,8 +93,8 @@ def test_whole_materialized_iteration_uses_bounded_pages_not_per_row_queries(db)
     assert len(list(materialized_messages(chat))) == 130
   finally:
     event.remove(db.get_bind(), "before_cursor_execute", record)
-  assert len(statements) == 3
-  assert all("chat_messages.seq >=" in sql and "chat_messages.seq <" in sql for sql in statements)
+  assert len(statements) == 1
+  assert "ORDER BY chat_messages.seq" in statements[0]
 
 
 def test_detail_read_owner_pins_live_count_coordinates_and_bodies(db, monkeypatch):

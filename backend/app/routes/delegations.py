@@ -136,9 +136,7 @@ def _row_for_principal(
 
 def _require_guest_child_lineage(row: models.Delegation, principal: Principal) -> None:
   """A guest may not start a clean owner or another guest's child run."""
-  if principal.browser_grant_id is not None and (
-    row.browser_grant_id, row.browser_grant_epoch
-  ) != (principal.browser_grant_id, principal.browser_grant_epoch):
+  if principal.browser_grant_id is not None and row.browser_grant_id != principal.browser_grant_id:
     raise HTTPException(status_code=403, detail="This helper belongs to another browser authority.")
 
 
@@ -274,7 +272,6 @@ async def submit_or_attach(
       cwd=cwd,
       notify_parent_on_complete=body.notify_parent_on_complete,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
     )
     try:
       row, attached = create_or_attach_delegation(db, intent)
@@ -299,6 +296,7 @@ async def submit_or_attach(
     from app.goal_plans import publish_plan_for_delegation
     publish_plan_for_delegation(db, row)
     publish_parent_waiting_changed(row.parent_chat_id)
+  await transcript_rows.ensure_converted_async(row.child_chat_id, db)
   payload = serialize_delegation(db, row)
   payload["attached"] = attached
   return payload
@@ -479,6 +477,7 @@ async def retry_delegation(
   started = await retry_limit_park(db, row, run_token=body.run_token)
   db.rollback()
   row = _row_for_principal(db, delegation_id, principal)
+  await transcript_rows.ensure_converted_async(row.child_chat_id, db)
   payload = serialize_delegation(db, row)
   payload["retry_started"] = started
   publish_parent_waiting_changed(row.parent_chat_id)
@@ -495,7 +494,7 @@ async def cancel_delegation(
   db: Session = Depends(get_db),
 ):
   row = _row_for_principal(db, delegation_id, principal)
-  status, _, _ = derived_status(db, row)
+  status, _, _ = derived_status(db, row, load_result=False)
   if status in ACTIVE_DELEGATION_STATUSES:
     if not await cancel_delegation_execution(row.id):
       raise HTTPException(
@@ -504,6 +503,7 @@ async def cancel_delegation(
       )
     db.rollback()
     row = _row_for_principal(db, delegation_id, principal)
+  await transcript_rows.ensure_converted_async(row.child_chat_id, db)
   payload = serialize_delegation(db, row)
   from app.goal_plans import publish_plan_for_delegation
   publish_plan_for_delegation(db, row)
@@ -557,7 +557,11 @@ async def message_delegation(
   if status in ACTIVE_DELEGATION_STATUSES:
     raise HTTPException(
       status_code=409,
-      detail="The helper is still working. Wait for its result, or stop it.",
+      detail=(
+        "The helper is still working. Wait for its result before a follow-up; "
+        "for a decision-changing note now, use send_agent_message(recipients, body) "
+        "with its peer chat id from list_agent_peers."
+      ),
     )
   from app import chat_queue
   from app.chat_start import start_programmatic_chat_turn
@@ -594,7 +598,7 @@ async def cancel_active_for_parent(db: Session, parent_chat_id: str) -> list[str
   ).all()
   cancelled: list[str] = []
   for row in rows:
-    status, _, _ = derived_status(db, row)
+    status, _, _ = derived_status(db, row, load_result=False)
     if status not in ACTIVE_DELEGATION_STATUSES:
       continue
     if await cancel_delegation_execution(row.id):

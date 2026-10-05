@@ -129,16 +129,19 @@ def test_projection_attaches_path_metadata_without_mutating_transcript(tmp_path)
   }
 
 
-def test_projection_leaves_unreadable_local_image_without_guessed_dimensions(
-  tmp_path,
-):
+def test_projection_marks_unreadable_local_images_explicitly(tmp_path):
   chat_id = "example-chat"
   media = tmp_path / "chats" / chat_id / "media"
   media.mkdir(parents=True)
+  Image.new("RGB", (640, 480)).save(media / "ok.png", "PNG")
   (media / "broken.png").write_bytes(b"not an image")
+  prefix = f"/api/chats/{chat_id}/media"
   messages = [{
     "role": "assistant",
-    "content": f"![broken](/api/chats/{chat_id}/media/broken.png)",
+    "content": (
+      f"![ok]({prefix}/ok.png) ![broken]({prefix}/broken.png) "
+      f"![missing]({prefix}/missing.png) ![escape]({prefix}/..%2F..%2Fsecret.png)"
+    ),
   }]
 
   projected = project_message_image_dimensions(
@@ -147,5 +150,11 @@ def test_projection_leaves_unreadable_local_image_without_guessed_dimensions(
     data_dir=str(tmp_path),
   )
 
-  assert projected is not messages
-  assert projected[0]["media_dimensions"] == {}
+  # Unreadable images are recorded as null rather than omitted, so the
+  # renderer can tell "unreadable" apart from "not in this map".
+  assert projected[0]["media_dimensions"] == {
+    f"{prefix}/ok.png": {"width": 640, "height": 480},
+    f"{prefix}/broken.png": None,
+    f"{prefix}/missing.png": None,
+    f"{prefix}/..%2F..%2Fsecret.png": None,
+  }

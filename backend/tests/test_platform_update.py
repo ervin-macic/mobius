@@ -19,7 +19,6 @@ uncommitted; an offline fetch keeps serving unchanged; a crash-interrupted
 reconcile is cleaned up on the next pass; and a merge-shaped legacy history is
 left untouched with an explicit normalization error.
 """
-from app.chat_writer import create_chat
 
 import asyncio
 import hashlib
@@ -38,6 +37,7 @@ import pytest
 
 from app import app_git, platform_activation, platform_boot
 from app import platform_update as pu
+from tests.test_app_git import bump_ctime_without_changing_bytes
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -72,7 +72,6 @@ def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FO
   app_dir.mkdir(parents=True, exist_ok=True)
   (app_dir / "__init__.py").write_text("")
   (app_dir / "main.py").write_text(main_py)
-  (app_dir / "routes.py").write_text("def require_all_routers_loaded():\n  return None\n")
   if foo_py is not None:
     (app_dir / "foo.py").write_text(foo_py)
 
@@ -199,12 +198,13 @@ def clone_env(tmp_path, monkeypatch):
   # The real startup check imports the full platform; these fixture clones
   # carry only a minimal backend, so the check is exercised separately.
   monkeypatch.setattr(
-    "app.restart_util.validate_restart_source", lambda platform_root=None, **_kwargs: None,
+    "app.restart_util.validate_restart_source", lambda platform_root=None: None,
   )
   monkeypatch.setenv("BUILD_SHA", "test-sha")
   # This boot's image runs the boot transaction; tests of images before it
   # remove the marker. ``_boot_image`` chooses the running image's revision.
   monkeypatch.setattr(pu, "BOOT_TRANSACTION_MARKER", tmp_path / ".boot-transaction")
+  monkeypatch.setattr(platform_boot, "BOOT_LOG", tmp_path / "platform-boot.jsonl")
   pu.BOOT_TRANSACTION_MARKER.write_text("1\n")
   monkeypatch.setenv("MOBIUS_BUILD_INFO_PATH", str(tmp_path / "build-info.json"))
   origin = _make_origin(tmp_path)
@@ -991,6 +991,44 @@ def test_late_edits_merge_back_before_the_server_imports_the_update(
   assert pu.read_prepared_update() is None
 
 
+def _bump_ctime_of_every_tracked_file(repo: Path) -> None:
+  """What a boot-time ownership or mode repair does to every tracked file."""
+  bump_ctime_without_changing_bytes(*(
+    repo / path for path in _git(repo, "ls-files", "-z").stdout.split("\0")
+    if path and os.path.lexists(repo / path)
+  ))
+
+
+def test_boot_merge_back_survives_a_metadata_only_repair_of_every_file(clone_env):
+  """The 2026-10-03 crash loop: a restart-only update was swapped in at
+  shutdown with a late commit and uncommitted edits, then the boot's no-op
+  chown left every index entry stat-dirty. The merge-back checkout rejected
+  an unchanged file as "not uptodate" on every boot. Unchanged bytes must
+  stay unchanged to the checkout, whatever their metadata."""
+  origin, platform = clone_env
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'LATE'\n"})
+  (platform / "backend/app/wip.py").write_text("WIP = 1\n")
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+
+  _bump_ctime_of_every_tracked_file(platform)
+  # The trigger is real: Git's cached stat data matches no tracked file,
+  # including every file the merge-back rewrites.
+  stale = _git(platform, "diff-files", "--name-only", "-z").stdout.split("\0")
+  tracked = _git(platform, "ls-files", "-z").stdout.split("\0")
+  assert set(stale) - {""} == set(tracked) - {""}
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'LATE'\n"
+  assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  # The uncommitted edit comes back uncommitted, as after any merge-back.
+  assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
+    "?? backend/app/wip.py",
+  ]
+
+
 def test_a_merged_back_tree_that_cannot_start_returns_to_the_previous_state(
   clone_env, tmp_path,
 ):
@@ -1246,7 +1284,7 @@ def test_an_answer_that_fails_the_startup_check_is_never_prepared(
   (platform / "backend/app/foo.py").write_text("VALUE = 'DIRTY'\n")
   from app import restart_util
 
-  def fails(platform_root=None, **_kwargs):
+  def fails(platform_root=None):
     raise restart_util.RestartSourceInvalid("startup check failed")
 
   monkeypatch.setattr("app.restart_util.validate_restart_source", fails)
@@ -1269,19 +1307,19 @@ def test_a_failed_swap_keeps_the_live_checkout_and_the_prepared_update(
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
   (platform / "backend/app/new_mod.py").write_text("NEW = True\n")
-  original_git = pu._git
+  original_checkout = app_git.merge_trees_into_worktree
   failed = False
 
-  def fail_first_candidate_checkout(*args, **kwargs):
+  def fail_first_candidate_checkout(repo, *trees, **kwargs):
     nonlocal failed
-    if not failed and kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
+    if not failed and repo == platform and not kwargs.get("dry_run"):
       failed = True
       raise RuntimeError("candidate checkout failed after the branch moved")
-    return original_git(*args, **kwargs)
+    return original_checkout(repo, *trees, **kwargs)
 
-  monkeypatch.setattr(pu, "_git", fail_first_candidate_checkout)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", fail_first_candidate_checkout)
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
-  monkeypatch.setattr(pu, "_git", original_git)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original_checkout)
 
   assert _served_sha(platform) == served
   assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
@@ -1304,21 +1342,21 @@ def test_boot_recovers_the_live_state_after_a_swap_killed_midway(
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
-  original_git = pu._git
+  original_checkout = app_git.merge_trees_into_worktree
 
   class Killed(BaseException):
     pass
 
-  def kill_after_branch_move(*args, **kwargs):
-    if kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
+  def kill_after_branch_move(repo, *trees, **kwargs):
+    if repo == platform and not kwargs.get("dry_run"):
       raise Killed()
-    return original_git(*args, **kwargs)
+    return original_checkout(repo, *trees, **kwargs)
 
   # A SIGKILL runs no cleanup: the branch has moved, the checkout has not.
-  monkeypatch.setattr(pu, "_git", kill_after_branch_move)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", kill_after_branch_move)
   with pytest.raises(Killed):
     pu.swap_in_prepared_update(cutover=True, repo=platform)
-  monkeypatch.setattr(pu, "_git", original_git)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original_checkout)
   assert _served_sha(platform) != served
 
   pu.boot_guard_clean_served_tree(platform)
@@ -1345,22 +1383,22 @@ def test_an_incomplete_swap_rollback_leaves_the_live_state_for_boot(
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
-  original_git = pu._git
+  original_checkout = app_git.merge_trees_into_worktree
   resets = 0
 
-  def fail_activation_and_rollback(*args, **kwargs):
+  def fail_activation_and_rollback(repo, *trees, **kwargs):
     nonlocal resets
-    if kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
+    if repo == platform and not kwargs.get("dry_run"):
       resets += 1
       if resets == 1:
         dirty.write_text("VALUE = 'PARTIAL CHECKOUT'\n")
         raise RuntimeError("activation checkout failed")
       return SimpleNamespace(returncode=1, stdout="", stderr="checkout blocked")
-    return original_git(*args, **kwargs)
+    return original_checkout(repo, *trees, **kwargs)
 
-  monkeypatch.setattr(pu, "_git", fail_activation_and_rollback)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", fail_activation_and_rollback)
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
-  monkeypatch.setattr(pu, "_git", original_git)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original_checkout)
 
   assert pu.RECONCILE_PRE_FLAG.exists()
   receipt = pu.boot_guard_clean_served_tree(platform)
@@ -1558,7 +1596,7 @@ def test_failed_candidate_never_rolls_back_a_newer_concurrent_writer(
   _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'update'\n"})
   raced: dict[str, str] = {}
 
-  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT, **_kwargs):
+  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT):
     raced["sha"] = _local_commit(
       platform, edits={"concurrent.txt": "newer owner\n"},
       msg="concurrent writer after activation",
@@ -2344,7 +2382,7 @@ def test_reconcile_pins_upstream_hook_source_before_unlock(monkeypatch, tmp_path
     events.append("unlocked")
 
   def fake_reconcile(
-    repo_path, *, target_ref, fetch_remote, progress, candidate_target=None,
+    repo_path, *, target_ref, fetch_remote, progress,
   ):
     assert events == ["locked"]
     assert repo_path == repo
@@ -5994,6 +6032,29 @@ def test_entrypoint_settles_guards_and_probes_before_any_served_code_runs():
   assert "cd /app/platform-baked/backend" in script
 
 
+def test_entrypoint_repairs_metadata_without_rewriting_what_is_already_right():
+  """chown and chmod update ctime even as no-ops, and Git's index caches it.
+  A recursive sweep on every boot would leave every served and app checkout
+  stat-dirty, so boot repairs only ownership and modes that are wrong."""
+  script = (
+    Path(__file__).resolve().parents[1] / "scripts" / "entrypoint.sh"
+  ).read_text(encoding="utf-8")
+  for unconditional in (
+    "chown -R mobius:mobius /data ", "chown -R mobius:mobius /data/platform",
+    "chmod -R go-w /data/platform", "chown -R mobius:mobius /data/.git",
+    "chown -R mobius:mobius /data/db", "chown -R mobius:mobius /data/cron-logs",
+    "chmod -R 777 /data/db",
+  ):
+    assert unconditional not in script
+  helper = script[script.index("_own_as_mobius() {"):]
+  helper = helper[:helper.index("}\n") + 2]
+  assert "! -user mobius -o ! -group mobius" in helper
+  assert "chown -h mobius:mobius" in helper
+  assert "if ! _own_as_mobius /data 2>/dev/null; then" in script
+  assert "_own_as_mobius /data/platform" in script
+  assert "find /data/platform ! -type l -perm /022 -exec chmod go-w {} +" in script
+
+
 def test_a_second_finish_cannot_rebind_an_update_already_bound(clone_env):
   """Two concurrent Finish requests: the first binding wins, so the request
   that is published is the one that can confirm the update."""
@@ -6297,7 +6358,7 @@ def test_rollback_preserves_uncommitted_edits_arriving_after_activation(
   _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
   path = platform / 'backend/app/foo.py'
 
-  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT, *, candidate_target=None):
+  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT):
     path.write_text("VALUE = 'arrived after activation'\n")
     return False, 'candidate rejected'
 
@@ -6362,17 +6423,17 @@ def test_checkout_rechecks_a_write_after_its_non_destructive_preflight(
   _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
   before = _served_sha(platform)
   path = platform / 'backend/app/foo.py'
-  original = pu._git
+  original = app_git.merge_trees_into_worktree
   edited = False
 
-  def edit_before_checkout(*args, **kwargs):
+  def edit_before_checkout(repo, *trees, **kwargs):
     nonlocal edited
-    if not edited and kwargs.get('repo') == platform and args[:3] == ('read-tree', '-m', '-u'):
+    if not edited and repo == platform and not kwargs.get("dry_run"):
       edited = True
       path.write_text("VALUE = 'newer than preflight'\n")
-    return original(*args, **kwargs)
+    return original(repo, *trees, **kwargs)
 
-  monkeypatch.setattr(pu, '_git', edit_before_checkout)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", edit_before_checkout)
   result = pu.reconcile_clone(platform)
   assert result.status == 'error'
   assert _served_sha(platform) == before
@@ -6387,22 +6448,22 @@ def test_reverse_checkout_success_does_not_clear_partial_source_marker(clone_env
   before = _served_sha(platform)
   tip = _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'candidate'\n"})
   _git(platform, 'fetch', '-q', 'origin')
-  original = pu._git
+  original = app_git.merge_trees_into_worktree
   forward = True
-  def half_written(*args, **kwargs):
+  def half_written(repo, *trees, **kwargs):
     nonlocal forward
-    if forward and kwargs.get('repo') == platform and args[:3] == ('read-tree', '-m', '-u'):
+    if forward and repo == platform and not kwargs.get("dry_run"):
       forward = False
       (platform / 'backend/app/foo.py').write_text("VALUE = 'candidate'\n")
       raise RuntimeError('interrupted before index write')
-    return original(*args, **kwargs)
-  monkeypatch.setattr(pu, '_git', half_written)
+    return original(repo, *trees, **kwargs)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", half_written)
   with pytest.raises(RuntimeError, match='interrupted'):
     pu._activate_candidate(platform, pu._local_branch(platform), before, tip)
   assert _served_sha(platform) == before
   assert (platform / 'backend/app/foo.py').read_text() == "VALUE = 'candidate'\n"
   assert pu.RECONCILE_PRE_FLAG.exists()
-  monkeypatch.setattr(pu, '_git', original)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original)
   receipt = pu.boot_guard_clean_served_tree(platform)
   saved = receipt.split(' saved_work=', 1)[1].split()[0]
   assert _git(platform, 'show', saved + ':backend/app/foo.py').stdout == "VALUE = 'candidate'\n"
@@ -6809,15 +6870,15 @@ def test_activation_preserves_late_ignored_file_and_directory_collisions(
 
     monkeypatch.setattr(pu, "_activate_candidate", write_then_activate)
   else:
-    git = pu._git
+    git = app_git.merge_trees_into_worktree
 
-    def write_after_native_preflight(*args, **kwargs):
-      proc = git(*args, **kwargs)
-      if kwargs.get("repo") == platform and args[:4] == ("read-tree", "-n", "-m", "-u"):
+    def write_after_native_preflight(repo, *trees, **kwargs):
+      proc = git(repo, *trees, **kwargs)
+      if repo == platform and kwargs.get("dry_run"):
         write_ignored_work()
       return proc
 
-    monkeypatch.setattr(pu, "_git", write_after_native_preflight)
+    monkeypatch.setattr(app_git, "merge_trees_into_worktree", write_after_native_preflight)
 
   result = pu.reconcile_clone(platform)
 
@@ -7626,41 +7687,3 @@ def test_failed_split_index_companion_capture_refuses_resolver_removal(clone_env
   assert resolver.exists()
   assert raw_path.read_bytes() == raw
   assert pu.RECONCILE_PRE_FLAG.exists()
-
-
-def test_forced_revert_refuses_detached_owner_history_before_journal_admission(clone_env):
-  origin, platform = clone_env
-  record = _prepare_package_update(platform, origin)
-  _boot_image(record["target"])
-  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
-  _git(platform, "checkout", "--detach", "HEAD")
-  _local_commit(platform, edits={"detached-owner.txt": "owner work\n"})
-  detached = _served_sha(platform)
-  index = (platform / ".git/index").read_bytes()
-  with pytest.raises(pu.BootTransactionError, match="HEAD changed"):
-    pu.revert_failed_update(platform)
-  assert _git(platform, "rev-parse", "HEAD").stdout.strip() == detached
-  assert pu._head_detached(platform)
-  assert (platform / ".git/index").read_bytes() == index
-  assert not pu.RECONCILE_PRE_FLAG.exists()
-  assert pu.read_prepared_update()["state"] == "swapped"
-
-
-@pytest.mark.parametrize("marker", ["journal", "{}", "[]"])
-def test_forced_revert_refuses_another_checkout_journal_without_overwriting_it(clone_env, marker):
-  origin, platform = clone_env
-  record = _prepare_package_update(platform, origin)
-  _boot_image(record["target"])
-  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
-  head = _served_sha(platform)
-  pu._write_reconcile_pre(head, head, saved_refs=["refs/mobius/other-owner"])
-  if marker != "journal":
-    pu.RECONCILE_PRE_FLAG.write_text(marker)
-  journal = pu.RECONCILE_PRE_FLAG.read_bytes()
-  index = (platform / ".git/index").read_bytes()
-  with pytest.raises(pu.BootTransactionError, match="Another checkout transaction"):
-    pu.revert_failed_update(platform)
-  assert pu.RECONCILE_PRE_FLAG.read_bytes() == journal
-  assert _served_sha(platform) == head
-  assert (platform / ".git/index").read_bytes() == index
-  assert pu.read_prepared_update()["state"] == "swapped"

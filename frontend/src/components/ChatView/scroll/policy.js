@@ -562,7 +562,8 @@ export function handoffNeedsPhysicalFreeze(scrollEl, mode, observedViewport) {
 
 /** A disclosure toggle obeys the existing reading mode instead of inventing a
  * second scroll policy. Current-response detail opened at the physical tail
- * stays in FOLLOW_BOTTOM; historical detail freezes the tapped header before
+ * stays in FOLLOW_BOTTOM; the current response is the whole active reply, whose
+ * live activity may be presented in an earlier row than the streaming one; historical detail freezes the tapped header before
  * it grows. Other modes always freeze their current anchor, and collapse
  * preserves the existing mode because it reveals no new reading surface. */
 export function modeForDisclosureToggle(
@@ -573,7 +574,7 @@ export function modeForDisclosureToggle(
   if (currentMode?.kind === 'FOLLOW_BOTTOM') {
     if (!nextOpen) return currentMode
     const opensLiveTail = isNearPhysicalBottom(scrollEl)
-      && !!target?.closest?.('[data-active-assistant="true"]')
+      && !!target?.closest?.('[data-current-response="true"]')
     if (opensLiveTail) return currentMode
     const disclosure = target?.closest?.(
       'button.chat__activity-header, button.chat__activity-think-toggle, button.chat__tool-header, button.chat__marker-header',

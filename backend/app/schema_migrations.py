@@ -7,6 +7,7 @@ obvious and prevents current schema work from disappearing into boot plumbing.
 """
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -1369,10 +1370,13 @@ def mapped_schema_gaps(eng) -> list[str]:
       gaps.append(f"{table.name} (missing table)")
       continue
     live = {column["name"] for column in inspector.get_columns(table.name)}
+    # `chats.messages` is the previous release's transcript column, kept as
+    # a derived mirror while it exists. The next release drops it; this
+    # release must still serve that database (transcript_rows.legacy_present).
     gaps.extend(
       f"{table.name}.{column.name}"
       for column in table.columns
-      if column.name not in live
+      if column.name not in live and not column.info.get("legacy_transcript")
     )
   return gaps
 
@@ -5822,6 +5826,411 @@ def _add_run_owner_input_at(eng) -> None:
       conn.execute(text("ALTER TABLE chat_runs ADD COLUMN owner_input_at DATETIME"))
 
 
+def _retire_quiet_write_sessions(eng) -> None:
+  """Never resume a provider session that may hold the quiet-write instruction.
+
+  The instruction rode on every turn from the moment the write journal was
+  added (0078) until this release, and a resumed session keeps its own
+  history, so the model keeps emitting frames nothing reads any more: raw text
+  in the reply and a lost save. Every session a run used in that window is
+  retired, and so is each chat's current session if the chat ran in it, which
+  also covers runs that died before recording their session (a missing link is
+  added already retired). A helper's
+  session pointer is cleared instead (shared-host helpers resume through it
+  rather than a session link), so its next follow-up gets the ordinary
+  no-replay refusal. Idempotent; chat history is untouched.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+  tables = set(sa_inspect(eng).get_table_names())
+  if "chat_session_links" not in tables:
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("chat_session_links")}
+  with eng.begin() as conn:
+    if "resume_retired_at" not in columns:
+      conn.execute(text("ALTER TABLE chat_session_links ADD COLUMN resume_retired_at DATETIME"))
+    if not {"schema_migrations", "chat_runs", "chats"} <= tables:
+      return
+    since = conn.execute(text(
+      "SELECT applied_at FROM schema_migrations WHERE version = '0078_agent_write_journal'"
+    )).scalar()
+    if since is None:
+      return  # This database never ran with the instruction.
+    window = "SELECT chat_id FROM chat_runs WHERE started_at >= :since"
+    conn.execute(text(f"""
+      UPDATE chat_session_links SET resume_retired_at = :now
+      WHERE resume_retired_at IS NULL AND (
+        session_id IN (
+          SELECT provider_session_id FROM chat_runs
+          WHERE started_at >= :since AND provider_session_id IS NOT NULL
+        )
+        OR session_id IN (
+          SELECT session_id FROM chats
+          WHERE session_id IS NOT NULL AND id IN ({window})
+        )
+      )
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    conn.execute(text(f"""
+      INSERT INTO chat_session_links
+        (provider, session_id, chat_id, first_seen_at, last_seen_at, resume_retired_at)
+      SELECT c.provider, c.session_id, MIN(c.id), :now, :now, :now FROM chats c
+      WHERE c.session_id IS NOT NULL AND c.provider IS NOT NULL AND c.provider <> ''
+        AND length(c.session_id) <= 128 AND c.id IN ({window})
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_session_links l WHERE l.session_id = c.session_id
+        )
+      GROUP BY c.provider, c.session_id
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    if "delegations" in tables:
+      conn.execute(text(f"""
+        UPDATE chats SET session_id = NULL
+        WHERE session_id IS NOT NULL
+          AND id IN (SELECT child_chat_id FROM delegations)
+          AND id IN ({window})
+      """), {"since": since})
+
+
+def _drop_agent_write_journal(eng) -> None:
+  """Retire the text-frame write journal; saves are ordinary tool calls."""
+  from sqlalchemy import inspect as sa_inspect, text
+  tables = set(sa_inspect(eng).get_table_names())
+  with eng.begin() as conn:
+    for table in ("agent_write_intents", "agent_write_streams"):
+      if table in tables:
+        conn.execute(text(f"DROP TABLE {table}"))
+
+
+def _add_app_shell_shortcuts(eng) -> None:
+  """Per-app opt-out from shell shortcuts; see ``models.App.shell_shortcuts``.
+
+  Existing apps default to true: shell shortcuts reach every app unless its
+  manifest declares otherwise, which the next apply records.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "shell_shortcuts" in columns:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE apps ADD COLUMN shell_shortcuts BOOLEAN "
+      "NOT NULL DEFAULT TRUE"
+    ))
+
+
+def _move_chat_media_out_of_generated(eng) -> None:
+  """Move old chat images from ``generated/`` to ``media/`` and relink them.
+
+  Chat images once lived in ``chats/<id>/generated/`` and transcripts linked
+  them as ``/api/chats/<id>/generated/<name>``. Current code writes and serves
+  only ``media/``. Finding the old links needs a ``LIKE`` over every stored
+  transcript, which no index can serve, so this runs once from the ledger
+  instead of at every boot.
+
+  Each step leaves a readable state if interrupted: copy into ``media/`` (the
+  old copy stays), commit the link rewrite, then delete the old copy. Name
+  collisions are checked before anything changes. A chat whose ``generated/``
+  file would replace a different ``media/`` file is left exactly as it was
+  and logged, so neither image is lost and boot is never blocked by it.
+  """
+  import filecmp
+  import logging
+  import shutil
+
+  from sqlalchemy import bindparam, inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chats" not in inspector.get_table_names():
+    return
+  columns = {column["name"] for column in inspector.get_columns("chats")}
+  transcripts = [
+    name for name in ("messages", "pending_messages") if name in columns
+  ]
+  if not transcripts:
+    return
+  chats_root = Path(os.environ.get("DATA_DIR", "/data")) / "chats"
+  legacy_link = "'%/api/chats/' || id || '/generated/%'"
+  with eng.connect() as conn:
+    chat_ids = set(conn.execute(text(
+      "SELECT id FROM chats WHERE " + " OR ".join(
+        f"CAST({name} AS TEXT) LIKE {legacy_link}" for name in transcripts
+      )
+    )).scalars())
+    # Orphaned directories without a chat row are left alone. ``os.path.isdir``
+    # never raises, so a chat folder that can be listed but not entered is
+    # skipped here and handled per chat below instead of stopping boot.
+    on_disk = sorted(
+      path.parent.name
+      for path in chats_root.glob("*/generated")
+      if os.path.isdir(path)
+    ) if os.path.isdir(chats_root) else []
+    for offset in range(0, len(on_disk), 500):
+      chat_ids.update(conn.execute(
+        text("SELECT id FROM chats WHERE id IN :ids").bindparams(
+          bindparam("ids", expanding=True),
+        ),
+        {"ids": on_disk[offset:offset + 500]},
+      ).scalars())
+
+  def old_files(chat_id: str) -> list[Path]:
+    old_dir = chats_root / chat_id / "generated"
+    # Never follow a symlink: copying its target into media/ would serve a
+    # file from outside the chat, which the media route otherwise refuses.
+    if old_dir.is_symlink() or not old_dir.is_dir():
+      return []
+    return [
+      source for source in old_dir.iterdir()
+      if source.is_file() and not source.is_symlink()
+    ]
+
+  def first_collision(sources: list[Path], media_dir: Path) -> str | None:
+    for source in sources:
+      destination = media_dir / source.name
+      if destination.exists() and (
+        not destination.is_file()
+        or not filecmp.cmp(source, destination, shallow=False)
+      ):
+        return source.name
+    return None
+
+  log = logging.getLogger(__name__)
+  for chat_id in sorted(chat_ids):
+    media_dir = chats_root / chat_id / "media"
+    # Any file error leaves this chat exactly as it was, like a collision:
+    # a one-time migration must never stop boot.
+    try:
+      sources = old_files(chat_id)
+      collision = first_collision(sources, media_dir)
+      if collision is not None:
+        log.warning(
+          "Left chat %s on legacy generated/ media: media/%s already exists "
+          "with different bytes",
+          chat_id, collision,
+        )
+        continue
+      for source in sources:
+        destination = media_dir / source.name
+        if destination.exists():
+          continue
+        media_dir.mkdir(parents=True, exist_ok=True)
+        # Copy under a temporary name so an interrupted copy never leaves a
+        # truncated file that a retry would mistake for a collision.
+        partial = media_dir / f".{source.name}.partial"
+        shutil.copy2(source, partial)
+        os.replace(partial, destination)
+    except OSError as error:
+      log.warning("Left chat %s on legacy generated/ media: %s", chat_id, error)
+      continue
+    # Bump updated_at only on chats whose links change: the browser reuses
+    # its cached copy of a chat while updated_at matches.
+    with eng.begin() as conn:
+      conn.execute(text(
+        "UPDATE chats SET " + ", ".join(
+          f"{name} = REPLACE({name}, :old, :new)" for name in transcripts
+        ) + ", updated_at = :now WHERE id = :chat_id AND (" + " OR ".join(
+          f"CAST({name} AS TEXT) LIKE :pattern" for name in transcripts
+        ) + ")"
+      ), {
+        "chat_id": chat_id,
+        "old": f"/api/chats/{chat_id}/generated/",
+        "new": f"/api/chats/{chat_id}/media/",
+        "pattern": f"%/api/chats/{chat_id}/generated/%",
+        "now": datetime.now(UTC).replace(tzinfo=None),
+      })
+    try:
+      for source in sources:
+        source.unlink()
+      old_dir = chats_root / chat_id / "generated"
+      if not old_dir.is_symlink() and old_dir.is_dir() and not any(old_dir.iterdir()):
+        old_dir.rmdir()
+    except OSError as error:
+      log.warning(
+        "Moved chat %s media but could not remove the old generated/ copy: %s",
+        chat_id, error,
+      )
+
+
+def _add_transcript_rows(eng, *, reconvert_all: bool = False) -> None:
+  """Install the schema half of per-message transcript storage.
+
+  This adds what the ORM does not own (creating the ORM-owned transcript
+  tables too when run without ``create_all``), idempotently and in one
+  transaction:
+
+  * search entries (titles at seq -1, prose rows) with their FTS5 index;
+  * triggers keeping those entries current for every writer, including the
+    previous release, and removing every transcript-derived row with its
+    chat (``chats_deleted``; the connection never enforces foreign keys);
+  * while the previous release's ``chats.messages`` exists,
+    ``chats_messages_written``, which clears a chat's conversion marker
+    (``models.ChatTranscriptState``) whenever any writer updates that column.
+    Existing chats start unconverted; transcript_rows converts them without
+    blocking boot.
+
+  ``reconvert_all`` (boot repair only, never the ledgered run) also clears
+  every conversion marker in the same transaction; see
+  ``ensure_transcript_triggers``.
+
+  The previous release ignores all of this: it adds no column to ``chats``,
+  and every trigger names only columns that release maps. SQLite only, the
+  shipped persistence runtime.
+  """
+  prose_flag = 32  # transcript_rows.PROSE when this migration was written
+  # Titles are stored stripped, as the previous search index stored them.
+  whitespace = "char(32, 9, 10, 11, 12, 13)"
+
+  if eng.dialect.name != "sqlite":
+    raise RuntimeError(
+      f"transcript rows require SQLite; unsupported database: {eng.dialect.name}"
+    )
+  prose_entry = (
+    "INSERT INTO chat_search_entries (chat_id, seq, ts, role, text) "
+    "SELECT NEW.chat_id, NEW.seq, "
+    "CASE WHEN json_type(NEW.ts) = 'integer' THEN CAST(NEW.ts AS INTEGER) END, "
+    f"NEW.role, json_extract(NEW.body, '$.content') WHERE NEW.flags & {prose_flag}; "
+  )
+  title_entry = (
+    "DELETE FROM chat_search_entries WHERE chat_id = NEW.id AND seq = -1; "
+    "INSERT INTO chat_search_entries (chat_id, seq, text) "
+    f"SELECT NEW.id, -1, trim(NEW.title, {whitespace}) "
+    f"WHERE coalesce(trim(NEW.title, {whitespace}), '') <> ''; "
+  )
+  with eng.begin() as conn:
+    tables = {row[0] for row in conn.exec_driver_sql(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )}
+    if "chats" not in tables:
+      return  # A partial schema without chats has no transcripts to own.
+    # create_all normally made these first (models.ChatMessage,
+    # ChatTranscriptState, ChatTranscriptDamage); the same DDL, frozen here,
+    # lets the migration stand alone.
+    for statement in (
+      "CREATE TABLE IF NOT EXISTS chat_messages (chat_id VARCHAR(64) NOT NULL, "
+      "seq INTEGER NOT NULL, message_key TEXT, message_id TEXT, client_id TEXT, "
+      "role TEXT, ts TEXT, flags INTEGER NOT NULL, body TEXT NOT NULL, "
+      "PRIMARY KEY (chat_id, seq), "
+      "FOREIGN KEY(chat_id) REFERENCES chats (id) ON DELETE CASCADE)",
+      "CREATE INDEX IF NOT EXISTS ix_chat_messages_message_key "
+      "ON chat_messages (chat_id, message_key)",
+      "CREATE INDEX IF NOT EXISTS ix_chat_messages_client_id "
+      "ON chat_messages (chat_id, client_id)",
+      "CREATE TABLE IF NOT EXISTS chat_transcript_state (chat_id VARCHAR(64) NOT NULL, "
+      "PRIMARY KEY (chat_id), "
+      "FOREIGN KEY(chat_id) REFERENCES chats (id) ON DELETE CASCADE)",
+      "CREATE TABLE IF NOT EXISTS chat_transcript_damage (id INTEGER NOT NULL, "
+      "chat_id VARCHAR(64) NOT NULL, raw BLOB NOT NULL, error TEXT NOT NULL, "
+      "recorded_at DATETIME NOT NULL, PRIMARY KEY (id), "
+      "FOREIGN KEY(chat_id) REFERENCES chats (id) ON DELETE CASCADE)",
+      "CREATE INDEX IF NOT EXISTS ix_chat_transcript_damage_chat_id "
+      "ON chat_transcript_damage (chat_id)",
+    ):
+      conn.exec_driver_sql(statement)
+    columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(chats)")}
+    legacy = "messages" in columns
+    statements = [
+      "CREATE TABLE IF NOT EXISTS chat_search_entries ("
+      "id INTEGER PRIMARY KEY, chat_id VARCHAR(64) NOT NULL, seq INTEGER NOT NULL, "
+      "ts BIGINT, role TEXT, text TEXT NOT NULL)",
+      "CREATE UNIQUE INDEX IF NOT EXISTS ix_chat_search_entries_position "
+      "ON chat_search_entries (chat_id, seq)",
+      "CREATE VIRTUAL TABLE IF NOT EXISTS chat_search_entries_fts USING fts5("
+      "text, content='chat_search_entries', content_rowid='id', "
+      "tokenize='unicode61 remove_diacritics 2')",
+      "CREATE TRIGGER IF NOT EXISTS chat_search_entries_ai AFTER INSERT ON chat_search_entries "
+      "BEGIN INSERT INTO chat_search_entries_fts(rowid, text) VALUES (NEW.id, NEW.text); END",
+      "CREATE TRIGGER IF NOT EXISTS chat_search_entries_ad AFTER DELETE ON chat_search_entries "
+      "BEGIN INSERT INTO chat_search_entries_fts(chat_search_entries_fts, rowid, text) "
+      "VALUES ('delete', OLD.id, OLD.text); END",
+      "CREATE TRIGGER IF NOT EXISTS chat_messages_ai AFTER INSERT ON chat_messages "
+      f"BEGIN {prose_entry}END",
+      "CREATE TRIGGER IF NOT EXISTS chat_messages_ad AFTER DELETE ON chat_messages "
+      "BEGIN DELETE FROM chat_search_entries WHERE chat_id = OLD.chat_id AND seq = OLD.seq; END",
+      "CREATE TRIGGER IF NOT EXISTS chat_messages_au AFTER UPDATE ON chat_messages "
+      "BEGIN DELETE FROM chat_search_entries WHERE chat_id = OLD.chat_id AND seq = OLD.seq; "
+      f"{prose_entry}END",
+      "CREATE TRIGGER IF NOT EXISTS chats_title_ai AFTER INSERT ON chats "
+      f"BEGIN {title_entry}END",
+      "CREATE TRIGGER IF NOT EXISTS chats_title_au AFTER UPDATE OF title ON chats "
+      f"BEGIN {title_entry}END",
+    ]
+    if legacy:
+      statements += [
+        "CREATE TRIGGER IF NOT EXISTS chats_messages_written "
+        "AFTER UPDATE OF messages ON chats "
+        "BEGIN DELETE FROM chat_transcript_state WHERE chat_id = NEW.id; END",
+      ]
+    deleted = (
+      "DELETE FROM chat_messages WHERE chat_id = OLD.id; "
+      "DELETE FROM chat_search_entries WHERE chat_id = OLD.id; "
+      "DELETE FROM chat_transcript_damage WHERE chat_id = OLD.id; "
+      + "".join(
+        # The previous release's own search index: hard-deleted prose must
+        # not outlive its chat there either.
+        f"DELETE FROM {table} WHERE chat_id = OLD.id; "
+        for table in ("chat_search_docs", "chat_search_state") if table in tables
+      )
+      + "DELETE FROM chat_transcript_state WHERE chat_id = OLD.id; "
+    )
+    statements.append(
+      f"CREATE TRIGGER IF NOT EXISTS chats_deleted AFTER DELETE ON chats BEGIN {deleted}END"
+    )
+    for statement in statements:
+      conn.exec_driver_sql(statement)
+    if reconvert_all and legacy:
+      # Writes made while chats_messages_written was missing left their
+      # markers behind; chats.messages is exact in every case (this
+      # release's mirror or the previous release's newer write).
+      conn.exec_driver_sql("DELETE FROM chat_transcript_state")
+    # Titles are read from before the legacy column, so this never reads a
+    # transcript; prose entries arrive as each chat converts.
+    conn.exec_driver_sql(
+      "INSERT OR IGNORE INTO chat_search_entries (chat_id, seq, text) "
+      f"SELECT id, -1, trim(title, {whitespace}) FROM chats "
+      f"WHERE coalesce(trim(title, {whitespace}), '') <> ''"
+    )
+
+
+# Triggers that keep transcript-derived data and the previous release's
+# change detection correct. Losing one (a later table rebuild drops a table's
+# triggers) would silently stop detecting the previous release's writes.
+TRANSCRIPT_TRIGGERS = (
+  "chats_messages_written", "chats_deleted", "chats_title_ai", "chats_title_au",
+  "chat_messages_ai", "chat_messages_ad", "chat_messages_au",
+  "chat_search_entries_ai", "chat_search_entries_ad",
+)
+
+
+def ensure_transcript_triggers(eng) -> list[str]:
+  """Reinstall missing transcript triggers from 0086's frozen DDL; boot-time.
+
+  The ledger never reruns 0086, so this one-``sqlite_master``-read check is
+  what keeps the triggers present while the previous release's column
+  exists. Returns the names it found missing (normally none).
+  """
+  from sqlalchemy import inspect as sa_inspect
+
+  if eng.dialect.name != "sqlite" or "chats" not in sa_inspect(eng).get_table_names():
+    return []
+  with eng.connect() as conn:
+    if "messages" not in {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(chats)")}:
+      return []
+    present = {row[0] for row in conn.exec_driver_sql(
+      "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )}
+  missing = [name for name in TRANSCRIPT_TRIGGERS if name not in present]
+  if missing:
+    detection_lost = "chats_messages_written" in missing
+    logging.getLogger(__name__).warning(
+      "reinstalling missing transcript triggers: %s%s", ", ".join(missing),
+      "; every chat will be re-converted from chats.messages, because the "
+      "previous release's writes went undetected while it was missing"
+      if detection_lost else "",
+    )
+    _add_transcript_rows(eng, reconvert_all=detection_lost)
+  return missing
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5917,13 +6326,14 @@ _SCHEMA_MIGRATIONS = (
   ("0081_browser_account_grants", _add_browser_account_grants),
   ("0081_goal_hold", _add_goal_hold),
   ("0082_run_owner_input_at", _add_run_owner_input_at),
+  ("0082_drop_agent_write_journal", _drop_agent_write_journal),
+  # Window-based, so it needs no journal. A new ID (not an edited 0082) so
+  # databases that ran an earlier, journal-based draft also run this once.
+  ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
+  ("0084_chat_media_directory", _move_chat_media_out_of_generated),
+  ("0085_app_shell_shortcuts", _add_app_shell_shortcuts),
+  ("0086_transcript_rows", _add_transcript_rows),
 )
-
-
-# Concrete transcript storage owns its data-moving conversion outside this
-# ledger. Subsequent ledger entries must preserve its tables and archive.
-ONE_WAY_BASELINE_MIGRATION = "0078_agent_write_journal"
-MIGRATION_WRITES: dict[str, tuple[str, ...]] = {}
 
 
 def schema_migration_history(eng) -> list[dict]:

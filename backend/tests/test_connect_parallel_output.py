@@ -44,7 +44,6 @@ def _paired_host(
   host["runner_protocol"] = connect_runner.RUNNER_PROTOCOL_VERSION
   host["runner_release"] = connect_runner.RUNNER_RELEASE
   host["runner_capabilities"] = list(capabilities)
-  host["runner_transport"] = "sse"
   connect_routes._save_host(host)
   channel = connect_routes._Channel()
   connect_routes._channels[pairing["id"]] = channel
@@ -75,7 +74,7 @@ def _post_output(host_id, request_id, chunks):
   connect_routes.connect_output.append(
     host_id, request_id, [chunk.model_dump() for chunk in chunks],
   )
-  command.output.notify()
+  command.notify()
 
 
 @pytest.mark.asyncio
@@ -210,10 +209,10 @@ async def test_missing_output_stays_visible_as_a_sequence_jump(client, auth):
 
 
 def test_live_output_notification_keeps_no_duplicate_chunks():
-  log = connect_routes._OutputLog()
-  log.notify()
-  assert not hasattr(log, "chunks")
-  assert not hasattr(log, "read")
+  command = connect_routes._ActiveCommand("a" * 16, 60, cmd="true")
+  command.notify()
+  assert not hasattr(command, "chunks")
+  assert not hasattr(command, "output")
 
 
 @pytest.mark.asyncio
@@ -246,7 +245,7 @@ async def test_reconnect_reconciles_every_command_the_runner_reports(
 
   replacement = connect_routes._Channel()
   connect_routes._replace_channel(host_id, replacement)
-  await connect_routes._reconcile_runner(host_id, replacement, {
+  connect_routes._reconcile_runner(host_id, {
     "active_request_ids": ["6" * 16, "8" * 16],
     "pending_result_ids": [],
   })
@@ -257,24 +256,6 @@ async def test_reconnect_reconciles_every_command_the_runner_reports(
   assert recent["result"]["outcome"] == "lost"
   # Work Möbius no longer tracks has no caller, so the runner is told to stop.
   assert await replacement.queue.get() == {"type": "cancel", "request_id": "8" * 16}
-
-
-@pytest.mark.asyncio
-async def test_single_legacy_active_command_record_is_restored(client, auth):
-  host_id, _channel = _paired_host(client, auth)
-  host = connect_routes._load_host(host_id)
-  host.pop("active_commands", None)
-  host["active_command"] = {
-    "id": "9" * 16, "timeout": 60, "created_at": time.time(),
-    "started_at": time.time(), "state": "running", "fingerprint": "x",
-  }
-  connect_routes._save_host(host)
-
-  assert list(connect_routes._host_commands(host_id)) == ["9" * 16]
-  connect_routes._persist_commands(host_id)
-  saved = connect_routes._load_host(host_id)
-  assert "active_command" not in saved
-  assert [record["id"] for record in saved["active_commands"]] == ["9" * 16]
 
 
 def test_command_label_is_the_first_line_and_never_persists():
@@ -407,7 +388,7 @@ def test_runner_sends_no_live_output_to_a_server_that_did_not_offer_it(
 def test_heavy_output_cannot_starve_the_time_limit(monkeypatch):
   queued = threading.Event()
 
-  def slow_post(url, payload, token=None, timeout=30):
+  def slow_post(url, payload, token=None, timeout=30, context=None):
     if url.endswith("/output"):
       time.sleep(0.05)
     if url.endswith("/output"):
@@ -432,8 +413,9 @@ def test_heavy_output_cannot_starve_the_time_limit(monkeypatch):
   assert result["exit_code"] == 124
   assert runner.active == {}
   # This test deliberately disables delivery; it owns the retained scratch.
-  for record in runner.pending_outputs.values():
-    record["output"].close()
+  for command in runner.outbox:
+    if command.output is not None:
+      command.output.close()
 
 
 def test_hello_enables_live_output_and_survives_reconnects(monkeypatch):
@@ -494,23 +476,6 @@ async def test_older_app_clients_still_see_and_stop_one_command(client, auth):
   public = connect_routes._public_host(connect_routes._load_host(host_id))
   assert public["active_command"]["id"] == "d" * 16
   assert len(public["active_commands"]) == 2
-
-
-def test_result_finished_before_upgrade_still_answers_a_retry(client, auth):
-  host_id, _channel = _paired_host(client, auth)
-  host = connect_routes._load_host(host_id)
-  host.pop("recent_commands", None)
-  host["last_command"] = {
-    "id": "f" * 16, "fingerprint": "abc", "finished_at": time.time(),
-    "result": {"request_id": "f" * 16, "exit_code": 0},
-  }
-  connect_routes._save_host(host)
-
-  connect_routes._prune_recent_commands(connect_routes._load_host(host_id))
-
-  saved = connect_routes._load_host(host_id)
-  assert "last_command" not in saved
-  assert saved["recent_commands"]["f" * 16]["fingerprint"] == "abc"
 
 
 def test_cached_runner_identity_still_honours_revocation(client, auth):

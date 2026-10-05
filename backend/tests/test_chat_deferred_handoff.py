@@ -1,6 +1,7 @@
 """Read-side compact hold status never supplies lifecycle authority."""
 from datetime import UTC, datetime, timedelta
 
+from app.chat_writer import create_chat
 import pytest
 from sqlalchemy import event
 
@@ -95,7 +96,7 @@ def test_non_deliberate_or_unpresented_hold_is_not_chat_deferral(client, auth, d
 def test_batch_projection_is_one_scalar_select_without_transcript_or_plan(db, chat):
   goal = seed(db, chat)
   for i in range(8):
-    other = models.Chat(id=f"batch-{i}", title="Batch")
+    other = create_chat(id=f"batch-{i}", title="Batch")
     db.add(other)
     db.flush()
     seed(db, other)

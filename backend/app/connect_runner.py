@@ -64,7 +64,7 @@ RUNNER_PROTOCOL_VERSION = 4
 # Increment this for every shipped runner change that an existing installation
 # should receive. Protocol only describes wire compatibility; compatible
 # releases can keep using the same protocol while still offering an update.
-RUNNER_RELEASE = 6
+RUNNER_RELEASE = 7
 # What this runner can do, announced on every stream. Möbius gates behavior on
 # these names, never on release numbers: independently maintained copies of
 # this runner can reach the same release number with different abilities.
@@ -274,14 +274,14 @@ def _remove_connection(url, host_id):
     return len(conns)
 
 
-def _post(url, payload, token=None, timeout=30):
+def _post(url, payload, token=None, timeout=30, *, context=None):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
-        with _open_url(req, timeout=timeout) as resp:
+        with _open_url(req, timeout=timeout, context=context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except http.client.HTTPException as exc:
         raise urllib.error.URLError(exc) from exc
@@ -585,12 +585,18 @@ def _script_input(script, *, is_windows=None):
 
 
 def _spawn_command(cmd, cwd, *, script=None, shell=None, before_spawn=None):
-    """Start one command with binary pipes so output can stream as it arrives."""
+    """Start one command with binary pipes so output can stream as it arrives.
+
+    Returns the process and the private script file an oversized inline
+    command runs from (None otherwise); the caller removes that file when the
+    command is over.
+    """
     popen_args = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "cwd": (cwd or None),
     }
+    path = None
     if script is not None:
         if cmd is not None:
             raise ValueError("runner received both cmd and script")
@@ -617,7 +623,6 @@ def _spawn_command(cmd, cwd, *, script=None, shell=None, before_spawn=None):
                 os.unlink(path)
                 raise
         else:
-            path = None
             popen_args["shell"] = True
             command = cmd
     if os.name == "nt":
@@ -631,12 +636,10 @@ def _spawn_command(cmd, cwd, *, script=None, shell=None, before_spawn=None):
             before_spawn()
         proc = subprocess.Popen(command, **popen_args)
     except BaseException:
-        if script is None and path is not None:
+        if path is not None:
             os.unlink(path)
         raise
-    if script is None and path is not None:
-        proc._mobius_command_file = path
-    return proc
+    return proc, path
 
 
 class _StartRefused(Exception):
@@ -921,22 +924,44 @@ def _supervise_process(proc, output, *, timeout, stdin_text=None,
     return ended_by if ended_by is not None else stop_reason()
 
 
+class _Command:
+    """One accepted command, from its reservation until its result is delivered."""
+
+    def __init__(self, request_id, timeout):
+        self.request_id = request_id
+        self.timeout = timeout
+        self.proc = None
+        # The private script file an oversized inline command runs from.
+        self.command_file = None
+        self.stdin_text = None
+        # Live output; once finished, only output that still has chunks to
+        # deliver before the result is kept here.
+        self.output = None
+        # Why the runner is stopping it ("canceled" or "disconnect").
+        self.stop_reason = None
+        # The final result message, retained until the server accepts it.
+        self.result = None
+
+
 class _CommandRunner:
-    """Own this connection's commands and retain lifecycle messages.
+    """Own this connection's commands and retain their final results.
 
     Commands run independently: each has its own request id, time limit,
     output, and cancellation. Nothing queues — a command starts at once or
     reports why it could not.
     """
 
-    def __init__(self, base, token):
+    def __init__(self, base, token, *, context=None):
         self.base = base
         self.token = token
+        # This connection's verified TLS context. A fresh default context
+        # reloads the system trust store, so command POSTs share this one.
+        self.context = context
         self.lock = threading.Lock()
         self.flush_lock = threading.Lock()
         self.active = {}
+        # Finished commands whose result the server has not accepted yet.
         self.outbox = deque()
-        self.pending_outputs = {}
         self.reconcile_requested = False
         # Turned on by the server's stream hello and kept across reconnects,
         # so output buffered during an outage is still delivered. Older
@@ -951,26 +976,18 @@ class _CommandRunner:
 
     def pending_messages(self):
         with self.lock:
-            return list(self.outbox)
+            return [command.result for command in self.outbox]
 
-    def acknowledge_message(self, message):
-        record = None
+    def _acknowledge(self, command):
         with self.lock:
-            for index, pending in enumerate(self.outbox):
-                if pending is message:
-                    del self.outbox[index]
-                    record = self.pending_outputs.pop(message.get("request_id"), None)
-                    break
-        if record is not None:
-            record["output"].close()
+            self.outbox.remove(command)
+        if command.output is not None:
+            command.output.close()
 
     def snapshot(self):
         with self.lock:
             active_ids = sorted(self.active)
-            pending = [
-                message.get("request_id") for message in self.outbox
-                if message.get("type") == "result" and message.get("request_id")
-            ]
+            pending = [command.request_id for command in self.outbox]
         return active_ids, pending
 
     def take_reconcile_request(self):
@@ -983,27 +1000,29 @@ class _CommandRunner:
     def flush_pending_results(self):
         """Retry retained results without holding the subprocess-state lock."""
         with self.flush_lock:
-            for message in self.pending_messages():
-                record = self.pending_outputs.get(message.get("request_id"))
-                if record is not None:
+            with self.lock:
+                pending = list(self.outbox)
+            for command in pending:
+                message = command.result
+                output = command.output
+                if output is not None:
                     try:
-                        if not self.flush_output(record, drain=True):
-                            if record["output"].output_error is None:
+                        if not self.flush_output(command, drain=True):
+                            if output.output_error is None:
                                 return False
                     except Exception as exc:
-                        record["output"].output_error = (
-                            "live output drain failed: %s" % exc
-                        )
-                    if record["output"].output_error is not None:
+                        output.output_error = "live output drain failed: %s" % exc
+                    if output.output_error is not None:
+                        # Never advertise output the server did not receive.
                         message.pop("output_seq", None)
-                        message["output_error"] = record["output"].output_error[:1024]
-                        record["output"].discard_pending()
-                        self.pending_outputs.pop(message.get("request_id"), None)
-                        record["output"].close()
+                        message["output_error"] = output.output_error[:1024]
+                        output.discard_pending()
+                        command.output = None
+                        output.close()
                 try:
                     _post(
                         self.base + "/api/connect/result", message,
-                        token=self.token,
+                        token=self.token, context=self.context,
                     )
                 except urllib.error.HTTPError as exc:
                     # A 4xx means the server refuses this exact payload, so an
@@ -1014,9 +1033,9 @@ class _CommandRunner:
                     if 400 <= exc.code < 500 and exc.code not in (408, 425, 429):
                         print(
                             "dropping unreportable result for %s: %s"
-                            % (message.get("request_id"), exc)
+                            % (command.request_id, exc)
                         )
-                        self.acknowledge_message(message)
+                        self._acknowledge(command)
                         # The server still owns the corresponding command.
                         # Reconnect without this pending id so its existing
                         # reconciliation path can finalize that command as
@@ -1026,20 +1045,19 @@ class _CommandRunner:
                         continue
                     print("failed to report result: %s" % exc)
                     return False
-                except (urllib.error.URLError, http.client.HTTPException,
-                        OSError, ValueError) as exc:
+                except (urllib.error.URLError, OSError, ValueError) as exc:
                     print("failed to report result: %s" % exc)
                     return False
-                self.acknowledge_message(message)
+                self._acknowledge(command)
         return True
 
-    def flush_output(self, record, drain=False):
+    def flush_output(self, command, drain=False):
         """Deliver pending live chunks: one batch per call unless draining.
 
         One batch per watch-loop tick keeps a fast-printing command from
         starving its own time-limit and cancel checks. False means retry later.
         """
-        output = record["output"]
+        output = command.output
         while True:
             if output.output_error is not None:
                 return False
@@ -1051,17 +1069,17 @@ class _CommandRunner:
                 return True
             try:
                 response = _post(self.base + "/api/connect/output", {
-                    "request_id": record["request_id"],
+                    "request_id": command.request_id,
                     "chunks": batch,
-                }, token=self.token, timeout=_OUTPUT_POST_TIMEOUT_SECONDS)
+                }, token=self.token, timeout=_OUTPUT_POST_TIMEOUT_SECONDS,
+                    context=self.context)
             except urllib.error.HTTPError as exc:
                 if 400 <= exc.code < 500 and exc.code not in (408, 425, 429):
                     # Rejection is not acknowledgement. Keep the known
                     # execution outcome, but never advertise complete output.
                     output.output_error = "live output upload rejected: HTTP %s" % exc.code
                 return False
-            except (urllib.error.URLError, http.client.HTTPException,
-                    OSError, ValueError):
+            except (urllib.error.URLError, OSError, ValueError):
                 return False
             # The server's durable cursor, not our attempted last chunk, is
             # authoritative when a previous response was lost after commit.
@@ -1079,14 +1097,14 @@ class _CommandRunner:
                 return True
 
     def _post_result(
-        self, request_id, stdout, stderr, exit_code, outcome, record=None,
+        self, command, stdout, stderr, exit_code, outcome,
         truncated=False, output_seq=None, output_error=None,
     ):
         stdout, stdout_truncated = _cap_output(stdout)
         stderr, stderr_truncated = _cap_output(stderr)
         message = {
             "type": "result",
-            "request_id": request_id,
+            "request_id": command.request_id,
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code,
@@ -1104,16 +1122,18 @@ class _CommandRunner:
         # Releasing the active command and retaining its result must be one
         # atomic state transition. Otherwise a reconnect can observe neither
         # and tell the server that successfully completed work was lost.
+        output = command.output
         with self.lock:
-            self.outbox.append(message)
-            output = record.get("output") if record is not None else None
-            retain_output = (output is not None and output.output_error is None
-                             and output.has_pending())
-            if retain_output:
-                self.pending_outputs[request_id] = record
-            if record is not None and self.active.get(request_id) is record:
-                del self.active[request_id]
-        if output is not None and not retain_output:
+            if output is not None and (
+                output.output_error is not None or not output.has_pending()
+            ):
+                # Nothing left to deliver before the result.
+                command.output = None
+            command.result = message
+            self.outbox.append(command)
+            if self.active.get(command.request_id) is command:
+                del self.active[command.request_id]
+        if output is not None and command.output is None:
             output.close()
         self._wake_result_worker()
 
@@ -1146,7 +1166,7 @@ class _CommandRunner:
         try:
             _post(self.base + "/api/connect/state", {
                 "request_id": request_id, "state": "started",
-            }, token=self.token)
+            }, token=self.token, context=self.context)
         except urllib.error.HTTPError as exc:
             # A runner can be upgraded before its server. Protocol v1 has no
             # start endpoint but still accepts this runner's final result.
@@ -1162,106 +1182,88 @@ class _CommandRunner:
                 if expiry <= now:
                     del self.recent_request_ids[old_id]
             if (request_id in self.active
-                    or any(m.get("request_id") == request_id for m in self.outbox)
+                    or any(c.request_id == request_id for c in self.outbox)
                     or request_id in self.recent_request_ids):
                 return
             self.recent_request_ids[request_id] = max(not_after, now + 3600)
-            record = {
-                "request_id": request_id, "proc": None, "reason": None,
-                "timeout": max(1, int(evt.get("timeout", 60))),
-                "input": None, "output": None,
-            }
-            self.active[request_id] = record
+            command = _Command(request_id, max(1, int(evt.get("timeout", 60))))
+            self.active[request_id] = command
+        # Its own thread from here on: the stream reader never waits for the
+        # start acknowledgement, the launch, or the command itself.
         try:
             threading.Thread(
-                target=self._start_reserved, args=(evt, record, not_after),
-                daemon=True, name="mobius-connect-start",
+                target=self._run, args=(evt, command, not_after),
+                daemon=True, name="mobius-connect-command",
             ).start()
         except RuntimeError as exc:
-            self._post_result(request_id, "", "runner error: %s" % exc,
-                              1, "lost", record=record)
+            self._post_result(command, "", "runner error: %s" % exc, 1, "lost")
 
-    def _start_reserved(self, evt, record, not_after):
-        request_id = record["request_id"]
+    def _run(self, evt, command, not_after):
         if not_after and time.time() > not_after:
-            self._post_result(request_id, "", "command expired before it could start",
-                              124, "expired", record=record)
+            self._post_result(command, "", "command expired before it could start",
+                              124, "expired")
             return
 
         try:
-            record["output"] = _CommandOutput()
-            self._post_started(request_id)
+            command.output = _CommandOutput()
+            self._post_started(command.request_id)
             script = evt.get("script")
             if script is not None:
-                record["input"] = _script_input(script)
+                command.stdin_text = _script_input(script)
 
             def before_spawn():
                 # Do not hold the lifecycle lock across file preparation or
                 # Popen: another request's deadline and cancel must progress.
                 with self.lock:
-                    if record["reason"] is not None:
+                    if command.stop_reason is not None:
                         raise _StartRefused("canceled")
                     if not_after and time.time() > not_after:
                         raise _StartRefused("expired")
 
             if script is not None:
-                proc = _spawn_command(
+                proc, command_file = _spawn_command(
                     None, evt.get("cwd"), script=script,
                     shell=evt.get("shell"), before_spawn=before_spawn,
                 )
             else:
-                proc = _spawn_command(
+                proc, command_file = _spawn_command(
                     evt.get("cmd", ""), evt.get("cwd"),
                     before_spawn=before_spawn,
                 )
             with self.lock:
-                # A cancel during Popen is retained in reason; _wait observes
-                # it as soon as the new process is available.
-                record["proc"] = proc
+                # A cancel during Popen is retained in stop_reason; _wait
+                # observes it as soon as the new process is available.
+                command.proc = proc
+                command.command_file = command_file
         except _StartRefused as refusal:
             expired = refusal.outcome == "expired"
             self._post_result(
-                request_id, "", "command expired before it could start" if expired
+                command, "", "command expired before it could start" if expired
                 else "command canceled before it could start",
-                124 if expired else 130, refusal.outcome, record=record,
+                124 if expired else 130, refusal.outcome,
             )
             return
         except Exception as exc:  # noqa: BLE001 - report the spawn boundary
-            self._post_result(
-                request_id, "", "runner error: %s" % exc, 1, "completed",
-                record=record,
-            )
+            self._post_result(command, "", "runner error: %s" % exc, 1, "completed")
             return
+        self._wait(command)
 
-        try:
-            threading.Thread(
-                target=self._wait, args=(record,), daemon=True,
-                name="mobius-connect-command",
-            ).start()
-        except RuntimeError as exc:
-            _terminate_process_tree(proc)
-            path = getattr(proc, "_mobius_command_file", None)
-            if path is not None:
-                os.unlink(path)
-            self._post_result(request_id, "", "runner error: %s" % exc,
-                              1, "lost", record=record)
-
-    def _wait(self, record):
-        proc = record["proc"]
-        output = record["output"]
+    def _wait(self, command):
+        proc = command.proc
+        output = command.output
 
         def stop_reason():
             with self.lock:
-                return record["reason"]
+                return command.stop_reason
 
         try:
             ended_by = _supervise_process(
                 proc,
                 output,
-                timeout=record["timeout"],
-                stdin_text=record["input"],
+                timeout=command.timeout,
+                stdin_text=command.stdin_text,
                 stop_reason=stop_reason,
-                on_tick=lambda: self.flush_output(record),
+                on_tick=lambda: self.flush_output(command),
             )
             error = None
         except Exception as exc:  # noqa: BLE001 - preserve a final result
@@ -1279,7 +1281,7 @@ class _CommandRunner:
             stderr = (stderr + "\n" if stderr else "") + error
         if ended_by == "timed_out":
             outcome, exit_code = "timed_out", 124
-            stderr = stderr or "command timed out after %ss" % record["timeout"]
+            stderr = stderr or "command timed out after %ss" % command.timeout
         elif ended_by is not None:
             outcome, exit_code = "canceled", 130
             stderr = stderr or "command canceled"
@@ -1287,16 +1289,15 @@ class _CommandRunner:
             outcome, exit_code = "completed", proc.returncode
         try:
             self._post_result(
-                record["request_id"], stdout, stderr, exit_code, outcome,
-                record=record, truncated=truncated,
+                command, stdout, stderr, exit_code, outcome,
+                truncated=truncated,
                 output_seq=None if output.output_error else output.next_seq,
                 output_error=output.output_error,
             )
         finally:
-            path = getattr(proc, "_mobius_command_file", None)
-            if path is not None:
+            if command.command_file is not None:
                 try:
-                    os.unlink(path)
+                    os.unlink(command.command_file)
                 except FileNotFoundError:
                     pass
 
@@ -1304,16 +1305,47 @@ class _CommandRunner:
         """Stop one command, or every command when request_id is None."""
         with self.lock:
             if request_id is None:
-                records = list(self.active.values())
+                commands = list(self.active.values())
             else:
-                record = self.active.get(request_id)
-                records = [record] if record is not None else []
-            for record in records:
-                if record["reason"] is None:
-                    record["reason"] = reason
+                command = self.active.get(request_id)
+                commands = [command] if command is not None else []
+            for command in commands:
+                if command.stop_reason is None:
+                    command.stop_reason = reason
         # The watch loop observes the marked reason within one tick and kills
         # the process tree. Never make the control reader wait for that kill.
-        return bool(records)
+        return bool(commands)
+
+
+def _handle_disconnect(conn, base, token, commands, request_id):
+    """Stop this instance's commands, forget its connection, and confirm it."""
+    commands.cancel(None, "disconnect")
+    # Drop only this instance's connection. The shared runner keeps serving
+    # any others; it uninstalls the whole service only when the last
+    # connection is gone.
+    try:
+        remaining = _remove_connection(conn.get("url"), conn.get("host_id"))
+        if remaining == 0:
+            _uninstall_service(stop_running=False)
+            stdout = "Connect daemon removed."
+        else:
+            stdout = "Disconnected from %s." % base
+        payload = {
+            "request_id": request_id, "stdout": stdout,
+            "stderr": "", "exit_code": 0,
+        }
+    except Exception as exc:  # local cleanup failure
+        payload = {
+            "request_id": request_id, "stdout": "",
+            "stderr": str(exc), "exit_code": 1,
+        }
+    try:
+        _post(
+            base + "/api/connect/result", payload,
+            token=token, context=commands.context,
+        )
+    except urllib.error.URLError as exc:
+        print("failed to report disconnect: %s" % exc)
 
 
 def _serve_connection(conn, stop_event=None):
@@ -1321,13 +1353,22 @@ def _serve_connection(conn, stop_event=None):
     token = conn["token"]
     ctx = ssl.create_default_context()
     plat = "%s %s" % (platform.system(), platform.release())
-    commands = _CommandRunner(base, token)
+    commands = _CommandRunner(base, token, context=ctx)
     backoff = 1
+    # Only a stream opened during the current attempt can establish health. Do
+    # not let a healthy prior stream make a new handshake failure look
+    # healthy when the transport raises before the next response opens.
+    stream_opened_at = None
+
+    def healthy():
+        """The current stream stayed open past one heartbeat interval."""
+        return (
+            stream_opened_at is not None
+            and time.monotonic() - stream_opened_at >= STREAM_HEALTHY_SECONDS
+        )
+
     print("Connecting to %s ..." % base)
     while True:
-        # Only a stream opened during this attempt can establish health. Do
-        # not let a healthy prior stream make a new handshake failure look
-        # healthy when the transport raises before the next response opens.
         stream_opened_at = None
         # A connection removed from config (or a shutting-down supervisor) sets
         # this event; stop retrying and let this thread exit.
@@ -1365,14 +1406,6 @@ def _serve_connection(conn, stop_event=None):
                     print("reconnecting to reconcile a rejected result")
                     continue
                 for raw in stream:
-                    if (
-                        time.monotonic() - stream_opened_at
-                        >= STREAM_HEALTHY_SECONDS
-                    ):
-                        # A heartbeat proves the stream survived its health
-                        # window. Clear any failures accumulated before it so
-                        # a later transport loss starts with the short retry.
-                        backoff = 1
                     # Heartbeat comments make this retry path run even while
                     # the host has no new commands.
                     if commands.take_reconcile_request():
@@ -1389,59 +1422,22 @@ def _serve_connection(conn, stop_event=None):
                         continue
                     if evt.get("type") == "hello":
                         commands.live_output = bool(evt.get("live_output"))
-                        continue
-                    if evt.get("type") == "cancel":
+                    elif evt.get("type") == "cancel":
                         commands.cancel(evt.get("request_id"))
-                        continue
-                    if evt.get("type") == "disconnect":
-                        commands.cancel(None, "disconnect")
-                        # Drop only this instance's connection. The shared
-                        # runner keeps serving any others; it uninstalls the
-                        # whole service only when the last connection is gone.
-                        try:
-                            remaining = _remove_connection(
-                                conn.get("url"), conn.get("host_id"),
-                            )
-                            if remaining == 0:
-                                _uninstall_service(stop_running=False)
-                                stdout = "Connect daemon removed."
-                            else:
-                                stdout = "Disconnected from %s." % base
-                            payload = {
-                                "request_id": evt.get("request_id"),
-                                "stdout": stdout,
-                                "stderr": "", "exit_code": 0,
-                            }
-                        except Exception as exc:  # local cleanup failure
-                            payload = {
-                                "request_id": evt.get("request_id"),
-                                "stdout": "", "stderr": str(exc),
-                                "exit_code": 1,
-                            }
-                        try:
-                            _post(
-                                base + "/api/connect/result", payload,
-                                token=token,
-                            )
-                        except (
-                            urllib.error.URLError,
-                            urllib.error.HTTPError,
-                        ) as exc:
-                            print("failed to report disconnect: %s" % exc)
+                    elif evt.get("type") == "disconnect":
+                        _handle_disconnect(
+                            conn, base, token, commands, evt.get("request_id"),
+                        )
                         return
-                    if evt.get("type") != "exec":
-                        continue
-                    print("Starting command %s" % evt.get("request_id", ""))
-                    commands.start(evt)
+                    elif evt.get("type") == "exec":
+                        print("Starting command %s" % evt.get("request_id", ""))
+                        commands.start(evt)
             if stop_event is not None and stop_event.is_set():
                 return
             # Streams intentionally end before a hosting proxy's response cap.
             # A command belongs to this runner, not the stream, so clean
             # rotation is the same recovery path as any network loss.
-            print("stream rotated; reconnecting")
-            if time.monotonic() - stream_opened_at >= STREAM_HEALTHY_SECONDS:
-                backoff = 1
-                continue
+            problem = None
         except KeyboardInterrupt:
             print("\nStopped.")
             return
@@ -1451,25 +1447,19 @@ def _serve_connection(conn, stop_event=None):
             # self-heals and a real revocation simply idles here until the
             # owner re-pairs or removes this connection -- never a silent
             # permanent exit that abandons one instance while the others stay up.
-            print("HTTP %s; retrying in %ss" % (exc.code, backoff))
+            problem = "HTTP %s" % exc.code
         except socket.timeout:
-            if (
-                stream_opened_at is not None
-                and time.monotonic() - stream_opened_at
-                >= STREAM_HEALTHY_SECONDS
-            ):
-                # A read timeout after a healthy stream is a later transport
-                # loss, not another failed open. Start its recovery quickly.
-                backoff = 1
-            print("connection stalled; retrying in %ss" % backoff)
+            problem = "connection stalled"
         except (urllib.error.URLError, http.client.HTTPException) as exc:
-            if (
-                stream_opened_at is not None
-                and time.monotonic() - stream_opened_at
-                >= STREAM_HEALTHY_SECONDS
-            ):
-                backoff = 1
-            print("connection lost (%s); retrying in %ss" % (exc, backoff))
+            problem = "connection lost (%s)" % exc
+        if healthy():
+            # The stream outlived its health window, so whatever ended it is a
+            # new loss: clear earlier failures and recover with a short retry.
+            backoff = 1
+            if problem is None:
+                print("stream rotated; reconnecting")
+                continue
+        print("%s; retrying in %ss" % (problem or "stream ended early", backoff))
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
 

@@ -33,6 +33,10 @@ _EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 # a generous ceiling so Contribute can offer a truthful "Show all files" for
 # normal projects while still bounding pathological repositories.
 _PATH_PREVIEW = 500
+# Contribute asks which local paths moved since each active proposal's recorded
+# source commit. Bound that list like every other input to this metadata route.
+_SINCE_LIMIT = 64
+_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _GITHUB_HTTPS = re.compile(
   r"^https://github\.com/([^/]+)/([^/#]+?)(?:\.git)?/?$", re.IGNORECASE,
 )
@@ -57,11 +61,14 @@ def _git_env(repo: Path) -> dict[str, str]:
   return env
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(
+  repo: Path, *args: str, stdin: str | None = None,
+) -> subprocess.CompletedProcess[str]:
   try:
     return subprocess.run(
-      ["git", "-C", str(repo), *args], capture_output=True, text=True,
-      errors="replace", timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
+      ["git", "-C", str(repo), *args], input=stdin, capture_output=True,
+      text=True, errors="replace", timeout=_GIT_TIMEOUT, check=False,
+      env=_git_env(repo),
     )
   except (OSError, subprocess.TimeoutExpired) as exc:
     return subprocess.CompletedProcess(
@@ -237,12 +244,59 @@ def _diff_summary(
   return summary
 
 
+def source_commits(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+  """Keep only distinct full commit ids, bounded, in caller order."""
+  result: list[str] = []
+  for value in values or ():
+    sha = str(value or "").strip().lower()
+    if _COMMIT_SHA.match(sha) and sha not in result:
+      result.append(sha)
+    if len(result) == _SINCE_LIMIT:
+      break
+  return tuple(result)
+
+
+def _local_paths_changed_since(
+  repo: Path, local: str, since: tuple[str, ...], paths: list[str],
+) -> dict[str, list[str]]:
+  """Name which local-only paths differ between each source commit and now.
+
+  A proposal staged from an earlier live source still covers a path whose
+  bytes are unchanged since then. Platform updates rewrite the live history,
+  so this compares trees rather than requiring ancestry. Unknown commits are
+  omitted, which callers must treat as "not proven covered".
+  """
+  if not since or not paths:
+    return {}
+  # Most recorded sources belong to other projects, so check them all with a
+  # single batch query instead of one process per commit.
+  check = _git(
+    repo, "cat-file", "--batch-check=%(objecttype)",
+    stdin="".join(f"{sha}^{{commit}}\n" for sha in since),
+  )
+  if check.returncode != 0:
+    return {}
+  found = [
+    sha for sha, kind in zip(since, check.stdout.splitlines())
+    if kind == "commit"
+  ]
+  wanted = set(paths)
+  result: dict[str, list[str]] = {}
+  for sha in found:
+    proc = _git(repo, "diff", "--no-renames", "--name-only", "-z", sha, local)
+    if proc.returncode != 0:
+      continue
+    result[sha] = sorted(set(proc.stdout.split("\0")) & wanted)
+  return result
+
+
 def _reconciliation_summary(
   repo: Path,
   local: str,
   upstream: str,
   *,
   managed_paths: set[str] | None = None,
+  since: tuple[str, ...] = (),
 ) -> dict[str, Any]:
   """Bound the shared semantic receipt for Contribute's read-only source map."""
   empty = {
@@ -257,6 +311,7 @@ def _reconciliation_summary(
     "compatible_count": 0,
     "unresolved_conflict_paths": [],
     "unresolved_conflict_count": 0,
+    "local_changed_since": {},
     "truncated": False,
   }
   try:
@@ -297,6 +352,9 @@ def _reconciliation_summary(
     "compatible_count": len(compatible_paths),
     "unresolved_conflict_paths": conflict_paths[:_PATH_PREVIEW],
     "unresolved_conflict_count": len(conflict_paths),
+    "local_changed_since": _local_paths_changed_since(
+      repo, local, since, local_paths[:_PATH_PREVIEW],
+    ),
     "truncated": truncated,
   }
 
@@ -563,6 +621,7 @@ def build_project_diff(
 def _project_status(
   *, repo: Path, kind: str, key: str, name: str, slug: str | None,
   version: str | None, manifest_url: str | None,
+  since: tuple[str, ...] = (),
 ) -> dict[str, Any]:
   response: dict[str, Any] = {
     "key": key,
@@ -649,6 +708,7 @@ def _project_status(
     "HEAD",
     comparison_ref,
     managed_paths=managed_paths,
+    since=since,
   )
   response.update({
     "behind": behind,
@@ -704,18 +764,20 @@ def _project_status(
   return response
 
 
-def build_platform_status() -> dict[str, Any]:
+def build_platform_status(since: tuple[str, ...] = ()) -> dict[str, Any]:
   """Inspect the live platform clone against its last-fetched origin/main."""
   settings = get_settings()
   data_dir = Path(settings.data_dir).resolve()
   return _project_status(
     repo=data_dir / "platform",
     kind="platform", key="platform", name="Möbius", slug=None,
-    version=None, manifest_url=None,
+    version=None, manifest_url=None, since=since,
   )
 
 
-def build_app_status(app: dict[str, Any]) -> dict[str, Any] | None:
+def build_app_status(
+  app: dict[str, Any], since: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
   """Inspect one validated live app source row; invalid paths are excluded."""
   settings = get_settings()
   app_root = Path(settings.data_dir).resolve() / "apps"
@@ -746,4 +808,5 @@ def build_app_status(app: dict[str, Any]) -> dict[str, Any] | None:
     manifest_url=(
       str(repository_manifest_url) if repository_manifest_url else None
     ),
+    since=since,
   )

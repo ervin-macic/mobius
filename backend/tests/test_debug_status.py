@@ -25,15 +25,6 @@ def test_debug_status_shape_matches_golden(client, auth):
 
   assert r.status_code == 200
   payload = r.json()
-  upgrades = payload.pop("one_way_upgrades")
-  assert len(upgrades) == 1
-  upgrade = upgrades[0]
-  assert set(upgrade) == {"level", "name", "state", "activated_at", "completed_at", "tasks"}
-  assert (upgrade["level"], upgrade["name"], upgrade["state"]) == (1, "transcript_rows", "active")
-  assert upgrade["activated_at"]
-  assert all(set(task) == {"task", "status", "done_units", "remaining_units", "retries", "last_error"}
-             for task in upgrade["tasks"])
-  assert next(task for task in upgrade["tasks"] if task["task"] == "index_messages")["status"] == "done"
   pool = payload.pop("database_pool")
   assert pool["type"]
   assert pool["current"]["checked_out"] >= 1
@@ -90,17 +81,6 @@ def test_debug_status_shape_matches_golden(client, auth):
   golden_path = Path(__file__).with_name("golden_debug_status.json")
   expected = json.loads(golden_path.read_text(encoding="utf-8"))
   assert payload == expected
-
-
-def test_debug_status_surfaces_media_migration_failure(client, auth):
-  client.app.state.media_migration_failed = True
-  try:
-    response = client.get("/api/debug/status", headers=auth)
-  finally:
-    client.app.state.media_migration_failed = False
-
-  assert response.status_code == 200
-  assert response.json()["media_migration_failed"] is True
 
 
 def test_debug_memory_report_is_authenticated_and_bounded(client, auth):

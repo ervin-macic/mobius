@@ -15,6 +15,11 @@ from app import models
 from app.chat_message_identity import assistant_message_run_id
 
 
+# The Goal tool's names across providers. A transcript row carrying one is
+# flagged so Goal placement reads only those bodies (transcript_rows).
+UPDATE_GOAL_TOOLS = frozenset({
+  "mobius_control:update_goal", "mcp__mobius_control__update_goal",
+})
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TASK_STATUSES = frozenset({
   "pending", "running", "completed", "blocked", "failed", "cancelled",
@@ -383,7 +388,7 @@ def _delegation_tree(
   *, all_attempts: bool = False,
 ) -> list[dict[str, Any]]:
   """Project durable immediate-child ownership without copying transcripts."""
-  from app.delegations import derived_status
+  from app.delegations import delegation_statuses
 
   run_ids = goal_attempt_root_ids(db, physical.chat_id, root.id)
   root_rows = db.query(models.Delegation).filter(
@@ -414,17 +419,20 @@ def _delegation_tree(
       children_by_parent.setdefault(child.parent_chat_id, []).append(child)
       frontier.append(child.child_chat_id)
 
+  statuses = delegation_statuses(db, roots + [
+    child for children in children_by_parent.values() for child in children
+  ])
+
   def project(row: models.Delegation, seen: set[str]) -> dict[str, Any]:
     if row.id in seen:
       return {"id": row.id, "task_key": row.task_key, "status": "failed", "children": []}
-    status, _run, _result = derived_status(db, row, load_result=False)
     children = children_by_parent.get(row.child_chat_id, [])
     return {
       "id": row.id,
       "task_key": row.task_key,
       "plan_task": row.goal_task_id,
       "provider": row.provider,
-      "status": status,
+      "status": statuses[row.id],
       "children": [project(child, seen | {row.id}) for child in children],
     }
 
@@ -709,9 +717,8 @@ def _goal_completion_anchor(messages, run_ids, result, status="completed"):
       continue
     for block in reversed(message.get("blocks") or []):
       if (not isinstance(block, dict) or block.get("type") != "tool"
-          or block.get("tool") not in {
-            "mobius_control:update_goal", "mcp__mobius_control__update_goal",
-          } or block.get("status") != "done"
+          or block.get("tool") not in UPDATE_GOAL_TOOLS
+          or block.get("status") != "done"
           or block.get("output_exit_code") != 0 or not block.get("tool_use_id")):
         continue
       raw = block.get("input")

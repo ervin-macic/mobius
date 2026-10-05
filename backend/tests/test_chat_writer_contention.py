@@ -301,6 +301,16 @@ def test_question_commit_failure_raises_so_card_is_not_broadcast():
     def expire_all(self):
       self._db.expire_all()
 
+    @property
+    def info(self):
+      return self._db.info
+
+    def get_bind(self, *a, **k):
+      return self._db.get_bind(*a, **k)
+
+    def connection(self, *a, **k):
+      return self._db.connection(*a, **k)
+
     def execute(self, *a, **k):
       return self._db.execute(*a, **k)
     def query(self, *a, **k):
@@ -421,14 +431,16 @@ def test_hot_terminal_write_updates_only_owned_message(actor, command, provider)
 
   writes = [sql for sql in statements if sql.lstrip().startswith(
     ("update", "insert", "delete"))]
-  assert len(writes) == 1, statements
-  assert writes[0].lstrip().startswith("update chat_messages"), statements
-  assert all("message_key" in sql or "seq =" in sql or "ts" in sql
+  # One owned row, plus release 1's single legacy-mirror statement for the
+  # chat (transcript_rows; rebuilt inside SQLite, never decoded here).
+  assert [sql.split()[1] for sql in writes] == ["chat_messages", "chats"], statements
+  assert "group_concat" in writes[1], statements
+  assert all("message_key" in sql or "seq =" in sql or "ts" in sql or "max(" in sql
              for sql in statements if sql.lstrip().startswith("select")), statements
   assert len(_load_chat()["messages"]) == 201
 
 
-def test_question_answer_scans_one_reverse_page_and_updates_one_row():
+def test_question_answer_streams_from_the_tail_and_updates_one_row():
   from sqlalchemy import event
   from app.database import engine
 
@@ -458,9 +470,10 @@ def test_question_answer_scans_one_reverse_page_and_updates_one_row():
   body_pages = [sql for sql in statements if sql.lstrip().startswith("select")
                 and "chat_messages.body" in sql]
   writes = [sql for sql in statements if sql.lstrip().startswith("update chat_messages")]
+  # One reverse stream that stops at the card, and one exact-row read.
   assert len(body_pages) == 2, statements
-  assert sum("seq >=" in sql and "seq <" in sql for sql in body_pages) == 1
-  assert sum("seq =" in sql and "seq >=" not in sql for sql in body_pages) == 1
+  assert sum("order by chat_messages.seq desc" in sql for sql in body_pages) == 1
+  assert sum("seq =" in sql for sql in body_pages) == 1
   assert len(writes) == 1, statements
   assert _load_chat()["messages"][-1]["blocks"][0]["answers"] == {"answer": "yes"}
 
@@ -1329,6 +1342,16 @@ def test_db_error_recreates_session_and_keeps_serving():
     def expire_all(self):
       self._db.expire_all()
 
+    @property
+    def info(self):
+      return self._db.info
+
+    def get_bind(self, *a, **k):
+      return self._db.get_bind(*a, **k)
+
+    def connection(self, *a, **k):
+      return self._db.connection(*a, **k)
+
     def execute(self, *a, **k):
       return self._db.execute(*a, **k)
     def query(self, *a, **k):
@@ -1403,6 +1426,16 @@ def test_fatal_actor_fails_callers():
 
     def expire_all(self):
       self._db.expire_all()
+
+    @property
+    def info(self):
+      return self._db.info
+
+    def get_bind(self, *a, **k):
+      return self._db.get_bind(*a, **k)
+
+    def connection(self, *a, **k):
+      return self._db.connection(*a, **k)
 
     def execute(self, *a, **k):
       return self._db.execute(*a, **k)
@@ -2012,3 +2045,43 @@ def test_provider_batch_marks_only_visible_owner_rows():
   single = [{"role": "user", "cid": "x", "provider_batch": {"id": "stale"}}]
   _stamp_provider_batch(single)
   assert "provider_batch" not in single[0]
+
+
+def test_wedged_recovery_writes_only_the_recovery_row_without_reading_history(actor):
+  """Recovery changes at most the live overlay and the recovery row; it must
+  never decode or rewrite the settled history (the old PersistError path did)."""
+  from sqlalchemy import event
+  from app.database import engine
+
+  _seed_chat(messages=[{"role": "user", "content": "x" * 5000, "ts": i} for i in range(50)])
+  _await(actor.submit(StartTurn(
+    chat_id="c1", run_token="run-a",
+    user_msg={"role": "user", "content": "go", "ts": 100, "cid": "go"},
+    title_source="go",
+  )))
+  statements = []
+
+  def record(_conn, _cursor, statement, _parameters, _context, _many):
+    if "chat_messages" in statement.lower():
+      statements.append(statement.lower())
+
+  event.listen(engine, "before_cursor_execute", record)
+  try:
+    assert _await(actor.submit(RecoverWedgedRun(
+      chat_id="c1", run_token="run-a",
+      interruption_block={"type": "error", "message": "interrupted", "resumable": True},
+    ))) is True
+  finally:
+    event.remove(engine, "before_cursor_execute", record)
+  whole_history_reads = [
+    sql for sql in statements if sql.lstrip().startswith("select")
+    and "chat_messages.body" in sql and "seq =" not in sql and "seq in" not in sql
+    and "seq <" not in sql
+  ]
+  assert whole_history_reads == [], statements
+  row_writes = [sql for sql in statements if sql.lstrip().startswith(
+    ("insert into chat_messages", "update chat_messages", "delete from chat_messages"))]
+  assert len(row_writes) == 1, statements
+  messages = _load_chat()["messages"]
+  assert len(messages) == 52
+  assert messages[-1]["blocks"][-1]["message"] == "interrupted"

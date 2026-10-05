@@ -173,7 +173,10 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      and {type:'moebius:shell-shortcut', actionId}       frame → parent
 //      The shell advertises only its reserved named actions to the live,
 //      interactive frame. Exact source + focus gating prevents arbitrary
-//      keylogging or a hidden frame dispatching workspace behavior.
+//      keylogging or a hidden frame dispatching workspace behavior. An app
+//      whose manifest sets "shell_shortcuts": false is advertised none. The
+//      frame shares the list with its direct child frames and relays their
+//      actions, so this side still sees only the frame as the source.
 //
 //  10. moebius:screen-control-command/result                bidirectional
 //      The owner-granted shell session may inspect or operate the VISIBLE app
@@ -705,10 +708,6 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
-        shellShortcuts: v === liveVersionRef.current && activeRef.current
-          && visibleRef.current && interactiveRef.current
-          ? shellShortcutsRef.current
-          : [],
       },
       '*',
     )

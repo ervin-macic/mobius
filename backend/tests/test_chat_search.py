@@ -1,4 +1,4 @@
-"""Drawer chat search: FTS index reconciliation + /api/chats/search."""
+"""Drawer chat search: trigger-maintained entries + /api/chats/search."""
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -6,27 +6,12 @@ import threading
 import uuid
 
 from app import chat_search, chat_writer, models, transcript_rows
-from app.chat_search import sql
+from sqlalchemy import text as sql
 from app.chat_visibility import visible_in_owner_drawer
 from app.timeutil import now_naive_utc
 
 
 import pytest
-
-
-@pytest.fixture(autouse=True)
-def _background_search_build(db, monkeypatch):
-  chat_search.create_schema_v2(db.connection())
-  real_search = chat_search.search
-  def built_search(session, query, limit=20):
-    while True:
-      done, _remaining = chat_search.index_batch(session.connection())
-      session.commit()
-      if _remaining == 0:
-        break
-    return real_search(session, query, limit=limit)
-  built_search.__wrapped__ = real_search
-  monkeypatch.setattr(chat_search, "search", built_search)
 
 
 def _make_chat(db, title, texts, role="user"):
@@ -46,7 +31,7 @@ def _make_chat(db, title, texts, role="user"):
 
 def _doc_count(db, chat_id):
   return db.execute(
-    sql("SELECT count(*) FROM chat_search_docs_v2 WHERE chat_id = :c"),
+    sql("SELECT count(*) FROM chat_search_entries WHERE chat_id = :c"),
     {"c": chat_id},
   ).fetchone()[0]
 
@@ -106,9 +91,7 @@ def test_prefix_match_on_last_token(db):
   assert any(r["id"] == c.id for r in chat_search.search(db, "budg"))
 
 
-def test_normalized_documents_preserve_visibility_prefix_and_reveal_contract(
-  db, monkeypatch,
-):
+def test_normalized_documents_preserve_visibility_prefix_and_reveal_contract(db):
   suffix = uuid.uuid4().hex
   exact = f"portablepostgres{suffix}"
   visible = _make_chat(
@@ -148,7 +131,6 @@ def test_normalized_documents_preserve_visibility_prefix_and_reveal_contract(
   db.add_all((hidden_row, hidden_chat, tool_only))
   db.commit()
 
-  monkeypatch.setattr(chat_search, "_database_dialect", lambda _db: "postgresql")
   results = chat_search.search(db, f"{exact} capy")
   ids = {result["id"] for result in results}
   assert visible.id in ids
@@ -158,9 +140,8 @@ def test_normalized_documents_preserve_visibility_prefix_and_reveal_contract(
   assert "capybara" in hit["snippet"]
 
 
-def test_normalized_postgres_path_finds_unicode_document_text(db, monkeypatch):
+def test_search_finds_unicode_document_text(db):
   c = _make_chat(db, "Unicode", ["réunion café itinerary"])
-  monkeypatch.setattr(chat_search, "_database_dialect", lambda _db: "postgresql")
 
   hit = next(
     result for result in chat_search.search(db, "réunion caf")
@@ -171,9 +152,7 @@ def test_normalized_postgres_path_finds_unicode_document_text(db, monkeypatch):
   assert "café" in hit["snippet"]
 
 
-def test_postgres_path_keeps_recent_matches_beyond_the_old_512_chat_cap(
-  db, monkeypatch,
-):
+def test_search_keeps_recent_matches_beyond_the_old_512_chat_cap(db):
   needle = f"completeportable{uuid.uuid4().hex}"
   now = now_naive_utc()
   verbose_old = chat_writer.create_chat(
@@ -198,7 +177,6 @@ def test_postgres_path_keeps_recent_matches_beyond_the_old_512_chat_cap(
   db.add_all([verbose_old, *recent])
   db.commit()
 
-  monkeypatch.setattr(chat_search, "_database_dialect", lambda _db: "postgresql")
 
   assert [result["id"] for result in chat_search.search(db, needle, limit=1)] == [
     max(chat.id for chat in recent),
@@ -362,8 +340,6 @@ def test_search_visibility_matches_owner_drawer_contract(db):
   ids = {result["id"] for result in chat_search.search(db, needle)}
   assert {owner_default.id, app_visible.id, app_forced_visible.id} <= ids
   assert {owner_hidden.id, app_default.id, app_forced_hidden.id}.isdisjoint(ids)
-  assert _doc_count(db, owner_hidden.id) == 0
-  assert _doc_count(db, app_default.id) == 0
 
 
 def test_search_and_drawer_visibility_helpers_share_one_behavior_contract():
@@ -431,7 +407,7 @@ def test_recent_match_outranks_old_chat_that_repeats_the_query():
   ]
 
 
-def test_overlapping_first_searches_leave_one_idempotent_document_generation(db):
+def test_overlapping_searches_share_one_document_generation(db):
   suffix = uuid.uuid4().hex
   needle = f"concurrentsearch{suffix}"
   c = _make_chat(db, "Concurrent index", [needle])
@@ -487,49 +463,33 @@ def test_search_anchor_opens_one_authoritative_window_through_the_tail(client, a
   ]
 
 
-def test_new_chats_reconcile_only_after_initial_generation_done(db):
-  from app import transcript_rows
-  # Call the production search, bypassing this file's simulated background
-  # build wrapper. A new chat is not indexed by a request during initial build.
-  real_search = chat_search.search.__wrapped__
-  db.execute(sql("UPDATE upgrade_tasks SET status='pending' WHERE level=1 AND task='index_messages'"))
-  first = _make_chat(db, "Initial tiger", ["initialtiger prose"])
-  assert real_search(db, "initialtiger") == []
-  done, remaining = chat_search.index_batch(db.connection())
-  assert done >= 1 and remaining == 0
-  db.execute(sql("UPDATE upgrade_tasks SET status='done', done_units=:done, remaining_units=0 "
-                 "WHERE level=1 AND task='index_messages'"), {"done": done})
-  db.commit()
-  assert [r["id"] for r in real_search(db, "initialtiger")] == [first.id]
-
+def test_new_and_changed_chats_are_searchable_in_their_own_transaction(db):
   visible = _make_chat(db, "New lemur", ["freshlemur body"])
   archived = _make_chat(db, "Archived mink", ["archivedmink body"])
   archived.archived_at = now_naive_utc()
   db.commit()
-  assert [r["id"] for r in real_search(db, "freshlemur")] == [visible.id]
-  archived_hit = real_search(db, "archivedmink")[0]
+  assert [r["id"] for r in chat_search.search(db, "freshlemur")] == [visible.id]
+  archived_hit = chat_search.search(db, "archivedmink")[0]
   assert archived_hit["id"] == archived.id and archived_hit["archived"] is True
 
   transcript_rows.replace_all(db, visible, [
     {"role": "user", "content": "revisedlemur body", "ts": 1000},
   ])
   db.commit()
-  assert real_search(db, "freshlemur") == []
-  assert [r["id"] for r in real_search(db, "revisedlemur")] == [visible.id]
+  assert chat_search.search(db, "freshlemur") == []
+  assert [r["id"] for r in chat_search.search(db, "revisedlemur")] == [visible.id]
 
 
-def test_completed_generation_new_chat_reconcile_is_bounded(db):
-  real_search = chat_search.search.__wrapped__
-  assert db.execute(sql("SELECT status FROM upgrade_tasks WHERE level=1 AND task='index_messages'")).scalar_one() == "done"
-  for i in range(25):
-    db.add(chat_writer.create_chat(
-      id=f"new-search-{i:02d}", title=f"Bounded {i}",
-      messages=[{"role": "user", "content": f"boundedotter{i:02d}", "ts": i}],
-    ))
-  db.commit()
-  assert real_search(db, "boundedotter24") == []
-  indexed = db.execute(sql(
-    "SELECT COUNT(*) FROM chat_search_state_v2 WHERE chat_id LIKE 'new-search-%'"
-  )).scalar_one()
-  assert indexed == chat_search.INDEX_BATCH_MAX_CHATS
-  assert [r["id"] for r in real_search(db, "boundedotter24")] == ["new-search-24"]
+def test_search_never_writes(db):
+  _make_chat(db, "Read only", ["readonlyheron"])
+  from sqlalchemy import event
+  writes = []
+  def record(_conn, _cursor, statement, *_rest):
+    if not statement.lstrip().upper().startswith("SELECT"):
+      writes.append(statement)
+  event.listen(db.get_bind(), "before_cursor_execute", record)
+  try:
+    assert chat_search.search(db, "readonlyheron")
+  finally:
+    event.remove(db.get_bind(), "before_cursor_execute", record)
+  assert writes == []

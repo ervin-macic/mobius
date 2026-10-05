@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import signal
 import tempfile
@@ -32,6 +31,7 @@ from app.continuations import (
   is_continuation_message,
 )
 from app.peer_message import peer_message_compaction_lines
+from app.provider_errors import ProviderErrorKind, classify_provider_error
 
 log = logging.getLogger("moebius.chat")
 
@@ -355,6 +355,11 @@ async def _run_claude_summarize_turn(
   )
   client = ClaudeSDKClient(options)
   parts: list[str] = []
+  # The CLI reports retries as system `api_retry` messages; a failed attempt
+  # arrives as an assistant message flagged with `error`. Only the latest
+  # assistant message and the terminal result explain why the turn ended.
+  attempt_error: list[str] = []
+  error_type: str | None = None
   terminal_seen = False
   try:
     try:
@@ -369,15 +374,24 @@ async def _run_claude_summarize_turn(
         await client.query(prompt)
         async for msg in client.receive_response():
           if isinstance(msg, AssistantMessage):
+            # Reset per message so an earlier attempt's error never goes stale.
+            error_type = msg.error
+            attempt_error = [
+              block.text for block in msg.content if isinstance(block, TextBlock)
+            ] if msg.error else []
             for block in msg.content:
               if isinstance(block, TextBlock):
                 parts.append(block.text)
           elif isinstance(msg, ResultMessage):
             terminal_seen = True
             if msg.is_error:
-              raise CompactionError(
-                "The incoming Claude agent could not compact the chat."
-              )
+              errors = list(msg.errors or [])
+              if isinstance(msg.result, str):
+                errors.append(msg.result)
+              raise CompactionError(_provider_compaction_failure(
+                "\n".join(errors or attempt_error), status=msg.api_error_status,
+                error_type=error_type,
+              ))
     except asyncio.TimeoutError:
       raise CompactionError(
         "Compaction receive loop timed out after "
@@ -423,34 +437,68 @@ def _codex_agent_text(stdout: bytes) -> str:
   return "".join(parts)
 
 
+def _provider_compaction_failure(
+  text: str, *, status: int | None = None, error_type: str | None = None,
+) -> str:
+  """Return only fixed, actionable messages for known synthesis refusals.
+
+  The summarizer serves both provider switches and manual /compact, so the
+  wording must hold for either caller.
+  """
+  unchanged = " Your existing conversation is unchanged."
+  kind = classify_provider_error(text, status=status, error_type=error_type)
+  if kind is ProviderErrorKind.TOO_LARGE:
+    return "The provider rejected the compaction request as too large." + unchanged
+  if kind is ProviderErrorKind.CREDITS:
+    return (
+      "The provider is out of credits. Add credits for that provider, "
+      "then try again." + unchanged
+    )
+  if kind is ProviderErrorKind.USAGE_LIMIT:
+    return (
+      "The provider has reached a usage or rate limit. "
+      "Try again when its allowance is available." + unchanged
+    )
+  if kind is ProviderErrorKind.AUTH:
+    return (
+      "The provider could not sign in. Reconnect that provider, "
+      "then try again." + unchanged
+    )
+  return "The incoming provider could not compact the chat."
+
+
 def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
-  """Classify a rejected synthesis without exposing raw provider output."""
-  errors: list[str] = []
+  """Classify the run's final failure, never assistant prose or raw output.
+
+  Codex reports errors it retries as `error` events too, so only the final
+  `turn.failed` (or, without one, the last error event) says why the run
+  ended; an earlier retried rate limit must not mask a final sign-in failure.
+  """
+  final: dict | None = None
+  last_error: dict | None = None
   for line in stdout.decode("utf-8", "replace").splitlines():
     try:
       event = json.loads(line)
     except ValueError:
       continue
-    if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
+    if not isinstance(event, dict):
       continue
-    error = event.get("error", event)
-    if isinstance(error, dict):
-      errors.extend(
-        value for key in ("code", "message")
-        if isinstance(value := error.get(key), str)
-      )
-  # Older CLI versions report their terminal failure only on stderr. Match
-  # known refusals, but never return or log arbitrary text from that stream.
-  text = "\n".join(errors) if errors else stderr.decode("utf-8", "replace")
-  if re.search(
-    r"request body is too large|request_body_too_large|"
-    r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
-  ):
-    return (
-      "The provider rejected the compaction request as too large. "
-      "Your existing conversation is unchanged."
+    if event.get("type") == "turn.failed":
+      final = event
+    elif event.get("type") == "error":
+      last_error = event
+  event = final or last_error
+  if event is None:
+    # Older CLI versions report their terminal failure only on stderr. Match
+    # known refusals, but never return or log arbitrary text from that stream.
+    return _provider_compaction_failure(stderr.decode("utf-8", "replace"))
+  error = event.get("error", event)
+  if isinstance(error, dict):
+    error = "\n".join(
+      value for key in ("code", "message")
+      if isinstance(value := error.get(key), str)
     )
-  return "The incoming provider could not compact the chat."
+  return _provider_compaction_failure(error if isinstance(error, str) else "")
 
 
 async def _run_codex_summarize_turn(

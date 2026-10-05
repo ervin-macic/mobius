@@ -126,8 +126,7 @@ def parse_pairing_command(command: str) -> tuple[str, str]:
 
 def _download_runner(base_url: str) -> bytes:
   request = urllib.request.Request(
-    base_url + "/api/connect/runner",
-    headers={"Accept": "text/x-python", "User-Agent": "Mobius-Connect/1"},
+    base_url + "/api/connect/runner", headers={"Accept": "text/x-python"},
   )
   try:
     with connect_runner._open_url(
@@ -230,6 +229,25 @@ async def set_agent_access(profile_id: str, enabled: bool) -> dict:
   return await asyncio.to_thread(_set_agent_access, profile_id, enabled)
 
 
+def _saved_profiles() -> list[tuple[str, dict]]:
+  profiles = []
+  for path in sorted(_profiles_dir().glob("o_*/profile.json")):
+    meta = _read_json(path)
+    profile_id = str((meta or {}).get("id") or "")
+    if meta and _ID_RE.fullmatch(profile_id):
+      profiles.append((profile_id, meta))
+  return profiles
+
+
+def _needs_relaunch(profile_id: str, meta: dict) -> bool:
+  """An active profile whose runner this backend neither owns nor finds alive."""
+  return (
+    meta.get("status") == "active"
+    and profile_id not in _owned_processes
+    and not _process_alive(profile_id)
+  )
+
+
 def _download_relaunch_runners() -> dict[str, bytes]:
   """Fetch the current runner for every supervised runner about to relaunch.
 
@@ -239,15 +257,8 @@ def _download_relaunch_runners() -> dict[str, bytes]:
   A profile whose Möbius cannot be reached relaunches its saved runner.
   """
   sources = {}
-  for path in sorted(_profiles_dir().glob("o_*/profile.json")):
-    meta = _read_json(path) or {}
-    profile_id = str(meta.get("id") or "")
-    if (
-      not _ID_RE.fullmatch(profile_id)
-      or meta.get("status") != "active"
-      or profile_id in _owned_processes
-      or _process_alive(profile_id)
-    ):
+  for profile_id, meta in _saved_profiles():
+    if not _needs_relaunch(profile_id, meta):
       continue
     try:
       sources[profile_id] = _download_runner(str(meta.get("base_url") or ""))
@@ -256,19 +267,13 @@ def _download_relaunch_runners() -> dict[str, bytes]:
   return sources
 
 
-def _install_runner(profile_id: str, source: bytes | None) -> None:
-  if source is None:
-    return
+def _install_runner(profile_id: str, source: bytes) -> None:
+  """Save the runner this profile launches, privately and atomically."""
   runner = _runner_path(profile_id)
-  try:
-    if runner.read_bytes() == source:
-      return
-  except OSError:
-    pass
-  try:
-    atomic_write(runner, source, mode=0o700)
-  except OSError as exc:
-    log.warning("keeping saved Connect runner for %s: %s", profile_id, exc)
+  runner.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  if runner.is_file() and runner.read_bytes() == source:
+    return
+  atomic_write(runner, source, mode=0o700)
 
 
 def _write_pid(profile_id: str, pid: int) -> None:
@@ -361,12 +366,8 @@ def _public_profile(meta: dict) -> dict:
 
 
 def list_profiles() -> list[dict]:
-  profiles = []
   with _lock:
-    for path in sorted(_profiles_dir().glob("o_*/profile.json")):
-      meta = _read_json(path)
-      if meta and _ID_RE.fullmatch(str(meta.get("id") or "")):
-        profiles.append(_public_profile(meta))
+    profiles = [_public_profile(meta) for _profile_id, meta in _saved_profiles()]
   return sorted(profiles, key=lambda item: float(item.get("created_at") or 0), reverse=True)
 
 
@@ -408,10 +409,7 @@ def _create_profile(label: str, command: str, agent: bool = False) -> dict:
     _profile_dir(profile_id).mkdir(parents=True, mode=0o700)
   try:
     with _lock:
-      runner = _runner_path(profile_id)
-      runner.parent.mkdir(parents=True, mode=0o700)
-      runner.write_bytes(source)
-      runner.chmod(0o700)
+      _install_runner(profile_id, source)
       _atomic_json(_meta_path(profile_id), meta)
       process = _launch(profile_id, "--pair", code, "--url", base_url)
 
@@ -544,7 +542,6 @@ def _disconnect_remote(config: dict) -> None:
     headers={
       "Authorization": "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Mobius-Connect/1",
     },
   )
   try:
@@ -597,13 +594,7 @@ async def revoke_profile(profile_id: str) -> None:
 def _reconcile_once() -> None:
   fresh_runners = _download_relaunch_runners()
   with _lock:
-    for path in sorted(_profiles_dir().glob("o_*/profile.json")):
-      meta = _read_json(path)
-      if not meta:
-        continue
-      profile_id = str(meta.get("id") or "")
-      if not _ID_RE.fullmatch(profile_id):
-        continue
+    for profile_id, meta in _saved_profiles():
       owned = _owned_processes.get(profile_id)
       if owned is not None:
         result = owned.poll()
@@ -627,12 +618,17 @@ def _reconcile_once() -> None:
           meta["status"] = "ended" if result == 0 else "error"
         _atomic_json(_meta_path(profile_id), meta)
         continue
-      if _process_alive(profile_id):
+      # Re-checked under the lock: pairing or revocation may have changed
+      # this profile while its runner was downloading.
+      if not _needs_relaunch(profile_id, meta):
         continue
-      if meta.get("status") != "active":
-        continue
+      source = fresh_runners.get(profile_id)
+      if source is not None:
+        try:
+          _install_runner(profile_id, source)
+        except OSError as exc:
+          log.warning("keeping saved Connect runner for %s: %s", profile_id, exc)
       try:
-        _install_runner(profile_id, fresh_runners.get(profile_id))
         _launch(profile_id)
       except (OSError, OutboundConnectError):
         meta["status"] = "error"

@@ -106,7 +106,7 @@ if (
     returncode=2,
   )
 
-from app.schema_migrations import _create_chat_search_tables
+from app.schema_migrations import _add_transcript_rows, _create_chat_search_tables
 from app.main import app
 from app.routes import auth as auth_module
 from app.routes.auth import _limiter as auth_limiter
@@ -125,6 +125,22 @@ def _test_secret_key_in_environment():
   need the fixed test key there."""
   yield
   os.environ["SECRET_KEY"] = _TEST_SECRET_KEY
+
+
+@pytest.fixture(autouse=True)
+def real_end_orphaned_hosts(monkeypatch):
+  """Keep the app lifespan's boot sweep from ending processes outside the test.
+
+  ``end_orphaned_hosts`` scans every process on the machine. Tests that enter
+  the real lifespan would otherwise end helper hosts that a parallel xdist
+  worker's test has just staged as orphans, failing that test intermittently.
+  The sweep's own test requests this fixture and calls the real function on a
+  scan limited to its processes.
+  """
+  from app import helper_hosts
+  real = helper_hosts.end_orphaned_hosts
+  monkeypatch.setattr(helper_hosts, "end_orphaned_hosts", lambda: 0)
+  return real
 
 
 @pytest.fixture(autouse=True)
@@ -168,6 +184,49 @@ def _isolate_git_env(monkeypatch, tmp_path, tmp_path_factory):
   )
 
 
+def _assert_legacy_mirrors_rows(connection) -> None:
+  """Suite-wide guard: a converted chat's legacy column equals its rows.
+
+  The previous release reads only ``chats.messages``; every committed state
+  this suite produces must leave it the decoded value of the rows.
+  """
+  import json as _json
+
+  def canonical(value):
+    return _json.dumps(value, sort_keys=True)
+
+  for chat_id, legacy in connection.exec_driver_sql(
+    "SELECT c.id, c.messages FROM chats c JOIN chat_transcript_state s ON s.chat_id = c.id"
+  ).fetchall():
+    rows = [_json.loads(body) for (body,) in connection.exec_driver_sql(
+      "SELECT body FROM chat_messages WHERE chat_id = ? ORDER BY seq", (chat_id,),
+    ).fetchall()]
+    assert canonical(_json.loads(legacy)) == canonical(rows), (
+      f"chat {chat_id}: chats.messages does not mirror its rows"
+    )
+
+
+def _install_unconverted_request_audit():
+  """Audit mode (MOBIUS_TEST_UNCONVERT_ON_REQUEST=1): before every HTTP request
+  the database looks as if the previous release had just written every chat.
+
+  That is the state a first boot after an upgrade serves. A run in this mode
+  finds event-loop code that reads some chat's rows without awaiting
+  ``transcript_rows.ensure_converted_async``. Off by default.
+  """
+  if os.environ.get("MOBIUS_TEST_UNCONVERT_ON_REQUEST") != "1":
+    return
+
+  @app.middleware("http")
+  async def unconvert_every_chat(request, call_next):
+    with engine.begin() as connection:
+      connection.exec_driver_sql("DELETE FROM chat_transcript_state")
+    return await call_next(request)
+
+
+_install_unconverted_request_audit()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _test_schema():
   """Create model and migration-owned schemas once for the test process."""
@@ -177,8 +236,11 @@ def _test_schema():
   # numbered migrations after create_all. Search tables deliberately have no
   # ORM model, so install their migration-owned schema explicitly here.
   _create_chat_search_tables(engine)
+  _add_transcript_rows(engine)
   yield
   with engine.begin() as connection:
+    connection.exec_driver_sql("DROP TABLE IF EXISTS chat_search_entries_fts")
+    connection.exec_driver_sql("DROP TABLE IF EXISTS chat_search_entries")
     connection.exec_driver_sql("DROP TABLE IF EXISTS chat_search_fts")
     connection.exec_driver_sql("DROP TABLE IF EXISTS chat_search_docs")
     connection.exec_driver_sql("DROP TABLE IF EXISTS chat_search_state")
@@ -249,24 +311,10 @@ def fresh_db():
   # would otherwise hold a stale identity map across the drop/create.
   from app import chat_writer as chat_writer_mod
   chat_writer_mod.stop_writer(timeout=5)
-  # This fixture owns an empty disposable database. Reproduce the actual
-  # fresh-install activation boundary before any database-backed owner runs.
-  from app import one_way_upgrades
-  import sqlite3
-  with sqlite3.connect(engine.url.database) as conn:
-    conn.execute(one_way_upgrades.COMPAT_TABLE_DDL)
-    conn.execute("INSERT OR IGNORE INTO platform_compat(id,floor,updated_at) "
-                 "VALUES(1,0,datetime('now'))")
-  one_way_upgrades.run_gate(engine.url.database, frozenset())
-  # Complete only the empty initial search generation. Historic migration
-  # tests still need the legacy derived tables, so do not retire them here.
-  # Initial-build tests explicitly set this task pending before seeding chats.
-  from app import chat_search
-  with sqlite3.connect(engine.url.database) as conn:
-    assert chat_search.index_batch(conn) == (0, 0)
-    conn.execute("UPDATE upgrade_tasks SET status='done', done_units=0, "
-                 "remaining_units=0, completed_at=datetime('now') "
-                 "WHERE level=1 AND task='index_messages'")
+  # Per-engine schema and "all converted" facts describe one database; the
+  # suite reuses one engine across tests that rebuild its state.
+  from app import transcript_rows as transcript_rows_mod
+  transcript_rows_mod.reset_conversion_facts()
   from app.database import SessionLocal as _WriterSession
   chat_writer_mod.start_writer(_WriterSession)
   # start_writer intentionally publishes before its worker opens and probes
@@ -316,22 +364,12 @@ def fresh_db():
   # The writer is already stopped, so no background transaction can race this
   # cleanup; the next test still gets a fresh actor and SQLAlchemy session.
   with engine.begin() as connection:
+    _assert_legacy_mirrors_rows(connection)
     # These disposable tables are migration-owned rather than ORM-owned, so
     # Base.metadata cannot include them in the generic deletion pass. Deleting
-    # docs first also drives the SQLite external-content FTS trigger.
-    # Lifespan tests run the real post-activation owner, which legitimately
-    # retires legacy derived tables. Cleanup cannot assume they still exist.
-    # Keep current mapped tables strict: a missing authoritative table must
-    # still fail rather than silently pass a damaged fixture.
-    tables = {row[0] for row in connection.exec_driver_sql(
-      "SELECT name FROM sqlite_master WHERE type='table'"
-    )}
-    for name in ("chat_search_docs", "chat_search_state", "chat_search_state_v1"):
-      if name in tables:
-        connection.exec_driver_sql(f'DELETE FROM "{name}"')
-    connection.exec_driver_sql("DELETE FROM chat_search_docs_v2")
-    connection.exec_driver_sql("DELETE FROM chat_search_state_v2")
-    connection.exec_driver_sql("DELETE FROM chat_transcript_cleanup")
+    # search rows first also drives the SQLite external-content FTS triggers.
+    for name in ("chat_search_docs", "chat_search_state", "chat_search_entries"):
+      connection.exec_driver_sql(f'DELETE FROM "{name}"')
     for table in reversed(Base.metadata.sorted_tables):
       connection.execute(table.delete())
 

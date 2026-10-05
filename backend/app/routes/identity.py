@@ -1601,64 +1601,18 @@ async def delete_link(
   link = _linked_row(db, owner.id)
   if link is None:
     return Response(status_code=204)
-  # Unlink is a local sharing-policy event. Revoke account-kind grants before
-  # the remote token is destroyed; legacy invitations remain untouched.
+  # Unlink is a local sharing-policy event. One local transaction ends every
+  # account grant before the remote token is destroyed and before any slower
+  # cleanup can fail; legacy link invitations remain untouched.
   from app import browser_access as shared_access
-  from app.routes.browser_access import _issuer_request
-  from app.routes.connect import cancel_browser_grant_commands
-  from app.app_services import cancel_browser_grant_calls
-  from app.chat import stop_browser_grant_runs
-  from sqlalchemy import or_, update
-  grants = db.query(shared_access.BrowserAccessGrant).filter_by(
-    owner_id=owner.id, kind="account",
-  ).all()
-  # One local transaction closes every account grant before any slower network
-  # or descendant cancellation can fail. None may remain live on partial work.
-  db.execute(update(shared_access.BrowserAccessGrant).where(
-    shared_access.BrowserAccessGrant.owner_id == owner.id,
-    shared_access.BrowserAccessGrant.kind == "account",
-    shared_access.BrowserAccessGrant.revoked_at.is_(None),
-  ).values(
-    revoked_at=now_naive_utc(),
-    epoch=shared_access.BrowserAccessGrant.epoch + 1,
-  ))
-  db.execute(update(shared_access.BrowserAccessGrant).where(
-    shared_access.BrowserAccessGrant.owner_id == owner.id,
-    shared_access.BrowserAccessGrant.kind == "account",
-    or_(
-      shared_access.BrowserAccessGrant.remote_status != "revoked",
-      shared_access.BrowserAccessGrant.remote_status.is_(None),
-    ),
-  ).values(remote_status="cleanup_pending"))
-  db.commit()
-  cleanup_pending = False
-  stop_pending = False
-  credential_lost = False
-  for grant in grants:
-    try:
-      if cancel_browser_grant_commands(grant.id):
-        stop_pending = True
-      await cancel_browser_grant_calls(grant.id)
-      await stop_browser_grant_runs(grant.id, db)
-    except Exception:
-      stop_pending = True
-    # A confirmed directory revocation must survive retry. A rejected or
-    # unreadable link credential cannot perform further directory cleanup;
-    # keep unconfirmed rows pending, but do not strand local unlink forever.
-    if grant.remote_status != "revoked" and not credential_lost:
-      try:
-        cleanup = await _issuer_request(db, owner.id, "DELETE", "/grants/" + grant.id)
-      except HTTPException as exc:
-        cleanup = None
-        credential_lost = exc.status_code == 409
-      if cleanup is not None and cleanup.status_code in (200, 204):
-        grant.remote_status = "revoked"
-      else:
-        credential_lost = credential_lost or (
-          cleanup is not None and cleanup.status_code == 401
-        )
-        cleanup_pending = True
-    db.commit()
+  cleanup_pending = stop_pending = credential_lost = False
+  for grant in shared_access.revoke_account_grants(db, owner.id):
+    # A rejected link credential cannot clean the directory; stop trying it,
+    # but do not strand local unlink forever.
+    ended = await shared_access.end_grant(db, grant, contact_directory=not credential_lost)
+    stop_pending = stop_pending or ended.stop_pending
+    cleanup_pending = cleanup_pending or ended.directory_cleanup_pending
+    credential_lost = credential_lost or ended.directory_credential_rejected
   if (cleanup_pending and not credential_lost) or stop_pending:
     raise HTTPException(502, "Shared access ended locally, but cleanup is pending. Retry unlink.")
   if credential_lost:

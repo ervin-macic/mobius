@@ -75,6 +75,7 @@ import {
 } from '../Shell/useDesktopSidebar.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
+import { drawerNameMaxLength, saveDrawerRename } from './drawerRename.js'
 import './Drawer.css'
 
 const LIST_TABS = ['recents', 'archived']
@@ -637,18 +638,16 @@ export default function Drawer({
   }
 
   async function renameChat(id, title) {
-    const res = await api.chats.update(id, { title })
-    if (res.ok) refreshChats()
+    if (await saveDrawerRename(() => api.chats.update(id, { title }), onNotice)) refreshChats()
   }
 
   async function renameApp(id, name) {
-    const res = await api.apps.update(id, { name })
-    if (res.ok) refreshApps()
+    if (await saveDrawerRename(() => api.apps.update(id, { name }), onNotice)) refreshApps()
   }
 
   async function renameProject(id, name) {
     const project = projects.find(row => String(row.id) === String(id))
-    if (project) await onProjectRename?.(project, name)
+    if (project) await saveDrawerRename(() => onProjectRename?.(project, name), onNotice)
   }
 
   async function publishHostedApp(id) {
@@ -1931,6 +1930,7 @@ const DrawerRow = memo(function DrawerRow({
             ref={inputRef}
             className="drawer__rename-input"
             defaultValue={label}
+            maxLength={drawerNameMaxLength(kind)}
             onKeyDown={onInputKeyDown}
             onBlur={onRenameBlur}
             aria-label="Rename app"
@@ -1944,6 +1944,7 @@ const DrawerRow = memo(function DrawerRow({
           ref={inputRef}
           className="drawer__rename-input"
           defaultValue={label}
+          maxLength={drawerNameMaxLength(kind)}
           onKeyDown={onInputKeyDown}
           onBlur={onRenameBlur}
           aria-label={`Rename ${kind}`}

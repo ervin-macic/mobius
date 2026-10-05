@@ -876,6 +876,7 @@ async def install_app(
     share_with_apps=app.share_with_apps,
     offline_capable=app.offline_capable,
     embeds_agent=app.embeds_agent,
+    shell_shortcuts=app.shell_shortcuts,
     manage_apps=app.manage_apps,
     github_access=app.github_access,
     manage_skills=app.manage_skills,
@@ -1248,7 +1249,7 @@ async def _start_conflict_resolver_turn(
     .first()
   )
   if (
-    chat is None or transcript_rows.history(chat) or has_running_run(db, chat_id) or
+    chat is None or chat.has_messages or has_running_run(db, chat_id) or
     is_chat_running(chat_id)
   ):
     return False
@@ -1491,10 +1492,10 @@ async def update_check(
   # fetching the candidate and comparing it with the recorded baseline.
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      candidate = await _fetch_update_candidate(
-        repo,
-        fetch_manifest_url,
-        strict=False,
+      # Discovery needs only the complete package identity, not its payload.
+      # The summary fetch enforces the same root-Git origin guard as install.
+      candidate = await asyncio.to_thread(
+        install.fetch_git_package_summary, repo, fetch_manifest_url,
       )
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,
@@ -1503,28 +1504,38 @@ async def update_check(
         installed_manifest_url, manifest_url, candidate.manifest,
       ):
         return _unknown()
-      recorded_tree = await asyncio.to_thread(
-        app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+      # The durable pending receipt wins before parsing/comparing a baseline.
+      # This fence stays inside the source lock after the fetch/identity check.
+      if pending is not None:
+        return _pending_result(pending, pending_state)
+      recorded_package = await asyncio.to_thread(
+        install.package_content_digest_from_git, repo, app_git.UPSTREAM_BRANCH,
       )
+      # Real legacy owner data has no package manifest. Preserve its bridge /
+      # executable-source comparison, while ordinary packages stream bytes.
+      recorded_tree = None
+      if recorded_package is None:
+        recorded_tree = await asyncio.to_thread(
+          app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+        )
+        # Only real pre-manifest owner data needs source bytes. Re-read the
+        # immutable candidate already fetched above, never another network ref.
+        legacy_candidate = await asyncio.to_thread(
+          install.read_git_install_candidate,
+          repo, candidate.commit, fetch_manifest_url, strict=False,
+        )
     except (
       HTTPException, OSError, subprocess.SubprocessError, RuntimeError,
       TypeError, ValueError,
     ):
       return _unknown()
-    if pending is not None:
-      return _pending_result(pending, pending_state)
     # One digest owns the complete declared package: manifest/capabilities,
     # executable source, icon, static assets, and seeds. A trusted catalog
     # app's migration bridge has no manifest to compare, so its first real
     # release is offered once: install replaces the bridge on exactly this
     # predicate, and later checks compare exact packages.
-    if "mobius.json" in recorded_tree:
-      try:
-        _, recorded_digest = install.package_content_digest_from_tree(
-          recorded_tree,
-        )
-      except install.PackageContentError:
-        return _unknown()
+    if recorded_package is not None:
+      _, recorded_digest = recorded_package
       update_available = recorded_digest != candidate.source_digest
     elif install.replaces_migration_bridge(
       recorded_tree,
@@ -1543,8 +1554,8 @@ async def update_check(
       except (AttributeError, KeyError, TypeError, ValueError, HTTPException):
         return _unknown()
       update_available = (
-        _recorded_update_source(recorded_tree, candidate.runtime_tree)
-        != candidate.runtime_tree
+        _recorded_update_source(recorded_tree, legacy_candidate.runtime_tree)
+        != legacy_candidate.runtime_tree
         or any(
           capability_changes[key]
           for key in ("added", "removed", "changed")

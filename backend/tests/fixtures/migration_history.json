@@ -89,6 +89,11 @@
     "0078_agent_write_journal": "fb8e95d93687d85b99b308c32f5f987f28ba60a13214b73cfd4a80d9a8d980ed",
     "0081_browser_account_grants": "a8d80a2a6f38f5096e51f7aa08ad794b03efd6f8984852fb294f8d5146051950",
     "0081_goal_hold": "ef656443434b13fed7bd22b99fa1903eef7a1ba86cd24b09967566cf1ed273d8",
-    "0082_run_owner_input_at": "5571a283b567cd3279688869d7ca79a7043d7d4f346548ecdf58f901ebc340ba"
+    "0082_run_owner_input_at": "5571a283b567cd3279688869d7ca79a7043d7d4f346548ecdf58f901ebc340ba",
+    "0082_drop_agent_write_journal": "ed5d1c08e9bea530937b32e6499da60c211971ea7962fabf1b9dc78ae819a74f",
+    "0083_retire_quiet_write_sessions": "81fa40a76702bed2e83413c0732196bc74e48b0baac31cd49f764cc65eeb50be",
+    "0084_chat_media_directory": "885e4751cab6638c3f0dddcb8b70f69f281e77defd7df2e0079c0ef6af8c8f60",
+    "0085_app_shell_shortcuts": "7a48e55ad4e1e00dcd643847f489ee4fde6557be968414f13336917d5495db19",
+    "0086_transcript_rows": "1eb049545de536d42713bfbaaffe282700fb3a1c131ff2811404ba31c7841fec"
   }
 }

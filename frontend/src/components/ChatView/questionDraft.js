@@ -1,27 +1,19 @@
-import { currentSharedBrowserStorage, isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
+import { localStore, sessionStore } from '../../lib/workspaceStorage.js'
 
 const QUESTION_DRAFT_PREFIX = 'qa-draft:'
 
 
 function browserDraftStorages() {
-  if (isSharedBrowserRoute()) {
-    const store = currentSharedBrowserStorage()
-    return store ? [store] : []
-  }
   // A question choice is unfinished user input, not disposable view state.
   // Android may recreate a standalone PWA after a long offline/background
   // spell, which drops sessionStorage even though the chat itself comes back.
-  // Keep the draft in durable origin storage; fall back to sessionStorage for
-  // restricted/private contexts where localStorage is unavailable.
+  // Keep the draft in durable storage; fall back to tab storage for
+  // restricted/private contexts where durable storage is unavailable. A guest
+  // has one grant store, which both accessors return.
   const stores = []
-  try {
-    if (globalThis.localStorage) stores.push(globalThis.localStorage)
-  } catch { /* storage blocked */ }
-  try {
-    if (globalThis.sessionStorage && !stores.includes(globalThis.sessionStorage)) {
-      stores.push(globalThis.sessionStorage)
-    }
-  } catch { /* storage blocked */ }
+  for (const store of [localStore(), sessionStore()]) {
+    if (store && !stores.includes(store)) stores.push(store)
+  }
   return stores
 }
 

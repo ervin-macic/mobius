@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
@@ -57,6 +57,7 @@ from app.chat import (
   continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
+from app.chat_compaction_state import compaction_kind
 from app.recovery_notifications import (
   complete_recovery_action,
   publish_recovery_notification,
@@ -107,7 +108,22 @@ from app.usage_metrics import CHAT_TOKEN_FIELDS, summarize_chat_run_tokens
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/chats", tags=["chats"])
+async def converted_path_chat(request: Request) -> None:
+  """Convert the path's chat before an event-loop handler reads its rows.
+
+  Handlers run on the event loop, which must never wait for a conversion
+  (transcript_rows.require_rows). This awaits the writer instead, once per
+  request, and is free for a chat that is already converted.
+  """
+  chat_id = request.path_params.get("chat_id")
+  if chat_id:
+    # A failure raises TranscriptUnavailable, which the app maps to 503.
+    await transcript_rows.ensure_converted_async(chat_id)
+
+
+router = APIRouter(
+  prefix="/api/chats", tags=["chats"], dependencies=[Depends(converted_path_chat)],
+)
 _OWNER_CHAT_CREATE_LOCK = threading.Lock()
 
 
@@ -170,7 +186,10 @@ def _active_assistant_message_id(
 # lives under its own /api/app-chats prefix so the owner-only /api/chats
 # surface stays unambiguously owner-only — the app path is additive and
 # greppable, not a flag threaded through the owner routes.
-app_chat_router = APIRouter(prefix="/api/app-chats", tags=["app-chats"])
+app_chat_router = APIRouter(
+  prefix="/api/app-chats", tags=["app-chats"],
+  dependencies=[Depends(converted_path_chat)],
+)
 
 # SOFT_DELETE_TTL is imported from app.timeutil — one shared window for chat +
 # app soft-delete so the two recovery periods can't drift.
@@ -448,18 +467,14 @@ def issue_media_token(
       app_nonce=principal.app_instance_id,
       chat_id=chat_id,
       session_id=principal.embed_session_id,
-      browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
-      browser_session_id=principal.browser_session_id,
+      browser=principal.browser,
     )
   else:
     token = auth.create_media_token(
       chat_id=chat_id,
       owner_username=principal.owner.username,
       token_epoch=principal.owner.token_epoch,
-      browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
-      browser_session_id=principal.browser_session_id,
+      browser=principal.browser,
     )
   return {"token": token, "expires_in": 900}
 
@@ -611,7 +626,7 @@ def _chat_detail_response(
   # This read owner pins the scalar/live snapshot and every body window.
   # General History views must not hold an old read transaction across an
   # external writer acknowledgement (startup repair and send planning use it).
-  transcript_rows.pin_read_snapshot(db)
+  transcript_rows.pin_read_snapshot(db, chat.id)
   db.refresh(chat)
   all_msgs = materialized_messages(chat)
   running = is_chat_running(chat.id) or has_running_run(db, chat.id)
@@ -777,6 +792,7 @@ def _chat_detail_response(
     "total": total,
     "offset": start,
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
     "runtime_revision": runtime_revision,
@@ -864,8 +880,9 @@ def list_chats(
   # a column read from the row itself would walk past the inline transcript.
   # A new projected column needs a new migration that replaces the index
   # under a new name (IF NOT EXISTS matches names only).
-  # ``has_messages`` is maintained with the transcript by the Chat model and the two writer bulk-update paths, so this hot query
-  # never reads or decodes the potentially large ``messages`` JSON column.
+  # ``has_messages`` is recomputed from the transcript rows in the same commit
+  # as every row change (transcript_rows), so this hot query never reads a
+  # transcript.
   # Recents now INCLUDES project chats, each carrying its project so the drawer
   # can render a project chip. The LEFT JOIN attaches the owning live project by
   # either membership shape — the current ``Chat.project_id`` link OR the legacy
@@ -1570,7 +1587,7 @@ async def patch_chat(
     # Capture the provider BEFORE any mutation so provider_switch logs the
     # real transition, and only when it actually changes (see after the commit).
     prev_provider = chat.provider
-    latest_message = (transcript_rows.history(chat) or [])[-1] if transcript_rows.history(chat) else None
+    latest_message = transcript_rows.at(db, chat, -1)
     legacy_handoff_ready = (
       isinstance(latest_message, dict)
       and latest_message.get("kind") == "compaction"
@@ -1844,6 +1861,7 @@ def get_chat_runtime(
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   response = {
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
@@ -1890,7 +1908,7 @@ def get_chat_message_sources(
   if principal.scope == "app":
     raise HTTPException(status_code=403, detail="App token is not valid here.")
   require_chat_embed_operation(principal, "chat:read")
-  transcript_rows.pin_read_snapshot(db)
+  transcript_rows.pin_read_snapshot(db, chat_id)
   chat = get_active_chat_for_principal(db, chat_id, principal)
   messages = materialized_messages(chat)
   if message_index >= len(messages):
@@ -1969,7 +1987,7 @@ def get_chat_activity_detail(
   if end <= start or end - start > MAX_ACTIVITY_DETAIL_BLOCKS:
     raise HTTPException(status_code=422, detail="Invalid activity range.")
 
-  transcript_rows.pin_read_snapshot(db)
+  transcript_rows.pin_read_snapshot(db, chat_id)
   chat = get_active_chat_for_principal(db, chat_id, principal)
   messages = materialized_messages(chat)
   if message_index >= len(messages):
@@ -2108,7 +2126,7 @@ def get_chat_edit_diffs(
   # is read once below, after rollback has retired the pre-fence snapshot.
   get_active_chat_or_404(db, chat_id, load_fields=(models.Chat.id,))
   _drain_writer_before_sidecar_read(db, chat_id, "chat changes")
-  transcript_rows.pin_read_snapshot(db)
+  transcript_rows.pin_read_snapshot(db, chat_id)
   chat = get_active_chat_or_404(db, chat_id)
   messages = materialized_messages(chat)
 
@@ -2239,29 +2257,6 @@ def get_thinking_trace_by_id(
       "X-Thinking-Complete": "1" if row.complete else "0",
     },
   )
-
-
-@router.get("/{chat_id}/write-outcomes/{run_id}/{operation_id}")
-def get_chat_write_outcome(
-  chat_id: str, run_id: str, operation_id: str,
-  _: models.Owner = Depends(get_current_owner),
-  db: Session = Depends(get_db),
-):
-  """Read one original write for repair, without replay or execution authority.
-
-  Like agent-context, this is owner/owner-agent observability, not an app or
-  shared-frame surface. Arguments are never automatically stuffed into failure
-  context; the agent retrieves one bounded operation only when it needs it.
-  """
-  get_active_chat_or_404(db, chat_id, load_fields=())
-  row = db.query(models.AgentWriteIntent).filter_by(
-    chat_id=chat_id, source_run_id=run_id, operation_id=operation_id,
-  ).first()
-  if row is None:
-    raise HTTPException(status_code=404, detail="Write outcome not found.")
-  return {"run_id": run_id, "id": row.operation_id, "tool": row.tool,
-          "arguments": json.loads(row.arguments_json), "status": row.status,
-          "stage": row.stage, "reason": row.reason}
 
 
 @router.get("/{chat_id}/agent-context")
@@ -2736,6 +2731,7 @@ async def _compact_chat_locked(
   db: Session,
 ):
   """Run one provider switch while settings PATCHes are excluded."""
+  from app.chat_compaction_state import compacting
   from app.chat_writer import (
     SwitchProviderWithCompaction, await_ack, get_writer,
     messages_fingerprint,
@@ -2828,116 +2824,119 @@ async def _compact_chat_locked(
   if auth_error is not None:
     raise HTTPException(status_code=409, detail=auth_error)
 
-  messages = list(transcript_rows.history(chat) or [])
-  source_messages_hash = messages_fingerprint(messages)
-  source_summary = load_cumulative_summary(data_dir, chat_id)
-  source_summary_hash = (
-    hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
-    if source_summary is not None
-    else None
-  )
-  try:
-    summary = await summarize_chat(
-      messages,
+  # Only a switch that will actually run marks the chat; refused or replayed
+  # requests return above without flashing the notice in every view.
+  with compacting(chat_id, "provider_switch"):
+    messages = list(transcript_rows.history(chat))
+    source_messages_hash = messages_fingerprint(messages)
+    source_summary = load_cumulative_summary(data_dir, chat_id)
+    source_summary_hash = (
+      hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
+      if source_summary is not None
+      else None
+    )
+    try:
+      summary = await summarize_chat(
+        messages,
+        data_dir=data_dir,
+        provider_id=body.provider,
+        source_summary=source_summary,
+        model=settings_patch.get("model"),
+        effort=settings_patch.get("effort"),
+      )
+    except CompactionError as exc:
+      raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+      log.warning(
+        "provider-switch synthesis failed for chat %s: %s", chat_id, exc,
+      )
+      raise HTTPException(
+        status_code=502,
+        detail="The incoming provider could not prepare the chat.",
+      )
+
+    # The note is a separate file the agent saves as it works. If it was
+    # rewritten while synthesis ran, retry from the fresh detailed source rather
+    # than committing a handoff the incoming provider derived from stale data.
+    latest_summary = load_cumulative_summary(data_dir, chat_id)
+    latest_hash = (
+      hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
+      if latest_summary is not None
+      else None
+    )
+    if latest_hash != source_summary_hash:
+      raise HTTPException(
+        status_code=409,
+        detail=(
+          "The chat summary changed while preparing the switch. Try again."
+        ),
+      )
+
+    ack = get_writer().submit(
+      SwitchProviderWithCompaction(
+        chat_id=chat_id,
+        switch_id=body.switch_id,
+        expected_provider=source_provider,
+        provider=body.provider,
+        settings_patch=settings_patch,
+        summary=summary,
+        source_messages_hash=source_messages_hash,
+        source_summary_hash=source_summary_hash,
+        data_dir=data_dir,
+        request_fingerprint=request_fingerprint,
+      )
+    )
+    try:
+      result = await await_ack(ack)
+    except Exception:
+      raise HTTPException(
+        status_code=503, detail="Could not save the provider switch; try again."
+      )
+    if result.get("status") == "conflict":
+      reason = result.get("reason")
+      if reason == "busy":
+        detail = "Chat is busy — finish or stop the turn before switching."
+      elif reason == "provider_pinned":
+        detail = (
+          "This chat runs in the background and stays on its original "
+          "provider; its provider can't be switched."
+        )
+      elif reason == "request_mismatch":
+        detail = "That provider-switch request id has different settings."
+      else:
+        detail = "The chat changed while preparing the switch. Try again."
+      raise HTTPException(status_code=409, detail=detail)
+
+    # The actor used its own session. Refresh this request's identity map before
+    # mirroring the committed choice to new-chat defaults.
+    db.expire_all()
+    settings_obj = _coerce_agent_settings(result.get("agent_settings_json"))
+    _mirror_agent_defaults(
+      db,
       data_dir=data_dir,
       provider_id=body.provider,
-      source_summary=source_summary,
-      model=settings_patch.get("model"),
-      effort=settings_patch.get("effort"),
+      settings_obj=settings_obj,
     )
-  except CompactionError as exc:
-    raise HTTPException(status_code=422, detail=str(exc))
-  except Exception as exc:
-    log.warning(
-      "provider-switch synthesis failed for chat %s: %s", chat_id, exc,
-    )
-    raise HTTPException(
-      status_code=502,
-      detail="The incoming provider could not prepare the chat.",
-    )
-
-  # The note is a separate file the agent saves as it works. If it was
-  # rewritten while synthesis ran, retry from the fresh detailed source rather
-  # than committing a handoff the incoming provider derived from stale data.
-  latest_summary = load_cumulative_summary(data_dir, chat_id)
-  latest_hash = (
-    hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
-    if latest_summary is not None
-    else None
-  )
-  if latest_hash != source_summary_hash:
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        "The chat summary changed while preparing the switch. Try again."
-      ),
-    )
-
-  ack = get_writer().submit(
-    SwitchProviderWithCompaction(
-      chat_id=chat_id,
-      switch_id=body.switch_id,
-      expected_provider=source_provider,
-      provider=body.provider,
-      settings_patch=settings_patch,
-      summary=summary,
-      source_messages_hash=source_messages_hash,
-      source_summary_hash=source_summary_hash,
-      data_dir=data_dir,
-      request_fingerprint=request_fingerprint,
-    )
-  )
-  try:
-    result = await await_ack(ack)
-  except Exception:
-    raise HTTPException(
-      status_code=503, detail="Could not save the provider switch; try again."
-    )
-  if result.get("status") == "conflict":
-    reason = result.get("reason")
-    if reason == "busy":
-      detail = "Chat is busy — finish or stop the turn before switching."
-    elif reason == "provider_pinned":
-      detail = (
-        "This chat runs in the background and stays on its original "
-        "provider; its provider can't be switched."
+    if result.get("status") == "committed":
+      activity.log_event(
+        "provider_switch",
+        chat_id=chat_id,
+        provider=body.provider,
+        from_provider=source_provider,
       )
-    elif reason == "request_mismatch":
-      detail = "That provider-switch request id has different settings."
-    else:
-      detail = "The chat changed while preparing the switch. Try again."
-    raise HTTPException(status_code=409, detail=detail)
 
-  # The actor used its own session. Refresh this request's identity map before
-  # mirroring the committed choice to new-chat defaults.
-  db.expire_all()
-  settings_obj = _coerce_agent_settings(result.get("agent_settings_json"))
-  _mirror_agent_defaults(
-    db,
-    data_dir=data_dir,
-    provider_id=body.provider,
-    settings_obj=settings_obj,
-  )
-  if result.get("status") == "committed":
-    activity.log_event(
-      "provider_switch",
-      chat_id=chat_id,
-      provider=body.provider,
-      from_provider=source_provider,
-    )
-
-  return {
-    "ok": True,
-    "protocol": "provider-switch-v1",
-    "switch_id": body.switch_id,
-    "summary": (result.get("stored") or {}).get("content", ""),
-    "stored": result.get("stored"),
-    "provider": body.provider,
-    "agent_settings_json": settings_obj or None,
-    "effective": providers.effective_agent_settings(
-      data_dir, settings_obj or None, provider=body.provider,
-    ),
-  }
+    return {
+      "ok": True,
+      "protocol": "provider-switch-v1",
+      "switch_id": body.switch_id,
+      "summary": (result.get("stored") or {}).get("content", ""),
+      "stored": result.get("stored"),
+      "provider": body.provider,
+      "agent_settings_json": settings_obj or None,
+      "effective": providers.effective_agent_settings(
+        data_dir, settings_obj or None, provider=body.provider,
+      ),
+    }
 
 
 @router.post(
@@ -2963,6 +2962,7 @@ async def compact_chat(
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
   )
+  from app.chat_compaction_state import compacting
   from app.compaction import (
     CompactionError, summarize_chat,
   )
@@ -2986,67 +2986,70 @@ async def compact_chat(
         status_code=409,
         detail="Chat is busy — finish or stop the current turn before compacting.",
       )
-    source_provider = chat.provider or "claude"
-    messages = list(transcript_rows.history(chat) or [])
-    data_dir = get_settings().data_dir
-    try:
+    # Other tabs, panes and devices learn the chat is busy from this state;
+    # a send made meanwhile waits on the transition lock above.
+    with compacting(chat_id, "compact"):
+      source_provider = chat.provider or "claude"
+      messages = list(transcript_rows.history(chat))
+      data_dir = get_settings().data_dir
       try:
-        note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
-      except OSError:
-        note = ""
-      source_summary = extract_cumulative_summary(note)
-      source_messages = messages
-      source_note_hash = None
+        try:
+          note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
+        except OSError:
+          note = ""
+        source_summary = extract_cumulative_summary(note)
+        source_messages = messages
+        source_note_hash = None
+        try:
+          source_summary, source_messages = recovery_source(note, messages)
+        except ValueError:
+          # Legacy or changed notes cannot replace history. Preserve the old
+          # full-transcript backstop, including its existing work limits.
+          pass
+        else:
+          source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
+        instructions = body.instructions if body is not None else None
+        settings_obj = chat.agent_settings_json or {}
+        summary = await summarize_chat(
+          source_messages,
+          data_dir=data_dir,
+          provider_id=source_provider,
+          source_summary=source_summary,
+          model=settings_obj.get("model"),
+          effort=settings_obj.get("effort"),
+          custom_instructions=instructions,
+        )
+      except CompactionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+      except Exception as exc:
+        log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
+        raise HTTPException(
+          status_code=502, detail="The summarize turn failed; not compacting."
+        )
       try:
-        source_summary, source_messages = recovery_source(note, messages)
-      except ValueError:
-        # Legacy or changed notes cannot replace history. Preserve the old
-        # full-transcript backstop, including its existing work limits.
-        pass
-      else:
-        source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
-      instructions = body.instructions if body is not None else None
-      settings_obj = chat.agent_settings_json or {}
-      summary = await summarize_chat(
-        source_messages,
-        data_dir=data_dir,
-        provider_id=source_provider,
-        source_summary=source_summary,
-        model=settings_obj.get("model"),
-        effort=settings_obj.get("effort"),
-        custom_instructions=instructions,
-      )
-    except CompactionError as exc:
-      raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-      log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
-      raise HTTPException(
-        status_code=502, detail="The summarize turn failed; not compacting."
-      )
-    try:
-      result = await await_ack(get_writer().submit(PersistCompaction(
-        chat_id=chat_id,
-        run_token=alloc_run_token(),
-        summary=summary,
-        expected_provider=source_provider,
-        source_messages_hash=messages_fingerprint(messages),
-        source_note_hash=source_note_hash,
-      )))
-    except Exception:
-      raise HTTPException(
-        status_code=503, detail="Could not store the compaction; try again."
-      )
-    if result.get("status") == "conflict":
-      raise HTTPException(
-        status_code=409,
-        detail="The chat changed while compacting. Try again.",
-      )
-    return {
-      "ok": True,
-      "summary": summary,
-      "command": f"POST /api/chats/{chat_id}/compact",
-      "stored": result.get("stored"),
-    }
+        result = await await_ack(get_writer().submit(PersistCompaction(
+          chat_id=chat_id,
+          run_token=alloc_run_token(),
+          summary=summary,
+          expected_provider=source_provider,
+          source_messages_hash=messages_fingerprint(messages),
+          source_note_hash=source_note_hash,
+        )))
+      except Exception:
+        raise HTTPException(
+          status_code=503, detail="Could not store the compaction; try again."
+        )
+      if result.get("status") == "conflict":
+        raise HTTPException(
+          status_code=409,
+          detail="The chat changed while compacting. Try again.",
+        )
+      return {
+        "ok": True,
+        "summary": summary,
+        "command": f"POST /api/chats/{chat_id}/compact",
+        "stored": result.get("stored"),
+      }
 
 
 # An app that opens a chat ABOUT one of its dated reports passes the report's
@@ -3242,7 +3245,7 @@ def _has_real_assistant_turn(chat: models.Chat) -> bool:
     isinstance(m, dict)
     and m.get("role") == "assistant"
     and m.get("kind") != "compaction"
-    for m in (transcript_rows.history(chat) or [])
+    for m in transcript_rows.history(chat)
   )
 
 
@@ -3293,7 +3296,6 @@ def _app_chat_started(chat: models.Chat, db: Session) -> bool:
   goal = presented_goal(db, chat.id)
   return bool(
     chat.has_messages
-    or transcript_rows.history(chat)
     or chat.pending_messages
     or chat.pending_question_id
     or chat.session_id
@@ -3619,7 +3621,7 @@ async def patch_app_chat(
     if body.system_prompt is not None:
       if (
         chat.system_prompt_snapshot_id
-        or transcript_rows.history(chat)
+        or chat.has_messages
         or chat.pending_messages
         or chat.session_id
         or has_nonterminal_run(db, chat_id)
@@ -3657,7 +3659,7 @@ async def patch_app_chat(
         if (
           is_chat_running(chat_id)
           or chat.pending_messages
-          or transcript_rows.history(chat)
+          or chat.has_messages
           or chat.session_id
           or has_nonterminal_run(db, chat_id)
         ):

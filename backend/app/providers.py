@@ -994,32 +994,23 @@ class MobiusProvider(BaseProvider):
     return self.declaration["models"] if self.declaration else []
 
   @staticmethod
-  def _socket_path() -> str:
-    return os.environ.get(
-      "MOBIUS_IDENTITY_BROKER_SOCKET",
-      "/run/mobius-identity-broker.sock",
-    )
-
-  @staticmethod
   def _catalog_path() -> Path:
     # Möbius intentionally owns the public product catalog instead of exposing
     # implementation model names. The context cap also bounds trial exposure.
     return Path(__file__).with_name("responses_codex_template.json").resolve()
 
   def _identity(self) -> dict[str, Any]:
-    import httpx
-    transport = httpx.HTTPTransport(uds=self._socket_path())
-    with httpx.Client(transport=transport, timeout=3.0) as client:
-      response = client.get("http://broker/identity")
+    from app.runtime_identity import broker_client
+    with broker_client(timeout=3.0) as client:
+      response = client.get("/identity")
       response.raise_for_status()
       value = response.json()
     return value if isinstance(value, dict) else {}
 
   def trial_status(self) -> dict[str, Any]:
-    import httpx
-    transport = httpx.HTTPTransport(uds=self._socket_path())
-    with httpx.Client(transport=transport, timeout=5.0) as client:
-      response = client.get("http://broker/v1/balance")
+    from app.runtime_identity import broker_client
+    with broker_client(timeout=5.0) as client:
+      response = client.get("/v1/balance")
       response.raise_for_status()
       value = response.json()
     if not isinstance(value, dict):

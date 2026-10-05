@@ -15,7 +15,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
-from app import auth, models
+from app import auth, browser_access, models
+from app.browser_access import BrowserLineage
 from app.config import get_settings
 from app.database import get_db
 from app.deps import (
@@ -111,8 +112,7 @@ def mint_embed_capability(
     instance_id=body.instance_id,
     owner_epoch=principal.owner.token_epoch,
     browser_grant_id=principal.browser_grant_id,
-    browser_grant_epoch=principal.browser_grant_epoch,
-    browser_session_id=principal.browser_session_id,
+    browser_session_id=principal.browser.session_id if principal.browser else None,
     role="participant",
     operations_json=list(PARTICIPANT_OPERATIONS),
     expires_at=expires_at,
@@ -167,11 +167,8 @@ def exchange_embed_capability(
   ):
     raise HTTPException(status_code=401, detail="Embed bootstrap grant was revoked.")
 
-  if grant.browser_grant_id is not None:
-    from app.browser_access import validate_grant, validate_session
-    validate_grant(db, grant.browser_grant_id, grant.browser_grant_epoch, owner.id)
-    if grant.browser_session_id is not None:
-      validate_session(db, grant.browser_session_id, grant.browser_grant_id, owner.id)
+  browser = BrowserLineage.of(grant.browser_grant_id, grant.browser_session_id)
+  browser_access.require_live(db, browser, owner.id)
 
   # A lost/slow response can make the parent mint and exchange a replacement
   # while this older request is still in flight. Grant creation order is the
@@ -247,9 +244,7 @@ def exchange_embed_capability(
     role=claims["role"],
     operations=claims["operations"],
     expires_delta=SESSION_TTL,
-    browser_grant_id=grant.browser_grant_id,
-    browser_grant_epoch=grant.browser_grant_epoch,
-    browser_session_id=grant.browser_session_id,
+    browser=browser,
   )
   return {
     "token": token,

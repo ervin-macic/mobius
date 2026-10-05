@@ -21,8 +21,8 @@ def _grant(db, monkeypatch):
   db.commit()
   grant = access.BrowserAccessGrant(
     id="g" * 32, owner_id=owner.id, label="Owner's instance", kind="account",
-    issuer=account.issuer_origin(), subject="user_123", recipient_handle="alice",
-    origin="https://shared.example", remote_status="active", epoch=0,
+    issuer=access.issuer_origin(), subject="user_123", recipient_handle="alice",
+    origin="https://shared.example", remote_status="active",
     grantor_binding=access.account_binding(db, owner.id),
   )
   db.add(grant)
@@ -37,7 +37,7 @@ def _owner_account_grant(db):
   db.commit()
   grant = access.BrowserAccessGrant(
     id="g" * 32, owner_id=owner.id, label="Shared", kind="account",
-    remote_status="active", epoch=0,
+    remote_status="active",
   )
   db.add(grant)
   db.commit()
@@ -62,7 +62,7 @@ def test_account_pending_binds_cookie_state_epoch_and_replay(db, monkeypatch):
   _denied(lambda: account.pending_for_callback(db, state, "wrong" * 10))
   _denied(lambda: account.pending_for_callback(db, "wrong" * 10, cookie))
   account.mark_verified(db, pending.id,
-    (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat())
+    (datetime.now(timezone.utc) + timedelta(seconds=30)))
   secret, session, _, _ = account.complete(db, pending.id)
   assert session.grant_id == grant.id
   assert access.renew_session(db, secret)[0].id == grant.id
@@ -100,7 +100,7 @@ async def test_proof_requires_exact_issuer_subject_origin_nonce_and_audience(db,
       assert kwargs["json"]["grant_id"] == grant.id
       return httpx.Response(200, json=proof)
   monkeypatch.setattr(account.httpx, "AsyncClient", Client)
-  assert await account.exchange_code(pending, grant, "c" * 32) == proof
+  assert await account.exchange_code(pending, grant, "c" * 32) == datetime.fromisoformat(proof["expires_at"])
   for key, wrong in (("iss", "https://evil.example"), ("sub", "other"),
                      ("aud", "owner"), ("origin", "https://evil.example"),
                      ("grant_id", "other"), ("nonce", "other")):
@@ -130,13 +130,13 @@ def test_account_route_registration_retry_and_revocation_cleanup(client, auth, d
       ids.append(payload["grant_id"])
       if calls == 1:
         raise HTTPException(502, "Lost response")
-      return httpx.Response(200, json={"issuer": account.issuer_origin(),
+      return httpx.Response(200, json={"issuer": access.issuer_origin(),
         "subject": "user_alice", "handle": "alice", "grant_id": payload["grant_id"],
         "origin": "https://shared.example", "open_url": "https://shared.example/ignored"})
     if method == "DELETE":
       return httpx.Response(503)
     return httpx.Response(200, json={"instances": []})
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   body = {"recipient_handle": "@Alice", "instance_name": "Test instance"}
   assert client.post("/api/connect/browser-access/accounts", json=body, headers=auth).status_code == 502
   reply = client.post("/api/connect/browser-access/accounts", json=body, headers=auth)
@@ -157,6 +157,99 @@ def test_account_route_registration_retry_and_revocation_cleanup(client, auth, d
   assert client.get("/api/connect/browser-access", headers=auth).json()["grants"][0]["directory_cleanup_pending"] is True
 
 
+def _linked_owner(client, db, monkeypatch, token="fixture-token-ciphertext"):
+  monkeypatch.setattr(get_settings(), "frontend_origin", "https://shared.example")
+  client.base_url = "https://shared.example"
+  client.headers["Origin"] = "https://shared.example"
+  owner = db.query(models.Owner).one()
+  db.add(models.IdentityAccountLink(owner_id=owner.id,
+    access_token_encrypted=token, scopes_json=["identity:read", "identity:write"]))
+  db.commit()
+  return owner
+
+
+def _registering_issuer(monkeypatch, posted):
+  async def remote(db, owner_id, method, suffix, payload=None):
+    if method == "POST":
+      posted.append(payload)
+      return httpx.Response(200, json={"issuer": access.issuer_origin(),
+        "subject": "user_" + payload["recipient_handle"], "handle": payload["recipient_handle"],
+        "grant_id": payload["grant_id"], "origin": "https://shared.example"})
+    return httpx.Response(204)
+  monkeypatch.setattr(account, "issuer_request", remote)
+
+
+def test_account_share_defaults_to_this_address_and_keeps_one_grant_per_handle(client, auth, db, monkeypatch):
+  _linked_owner(client, db, monkeypatch)
+  posted = []
+  _registering_issuer(monkeypatch, posted)
+  first = client.post("/api/connect/browser-access/accounts", json={"recipient_handle": "alice"}, headers=auth)
+  assert first.status_code == 200, first.text
+  # The recipient sees a meaningful name, never a generic "This Möbius".
+  assert posted[0]["instance_name"] == "shared.example"
+  assert first.json()["grant"]["label"] == "shared.example"
+  renamed = client.post("/api/connect/browser-access/accounts",
+    json={"recipient_handle": "@Alice", "instance_name": "Work"}, headers=auth)
+  assert renamed.status_code == 200
+  assert renamed.json()["grant"]["id"] == first.json()["grant"]["id"]
+  assert len(posted) == 1
+  live = db.query(access.BrowserAccessGrant).filter_by(recipient_handle="alice", revoked_at=None).count()
+  assert live == 1
+
+
+def test_account_errors_carry_codes(client, auth, db, monkeypatch):
+  monkeypatch.setattr(get_settings(), "frontend_origin", "https://shared.example")
+  client.base_url = "https://shared.example"
+  client.headers["Origin"] = "https://shared.example"
+  unlinked = client.post("/api/connect/browser-access/accounts", json={"recipient_handle": "alice"}, headers=auth)
+  assert unlinked.status_code == 409
+  assert unlinked.json() == {"detail": "Link your mobius.you account in Identity first.", "code": "account_unlinked"}
+  inbox = client.get("/api/connect/browser-access/shared", headers=auth)
+  assert inbox.status_code == 409 and inbox.json()["code"] == "account_unlinked"
+  invalid = client.post("/api/connect/browser-access/accounts", json={"recipient_handle": "-bad-"}, headers=auth)
+  assert invalid.status_code == 422 and invalid.json()["code"] == "invalid_handle"
+  _linked_owner(client, db, monkeypatch)
+  async def remote(db, owner_id, method, suffix, payload=None):
+    if method == "POST":
+      return httpx.Response(404, json={"error": "unknown_handle"})
+    if suffix == "/shared":
+      return httpx.Response(403, json={"error": "Not Allowed!"})
+    return httpx.Response(204)
+  monkeypatch.setattr(account, "issuer_request", remote)
+  unknown = client.post("/api/connect/browser-access/accounts", json={"recipient_handle": "nobody"}, headers=auth)
+  assert unknown.status_code == 404
+  assert unknown.json() == {"detail": "No mobius.you account has that handle.", "code": "unknown_handle"}
+  # The reserved grant stays pending (not live access) and is reused on retry.
+  grant = db.query(access.BrowserAccessGrant).filter_by(recipient_handle="nobody").one()
+  assert grant.remote_status == "pending"
+  # An unreadable directory code still has a stable code.
+  rejected = client.get("/api/connect/browser-access/shared", headers=auth)
+  assert rejected.status_code == 403 and rejected.json()["code"] == "directory_rejected"
+
+
+def test_relinked_owner_sees_stale_grant_inactive_and_reinvite_replaces_it(client, auth, db, monkeypatch):
+  owner = _linked_owner(client, db, monkeypatch)
+  posted = []
+  _registering_issuer(monkeypatch, posted)
+  first = client.post("/api/connect/browser-access/accounts", json={"recipient_handle": "alice"}, headers=auth)
+  old_id = first.json()["grant"]["id"]
+  assert first.json()["grant"]["status"] == "active"
+  # Relinking replaces the link credential the grant was bound to.
+  link = db.get(models.IdentityAccountLink, owner.id)
+  link.access_token_encrypted = "replacement-token-ciphertext"
+  db.commit()
+  grants = client.get("/api/connect/browser-access", headers=auth).json()["grants"]
+  assert [(g["id"], g["status"]) for g in grants] == [(old_id, "inactive")]
+  assert not access.is_live(db, access.BrowserLineage(old_id), owner.id)
+  again = client.post("/api/connect/browser-access/accounts", json={"recipient_handle": "alice"}, headers=auth)
+  assert again.status_code == 200, again.text
+  new_id = again.json()["grant"]["id"]
+  assert new_id != old_id and again.json()["grant"]["status"] == "active"
+  assert db.get(access.BrowserAccessGrant, old_id).revoked_at is not None
+  statuses = {g["id"]: g["status"] for g in client.get("/api/connect/browser-access", headers=auth).json()["grants"]}
+  assert statuses == {old_id: "revoked", new_id: "active"}
+
+
 def test_revoke_retry_preserves_confirmed_directory_cleanup_while_stopping_work(client, auth, db, monkeypatch):
   from app.routes import browser_access as routes, connect
   owner, grant = _owner_account_grant(db)
@@ -165,7 +258,7 @@ def test_revoke_retry_preserves_confirmed_directory_cleanup_while_stopping_work(
   async def remote(db, owner_id, method, suffix, payload=None):
     cleanup_calls.append(suffix)
     return httpx.Response(204 if len(cleanup_calls) == 1 else 401)
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   monkeypatch.setattr(connect, "cancel_browser_grant_commands", lambda grant_id:
     [{"request_id": "fixture-command", "remote_confirmed": False}] if stops_pending else [])
   path = "/api/connect/browser-access/" + grant.id
@@ -204,10 +297,10 @@ def test_account_registration_pins_canonical_https_origin(
   async def remote(db, owner_id, method, suffix, payload=None):
     assert method == "POST" and suffix == "/grants"
     return httpx.Response(200, json={
-      "issuer": account.issuer_origin(), "grant_id": payload["grant_id"],
+      "issuer": access.issuer_origin(), "grant_id": payload["grant_id"],
       "origin": canonical, "handle": "alice", "subject": "user_alice",
     })
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   client.base_url = canonical
   response = client.post("/api/connect/browser-access/accounts", headers={
     **auth, "Origin": canonical, "Sec-Fetch-Site": "same-origin",
@@ -215,9 +308,9 @@ def test_account_registration_pins_canonical_https_origin(
   assert response.status_code == 200, response.text
   grant = db.get(access.BrowserAccessGrant, response.json()["grant"]["id"])
   assert grant.origin == canonical
-  assert access.validate_grant(db, grant.id, grant.epoch, owner.id).id == grant.id
+  assert access.is_live(db, access.BrowserLineage(grant.id), owner.id)
   monkeypatch.setattr(get_settings(), "frontend_origin", canonical)
-  assert access.validate_grant(db, grant.id, grant.epoch, owner.id).id == grant.id
+  assert access.is_live(db, access.BrowserLineage(grant.id), owner.id)
 
 
 @pytest.mark.parametrize("configured,canonical", [
@@ -252,7 +345,7 @@ def test_account_origin_rejects_unsafe_config(monkeypatch, invalid):
   from app.routes import browser_access as routes
   monkeypatch.setattr(get_settings(), "frontend_origin", invalid)
   with pytest.raises(HTTPException) as error:
-    routes._origin()
+    access.runtime_origin()
   assert error.value.status_code == 409
 
 
@@ -270,7 +363,7 @@ def test_callback_requires_same_origin_finalize_and_redirects_without_code(clien
   async def verified(pending, found, code):
     assert code == "c" * 32
     assert found.id == grant.id
-    return {"expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()}
+    return datetime.now(timezone.utc) + timedelta(seconds=30)
   monkeypatch.setattr(account, "exchange_code", verified)
   response = client.get("/api/connect/browser-access/session/account/callback", params={
     "code": "c" * 32, "state": state,
@@ -308,14 +401,21 @@ def test_shared_directory_rebuilds_link_and_rejects_unsafe_origin(client, auth, 
          "open_url": "https://evil.example/steal", "status": "invited", "unread": True}
   async def remote(*args, **kwargs):
     return httpx.Response(200, json={"instances": [row]})
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   response = client.get("/api/connect/browser-access/shared", headers=auth)
   assert response.status_code == 200
   instance = response.json()["instances"][0]
   assert instance["name"] == "<b>not HTML</b>"
   assert instance["open_url"] == "https://other.example/api/connect/browser-access/session/account/start?grant_id=" + "g" * 32
-  row["origin"] = "https://other.example@evil.example"
-  assert client.get("/api/connect/browser-access/shared", headers=auth).status_code == 502
+  # One unsafe or malformed row is skipped; it never hides the valid ones.
+  unsafe = {**row, "origin": "https://other.example@evil.example", "grant_id": "u" * 32}
+  short_id = {**row, "grant_id": "abcdefgh"}
+  async def mixed(*args, **kwargs):
+    return httpx.Response(200, json={"instances": [unsafe, short_id, "junk", row]})
+  monkeypatch.setattr(account, "issuer_request", mixed)
+  response = client.get("/api/connect/browser-access/shared", headers=auth)
+  assert response.status_code == 200
+  assert [item["grant_id"] for item in response.json()["instances"]] == ["g" * 32]
 
 
 def test_link_generation_change_invalidates_existing_account_session(db, monkeypatch):
@@ -324,12 +424,12 @@ def test_link_generation_change_invalidates_existing_account_session(db, monkeyp
   state = parse_qs(urlsplit(url).query)["state"][0]
   pending, _ = account.pending_for_callback(db, state, cookie)
   account.mark_verified(db, pending.id,
-    (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat())
+    (datetime.now(timezone.utc) + timedelta(seconds=30)))
   secret, session, _, _ = account.complete(db, pending.id)
-  assert access.validate_session(db, session.id, grant.id, owner.id).id == session.id
+  assert access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
   db.delete(db.get(models.IdentityAccountLink, owner.id))
   db.commit()
-  _denied(lambda: access.validate_session(db, session.id, grant.id, owner.id))
+  assert not access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
   _denied(lambda: access.renew_session(db, secret))
   _denied(lambda: account.start(db, grant.id))
 
@@ -345,8 +445,8 @@ def test_explicit_identity_unlink_revokes_account_grants_before_link_removal(cli
   db.commit()
   grant = access.BrowserAccessGrant(
     id="u" * 32, owner_id=owner.id, label="Test", kind="account",
-    issuer=account.issuer_origin(), subject="user_alice", recipient_handle="alice",
-    origin="https://shared.example", remote_status="active", epoch=0,
+    issuer=access.issuer_origin(), subject="user_alice", recipient_handle="alice",
+    origin="https://shared.example", remote_status="active",
     grantor_binding=access.account_binding(db, owner.id),
   )
   db.add(grant)
@@ -358,7 +458,7 @@ def test_explicit_identity_unlink_revokes_account_grants_before_link_removal(cli
     assert db.get(models.IdentityAccountLink, owner.id) is not None
     order.append("grant-delete")
     return httpx.Response(204)
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   import app.routes.identity as identity
   monkeypatch.setattr(identity, "_open", lambda value: "fake-token")
   original = httpx.AsyncClient
@@ -379,7 +479,7 @@ def test_finalization_expires_with_proof_not_ten_minute_pending(db, monkeypatch)
   state = parse_qs(urlsplit(url).query)["state"][0]
   pending, _ = account.pending_for_callback(db, state, cookie)
   account.mark_verified(db, pending.id,
-    (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat())
+    (datetime.now(timezone.utc) + timedelta(seconds=2)))
   pending.verified_expires_at = account.now_naive_utc() - timedelta(seconds=1)
   db.commit()
   _denied(lambda: account.verified_for_cookie(db, cookie))
@@ -399,8 +499,8 @@ def test_unlink_failure_still_closes_every_local_account_grant(client, auth, db,
   for grant_id in ("a" * 32, "b" * 32):
     db.add(access.BrowserAccessGrant(
       id=grant_id, owner_id=owner.id, label="Shared", kind="account",
-      issuer=account.issuer_origin(), subject="user_alice", recipient_handle="alice",
-      origin="https://shared.example", remote_status="active", epoch=0,
+      issuer=access.issuer_origin(), subject="user_alice", recipient_handle="alice",
+      origin="https://shared.example", remote_status="active",
       grantor_binding=binding,
     ))
   db.commit()
@@ -408,7 +508,7 @@ def test_unlink_failure_still_closes_every_local_account_grant(client, auth, db,
   async def remote(db, owner_id, method, suffix, payload=None):
     attempted.append(suffix)
     return httpx.Response(503)
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   response = client.delete("/api/identity/link", headers=auth)
   assert response.status_code == 502
   grants = db.query(access.BrowserAccessGrant).filter_by(kind="account").all()
@@ -425,7 +525,7 @@ def test_unlink_retry_skips_confirmed_directory_revocations(client, auth, db, mo
   confirmed.revoked_at = access.now_naive_utc()
   pending = access.BrowserAccessGrant(
     id="p" * 32, owner_id=owner.id, label="Pending", kind="account",
-    remote_status="cleanup_pending", epoch=1,
+    remote_status="cleanup_pending",
   )
   db.add(pending)
   db.commit()
@@ -433,7 +533,7 @@ def test_unlink_retry_skips_confirmed_directory_revocations(client, auth, db, mo
   async def remote(db, owner_id, method, suffix, payload=None):
     calls.append(suffix)
     return httpx.Response(204)
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   monkeypatch.setattr(identity, "_open", lambda value: "fixture-token")
   original = httpx.AsyncClient
   monkeypatch.setattr(identity.httpx, "AsyncClient", lambda **kwargs: original(
@@ -456,7 +556,7 @@ def test_unlink_lost_credential_closes_local_grants_without_directory_claim(
   owner, first = _owner_account_grant(db)
   second = access.BrowserAccessGrant(
     id="q" * 32, owner_id=owner.id, label="Second", kind="account",
-    remote_status="active", epoch=0,
+    remote_status="active",
   )
   db.add(second)
   db.commit()
@@ -466,7 +566,7 @@ def test_unlink_lost_credential_closes_local_grants_without_directory_claim(
     if lost_credential == "unreadable":
       raise HTTPException(409, "Sign in again to reconnect your account.")
     return httpx.Response(401)
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   response = client.delete("/api/identity/link", headers=auth)
   assert response.status_code == 204, response.text
   assert calls == ["/grants/" + first.id]
@@ -491,11 +591,11 @@ def test_registration_response_cannot_reactivate_locally_revoked_grant(client, a
     calls.append(method)
     if method == "POST":
       access.revoke_grant(db, payload["grant_id"], owner_id)
-      return httpx.Response(200, json={"issuer": account.issuer_origin(),
+      return httpx.Response(200, json={"issuer": access.issuer_origin(),
         "subject": "user_alice", "handle": "alice", "grant_id": payload["grant_id"],
         "origin": "https://shared.example"})
     return httpx.Response(204)
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   response = client.post("/api/connect/browser-access/accounts", headers=auth,
     json={"recipient_handle": "alice"})
   assert response.status_code == 409
@@ -510,7 +610,7 @@ def _signed_account_session(db, grant):
   state = parse_qs(urlsplit(url).query)["state"][0]
   pending, _ = account.pending_for_callback(db, state, cookie)
   account.mark_verified(db, pending.id,
-    (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat())
+    (datetime.now(timezone.utc) + timedelta(seconds=30)))
   secret, session, _, _ = account.complete(db, pending.id)
   return secret, session
 
@@ -528,25 +628,25 @@ def test_managed_binding_pins_instance_id_and_issuer_for_jwt_and_refresh(db, mon
     id="m" * 32, owner_id=owner.id, label="Managed", kind="account",
     issuer="https://identity.example", subject="user_guest",
     recipient_handle="guest", origin="https://managed.example",
-    remote_status="active", epoch=0,
+    remote_status="active",
     grantor_binding=access.account_binding(db, owner.id),
   )
   db.add(grant)
   db.commit()
   secret, session = _signed_account_session(db, grant)
-  assert access.validate_grant(db, grant.id, grant.epoch, owner.id).id == grant.id
-  assert access.validate_session(db, session.id, grant.id, owner.id).id == session.id
+  assert access.is_live(db, access.BrowserLineage(grant.id), owner.id)
+  assert access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
   for setting, changed in (
     ("mobius_sso_instance_id", "mob_replacement"),
     ("mobius_sso_issuer", "https://replacement-identity.example"),
   ):
     original = getattr(settings, setting)
     monkeypatch.setattr(settings, setting, changed)
-    _denied(lambda: access.validate_grant(db, grant.id, grant.epoch, owner.id))
-    _denied(lambda: access.validate_session(db, session.id, grant.id, owner.id))
+    assert not access.is_live(db, access.BrowserLineage(grant.id), owner.id)
+    assert not access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
     _denied(lambda: access.renew_session(db, secret))
     monkeypatch.setattr(settings, setting, original)
-    assert access.validate_session(db, session.id, grant.id, owner.id).id == session.id
+    assert access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
 
 
 def test_changed_runtime_origin_invalidates_existing_account_jwt_and_refresh(db, monkeypatch):
@@ -559,12 +659,12 @@ def test_changed_runtime_origin_invalidates_existing_account_jwt_and_refresh(db,
   ):
     original = getattr(settings, setting)
     monkeypatch.setattr(settings, setting, changed)
-    _denied(lambda: access.validate_grant(db, grant.id, grant.epoch, owner.id))
-    _denied(lambda: access.validate_session(db, session.id, grant.id, owner.id))
+    assert not access.is_live(db, access.BrowserLineage(grant.id), owner.id)
+    assert not access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
     _denied(lambda: access.renew_session(db, secret))
     _denied(lambda: account.start(db, grant.id))
     monkeypatch.setattr(settings, setting, original)
-    assert access.validate_session(db, session.id, grant.id, owner.id).id == session.id
+    assert access.is_live(db, access.BrowserLineage(grant.id, session.id), owner.id)
 
 
 def test_shared_inbox_response_is_recipient_proxy_not_session_creation(client, auth, db, monkeypatch):
@@ -579,7 +679,7 @@ def test_shared_inbox_response_is_recipient_proxy_not_session_creation(client, a
     calls.append((owner_id, method, suffix, payload))
     row["status"] = "accepted" if payload["action"] == "accept" else row["status"]
     return httpx.Response(200, json={"instance": row})
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   before = db.query(access.BrowserAccessSession).count()
   for action, expected in (("later", "invited"), ("accept", "accepted"), ("accept", "accepted")):
     response = client.post("/api/connect/browser-access/shared/respond", headers=headers,
@@ -607,7 +707,7 @@ def test_shared_inbox_rejects_bad_input_before_issuer(client, auth, monkeypatch,
   client.base_url = "https://shared.example"
   async def remote(*args, **kwargs):
     pytest.fail("Invalid response must never reach the issuer")
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   body = {"origin": "https://other.example", "grant_id": "g" * 32, "action": "accept", **changes}
   response = client.post("/api/connect/browser-access/shared/respond", json=body,
     headers={**auth, "Origin": "https://shared.example"})
@@ -626,7 +726,7 @@ def test_shared_inbox_rejects_mismatched_issuer_receipt(client, auth, monkeypatc
     return httpx.Response(200, json={"instance": {
       "origin": "https://other.example", "grant_id": "g" * 32, "name": "Other",
       "owner_handle": "owner", "status": "accepted", "unread": False, **changes}})
-  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(account, "issuer_request", remote)
   response = client.post("/api/connect/browser-access/shared/respond", headers={**auth, "Origin": "https://shared.example"},
     json={"origin": "https://other.example", "grant_id": "g" * 32, "action": "accept"})
   assert response.status_code == 502, response.text

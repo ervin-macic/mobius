@@ -32,6 +32,7 @@ def _app_owned_reviewer_policy(monkeypatch):
 
 def test_public_authority_changes_require_installation_owner():
   from app.deps import Principal
+  from app.browser_access import BrowserLineage
   from app.routes import reviewer as reviewer_routes
 
   owner = models.Owner(username="reviewer-fixture", hashed_password="unused")
@@ -40,7 +41,7 @@ def test_public_authority_changes_require_installation_owner():
   for principal in (
     Principal(owner=owner, scope="app", app_id=12),
     Principal(owner=owner, app_id=None, delegation_id="child-1"),
-    Principal(owner=owner, app_id=None, browser_grant_id="guest", browser_grant_epoch=0),
+    Principal(owner=owner, app_id=None, browser=BrowserLineage("guest")),
   ):
     with pytest.raises(HTTPException) as denied:
       reviewer_routes._require_reviewer_owner_action(principal)

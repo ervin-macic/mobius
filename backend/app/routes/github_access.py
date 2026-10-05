@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict
 from slowapi import Limiter
@@ -306,14 +306,17 @@ async def github_status(
 async def github_source_status(
   _: models.Owner = Depends(get_owner_or_app_with_github_access),
   db: Session = Depends(get_db),
+  since: list[str] = Query(default=[]),
 ):
   """Fetch-free local source map for the Contribute app.
 
   Returns refs, diff magnitudes, and working-tree metadata for the platform and
   every live app source repository.  It deliberately does not fetch remotes,
   expose source contents/absolute paths, or grant Contribute the much broader
-  filesystem capability. App reads take the same per-source lock as explicit
-  apply and Store install, so a commit/update cannot split one status snapshot.
+  filesystem capability. Optional ``since`` commits (active proposals' recorded
+  sources) add which local-only paths changed after each one. App reads take
+  the same per-source lock as explicit apply and Store install, so a
+  commit/update cannot split one status snapshot.
   """
   rows = (
     db.query(models.App)
@@ -342,14 +345,19 @@ async def github_source_status(
   # safe and idempotent.
   db.close()
 
-  platform = await asyncio.to_thread(source_status.build_platform_status)
+  since_commits = source_status.source_commits(since)
+  platform = await asyncio.to_thread(
+    source_status.build_platform_status, since_commits,
+  )
   semaphore = asyncio.Semaphore(4)
 
   async def inspect(app: dict) -> dict | None:
     async with semaphore:
       async with fs_locks.source_dir_lock(app["source_dir"]):
         try:
-          return await asyncio.to_thread(source_status.build_app_status, app)
+          return await asyncio.to_thread(
+            source_status.build_app_status, app, since_commits,
+          )
         except Exception:
           # One damaged checkout must not blank the complete repository map.
           # The omitted app can recover on the next refresh after its source is

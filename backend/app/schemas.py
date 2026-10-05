@@ -175,6 +175,8 @@ class AppOut(BaseModel):
   offline_capable: bool = False
   # The app embeds an agent chat — surfaced as a badge. See models.App.
   embeds_agent: bool = False
+  # Shell shortcuts reach this app's frame. See models.App.shell_shortcuts.
+  shell_shortcuts: bool = True
   # Install authority — see models.App.manage_apps for the contract.
   manage_apps: bool = False
   # GitHub data/reviewed-submit access — see models.App.github_access.

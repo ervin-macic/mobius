@@ -20,7 +20,6 @@ export default function SharedBrowserAccess({ initialEntry = null }) {
   const [grant, setGrant] = useState(null)
   const [status, setStatus] = useState(initialEntry?.kind === 'invite' ? 'invited' : initialEntry?.kind === 'invalid' ? 'ended' : 'checking')
   const [logoutFailed, setLogoutFailed] = useState(false)
-  const [unsupportedBrowser, setUnsupportedBrowser] = useState(false)
   const admissionVersionRef = useRef(0)
 
   useEffect(() => watchSharedBrowserEntries(window, nextEntry => {
@@ -31,7 +30,6 @@ export default function SharedBrowserAccess({ initialEntry = null }) {
     queryClient.clear()
     setGrant(null)
     setLogoutFailed(false)
-    setUnsupportedBrowser(false)
     setEntry(nextEntry)
     setStatus(nextEntry.kind === 'invite' ? 'invited' : nextEntry.kind === 'invalid' ? 'ended' : 'checking')
   }), [queryClient])
@@ -46,11 +44,8 @@ export default function SharedBrowserAccess({ initialEntry = null }) {
       if (!live || admissionVersion !== admissionVersionRef.current) return
       setGrant(data.grant)
       setStatus('active')
-    }).catch(error => {
-      if (live && admissionVersion === admissionVersionRef.current) {
-        setUnsupportedBrowser(error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED')
-        setStatus('ended')
-      }
+    }).catch(() => {
+      if (live && admissionVersion === admissionVersionRef.current) setStatus('ended')
     })
     return () => { live = false }
   }, [entry])
@@ -72,11 +67,8 @@ export default function SharedBrowserAccess({ initialEntry = null }) {
       if (admissionVersion !== admissionVersionRef.current) return
       setGrant(data.grant)
       setStatus('active')
-    } catch (error) {
-      if (admissionVersion === admissionVersionRef.current) {
-        setUnsupportedBrowser(error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED')
-        setStatus('ended')
-      }
+    } catch {
+      if (admissionVersion === admissionVersionRef.current) setStatus('ended')
     }
   }
 
@@ -86,9 +78,7 @@ export default function SharedBrowserAccess({ initialEntry = null }) {
     try {
       await leaveSharedBrowserSession()
       setLogoutFailed(false)
-    } catch (error) {
-      if (error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED') clearSharedBrowserSession()
-      setUnsupportedBrowser(error?.message === 'SHARED_ACCESS_BROWSER_UNSUPPORTED')
+    } catch {
       setLogoutFailed(true)
     }
   }
@@ -113,12 +103,10 @@ export default function SharedBrowserAccess({ initialEntry = null }) {
       </>}
       {status === 'working' && <p role="status">Opening shared access…</p>}
       {status === 'ended' && <>
-        <p>{unsupportedBrowser
-          ? 'This browser does not support the secure shared-session coordination needed for access. Use a current browser with Web Locks support.'
-          : logoutFailed
+        <p>{logoutFailed
           ? 'Access is closed in this tab, but server sign-out could not be confirmed. Reloading may restore access.'
           : 'This sign-in or session is no longer available. Open the instance again from Shared with me, or request a new invitation.'}</p>
-        {logoutFailed && !unsupportedBrowser && <button type="button" onClick={leave}>Retry server sign-out</button>}
+        {logoutFailed && <button type="button" onClick={leave}>Retry server sign-out</button>}
         <a href={`${BASE}/shell/`}>Sign in as the owner</a>
       </>}
     </section>

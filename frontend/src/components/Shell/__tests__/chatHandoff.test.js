@@ -338,12 +338,13 @@ test('direct chat actions hand focus to the destination composer', () => {
   assert.match(startUserNewChatPresentation,
     /if \(pendingNewChatRef\.current\) \{[\s\S]*newChatRequestSeqRef\.current \+= 1[\s\S]*pendingNewChatRef\.current = null[\s\S]*setPendingNewChatToken\(0\)/,
     'an explicit New Chat must invalidate an older deferred null-slot result')
-  assert.match(shell,
-    /const requestEmptySingleNewChat = useCallback\(\(\) => \{[\s\S]*?if \(newChatPresentationRef\.current\) return/,
-    'a stale list refresh must not restart automatic allocation over the explicit presentation')
-  assert.match(shell,
-    /const hadNewChatPresentationRef = useRef\(false\)[\s\S]*hadPresentation = hadNewChatPresentationRef\.current[\s\S]*if \(!hadPresentation \|\| newChatPresentation != null\) return[\s\S]*ws\.viewMode !== 'single' \|\| ws\.singleScreen != null[\s\S]*requestEmptySingleNewChat\(\)/,
-    'retiring an explicit presentation must return an otherwise-empty Standard slot to automatic repair')
+  const emptySlotRepair = shell.match(
+    /const requestEmptySingleNewChat = useCallback\(\(\) => \{([\s\S]*?)\n  \},/,
+  )?.[1] || ''
+  assert.match(emptySlotRepair, /if \(!single \|\| ws\.singleScreen != null\) return/,
+    'a concrete destination, including a provisional chat, prevents automatic allocation')
+  assert.doesNotMatch(emptySlotRepair, /newChatPresentationRef/,
+    'an off-screen pending creation cannot strand an unrelated empty Standard slot')
   assert.match(startUserNewChatPresentation,
     /const openIntent = newChatIntentRef\.current[\s\S]*const openIntentDraft = openIntent \? readComposerDraft\(openIntent\.chatId\) : null[\s\S]*const visibleSingleChatId = ws\.viewMode === 'single'[\s\S]*const savedIntentIsElsewhere = openIntent != null[\s\S]*visibleSingleChatId !== String\(openIntent\.chatId\)[\s\S]*!savedIntentIsElsewhere[\s\S]*visibleSingleChatId === String\(activeChatIdRef\.current\)/,
     'only the chat in the actual Standard slot can be reused, and never over a durable New Chat intent')

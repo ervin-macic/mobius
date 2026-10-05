@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
       transcript_host_proof:
-        description: Prove the transcript-row first upgrade, interruptions and floor-aware recovery with the real Host helper on a disposable hosted runner (up to 120 minutes)
+        description: Prove per-message transcripts survive a real Host worker round trip to the previous release (disposable hosted runner)
         type: boolean
         default: false
   pull_request:
@@ -103,7 +103,9 @@ jobs:
             if docker manifest inspect "$image:sha-$sha" >/dev/null 2>&1; then previous=$sha; break; fi
           done
           [ -n "$previous" ] || { echo "no published release at or before $base"; exit 1; }
-          docker pull -q "$image:sha-$previous"
+          # One platform only: the disposable registry stores what is pushed, and
+          # a partially pulled multi-platform index cannot be pushed whole.
+          docker pull -q --platform linux/amd64 "$image:sha-$previous"
           docker pull -q registry:2
           certs=$(mktemp -d)
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=ghcr.io" \
@@ -146,11 +148,11 @@ jobs:
           sudo ss -ltnp | grep -E ':(80|443) ' || true
           docker logs --tail 200 disposable-registry 2>&1 || true
           sudo journalctl --no-pager -u docker --since '-2h' | tail -n 120 || true
-      - name: First upgrade, interruptions and floor-aware recovery on a real Host
+      - name: Transcripts survive target -> previous -> target through the real Host worker
         run: |
           # The installer runs as root over this runner-owned checkout.
           sudo git config --global --add safe.directory '*'
-          sudo scripts/test-transcript-host-cutover.sh "$PREVIOUS" "${{ github.sha }}"
+          sudo env MOBIUS_TRANSCRIPT_PROOF=1 scripts/test-host-helper.sh "$PREVIOUS" "${{ github.sha }}"
 
   privacy:
     runs-on: ubuntu-latest
@@ -226,9 +228,12 @@ jobs:
         # First boot only logs a failed default-app install, so a platform
         # contract change, or an app `main` that no longer installs on this platform,
         # would otherwise ship silently. This step fetches the apps from GitHub.
+        # Shared runners exhaust the unauthenticated API rate limit; the
+        # read-only workflow token lifts it for api.github.com requests.
         working-directory: backend
         env:
           MOBIUS_LIVE_BOOTSTRAP: '1'
+          GITHUB_TOKEN: ${{ github.token }}
         run: pytest -q tests/test_bootstrap_live.py
       - name: Validate bundled Caddy policy
         # Caddy expands these placeholders inside its container. Keep the
@@ -438,7 +443,7 @@ jobs:
           run=true
           if [ "$EVENT" = pull_request ]; then
             git diff --name-only "$PR_BASE" HEAD \
-              | grep -qE '^(Dockerfile|\.dockerignore|backend/requirements\.(txt|lock)|backend/runtime/|backend/scripts/(entrypoint\.sh|install_platform_release\.py|prepare-container-cutover\.py)|backend/app/(platform_update|platform_boot|platform_activation|deployment_control|restart_util|restart_ledger|main|startup|auth)\.py|backend/app/routes/(platform|admin|auth)\.py|scripts/(mobius-rebuild-host\.py|install-rebuild-helper\.sh|finish-helper-update\.py|test-upgrade-path\.sh)|deployment/|\.github/workflows/test\.yml)' \
+              | grep -qE '^(Dockerfile|\.dockerignore|backend/requirements\.(txt|lock)|backend/runtime/|backend/scripts/(entrypoint\.sh|install_platform_release\.py|prepare-container-cutover\.py)|backend/app/(platform_update|platform_boot|platform_activation|deployment_control|restart_util|restart_ledger|main|startup|auth)\.py|backend/app/routes/(platform|admin|auth)\.py|backend/app/(transcript_rows|chat_writer|schema_migrations|models|chat_search)\.py|scripts/(mobius-rebuild-host\.py|test-upgrade-path\.sh|test-transcript-rollback\.sh|transcript_rollback_probe\.py)|deployment/|\.github/workflows/test\.yml)' \
               || run=false
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
@@ -488,6 +493,11 @@ jobs:
           [ -n "$previous" ] || { echo "infrastructure: no published image at or before $base"; exit 1; }
           docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
           scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
+          echo "PREVIOUS_IMAGE=ghcr.io/mobius-os/mobius:sha-$previous" >> "$GITHUB_ENV"
+
+      - name: Roll back to the previous release and return without losing a chat
+        if: steps.scope.outputs.run == 'true'
+        run: scripts/test-transcript-rollback.sh "$PREVIOUS_IMAGE" mobius-test:ci
 
   e2e:
     runs-on: ubuntu-latest

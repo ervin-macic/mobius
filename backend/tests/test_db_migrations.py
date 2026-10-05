@@ -9,14 +9,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import String, create_engine, event, inspect, select, text
+from sqlalchemy import String, create_engine, event, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models
 from app.chat_writer import create_chat
-from app import transcript_rows
-from app import one_way_upgrades
 import app.schema_migrations as migrations
 from app.config import get_settings
 from app.schema_migrations import (
@@ -69,27 +67,6 @@ def _migration_versions_before(target: str) -> list[str]:
   return versions[:versions.index(target)]
 
 
-def _seed_historic_messages_column(eng, chat_ids: list[str] | None = None) -> None:
-  """Give a pre-normalization migration its real former JSON column.
-
-  These tests create current ORM chat rows for unrelated scalar fields. The
-  retired migration under test reads ``chats.messages``, not normalized rows,
-  so copy the fixture's initial bodies into an explicit former-schema column.
-  """
-  with Session(eng) as session:
-    if chat_ids is None:
-      chat_ids = session.execute(select(models.Chat.id)).scalars().all()
-    bodies = {
-      chat_id: transcript_rows.read_all(session, chat_id)
-      for chat_id in chat_ids
-    }
-  with eng.begin() as conn:
-    conn.execute(text("ALTER TABLE chats ADD COLUMN messages JSON"))
-    for chat_id, messages in bodies.items():
-      conn.execute(text("UPDATE chats SET messages=:messages WHERE id=:id"),
-                   {"id": chat_id, "messages": json.dumps(messages)})
-
-
 def test_previous_release_database_upgrades_to_current_orm(tmp_path):
   """The real boot order must close every ORM gap on an existing install.
 
@@ -108,18 +85,12 @@ def test_previous_release_database_upgrades_to_current_orm(tmp_path):
   assert "goal_plan_json" not in before
   assert "goal_plan_revision" not in before
 
-  seen = one_way_upgrades.preflight(eng)
-  one_way_upgrades.ensure_compat_record(str(db_path), seen)
   # Production creates new tables first, then upgrades existing ones. Keep the
   # test on that exact ordering: reversing it would prove a different system.
   models.Base.metadata.create_all(bind=eng)
   run_migrations(eng)
   first_history = schema_migration_history(eng)
   run_migrations(eng)
-  # The ledger intentionally leaves the former JSON column intact for the
-  # separately gated, one-way transcript cutover. Mapper compatibility is only
-  # promised after that concrete gate, as on production boot.
-  one_way_upgrades.run_gate(str(db_path), seen.existing_tables)
 
   assert migrations.mapped_schema_gaps(eng) == []
   assert schema_migration_history(eng) == first_history
@@ -1248,12 +1219,11 @@ def test_run_migrations_removes_only_persisted_codex_prompt_summaries(tmp_path):
     ("claude", "claude", "agent_started", "running", "message-uuid",
      "task description"),
   ]
-  with Session(eng) as session:
-    session.add(create_chat(id="chat", title="Chat", title_locked=False,
-                            messages=[], pending_messages=[], uploads=[],
-                            provider="claude"))
-    session.commit()
   with eng.connect() as conn:
+    conn.execute(text(
+      "INSERT INTO chats (id, title, title_locked, messages, pending_messages, "
+      "uploads, provider) VALUES ('chat', 'Chat', 0, '[]', '[]', '[]', 'claude')"
+    ))
     for index, (key, provider, event_type, state, source_id, summary) in enumerate(
       rows,
     ):
@@ -1819,6 +1789,11 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0081_browser_account_grants",
     "0081_goal_hold",
     "0082_run_owner_input_at",
+    "0082_drop_agent_write_journal",
+    "0083_retire_quiet_write_sessions",
+    "0084_chat_media_directory",
+    "0085_app_shell_shortcuts",
+    "0086_transcript_rows",
   ]
   assert second == first
 
@@ -1878,20 +1853,19 @@ def test_chat_retention_repair_reclaims_broken_workflow_graph(
   app = models.App(
     name="Repair", slug="repair", source_dir=str(source_dir),
   )
-  # This is a pre-transcript-cutover retention fixture. Its old chat rows had
-  # no normalized state/children yet; adding those future rows would create
-  # FK debt outside the historical repair migration's ownership boundary.
+  # A previous-release retention fixture: a chats row only, with no rows or
+  # conversion marker, as that release wrote it.
   controller = models.Chat(
-    id=controller_id, title="Controller", provider="codex",
+    id=controller_id, title="Controller", legacy_messages=[], provider="codex",
   )
   child = models.Chat(
-    id=child_id, title="Child", provider="codex",
+    id=child_id, title="Child", legacy_messages=[], provider="codex",
   )
   nested = models.Chat(
-    id=nested_id, title="Nested", provider="codex",
+    id=nested_id, title="Nested", legacy_messages=[], provider="codex",
   )
   survivor = models.Chat(
-    id=survivor_id, title="Survivor", provider="codex",
+    id=survivor_id, title="Survivor", legacy_messages=[], provider="codex",
   )
   missing_run = models.ChatRun(
     id="missing-run", root_run_id="missing-run", chat_id=survivor_id,
@@ -2684,11 +2658,8 @@ def test_legacy_chat_models_pin_only_established_unselected_chats(
         agent_settings_json={"model": "gpt-5.5", "effort": "low"},
       ),
     ]
-    legacy_chat_ids = [row.id for row in rows]
     session.add_all(rows)
     session.commit()
-
-  _seed_historic_messages_column(eng, legacy_chat_ids)
 
   with eng.begin() as conn:
     conn.execute(text(
@@ -2775,10 +2746,6 @@ def test_legacy_chat_models_never_invent_a_provider_default(
     ])
     session.commit()
 
-  _seed_historic_messages_column(
-    eng, ["known-provider-choice", "no-provider-choice"],
-  )
-
   migrations._pin_established_legacy_chat_models(eng)
   migrations._pin_established_legacy_chat_models(eng)
 
@@ -2818,7 +2785,6 @@ def test_legacy_chat_models_preserve_malformed_settings(tmp_path, monkeypatch):
       agent_settings_json=None,
     ))
     session.commit()
-  _seed_historic_messages_column(eng, ["malformed-settings"])
   with eng.begin() as conn:
     conn.execute(text(
       "UPDATE chats SET agent_settings_json = '{malformed' "
@@ -3325,7 +3291,6 @@ def test_goal_migration_backfills_only_the_running_turns_initiating_goal(
       started_at=started_at,
     ))
     session.commit()
-  _seed_historic_messages_column(eng)
   with eng.begin() as conn:
     conn.execute(text("ALTER TABLE chat_runs DROP COLUMN goal_objective"))
 
@@ -3682,7 +3647,6 @@ def test_active_chat_model_migrations_pin_lazy_drafts_and_scoped_rows(
       },
     ))
     session.commit()
-  _seed_historic_messages_column(eng)
   with eng.begin() as conn:
     conn.execute(text(
       "CREATE TABLE schema_migrations ("
@@ -3801,7 +3765,6 @@ def test_active_chat_model_migration_never_reassigns_queued_provider_state(
       },
     ))
     session.commit()
-  _seed_historic_messages_column(eng)
   with eng.begin() as conn:
     conn.execute(text(
       "CREATE TABLE schema_migrations ("
@@ -3842,7 +3805,6 @@ def test_active_chat_model_migration_honors_unknown_picker_model_provider_pair(
       created_by_app_id=7, agent_settings_json=None,
     ))
     session.commit()
-  _seed_historic_messages_column(eng)
   with eng.begin() as conn:
     conn.execute(text(
       "CREATE TABLE schema_migrations ("
@@ -3920,7 +3882,6 @@ def test_post_explicit_model_repair_pins_all_later_gaps_without_provider_handoff
       },
     ))
     session.commit()
-  _seed_historic_messages_column(eng)
   with eng.begin() as conn:
     conn.execute(text(
       "CREATE TABLE schema_migrations ("
@@ -3997,7 +3958,6 @@ def test_post_explicit_model_repair_preserves_only_genuine_first_install_chat(
       messages=[], agent_settings_json=None,
     ))
     session.commit()
-  _seed_historic_messages_column(eng)
   with eng.begin() as conn:
     conn.execute(text(
       "CREATE TABLE schema_migrations ("
@@ -4732,3 +4692,16 @@ def test_delegation_goal_task_keeps_existing_name_links(tmp_path):
       "SELECT id, goal_task_id FROM delegations"
     )).all())
   assert links == {"old": "audit", "new": None}
+
+
+def test_retired_write_journal_tables_are_dropped_idempotently(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'write-journal.db'}")
+  with eng.begin() as conn:
+    conn.execute(text("CREATE TABLE chats (id VARCHAR(64) PRIMARY KEY)"))
+    conn.execute(text("CREATE TABLE chat_runs (id VARCHAR(64) PRIMARY KEY)"))
+  migrations._add_agent_write_journal(eng)
+  migrations._drop_agent_write_journal(eng)
+  migrations._drop_agent_write_journal(eng)
+  tables = set(inspect(eng).get_table_names())
+  assert not {"agent_write_streams", "agent_write_intents"} & tables
+  assert {"chats", "chat_runs"} <= tables

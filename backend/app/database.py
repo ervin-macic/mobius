@@ -162,6 +162,32 @@ def _make_engine():
 engine = _make_engine()
 
 
+def reclaim_startup_database_file_cache() -> dict | None:
+  """Advise away clean pages of the main SQLite file after a healthy boot.
+
+  Migrations and startup reconciliation read much of the database once; on
+  hosts that charge page cache to the container those clean pages stay
+  billable long after boot. This is a one-shot startup policy, not pool or
+  per-request cleanup. Only an ordinary absolute filename from the active
+  engine qualifies: opening a connection to ask SQLite for its filename could
+  checkpoint WAL when that last connection closes, so URI, relative and
+  in-memory configurations get no advice. WAL/SHM files, attached databases
+  and SQLite's own page-cache settings stay untouched.
+  """
+  if engine.dialect.name != "sqlite":
+    return None
+  filename = engine.url.database
+  if (
+    not filename
+    or engine.url.query.get("uri")
+    or not Path(filename).is_absolute()
+  ):
+    return None
+  from app.file_cache import reclaim_file_cache
+
+  return reclaim_file_cache([filename])
+
+
 def checked_out_connections() -> int:
   """Return live DB checkouts without depending on a concrete pool class."""
   with _pool_metrics_lock:

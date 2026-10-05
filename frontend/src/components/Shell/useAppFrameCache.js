@@ -15,7 +15,7 @@ import {
   appFrameCacheMaxForDeviceMemory,
   deriveRenderedAppIds,
 } from './appFrameCache.js'
-import { isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
+import { isOwnerWorkspace } from '../../lib/workspaceStorage.js'
 
 /** Own mounted app-frame identity, bounded recency, warming, and eviction. */
 export default function useAppFrameCache({
@@ -109,7 +109,7 @@ export default function useAppFrameCache({
   const warmAppCode = useCallback(async (app) => {
     // Guest modules must be fetched live through the broker, not seeded into
     // the owner's token-stripped offline app-code key by speculative warming.
-    if (isSharedBrowserRoute()) return
+    if (!isOwnerWorkspace()) return
     try {
       const token = await queryClient.fetchQuery({
         queryKey: appQueries.token.key(app.id),

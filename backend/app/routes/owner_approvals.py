@@ -25,7 +25,11 @@ from app.owner_input import publish_owner_input_changed
 from app.resource_access import get_active_chat_for_principal
 from app.agent_work_claims import claim_work
 
-router = APIRouter(prefix="/api/chats", tags=["owner-approvals"])
+from app.routes.chats import converted_path_chat
+
+router = APIRouter(
+  prefix="/api/chats", tags=["owner-approvals"], dependencies=[Depends(converted_path_chat)],
+)
 
 
 class ApprovalOption(BaseModel):
@@ -66,7 +70,7 @@ class QuestionSpec(BaseModel):
 
 class QuestionRequest(BaseModel):
   model_config = ConfigDict(extra="forbid")
-  questions: list[QuestionSpec] = Field(min_length=1, max_length=3)
+  questions: list[QuestionSpec] = Field(min_length=1, max_length=10)
 
   @model_validator(mode="after")
   def distinct_questions(self):
@@ -213,6 +217,7 @@ async def save_owner_question(
   """One save-before-receipt owner for every terminal question card."""
   if principal.chat_id != chat_id:
     raise HTTPException(status_code=403, detail="Agent run belongs to another chat.")
+  await transcript_rows.ensure_converted_async(chat_id, db)
   # An identical retry in the same physical turn addresses the same card,
   # including when the first HTTP response was lost after commit.
   question_id = str(uuid5(NAMESPACE_URL, json.dumps(
@@ -254,7 +259,7 @@ async def save_owner_question(
         activation_wait["created_by_run_id"] = run.id
         activation_wait["root_run_id"] = run.root_run_id or run.id
         activation_wait["goal_id"] = run.goal_id
-      for message in reversed(transcript_rows.history(chat) or []):
+      for message in reversed(transcript_rows.history(chat)):
         for block in message.get("blocks") or []:
           if block.get("type") == "question" and block.get("question_id") == question_id:
             if block.get("answers"):

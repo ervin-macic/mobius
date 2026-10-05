@@ -1,5 +1,6 @@
 """Contract tests for the unregistered browser-access persistence foundation."""
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -9,7 +10,7 @@ from app.browser_access import (
   BrowserAccessGrant, BrowserAccessInvite, BrowserAccessSession,
   INVITATION_TTL, SESSION_IDLE_TTL, create_invitation,
   logout_session, redeem_invitation, reissue_invitation, renew_session,
-  revoke_grant, validate_grant, validate_session,
+  BrowserLineage, is_live, revoke_grant,
 )
 from app.models import Owner
 from app.database import SessionLocal
@@ -21,6 +22,10 @@ def _owner(db, name):
   db.add(owner)
   db.commit()
   return owner
+
+
+def _live(db, grant_id, owner_id, session_id=None):
+  return is_live(db, BrowserLineage(grant_id, session_id), owner_id)
 
 
 def _denied(action):
@@ -38,7 +43,6 @@ def test_new_grants_are_recipient_isolated_and_secrets_are_never_stored(db):
   assert grant_a.label == "laptop"
   assert grant_a.revoked_at is None
   assert grant_a.created_at is not None
-  assert grant_a.epoch == 0
   assert grant_a.id != invitation_a
   assert invitation_a != invitation_b
   invites = db.query(BrowserAccessInvite).all()
@@ -46,10 +50,9 @@ def test_new_grants_are_recipient_isolated_and_secrets_are_never_stored(db):
   assert all(invite.secret_hash not in (invitation_a, invitation_b) for invite in invites)
   assert all(invite.expires_at - invite.created_at == INVITATION_TTL for invite in invites)
   assert all(invite.owner_token_epoch == owner.token_epoch for invite in invites)
-  assert validate_grant(db, grant_a.id, 0, owner.id).id == grant_a.id
-  _denied(lambda: validate_grant(db, grant_a.id, 0, other.id))
-  _denied(lambda: validate_grant(db, grant_a.id, 1, owner.id))
-  _denied(lambda: validate_grant(db, grant_b.id, 0, other.id))
+  assert _live(db, grant_a.id, owner.id)
+  assert not _live(db, grant_a.id, other.id)
+  assert not _live(db, grant_b.id, other.id)
 
 
 def test_invitation_is_one_use_and_session_is_idle_expiring_not_grant_expiring(db):
@@ -66,11 +69,11 @@ def test_invitation_is_one_use_and_session_is_idle_expiring_not_grant_expiring(d
   })
   db.commit()
   assert renew_session(db, secret)[0].id == grant.id
-  assert validate_grant(db, grant.id, 0, owner.id).id == grant.id
+  assert _live(db, grant.id, owner.id)
   session.idle_expires_at = now_naive_utc() - timedelta(seconds=1)
   db.commit()
   _denied(lambda: renew_session(db, secret))
-  assert validate_grant(db, grant.id, 0, owner.id).id == grant.id
+  assert _live(db, grant.id, owner.id)
 
 
 def test_expired_invitation_never_consumes_or_issues_session(db):
@@ -91,13 +94,13 @@ def test_revocation_is_idempotent_and_cannot_affect_another_grant(db):
   grant_b, invite_b = create_invitation(db, owner, "b")
   secret_a, _, _, _ = redeem_invitation(db, invite_a)
   secret_b, _, _, _ = redeem_invitation(db, invite_b)
-  assert revoke_grant(db, grant_a.id, owner.id).epoch == 1
-  assert revoke_grant(db, grant_a.id, owner.id).epoch == 1
+  revoked_at = revoke_grant(db, grant_a.id, owner.id).revoked_at
+  assert revoked_at is not None
+  assert revoke_grant(db, grant_a.id, owner.id).revoked_at == revoked_at
   _denied(lambda: renew_session(db, secret_a))
-  _denied(lambda: validate_grant(db, grant_a.id, 0, owner.id))
-  _denied(lambda: validate_grant(db, grant_a.id, 1, owner.id))
+  assert not _live(db, grant_a.id, owner.id)
   assert renew_session(db, secret_b)[0].id == grant_b.id
-  assert validate_grant(db, grant_b.id, 0, owner.id).id == grant_b.id
+  assert _live(db, grant_b.id, owner.id)
 
 
 def test_owner_epoch_change_invalidates_session_but_not_other_permission(db):
@@ -107,7 +110,7 @@ def test_owner_epoch_change_invalidates_session_but_not_other_permission(db):
   owner.token_epoch += 1
   db.commit()
   _denied(lambda: renew_session(db, secret))
-  assert validate_grant(db, grant.id, 0, owner.id).id == grant.id
+  assert _live(db, grant.id, owner.id)
 
 
 def test_owner_epoch_change_invalidates_unredeemed_invitation(db):
@@ -121,36 +124,36 @@ def test_owner_epoch_change_invalidates_unredeemed_invitation(db):
   assert invite.consumed_at is None
 
 
-def test_validate_session_checks_lineage_expiry_epoch_and_logout(db):
+def test_session_liveness_checks_lineage_expiry_epoch_and_logout(db):
   owner = _owner(db, "owner")
   other = _owner(db, "other")
   grant, invitation = create_invitation(db, owner, "recipient")
   other_grant, _ = create_invitation(db, owner, "other recipient")
   secret, session, _, _ = redeem_invitation(db, invitation)
-  assert validate_session(db, session.id, grant.id, owner.id).id == session.id
-  _denied(lambda: validate_session(db, session.id, other_grant.id, owner.id))
-  _denied(lambda: validate_session(db, session.id, grant.id, other.id))
-  _denied(lambda: validate_session(db, "missing", grant.id, owner.id))
+  assert _live(db, grant.id, owner.id, session.id)
+  assert not _live(db, other_grant.id, owner.id, session.id)
+  assert not _live(db, grant.id, other.id, session.id)
+  assert not _live(db, grant.id, owner.id, "missing")
   logout_session(db, secret)
   logout_session(db, secret)
   logout_session(db, "unknown-secret-with-adequate-length")
   logout_session(db, None)
-  _denied(lambda: validate_session(db, session.id, grant.id, owner.id))
+  assert not _live(db, grant.id, owner.id, session.id)
   _denied(lambda: renew_session(db, secret))
-  assert validate_grant(db, grant.id, 0, owner.id).id == grant.id
+  assert _live(db, grant.id, owner.id)
 
 
-def test_validate_session_denies_idle_expiry_and_owner_epoch_change(db):
+def test_session_liveness_denies_idle_expiry_and_owner_epoch_change(db):
   owner = _owner(db, "owner")
   grant, invitation = create_invitation(db, owner, "recipient")
   _, session, _, _ = redeem_invitation(db, invitation)
   session.idle_expires_at = now_naive_utc() - timedelta(seconds=1)
   db.commit()
-  _denied(lambda: validate_session(db, session.id, grant.id, owner.id))
+  assert not _live(db, grant.id, owner.id, session.id)
   session.idle_expires_at = now_naive_utc() + SESSION_IDLE_TTL
   owner.token_epoch += 1
   db.commit()
-  _denied(lambda: validate_session(db, session.id, grant.id, owner.id))
+  assert not _live(db, grant.id, owner.id, session.id)
 
 
 def test_reissue_invitation_keeps_grant_and_session_but_expires_old_invite(db):
@@ -163,28 +166,72 @@ def test_reissue_invitation_keeps_grant_and_session_but_expires_old_invite(db):
   _denied(lambda: redeem_invitation(db, old_invitation))
   secret, session, received_grant, _ = redeem_invitation(db, new_invitation)
   assert received_grant.id == grant.id
-  assert validate_session(db, session.id, grant.id, owner.id).id == session.id
+  assert _live(db, grant.id, owner.id, session.id)
   again = reissue_invitation(db, owner, grant.id)
   assert again != new_invitation
   assert renew_session(db, secret)[0].id == grant.id
   revoke_grant(db, grant.id, owner.id)
   _denied(lambda: reissue_invitation(db, owner, grant.id))
   _denied(lambda: redeem_invitation(db, again))
-  _denied(lambda: validate_session(db, session.id, grant.id, owner.id))
+  assert not _live(db, grant.id, owner.id, session.id)
 
 
-@pytest.mark.parametrize("claim", [None, "", 123, [], {}, True])
-def test_malformed_grant_id_claim_fails_closed(db, claim):
+@pytest.mark.parametrize("claim", [None, "", 123, [], {}, True, "x" * 65])
+def test_malformed_grant_id_claim_fails_closed(claim):
+  _denied(lambda: BrowserLineage.from_claims({"browser_grant": claim}))
+  if claim is not None:
+    _denied(lambda: BrowserLineage.from_claims({"browser_grant": "grant", "browser_session": claim}))
+
+
+def test_retired_epoch_claim_is_ignored_but_never_stands_alone(db):
   owner = _owner(db, "owner")
-  grant, _ = create_invitation(db, owner, "recipient")
-  _denied(lambda: validate_grant(db, claim, 0, owner.id))
+  grant, invitation = create_invitation(db, owner, "recipient")
+  _, session, _, _ = redeem_invitation(db, invitation)
+  # Bearers minted before the epoch retired keep working until revoked.
+  legacy = {"browser_grant": grant.id, "browser_grant_epoch": 0, "browser_session": session.id}
+  assert BrowserLineage.from_claims(legacy) == BrowserLineage(grant.id, session.id)
+  assert BrowserLineage.from_claims({"sub": "owner"}) is None
+  _denied(lambda: BrowserLineage.from_claims({"browser_grant_epoch": 0}))
+  _denied(lambda: BrowserLineage.from_claims({"browser_session": session.id}))
+  revoke_grant(db, grant.id, owner.id)
+  assert not is_live(db, BrowserLineage.from_claims(legacy), owner.id)
 
 
-@pytest.mark.parametrize("claim", [None, "0", True, -1, 0.0, [], {}])
-def test_malformed_epoch_claim_fails_closed(db, claim):
-  owner = _owner(db, "owner")
-  grant, _ = create_invitation(db, owner, "recipient")
-  _denied(lambda: validate_grant(db, grant.id, claim, owner.id))
+def test_revocation_is_terminal_nothing_clears_revoked_at():
+  """A grant id is sufficient lineage only because revocation is permanent.
+
+  If grants ever need pause/resume, reintroduce a generation number rather
+  than clearing ``revoked_at`` (see browser_access module docstring).
+  """
+  import ast
+  from pathlib import Path
+  offenders = []
+  for path in Path(__file__).resolve().parents[1].joinpath("app").rglob("*.py"):
+    source = path.read_text(encoding="utf-8")
+    if "BrowserAccessGrant" not in source and "browser_access_grants" not in source:
+      continue
+    if re.search(r"revoked_at\s*=\s*NULL", source, re.IGNORECASE):
+      offenders.append(f"{path.name}: SQL clears revoked_at")
+    for node in ast.walk(ast.parse(source)):
+      clears = False
+      if isinstance(node, ast.Assign):
+        clears = any(isinstance(t, ast.Attribute) and t.attr == "revoked_at" for t in node.targets) and (
+          isinstance(node.value, ast.Constant) and node.value.value is None)
+      elif isinstance(node, ast.Call) and not (
+        isinstance(node.func, ast.Attribute) and node.func.attr in ("filter_by", "get", "pop")
+      ):
+        clears = any(k.arg == "revoked_at" and isinstance(k.value, ast.Constant) and k.value.value is None
+                     for k in node.keywords)
+      elif isinstance(node, ast.Dict):
+        clears = any(
+          ((isinstance(k, ast.Attribute) and k.attr == "revoked_at")
+           or (isinstance(k, ast.Constant) and k.value == "revoked_at"))
+          and isinstance(v, ast.Constant) and v.value is None
+          for k, v in zip(node.keys, node.values)
+        )
+      if clears:
+        offenders.append(f"{path.name}:{node.lineno}")
+  assert offenders == []
 
 
 def test_wrong_owner_cannot_revoke_and_invite_remains_redeemable(db):
@@ -224,3 +271,66 @@ def test_browser_tables_migrate_without_current_model_metadata(tmp_path):
   with engine.begin() as connection:
     connection.execute(text("INSERT INTO browser_access_grants (id,owner_id,label,epoch,created_at) VALUES ('guest',1,'Alice',0,CURRENT_TIMESTAMP)"))
     assert connection.execute(text("SELECT label FROM browser_access_grants")).scalar_one() == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_ending_a_grant_runs_every_stop_step_when_one_fails(db, monkeypatch):
+  from app import app_services, chat, browser_access
+  from app.routes import connect
+  owner = _owner(db, "owner")
+  grant, _ = create_invitation(db, owner, "recipient")
+  grant = revoke_grant(db, grant.id, owner.id)
+  calls = []
+
+  def broken_commands(grant_id):
+    raise OSError("ledger unavailable")
+
+  async def stop_calls(grant_id):
+    calls.append("calls")
+
+  async def stop_runs(grant_id, session):
+    calls.append("runs")
+
+  monkeypatch.setattr(connect, "cancel_browser_grant_commands", broken_commands)
+  monkeypatch.setattr(app_services, "cancel_browser_grant_calls", stop_calls)
+  monkeypatch.setattr(chat, "stop_browser_grant_runs", stop_runs)
+  ended = await browser_access.end_grant(db, grant)
+  assert calls == ["calls", "runs"]
+  assert isinstance(ended.stop_error, OSError)
+  assert ended.stop_pending
+
+
+@pytest.mark.asyncio
+async def test_ending_a_grant_still_records_cleanup_after_a_step_breaks_the_session(db, monkeypatch):
+  from app import account_browser_access, app_services, chat, browser_access
+  from app.browser_access import BrowserAccessGrant
+  from app.routes import connect
+  owner = _owner(db, "owner")
+  grant = BrowserAccessGrant(
+    id="g" * 24, owner_id=owner.id, label="Shared", kind="account",
+    recipient_handle="friend", remote_status="active",
+  )
+  db.add(grant)
+  db.commit()
+  grant = revoke_grant(db, grant.id, owner.id)
+
+  async def broken_runs(grant_id, session):
+    # A failed flush leaves the session needing a rollback.
+    session.add(BrowserAccessGrant(id="h" * 24, owner_id=None, label="x"))
+    session.flush()
+
+  async def unregister(session, row):
+    return "revoked"
+
+  async def no_calls(grant_id):
+    return None
+
+  monkeypatch.setattr(connect, "cancel_browser_grant_commands", lambda grant_id: [])
+  monkeypatch.setattr(app_services, "cancel_browser_grant_calls", no_calls)
+  monkeypatch.setattr(chat, "stop_browser_grant_runs", broken_runs)
+  monkeypatch.setattr(account_browser_access, "unregister", unregister)
+  ended = await browser_access.end_grant(db, grant)
+  assert ended.stop_error is not None
+  assert not ended.directory_cleanup_pending
+  db.expire_all()
+  assert db.get(BrowserAccessGrant, grant.id).remote_status == "revoked"

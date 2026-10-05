@@ -334,6 +334,13 @@ class SystemSubscription(asyncio.Queue):
   exactly as long as the connection that carries it — unsubscribe drops both,
   with no timer or heartbeat to go stale. `visible_app_ids` stays empty for
   subscribers that never report (internal waiters, embedded chats).
+
+  The queue belongs to the event loop its reader runs on. asyncio queues are
+  not thread-safe, and synchronous routes publish from worker threads, so
+  `offer` hands a cross-thread event to that loop instead of touching the
+  queue directly. A direct cross-thread put does not wake the loop (delivery
+  stalls until something else does) and can race a reader cancelling its
+  wait, raising after the publisher's own work already committed.
   """
 
   def __init__(self):
@@ -341,6 +348,36 @@ class SystemSubscription(asyncio.Queue):
     self.id = secrets.token_urlsafe(16)
     self.visible_app_ids: frozenset[str] = frozenset()
     self.visible_apps_sequence = 0
+    # None when created outside a running loop (synchronous tests and
+    # tools); such a subscriber is read on the publisher's own thread.
+    self._reader_loop = _running_loop_or_none()
+
+  def offer(self, event: dict) -> None:
+    """Queue ``event`` for this subscriber from any thread; never raises."""
+    loop = self._reader_loop
+    if loop is None or _running_loop_or_none() is loop:
+      self._put_or_drop(event)
+      return
+    try:
+      loop.call_soon_threadsafe(self._put_or_drop, event)
+    except RuntimeError:
+      # The reader's loop has closed (shutdown): nobody is left to read it.
+      pass
+
+  def _put_or_drop(self, event: dict) -> None:
+    try:
+      self.put_nowait(event)
+    except asyncio.QueueFull:
+      log.warning(
+        "system subscriber queue full, dropping %s", event.get("type", "?"),
+      )
+
+
+def _running_loop_or_none() -> asyncio.AbstractEventLoop | None:
+  try:
+    return asyncio.get_running_loop()
+  except RuntimeError:
+    return None
 
 
 class SystemBroadcast:
@@ -367,18 +404,16 @@ class SystemBroadcast:
     self.subscribers: list[SystemSubscription] = []
 
   def publish(self, event: dict) -> None:
-    """Push an event to every live subscriber. Failures (queue full,
-    closed) are logged + dropped — publishers such as explicit app apply
-    or the agent's POST /api/notify cannot usefully
-    block on a stuck subscriber."""
-    for q in self.subscribers:
-      try:
-        q.put_nowait(event)
-      except asyncio.QueueFull:
-        log.warning(
-          "system subscriber queue full, dropping %s",
-          event.get("type", "?"),
-        )
+    """Push an event to every live subscriber, from any thread. Failures
+    are dropped (a full queue is also logged) — publishers such as
+    explicit app apply or the agent's POST /api/notify cannot usefully
+    block on a stuck subscriber, and a committed owner action must never
+    turn into an error response because a notification could not be sent.
+
+    Iterate a snapshot: a worker-thread publish can overlap the loop
+    subscribing or unsubscribing, and a live list may skip a subscriber."""
+    for q in tuple(self.subscribers):
+      q.offer(event)
 
   def subscribe(self) -> SystemSubscription:
     """Returns a queue that receives live events. The caller MUST
