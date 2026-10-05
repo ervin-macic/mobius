@@ -18,11 +18,11 @@
     <meta name="description" content="AI-powered personal app platform." />
     <!-- iOS PWA: hides Safari UI chrome when launched from home screen -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <!-- Installed iOS launches use an opaque black OS status bar in every
-         theme, including standalone /apps/<slug>/ installs and fullscreen
-         games (which reuse this document). Immersive apps cannot paint under
-         the notch. iOS may pin this policy at Home Screen installation, so a
-         reload alone may not adopt a changed launch policy. -->
+    <!-- Installed iOS launches use the opaque `default` status bar, tinted from
+         theme-color to the active theme, including standalone /apps/<slug>/
+         installs and fullscreen games (which reuse this document). Immersive
+         apps cannot paint under the notch. iOS may pin this policy at Home
+         Screen installation, so re-add the icon to adopt a changed policy. -->
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Möbius" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
