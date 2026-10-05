@@ -74,14 +74,20 @@ function appFrameShortcuts() {
   // Messages are built in the script's own realm; compare them as plain data.
   const plain = value => JSON.parse(JSON.stringify(value))
   const child = { postMessage(message) { childPosts.push(plain(message)) } }
+  const otherChild = { postMessage() {} }
   const parent = { postMessage(message, origin) { shellPosts.push({ message: plain(message), origin }) } }
   const window = {
     parent,
-    frames: [child],
+    frames: [child, otherChild],
     location: { origin: SHELL_ORIGIN },
     addEventListener(type, callback) { listeners.set(type, callback) },
   }
+  // Focus starts on the child's iframe inside a focused app document.
+  const iframeOf = contentWindow => ({ contentWindow })
+  let documentFocused = true
   const document = {
+    activeElement: iframeOf(child),
+    hasFocus() { return documentFocused },
     addEventListener(type, callback, capture) {
       assert.equal(capture, true)
       listeners.set(type, callback)
@@ -90,7 +96,13 @@ function appFrameShortcuts() {
   runInNewContext(source, { window, document, Array, String, Boolean })
   return {
     child,
+    otherChild,
     parent,
+    focus(element, focused = true) {
+      document.activeElement = element
+      documentFocused = focused
+    },
+    iframeOf,
     shellPosts,
     childPosts,
     message(eventSource, data, origin = 'null') {
@@ -154,4 +166,28 @@ test('the app frame shares shell chords with its direct child frames and relays 
   assert.deepEqual(frameDoc.childPosts.at(-1).shortcuts, [], 'opting out reaches child frames too')
   frameDoc.message(frameDoc.child, { type: 'moebius:shell-shortcut', actionId: 'search.open' })
   assert.equal(frameDoc.shellPosts.length, 1)
+})
+
+test('the app frame relays a child frame\'s shell action only while that frame has keyboard focus', () => {
+  const frameDoc = appFrameShortcuts()
+  frameDoc.advertise(searchShortcut)
+  const action = { type: 'moebius:shell-shortcut', actionId: 'search.open' }
+
+  frameDoc.focus(frameDoc.iframeOf(frameDoc.otherChild))
+  frameDoc.message(frameDoc.child, action)
+  assert.equal(frameDoc.shellPosts.length, 0, 'not while a different child frame is focused')
+
+  frameDoc.focus({ tagName: 'BODY' })
+  frameDoc.message(frameDoc.child, action)
+  frameDoc.focus(null)
+  frameDoc.message(frameDoc.child, action)
+  assert.equal(frameDoc.shellPosts.length, 0, 'not while no child frame is focused')
+
+  frameDoc.focus(frameDoc.iframeOf(frameDoc.child), false)
+  frameDoc.message(frameDoc.child, action)
+  assert.equal(frameDoc.shellPosts.length, 0, 'not while the app document lacks focus')
+
+  frameDoc.focus(frameDoc.iframeOf(frameDoc.child))
+  frameDoc.message(frameDoc.child, action)
+  assert.deepEqual(frameDoc.shellPosts.at(-1).message, action, 'relayed from the focused child frame')
 })

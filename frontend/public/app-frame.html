@@ -160,9 +160,11 @@
            the named action. Raw keystrokes never cross the frame boundary,
            and every other key, including in text fields, stays with the app.
            Direct child frames of the app (embedded chat, authored previews)
-           receive the same list and may forward the same message for any
-           advertised action, exactly what the app document itself can post;
-           the shell itself still accepts only advertised actions. -->
+           receive the same list. A child frame may forward an advertised
+           action only while it holds keyboard focus: this document has focus
+           and its focused element is that child's iframe. A background embed
+           (an ad, map or video) cannot trigger shell actions. The shell
+           itself still accepts only advertised actions. -->
       <script data-mobius-shell-shortcuts>(function () {
   var shortcuts = [];
 
@@ -171,6 +173,11 @@
       if (window.frames[i] === source) return true;
     }
     return false;
+  }
+
+  function isFocusedChildFrame(source) {
+    var focused = document.activeElement;
+    return document.hasFocus() && Boolean(focused) && focused.contentWindow === source;
   }
 
   function advertise(target) {
@@ -204,11 +211,14 @@
       for (var i = 0; i < window.frames.length; i += 1) advertise(window.frames[i]);
       return;
     }
-    if (!isChildFrame(event.source)) return;
-    if (msg.type === 'moebius:frame-shortcuts-request') advertise(event.source);
-    // Any direct child frame may trigger an advertised shell action, the same
-    // ones the app document can post itself; forward() drops the rest.
-    if (msg.type === 'moebius:shell-shortcut') forward(msg.actionId);
+    if (msg.type === 'moebius:frame-shortcuts-request' && isChildFrame(event.source)) {
+      advertise(event.source);
+    }
+    // Only the child frame holding keyboard focus may trigger an advertised
+    // shell action; forward() drops the rest.
+    if (msg.type === 'moebius:shell-shortcut' && isFocusedChildFrame(event.source)) {
+      forward(msg.actionId);
+    }
   });
 
   document.addEventListener('keydown', function (event) {
