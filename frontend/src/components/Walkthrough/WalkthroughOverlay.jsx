@@ -6,6 +6,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client.js'
 import { ownerQueries } from '../../hooks/queries.js'
 import useDialogFocus from '../../hooks/useDialogFocus.js'
+import { escapeShouldDismissGuide } from './guideEscape.js'
 import WalkthroughSetup from './WalkthroughSetup.jsx'
 import { AgentBrainFlow, AgentChatDemo } from './WalkthroughAgent.jsx'
 import WalkthroughAppGroup from './WalkthroughAppGroup.jsx'
@@ -108,8 +109,8 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
 
   // A modal dialog: focus starts on the title, Tab stays inside the card, the page behind is inert,
   // and focus returns to where it was when the guide goes away. Escape dismisses it exactly like the
-  // close button. (While an access confirmation is open, Escape belongs to that popup and only cancels it.)
-  useDialogFocus({ open: !suspended, containerRef: cardRef, initialFocusRef: titleRef, onClose: finish })
+  // close button, except while typing in a field. (While an access confirmation is open, Escape belongs to that popup and only cancels it.)
+  useDialogFocus({ open: !suspended, containerRef: cardRef, initialFocusRef: titleRef, onClose: finish, shouldCloseOnEscape: escapeShouldDismissGuide })
   // Each screen announces itself by moving focus to its title.
   useEffect(() => { titleRef.current?.focus({ preventScroll: true }) }, [stepIndex])
 

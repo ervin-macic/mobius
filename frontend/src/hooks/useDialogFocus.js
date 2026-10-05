@@ -87,6 +87,8 @@ export default function useDialogFocus({
   shouldRestoreFocus,
   onClose,
   closeOnEscape = true,
+  // Optional: return false to let an Escape press through without closing (for example while typing).
+  shouldCloseOnEscape,
   modal = true,
   lockScroll = modal,
   // A local modal can block only its owning surface while leaving sibling
@@ -98,6 +100,8 @@ export default function useDialogFocus({
   onCloseRef.current = onClose
   const closeOnEscapeRef = useRef(closeOnEscape)
   closeOnEscapeRef.current = closeOnEscape
+  const shouldCloseOnEscapeRef = useRef(shouldCloseOnEscape)
+  shouldCloseOnEscapeRef.current = shouldCloseOnEscape
 
   useEffect(() => {
     if (!open) return undefined
@@ -147,7 +151,12 @@ export default function useDialogFocus({
       // keypress even though inerting correctly hides the lower surface.
       if (dialogStack.at(-1) !== stackEntry) return
       const eventIsInsideDialog = container.contains(event.target)
-      if (event.key === 'Escape' && closeOnEscapeRef.current && (modal || eventIsInsideDialog)) {
+      if (
+        event.key === 'Escape'
+        && closeOnEscapeRef.current
+        && (modal || eventIsInsideDialog)
+        && shouldCloseOnEscapeRef.current?.(event) !== false
+      ) {
         event.preventDefault()
         onCloseRef.current?.()
         return
