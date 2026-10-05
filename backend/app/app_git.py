@@ -3972,14 +3972,18 @@ class BenignResolution:
   APP_VERSION taken from upstream); `tree_oid` is the merge-tree oid it was built
   from, so the caller can read exec bits off the same tree the clean-merge path
   uses (`read_tree_exec_paths`) rather than approximating from a branch.
+  `kept_local` names conflicting paths outside the package that keep the
+  local version as is.
   """
   tree: dict[str, bytes]
   tree_oid: str
+  kept_local: tuple[str, ...] = ()
 
 
 def resolve_benign_conflict(
   source_dir: str | Path, conflict_paths: list[str],
   *, merge_base: str | None = None,
+  is_package_path: Callable[[str], bool] = lambda _rel: True,
 ) -> BenignResolution | None:
   """Full merged source tree with every BENIGN conflict auto-resolved, or None
   when any conflicting file carries a genuine overlap.
@@ -3998,6 +4002,10 @@ def resolve_benign_conflict(
   Pass ``merge_base`` when the caller's merge verdict used an explicit base
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
+
+  A conflicting path for which ``is_package_path`` is false belongs to no
+  package the update installs, so it keeps the local version, a local deletion
+  included. The owner's edit survives and the update serves nothing from it.
   """
   repo = Path(source_dir)
   if not conflict_paths:
@@ -4036,9 +4044,14 @@ def resolve_benign_conflict(
     base_ref = base_proc.stdout.strip() if base_proc.returncode == 0 else ""
   if not base_ref:
     return None
-  resolved: dict[str, bytes] = {}
+  resolved: dict[str, bytes | None] = {}
+  kept_local: list[str] = []
   for rel in merge_conflicts:
     ours = read_blob(repo, LOCAL_BRANCH, rel)
+    if not is_package_path(rel):
+      resolved[rel] = ours
+      kept_local.append(rel)
+      continue
     theirs = read_blob(repo, UPSTREAM_BRANCH, rel)
     # A deletion on either side is not a benign shape; leave it to the owner.
     if ours is None or theirs is None:
@@ -4050,8 +4063,14 @@ def resolve_benign_conflict(
       return None
     resolved[rel] = merged
   full = read_merged_tree(repo, tree_oid)
-  full.update(resolved)
-  return BenignResolution(tree=full, tree_oid=tree_oid)
+  for rel, data in resolved.items():
+    if data is None:
+      full.pop(rel, None)
+    else:
+      full[rel] = data
+  return BenignResolution(
+    tree=full, tree_oid=tree_oid, kept_local=tuple(kept_local),
+  )
 
 
 # Smells

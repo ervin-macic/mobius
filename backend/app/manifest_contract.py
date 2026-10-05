@@ -394,6 +394,29 @@ def package_bytes_on_disk(root: Path, manifest: Mapping) -> int:
   return package_bytes(manifest, size_of)
 
 
+def names_path(manifest: Mapping, path: str) -> bool:
+  """Whether a manifest could declare `path` as part of its package.
+
+  Deliberately conservative: every string the manifest holds, as a value or a
+  key, counts as a possible path, and one ending in `/` (a folder skill) covers
+  its contents. Path-bearing fields keep growing, so enumerating them would
+  silently miss the next one; over-matching only keeps a path in the package.
+  """
+  pending: list[object] = [manifest]
+  while pending:
+    value = pending.pop()
+    if isinstance(value, Mapping):
+      pending.extend(value.keys())
+      pending.extend(value.values())
+    elif isinstance(value, list):
+      pending.extend(value)
+    elif isinstance(value, str) and value:
+      for name in {value, unquote(value)}:
+        if path == name or (name.endswith("/") and path.startswith(name)):
+          return True
+  return False
+
+
 def _validate_running_label(running_label, field: str) -> None:
   if (
     not isinstance(running_label, str)

@@ -75,6 +75,7 @@ from app.manifest_contract import (
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
+  names_path,
   package_bytes,
   python_lock,
   skill_member_paths,
@@ -331,6 +332,9 @@ def _normalize_raw_base(raw_base: str) -> str:
   return base if base.endswith("/") else base + "/"
 
 
+_MANIFEST_ID_MARKER = "#manifest-id="
+
+
 def _canonical_base(url_or_base: str) -> str:
   """The canonical base of a manifest URL: fragment, query string, a trailing
   `/mobius.json`, and a trailing slash all stripped.
@@ -524,7 +528,7 @@ def _find_ref_independent_catalog_row(
   repository = _github_root_manifest_identity(canonical_manifest_url)
   if repository is None:
     return None
-  suffix = f"#manifest-id={manifest_id}"
+  suffix = f"{_MANIFEST_ID_MARKER}{manifest_id}"
   candidates = (
     db.query(models.App)
     .filter(models.App.manifest_url.like(f"%{suffix}"))
@@ -715,7 +719,7 @@ def _catalog_identity_matches(
   candidate_identity = _canonical_identity_key(candidate_url, manifest_id)
   if candidate_identity == existing_identity:
     return True
-  suffix = f"#manifest-id={manifest_id}"
+  suffix = f"{_MANIFEST_ID_MARKER}{manifest_id}"
   existing_repo = _github_root_manifest_identity(existing_identity)
   candidate_repo = _github_root_manifest_identity(candidate_identity)
   return bool(
@@ -764,7 +768,35 @@ def _canonical_identity_key(url_or_base: str, manifest_id: str) -> str:
   underlying app. Re-installing via the other path then missed the
   update branch and created a duplicate row. The fragment is purely a
   marker — it's never dereferenced over the wire."""
-  return f"{_canonical_base(url_or_base)}#manifest-id={manifest_id}"
+  return f"{_canonical_base(url_or_base)}{_MANIFEST_ID_MARKER}{manifest_id}"
+
+
+def stored_manifest_fetch_url(identity_key: str) -> str:
+  """The raw manifest behind an `App.manifest_url` identity key."""
+  return _canonical_base(identity_key) + "/mobius.json"
+
+
+def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
+  """Accept an installed app's own identity key wherever a manifest is fetched.
+
+  Returns the URL to fetch and, for an identity key, the manifest id it binds.
+  The fetched package must still carry that id (or name it as `previous_id`),
+  so the key keeps meaning one package. Any other URL passes through as is.
+  """
+  _, marker, manifest_id = manifest_url.rpartition(_MANIFEST_ID_MARKER)
+  if not marker or not manifest_id:
+    return manifest_url, None
+  return stored_manifest_fetch_url(manifest_url), manifest_id
+
+
+def _require_bound_manifest(manifest: dict, bound_id: str | None) -> None:
+  if bound_id is not None and bound_id not in (
+    manifest.get("id"), manifest.get("previous_id"),
+  ):
+    raise HTTPException(
+      409,
+      f"The manifest at this address is no longer the {bound_id!r} app.",
+    )
 
 
 async def _http_get(
@@ -1278,6 +1310,48 @@ def committed_conflict_marker_paths(
   if found.returncode > 1:
     return None
   return [p.removeprefix(f"{ref}:") for p in found.stdout.split("\0") if p]
+
+
+def _update_package_paths(
+  source_dir: str | Path, incoming_manifest: dict,
+) -> Callable[[str], bool]:
+  """Which conflicting paths an update must reconcile rather than keep local.
+
+  A path belongs to the package when the incoming or the local manifest could
+  declare it, so a file one side newly declares is never set aside. The
+  manifest itself always belongs, and an unreadable local manifest makes every
+  path belong, as before this distinction existed.
+  """
+  try:
+    local_manifest = json.loads(
+      app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b"",
+    )
+  except (UnicodeDecodeError, json.JSONDecodeError):
+    local_manifest = None
+  if not isinstance(local_manifest, dict):
+    return lambda _rel: True
+  return lambda rel: rel == "mobius.json" or any(
+    names_path(side, rel) for side in (incoming_manifest, local_manifest)
+  )
+
+
+def _undeclared_imports(tree: Mapping[str, bytes], manifest: dict) -> set[str]:
+  """Undeclared files the entry or job imports from this exact source tree.
+
+  A Git install may run such a file even though no manifest field names it, so
+  an update cannot set it aside as outside the package.
+  """
+  schedule = manifest.get("schedule")
+  result = check_app_source(
+    {rel: data.decode("utf-8", "replace") for rel, data in tree.items()},
+    entry=manifest["entry"],
+    source_files=manifest.get("source_files") or [],
+    job=schedule.get("job") if isinstance(schedule, dict) else None,
+  )
+  return {
+    finding.path for finding in result.errors
+    if finding.code == "undeclared_source"
+  }
 
 
 def committed_pending_resolution(
@@ -2337,6 +2411,9 @@ async def preview_manifest_capabilities(
   raw_base: str | None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
+  bound_manifest_id = None
+  if manifest_url is not None:
+    manifest_url, bound_manifest_id = requested_manifest_source(manifest_url)
   async with httpx.AsyncClient(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
@@ -2347,6 +2424,7 @@ async def preview_manifest_capabilities(
       manifest=manifest,
       raw_base=raw_base,
     )
+  _require_bound_manifest(loaded, bound_manifest_id)
   contract, digest = contract_and_digest(loaded)
   return loaded, normalized_base, contract, digest
 
@@ -2966,7 +3044,7 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  old_manifest_url = _canonical_base(existing.manifest_url) + "/mobius.json"
+  old_manifest_url = stored_manifest_fetch_url(existing.manifest_url)
   async with httpx.AsyncClient(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
@@ -3976,6 +4054,9 @@ async def install_from_manifest(
       raise ValueError("publication handoff requires its dedicated source")
     if expected_app_id is not None:
       raise ValueError("publication handoff cannot be a pending replay")
+  bound_manifest_id = None
+  if manifest_url is not None:
+    manifest_url, bound_manifest_id = requested_manifest_source(manifest_url)
   # Phase 1: immutable, review-bound candidate. A Store update and a conflict
   # replay both read the exact Git commit already selected by Review; fresh
   # installs keep the ordinary URL/inline package path.
@@ -4094,6 +4175,8 @@ async def install_from_manifest(
       expected_upstream_commit=expected_upstream_commit,
       expected_candidate_digest=expected_candidate_digest,
     )
+
+  _require_bound_manifest(candidate.manifest, bound_manifest_id)
 
   # Phase 2: immutable identity/update decision. No writes occur here.
   target = _select_install_target(
@@ -4648,11 +4731,16 @@ async def _install_candidate(
             # JSON manifests can reconcile serialization drift and disjoint
             # edits structurally. Other files retain the APP_VERSION-only
             # rule. Any remaining overlap leaves the whole update untouched
-            # for the owner to resolve.
+            # for the owner to resolve. A path outside the package keeps the
+            # owner's version.
+            is_package_path = await asyncio.to_thread(
+              _update_package_paths, git_source_dir, manifest,
+            )
             benign = await asyncio.to_thread(
               app_git.resolve_benign_conflict,
               git_source_dir, merge.conflict_paths,
               merge_base=git_merge_base_override,
+              is_package_path=is_package_path,
             )
             resolved_source = None
             if benign is not None:
@@ -4660,6 +4748,10 @@ async def _install_candidate(
                 rel: data for rel, data in benign.tree.items()
                 if rel not in _MERGED_NON_SOURCE
               }
+              if benign.kept_local and _undeclared_imports(
+                resolved_source, manifest,
+              ).intersection(benign.kept_local):
+                resolved_source = None
             if resolved_source is not None and entry_key in resolved_source:
               source_tree = resolved_source
               divergence = "clean_merge"
@@ -4668,6 +4760,11 @@ async def _install_candidate(
                 "auto-resolved a benign update conflict "
                 "(no semantic overlap between local edits and upstream)"
               )
+              if benign.kept_local:
+                warnings.append(
+                  "kept local edits to files outside the app package: "
+                  + ", ".join(benign.kept_local)
+                )
               reconciliation = app_git.ReconciliationReceipt(
                 proven_present=reconciliation.proven_present,
                 local_only_paths=reconciliation.local_only_paths,

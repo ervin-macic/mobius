@@ -4303,6 +4303,252 @@ def test_store_update_of_a_resolved_release_finishes_it(
   assert not checkout.exists()
 
 
+def _publish_clone_files(work: Path, bare: Path, files: dict[str, str]) -> str:
+  for rel, text in files.items():
+    (work / rel).write_text(text, encoding="utf-8")
+  head = _fixture_commit(work, "release")
+  subprocess.run(
+    ["git", "-C", str(work), "push", "-q", str(bare), "main"],
+    check=True, env=app_git._git_env(work),
+  )
+  return head
+
+
+def _press_reviewed_update(client, auth, app_id, bare, manifest_url):
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    preview = client.get(
+      f"/api/apps/{app_id}/update-candidate-preview",
+      headers=auth,
+      params={"manifest_url": manifest_url},
+    )
+  assert preview.status_code == 200, preview.text
+  with patch("app.install.httpx.AsyncClient"):
+    return client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": manifest_url,
+      "reviewed_source_digest": preview.json()["source_digest"],
+      "update_app_id": app_id,
+      "reviewed_upstream_commit": preview.json()["upstream_commit"],
+    })
+
+
+def _install_readme_fixture(client, auth, tmp_path, app_id, manifest):
+  base = f"https://raw.githubusercontent.com/example/{app_id}/main/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps(manifest), "README.md": "readme v1\n",
+  })
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file="cards.js" in (manifest.get("source_files") or []),
+  )
+  assert installed.status_code == 201, installed.text
+  source_dir = Path(get_settings().data_dir) / "apps" / manifest["id"]
+  return base, work, bare, installed.json()["id"], source_dir
+
+
+def test_names_path_covers_every_way_a_manifest_names_a_file():
+  from app.manifest_contract import names_path
+
+  manifest = {
+    "entry": "index.jsx",
+    "skills": ["guide/"],
+    "source_files": ["guide/SKILL.md"],
+    "static_assets": {"logo.png": "art/logo%20v2.png"},
+    "setup": {"steps": ["setup.sh"]},
+    "schedule": {"cron": "0 * * * *", "job": "job.sh"},
+  }
+  for path in (
+    "index.jsx", "guide/SKILL.md", "guide/notes.md", "art/logo v2.png",
+    "logo.png", "setup.sh", "job.sh",
+  ):
+    assert names_path(manifest, path), path
+  for path in ("README.md", "guide", "art/other.png"):
+    assert not names_path(manifest, path), path
+
+
+def test_conflict_outside_the_package_keeps_local_and_updates(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  """A file no manifest declares is never served, so its conflict must not
+  block the update: the owner's version stays and the package updates."""
+  manifest = {
+    "id": "undeclared-conflict", "name": "Undeclared", "version": "1.0.0",
+    "description": "README conflict", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  (source_dir / "README.md").write_text("readme local\n")
+  index_v2 = CLONE_INDEX_V1.replace("TITLE_V1", "TITLE_V2")
+  upstream_v2 = _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "README.md": "readme upstream\n",
+    "index.jsx": index_v2,
+  })
+
+  updated = _press_reviewed_update(
+    client, auth, app_id, bare, base + "mobius.json",
+  )
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert updated.json()["version"] == "2.0.0"
+  assert any("README.md" in warning for warning in updated.json()["warnings"])
+  assert (source_dir / "README.md").read_text() == "readme local\n"
+  assert (source_dir / "index.jsx").read_text() == index_v2
+  assert not install.pending_conflict_update_receipt_present(source_dir)
+  assert app_git.ref_is_ancestor(source_dir, upstream_v2, "main") is True
+
+  # The advanced base keeps later releases ordinary merges.
+  index_v3 = CLONE_INDEX_V1.replace("TITLE_V1", "TITLE_V3")
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "3.0.0"}),
+    "index.jsx": index_v3,
+  })
+  again = _press_reviewed_update(
+    client, auth, app_id, bare, base + "mobius.json",
+  )
+  assert again.status_code == 201, again.text
+  assert again.json()["mode"] == "update"
+  assert again.json()["divergence"] == "clean_merge"
+  assert (source_dir / "README.md").read_text() == "readme local\n"
+  assert (source_dir / "index.jsx").read_text() == index_v3
+
+
+@pytest.mark.parametrize("declared_by", ["incoming", "local"])
+def test_conflict_in_a_declared_file_still_needs_the_resolver(
+  client, auth, tmp_path, bypass_url_validation, declared_by,
+):
+  """Either manifest declaring the path keeps it a package conflict."""
+  manifest = {
+    "id": f"declared-{declared_by}", "name": "Declared", "version": "1.0.0",
+    "description": "Declared conflict", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  declaring = {**manifest, "source_files": ["cards.js", "README.md"]}
+  (source_dir / "README.md").write_text("readme local\n")
+  if declared_by == "local":
+    (source_dir / "mobius.json").write_text(json.dumps(declaring))
+  incoming = declaring if declared_by == "incoming" else manifest
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**incoming, "version": "2.0.0"}),
+    "README.md": "readme upstream\n",
+  })
+
+  conflicted = _press_reviewed_update(
+    client, auth, app_id, bare, base + "mobius.json",
+  )
+
+  assert conflicted.status_code == 201, conflicted.text
+  assert conflicted.json()["mode"] == "conflict"
+  assert "README.md" in conflicted.json()["conflict_paths"]
+  assert (source_dir / "README.md").read_text() == "readme local\n"
+  assert install.pending_conflict_update_receipt_present(source_dir)
+  opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
+  assert opened.status_code == 200, opened.text
+  checkout = install.pending_update_worktree(source_dir)
+  assert "<<<<<<<" in (checkout / "README.md").read_text()
+
+
+def test_conflict_in_an_undeclared_import_still_needs_the_resolver(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  """A Git install can bundle an imported file its manifest omits, so that
+  file stays part of what the update must reconcile."""
+  manifest = {
+    "id": "undeclared-import", "name": "Undeclared import",
+    "version": "1.0.0", "description": "Imported", "entry": "index.jsx",
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  (source_dir / "cards.js").write_text(
+    CLONE_CARDS_V1.replace("CARD_V1", "CARD_LOCAL"),
+  )
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "cards.js": CLONE_CARDS_V1.replace("CARD_V1", "CARD_UPSTREAM"),
+  })
+
+  conflicted = _press_reviewed_update(
+    client, auth, app_id, bare, base + "mobius.json",
+  )
+
+  assert conflicted.status_code == 201, conflicted.text
+  assert conflicted.json()["mode"] == "conflict"
+  assert conflicted.json()["conflict_paths"] == ["cards.js"]
+
+
+def test_update_accepts_the_apps_own_stored_manifest_url(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  """The `manifest_url` the app list returns installs its update as is."""
+  manifest = {
+    "id": "stored-address", "name": "Stored address", "version": "1.0.0",
+    "description": "Stored identity key", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  listed = client.get("/api/apps/", headers=auth)
+  stored = next(app for app in listed.json() if app["id"] == app_id)["manifest_url"]
+  assert stored == base.rstrip("/") + "#manifest-id=stored-address"
+  index_v2 = CLONE_INDEX_V1.replace("TITLE_V1", "TITLE_V2")
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "index.jsx": index_v2,
+  })
+
+  updated = _press_reviewed_update(client, auth, app_id, bare, stored)
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert updated.json()["id"] == app_id
+  assert updated.json()["manifest_url"] == stored
+  assert (source_dir / "index.jsx").read_text() == index_v2
+
+
+def test_install_from_a_stored_manifest_url_keeps_its_package_binding(
+  client, auth, bypass_url_validation,
+):
+  base = "https://stored-key.test/repo/"
+  manifest = {**MANIFEST_NEWS, "id": "stored-key"}
+  installed = _install_v1(client, auth, base, manifest, JSX)
+  assert installed.status_code == 201, installed.text
+  stored = installed.json()["manifest_url"]
+  assert stored.endswith("#manifest-id=stored-key")
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+    base + "icon.png": (200, _png_bytes()),
+    base + "prompt.md": (200, PROMPT.encode()),
+    base + "fetch.sh": (200, b""),
+  }
+
+  def post(url):
+    with patch(
+      "app.install.httpx.AsyncClient",
+      side_effect=_fake_async_client(responses),
+    ):
+      return client.post("/api/apps/install", headers=auth, json={
+        "manifest_url": url,
+      })
+
+  reinstalled = post(stored)
+  assert reinstalled.status_code == 201, reinstalled.text
+  assert reinstalled.json()["id"] == installed.json()["id"]
+  assert reinstalled.json()["mode"] == "update"
+
+  # The identity names one package; another app at that address is refused.
+  other = post(stored.replace("#manifest-id=stored-key", "#manifest-id=other"))
+  assert other.status_code == 409, other.text
+
+
 def test_missing_reviewed_git_commit_is_a_stale_update(
   client, auth, bypass_url_validation,
 ):

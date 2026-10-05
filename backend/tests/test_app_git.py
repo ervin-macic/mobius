@@ -3633,6 +3633,36 @@ def test_version_only_conflict_resolves_to_upstream(tmp_path):
   assert tree["index.jsx"] == jsx
 
 
+def test_conflict_outside_the_package_keeps_the_local_side(tmp_path):
+  """A conflicting path the caller rules out of the package keeps the local
+  version, a local deletion included; any other path still needs the owner."""
+  repo = tmp_path / "app"
+  jsx = b"export default () => null\n"
+  _diverge(
+    repo,
+    local_files={"index.jsx": jsx, "notes.md": b"local\n"},
+    upstream_files={
+      "index.jsx": jsx, "notes.md": b"upstream\n", "todo.md": b"upstream\n",
+    },
+    base_files={"index.jsx": jsx, "notes.md": b"base\n", "todo.md": b"base\n"},
+  )
+  (repo / "todo.md").unlink()
+  app_git.commit_local(repo, "local delete")
+  merge = app_git.merge_upstream(repo)
+  assert merge.status == "conflict"
+  assert sorted(merge.conflict_paths) == ["notes.md", "todo.md"]
+
+  assert app_git.resolve_benign_conflict(repo, merge.conflict_paths) is None
+  res = app_git.resolve_benign_conflict(
+    repo, merge.conflict_paths, is_package_path=lambda rel: rel == "index.jsx",
+  )
+  assert res is not None
+  assert sorted(res.kept_local) == ["notes.md", "todo.md"]
+  assert res.tree["notes.md"] == b"local\n"
+  assert "todo.md" not in res.tree
+  assert res.tree["index.jsx"] == jsx
+
+
 def test_add_add_manifest_uses_recorded_base_without_shared_history(
   tmp_path,
 ):
