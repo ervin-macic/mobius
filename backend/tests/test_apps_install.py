@@ -6056,11 +6056,104 @@ def test_git_package_inputs_are_bounded_like_http_installs(monkeypatch):
   }
   monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 399)
 
-  with pytest.raises(ValueError, match="app package limit"):
+  with pytest.raises(install.PackageTooLarge, match="MiB app package limit"):
     install._read_git_package_inputs(tree, strict=True)
 
   monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 400)
   assert install._read_git_package_inputs(tree, strict=True).static_assets
+
+
+def _commit_package(root: Path, files: dict[str, bytes]) -> tuple[Path, str]:
+  repo = root / "package"
+  for rel, body in files.items():
+    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / rel).write_bytes(body)
+  git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t.test"]
+  subprocess.run(["git", "init", "-q", str(repo)], check=True)
+  subprocess.run([*git, "add", "-A"], check=True)
+  subprocess.run([*git, "commit", "-qm", "package"], check=True)
+  commit = subprocess.run(
+    [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+  ).stdout.strip()
+  return repo, commit
+
+
+def test_git_install_candidate_streams_the_tree_and_reads_only_declared_files(
+  tmp_path, monkeypatch,
+):
+  """A Store update is bounded before its files are read into memory, and an
+  undeclared file in the release is never read at all."""
+  from app import install
+
+  manifest = {
+    **MANIFEST_MULTI, "id": "git-stream", "source_files": [],
+    "static_assets": {"data.bin": "data.bin"},
+  }
+  repo, commit = _commit_package(tmp_path, {
+    "mobius.json": json.dumps(manifest).encode(),
+    "index.jsx": JSX.encode(),
+    "data.bin": b"x" * 100,
+    "undeclared.bin": b"y" * 5000,
+  })
+  monkeypatch.setattr(
+    app_git, "read_ref_tree",
+    lambda *_: pytest.fail("the whole release was read into memory"),
+  )
+  source_url = "https://raw.githubusercontent.com/acme/git-stream/main/mobius.json"
+
+  read = install.read_git_install_candidate(repo, commit, source_url)
+  assert read.candidate.static_assets == {"data.bin": b"x" * 100}
+
+  monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 99)
+  with pytest.raises(install.PackageTooLarge, match="MiB app package limit"):
+    install.read_git_install_candidate(repo, commit, source_url)
+
+
+def test_update_preview_says_an_oversized_release_is_too_large(
+  client, auth, bypass_url_validation,
+):
+  from app import install
+
+  base = "https://oversized-preview.test/repo/"
+  r1 = _install_v1(client, auth, base, {**MANIFEST_NEWS, "id": "oversized-preview"}, JSX)
+  assert r1.status_code == 201, r1.text
+  reason = install.package_limit_message(65 * 1024 * 1024)
+  with patch(
+    "app.routes.apps._fetch_update_candidate",
+    side_effect=install.PackageTooLarge(reason),
+  ):
+    preview = client.get(
+      f"/api/apps/{r1.json()['id']}/update-candidate-preview", headers=auth,
+    )
+
+  assert preview.status_code == 413, preview.text
+  assert preview.json()["detail"] == reason
+
+
+def test_applying_an_oversized_reviewed_update_says_it_is_too_large(
+  client, auth, bypass_url_validation,
+):
+  from app import install
+
+  app = create_local_app(client, auth, name="Oversized reviewed update")
+  reason = install.package_limit_message(65 * 1024 * 1024)
+  with patch("app.install._reviewed_commit_has_manifest", return_value=True), patch(
+    "app.install.read_git_install_candidate",
+    side_effect=install.PackageTooLarge(reason),
+  ):
+    rejected = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": (
+        "https://raw.githubusercontent.com/acme/oversized/main/mobius.json"
+      ),
+      "reviewed_source_digest": "0" * 64,
+      "update_app_id": app["id"],
+      "reviewed_upstream_commit": "f" * 40,
+    })
+
+  assert rejected.status_code == 413, rejected.text
+  assert rejected.json()["detail"] == {
+    "code": "package_too_large", "message": reason,
+  }
 
 
 def test_multifile_install_rejects_incomplete_source_files(

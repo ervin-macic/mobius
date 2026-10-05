@@ -29,8 +29,8 @@ MANIFEST_MAX_BYTES = 64 * 1024
 # real safety bound, and no single file or file kind has its own cap. Store
 # publication bounds both its whole tree and this declared sum by the same
 # number, so every app the Store accepts is installable. The Store host
-# preserves releases up to 64 MiB too. What the
-# shell can load is a separate, smaller bound on the compiled module
+# preserves releases up to 64 MiB too. What the shell can load is a separate,
+# smaller bound on the compiled module
 # (`app_compile_contract.COMPILED_MODULE_MAX_BYTES`): large data belongs in
 # `static_assets`, fetched at runtime, rather than imported into the bundle.
 PACKAGE_MAX_BYTES = 64 * 1024 * 1024
@@ -386,12 +386,23 @@ def package_bytes(manifest: Mapping, size_of: Callable[[str], int]) -> int:
   return sum(size_of(rel) for rel in declared if isinstance(rel, str) and rel)
 
 
+def size_on_disk(root: Path, rel: str) -> int:
+  """A declared file's size from its metadata, or 0 when it is not a file."""
+  path = root / rel
+  return path.stat().st_size if path.is_file() else 0
+
+
 def package_bytes_on_disk(root: Path, manifest: Mapping) -> int:
   """`package_bytes` for a source tree, from file metadata before any read."""
-  def size_of(rel: str) -> int:
-    path = root / rel
-    return path.stat().st_size if path.is_file() else 0
-  return package_bytes(manifest, size_of)
+  return package_bytes(manifest, lambda rel: size_on_disk(root, rel))
+
+
+def package_limit_message(declared: int) -> str:
+  """The one refusal every path gives for a package over the bound."""
+  return (
+    f"This app declares {declared} bytes of files, more than the "
+    f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit."
+  )
 
 
 def _validate_running_label(running_label, field: str) -> None:

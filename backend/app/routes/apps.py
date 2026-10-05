@@ -1646,6 +1646,8 @@ async def update_candidate_preview(
       )
     except HTTPException:
       raise
+    except install.PackageTooLarge as exc:
+      raise HTTPException(413, str(exc)) from exc
     except (
       OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
     ) as exc:
