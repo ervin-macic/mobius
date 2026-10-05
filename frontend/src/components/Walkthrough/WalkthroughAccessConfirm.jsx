@@ -8,8 +8,10 @@ export default function WalkthroughAccessConfirm({ confirmation, app, icon, onAp
   const dialogRef = useRef(null)
   const confirmRef = useRef(null)
   const installButtonRef = useRef(null)
-  const { rows, notice, manifest, item } = confirmation
+  const { rows, notice, manifest } = confirmation
   const libraries = manifest?.runtime?.esm_deps || []
+  // Only a web link is offered; anything else in the manifest is left for the App Store to show.
+  const homepage = /^https:\/\//.test(manifest?.homepage || '') ? manifest.homepage : ''
   // Focus starts on Confirm, Tab and the page behind are held, Escape cancels, and focus goes back to
   // the Install button when it closes. The button is looked up rather than remembered, because some
   // browsers do not focus a button when it is tapped.
@@ -35,7 +37,7 @@ export default function WalkthroughAccessConfirm({ confirmation, app, icon, onAp
             </li>)}
           </ul>}
         {libraries.length > 0 && <p className="wt-confirm__meta">Loads {libraries.length === 1 ? 'one library' : `${libraries.length} libraries`} from esm.sh on first open: {libraries.join(', ')}.</p>}
-        <p className="wt-confirm__meta">Source: {item.manifest_url}</p>
+        {homepage && <p className="wt-confirm__meta"><a href={homepage} target="_blank" rel="noopener noreferrer">View source</a></p>}
       </section>
       <div className="wt-confirm__actions">
         <button type="button" className="wt-btn" onClick={onCancel}>Cancel</button>
