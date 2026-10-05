@@ -107,9 +107,9 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   }, [suspended])
 
   // A modal dialog: focus starts on the title, Tab stays inside the card, the page behind is inert,
-  // and focus returns to where it was when the guide goes away. Escape does not dismiss it,
-  // because dismissing marks the guide as done for good.
-  useDialogFocus({ open: !suspended, containerRef: cardRef, initialFocusRef: titleRef, closeOnEscape: false })
+  // and focus returns to where it was when the guide goes away. Escape dismisses it exactly like the
+  // close button. (While an access confirmation is open, Escape belongs to that popup and only cancels it.)
+  useDialogFocus({ open: !suspended, containerRef: cardRef, initialFocusRef: titleRef, onClose: finish })
   // Each screen announces itself by moving focus to its title.
   useEffect(() => { titleRef.current?.focus({ preventScroll: true }) }, [stepIndex])
 

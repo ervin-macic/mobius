@@ -95,7 +95,7 @@ test('first-use guidance is a labeled modal dialog with a dismiss action', () =>
   const source = read('../../Walkthrough/WalkthroughOverlay.jsx')
   assert.match(source, /role="dialog"/)
   assert.match(source, /aria-modal="true"/)
-  assert.match(source, /useDialogFocus\(\{[\s\S]*?closeOnEscape: false/)
+  assert.match(source, /useDialogFocus\(\{[\s\S]*?onClose: finish/)
   assert.match(source, /aria-labelledby="wt-title"/)
   assert.match(source, /aria-label="Dismiss welcome"/)
 })

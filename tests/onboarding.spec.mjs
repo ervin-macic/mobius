@@ -82,18 +82,28 @@ test('a new owner can move through the guide and finish it', async ({ page }) =>
   await expect(guide).toHaveCount(0)
 })
 
-test('the guide is a modal: Escape and Tab stay inside, and dismissing completes it once', async ({ page }) => {
+test('the guide is a modal: Tab stays inside, and Escape dismisses it like the close button', async ({ page }) => {
   const { guide, completionCount } = await openGuide(page)
-  await page.keyboard.press('Escape')
-  await expect(guide).toBeVisible()
-  expect(completionCount()).toBe(0)
   for (let press = 0; press < 30; press += 1) {
     await page.keyboard.press('Tab')
     expect(await guide.evaluate(card => card.contains(document.activeElement))).toBe(true)
   }
-  await guide.getByRole('button', { name: 'Dismiss welcome' }).click()
+  await page.keyboard.press('Escape')
   await expect(guide).toHaveCount(0)
   await expect.poll(completionCount).toBe(1)
+})
+
+test('Escape in the access review cancels only the review, not the guide', async ({ page }) => {
+  await stubCatalog(page)
+  await page.route(/\/api\/apps\/preview$/, route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ manifest: { id: 'memory' }, capability_contract: {}, capability_digest: 'd1' }) }))
+  const { guide, completionCount } = await openGuide(page)
+  await goToScreen(guide, 'Make it yours')
+  await guide.getByRole('button', { name: 'Install Memory' }).click()
+  await expect(page.getByRole('alertdialog', { name: 'Memory asks for access' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
+  await expect(guide).toBeVisible()
+  expect(completionCount()).toBe(0)
 })
 
 test('mobile guide fills the screen and keeps Continue reachable', async ({ page }) => {
