@@ -62,15 +62,42 @@ the additions. Its own search tables are left to it; it reconciles them from
   convert. Projections are total over arbitrary JSON, so such a failure means
   a bug, which stays visible.
 - The disk rule is split by cause, not by path. The background loop is
-  deferrable bulk work that grows the database by about the legacy
-  transcript size, so it honours the platform's existing critical-disk
-  verdict (the floor that already defers agent turns): it stops, and the next
-  boot resumes it (the disk-pressure code has no recovery hook, and nothing
-  re-arms it on a timer; the marker table is its durable progress). A
+  deferrable bulk work. It must never itself push the volume into the
+  critical tier, where agent admission defers every turn, so it stops one
+  tier earlier, at the existing "constrained" verdict, checked before each
+  chat. A per-chat byte bound against the critical floor would be the
+  tighter rule, but it is not provable: an FTS5 insert can trigger an
+  incremental merge whose output is proportional to the whole search index,
+  not to the chat, and those pages sit in the WAL until a checkpoint. The
+  stop is recorded; the existing capacity-monitor tick re-arms the loop when
+  it observes disk pressure back to normal (no timer of its own), and the
+  next boot resumes it in any case (the marker table is its durable
+  progress). The residual risk is a single chat whose conversion, including
+  any merge it triggers, needs more than the gap between the constrained and
+  critical tiers (at least 32 MiB; 5% of the volume, up to 1 GiB). A
   conversion that serves a request (a reader's, or inline in a writer
   command) needs that one chat and is bounded by it, so it never consults
-  the floor; SQLite's own `SQLITE_FULL` is its bound, and a failure leaves
-  the legacy value authoritative. No reader is refused because of the floor.
+  the tiers; SQLite's own `SQLITE_FULL` is its bound, and a failure leaves
+  the legacy value authoritative. No reader is refused because of disk tiers.
+- Disk cost: conversion adds about 1x the converted chats' legacy transcript
+  bytes (measured 1.09x: rows, search entries and indexes; the legacy column
+  is kept). A rollback does not return it, and neither does release 2's
+  column drop without a VACUUM. `/api/debug/status` states this beside the
+  pending count.
+- Unconverted chats only come into existence while older code runs, so all
+  of them exist at boot; afterwards the only unconverted chats are those
+  whose conversion failed or was deferred. Before boot recovery, sweeps or
+  any resume, a startup step (`convert live transcripts`) converts the live
+  working set (`transcript_rows.live_working_set`): chats with a non-terminal
+  run, chats with queued messages, chats with an open Goal, and both ends of
+  every delegation touching those. It is request-serving conversion: no disk
+  tier, no dependence on background progress. Later event-loop readers of
+  other chats await them first (`delegations.ensure_parent_helpers_converted`:
+  resumed turns, wake and steer paths, the continuation and wedged sweeps),
+  and each continuation-sweep candidate is isolated, so one chat never stops
+  every resume.
+- A legacy JSON `null` converts to an empty transcript, as the previous
+  release displayed it.
 - Any conversion that fails while serving a request raises
   `transcript_rows.TranscriptUnavailable`, which one app-level handler maps
   to 503 for every route, sync or async: "being prepared" only when the
@@ -141,3 +168,5 @@ supported database; migration `0086_transcript_rows` refuses others.
   rows.
 - The previous release refuses a release-2 database by its own schema check
   (missing mapped column) before writing anything.
+- Plan space reclamation: dropping the column frees no file space until a
+  `VACUUM`, which itself needs about the database's size free while it runs.
