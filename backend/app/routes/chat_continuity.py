@@ -23,8 +23,8 @@ class CheckpointBody(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   title: str | None = Field(default=None, max_length=200)
-  digest: str | None = Field(default=None, max_length=1_000)
-  summary: str | None = Field(default=None, max_length=8_000)
+  summary: str | None = None
+  digest: str | None = None
 
 
 def _save_note(data_dir: str, chat_id: str, body: CheckpointBody, run_token: str) -> dict | None:
@@ -39,8 +39,8 @@ def _save_note(data_dir: str, chat_id: str, body: CheckpointBody, run_token: str
       existing = None
     write_note(path, apply_checkpoint(
       existing, name=chat.title or "",
-      digest=(body.digest or "").strip() or None,
       summary=(body.summary or "").strip() or None,
+      digest=(body.digest or "").strip() or None,
       coverage=checkpoint_coverage(list(chat.messages or []), run_token),
     ))
     return renamed_event(chat)
@@ -62,7 +62,7 @@ async def checkpoint_chat(
   """
   chat_id = principal.chat_id or ""
   title = " ".join((body.title or "").split()) or None
-  if title is None and not (body.digest or "").strip() and not (body.summary or "").strip():
+  if title is None and not (body.summary or "").strip() and not (body.digest or "").strip():
     return None
   async with chat_queue.get_transition_lock(chat_id):
     result = await await_ack(get_writer().submit(AuthorizeCheckpoint(
