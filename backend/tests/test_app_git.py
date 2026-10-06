@@ -4731,8 +4731,7 @@ def _bare_origin(tmp_path: Path) -> Path:
   return bare
 
 
-def test_file_transport_clone_and_fetch_wire_network_options(tmp_path, monkeypatch):
-  """file:// exercises option wiring, not HTTP progress or stall detection."""
+def test_file_transport_clone_and_fetch_use_the_git_timeout(tmp_path, monkeypatch):
   bare = _bare_origin(tmp_path)
   real_run = subprocess.run
   seen: list[tuple[list[str], object]] = []
@@ -4754,23 +4753,14 @@ def test_file_transport_clone_and_fetch_wire_network_options(tmp_path, monkeypat
     word for cmd, _ in network for word in cmd if word in ("clone", "fetch")
   }
   for cmd, timeout in network:
-    assert "http.lowSpeedLimit=1000" in cmd
-    assert "http.lowSpeedTime=60" in cmd
     assert timeout == 30
   local = {timeout for cmd, timeout in seen if (cmd, timeout) not in network}
   assert local == {app_git._GIT_TIMEOUT}
 
 
-@pytest.mark.parametrize("outcome", ["stalled", "overlong"])
-def test_stalled_network_git_surfaces_as_a_timeout(tmp_path, monkeypatch, outcome):
+def test_overlong_network_git_surfaces_as_a_timeout(tmp_path, monkeypatch):
   def fake_run(cmd, *args, **kwargs):
-    if outcome == "overlong":
-      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-    return subprocess.CompletedProcess(
-      cmd, 128, "",
-      "error: RPC failed; curl 28 Operation too slow. Less than 1000 "
-      "bytes/sec transferred the last 60 seconds\nfatal: early EOF\n",
-    )
+    raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
   monkeypatch.setattr(app_git.subprocess, "run", fake_run)
   with pytest.raises(app_git.GitTransferTimeout):

@@ -103,25 +103,14 @@ _EXCLUDE_END = "# END MOBIUS MANAGED IGNORE RULES"
 _GIT_NAME = "Mobius"
 _GIT_EMAIL = "mobius@localhost"
 
-# Timeout for local git subprocesses. They read and write only the app's own
-# repository, so one that runs longer than this is wedged, not slow.
+# One wall-clock ceiling for Git subprocesses. Network transfers can run while
+# lifecycle or source locks are held, so even healthy but slow downloads must
+# be bounded to avoid monopolizing those locks.
 _GIT_TIMEOUT = 30
-
-# Network transfers (clone, fetch, unshallow) can run while lifecycle or source
-# locks are held. Bound every transfer to 30 seconds, including healthy but
-# slow downloads, so network work cannot monopolize those locks.
-_GIT_NETWORK_OPTIONS = (
-  "-c", "http.lowSpeedLimit=1000",
-  "-c", "http.lowSpeedTime=60",
-)
-_GIT_NETWORK_TIMEOUT = 30
-_STALLED_TRANSFER = re.compile(
-  r"curl 28|operation too slow|timed out", re.IGNORECASE,
-)
 
 
 class GitTransferTimeout(RuntimeError):
-  """A network Git transfer stalled or exceeded its overall ceiling."""
+  """A network Git transfer exceeded its wall-clock ceiling."""
 
 
 # Contribute records a reviewed change as a Git object in the repository that
@@ -439,24 +428,18 @@ def _run_network_command(
 ) -> subprocess.CompletedProcess:
   """Run one network Git command with a short wall-clock ceiling.
 
-  ``cmd`` starts with ``git``; the low-speed options are inserted as global
-  options. A stalled or overlong transfer raises ``GitTransferTimeout`` (even
-  with ``check=False``) so callers can tell the owner it timed out rather than
-  that the source is missing.
+  An overlong transfer raises ``GitTransferTimeout`` even with ``check=False``,
+  so callers can report a timeout rather than a missing source.
   """
-  cmd = [cmd[0], *_GIT_NETWORK_OPTIONS, *cmd[1:]]
-  timeout = _GIT_NETWORK_TIMEOUT
   try:
     result = subprocess.run(
-      cmd, capture_output=True, text=True, timeout=timeout,
+      cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
       check=False, env=env,
     )
   except subprocess.TimeoutExpired as exc:
     raise GitTransferTimeout(
-      f"it ran longer than {timeout} seconds"
+      f"it ran longer than {_GIT_TIMEOUT} seconds"
     ) from exc
-  if result.returncode != 0 and _STALLED_TRANSFER.search(result.stderr or ""):
-    raise GitTransferTimeout("the remote stopped sending data")
   if check and result.returncode != 0:
     raise subprocess.CalledProcessError(
       result.returncode, cmd, output=result.stdout, stderr=result.stderr,
