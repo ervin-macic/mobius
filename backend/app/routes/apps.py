@@ -1646,6 +1646,14 @@ async def update_candidate_preview(
       )
     except HTTPException:
       raise
+    except app_git.GitTransferTimeout as exc:
+      raise install._git_source_error(
+        "git_update_unavailable",
+        "This app does not have a usable Git update source.",
+        "The installed version was left unchanged.",
+        exc,
+      ) from exc
+    # Package-size failures belong before this generic Git-source fallback.
     except (
       OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
     ) as exc:

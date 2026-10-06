@@ -2071,6 +2071,36 @@ def test_install_keeps_an_ordinary_403_as_an_upstream_error(
   assert r.status_code == 502, r.text
   assert "Upstream 403" in r.json()["detail"]
 
+
+@pytest.mark.parametrize("host, status, expected", [
+  ("api.github.com", 403, 429),
+  ("github.com", 403, 429),
+  ("raw.githubusercontent.com", 403, 429),
+  ("example.test", 403, 502),
+  ("github.com.example.test", 403, 502),
+  ("notgithub.test", 403, 502),
+  ("example.test", 429, 429),
+])
+@pytest.mark.parametrize("headers", [
+  {"retry-after": "60"}, {"x-ratelimit-remaining": "0"},
+])
+def test_install_reinterprets_rate_limit_403_only_for_github_hosts(
+  client, auth, bypass_url_validation, host, status, expected, headers,
+):
+  url = f"https://{host}/mobius.json"
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client({url: (status, b"unavailable", headers)}),
+  ):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": url,
+    })
+
+  assert response.status_code == expected, response.text
+  if expected == 502:
+    assert "Upstream 403" in response.json()["detail"]
+
+
 # --- Update path rolls back compiled bundle (fix 4) -----------------
 
 
@@ -4185,6 +4215,47 @@ def test_update_candidate_preview_fetches_incoming_diff_without_mutation(
   listed = client.get("/api/apps/", headers=auth).json()
   row = next(app for app in listed if app["id"] == app_id)
   assert row["version"] == "1.0.0"
+
+
+def test_update_candidate_preview_classifies_git_transfer_timeout_without_mutation(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  base = "https://raw.githubusercontent.com/acme/preview-timeout/main/"
+  manifest = {
+    "id": "preview-timeout", "name": "Preview timeout", "version": "1.0.0",
+    "description": "Git preview timeout", "entry": "index.jsx",
+  }
+  _, bare, _ = _make_clone_fixture(tmp_path, JSX_MULTI, "")
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, JSX_MULTI, "", bare,
+  )
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  repo = Path(get_settings().data_dir) / "apps" / manifest["id"]
+  before = (repo / "index.jsx").read_bytes()
+  upstream = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
+
+  with patch(
+    "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
+  ), patch(
+    "app.app_git._run_network_command",
+    side_effect=app_git.GitTransferTimeout("the remote stopped sending data"),
+  ) as network:
+    response = client.get(
+      f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
+    )
+
+  network.assert_called_once()
+  assert "fetch" in network.call_args.args[0]
+  assert response.status_code == 409, response.text
+  detail = response.json()["detail"]
+  assert detail["code"] == "git_transfer_timeout"
+  assert "timed out: the remote stopped sending data" in detail["message"]
+  assert "installed version was left unchanged" in detail["message"]
+  assert (repo / "index.jsx").read_bytes() == before
+  assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == upstream
+  db.expire_all()
+  assert db.get(models.App, app_id).version == manifest["version"]
 
 
 def test_update_candidate_preview_applies_the_reviewed_commit_without_refetch(

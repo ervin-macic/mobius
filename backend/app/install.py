@@ -813,7 +813,7 @@ async def _http_get(
         next_url = None
         if r.status_code == 404:
           raise HTTPException(404, f"Not found: {url}")
-        if _is_rate_limited(r.status_code, r.headers):
+        if _is_rate_limited(url, r.status_code, r.headers):
           raise HTTPException(429, _rate_limit_detail(url, r.headers))
         if r.status_code >= 400:
           raise HTTPException(
@@ -941,7 +941,12 @@ def _wait_label(seconds: int) -> str:
   return f"about {minutes} minute{'s' if minutes != 1 else ''}"
 
 
-def _is_rate_limited(status_code: int, headers) -> bool:
+_GITHUB_RATE_LIMIT_HOSTS = frozenset((
+  "github.com", "api.github.com", "raw.githubusercontent.com",
+))
+
+
+def _is_rate_limited(url: str, status_code: int, headers) -> bool:
   """True for 429, and for the 403 GitHub uses for its rate limits.
 
   GitHub answers an exhausted primary limit with 403 and
@@ -950,6 +955,7 @@ def _is_rate_limited(status_code: int, headers) -> bool:
   """
   return status_code == 429 or (
     status_code == 403
+    and urlparse(url).hostname in _GITHUB_RATE_LIMIT_HOSTS
     and (
       _header(headers, "x-ratelimit-remaining") == "0"
       or _header(headers, "retry-after") is not None
@@ -959,7 +965,7 @@ def _is_rate_limited(status_code: int, headers) -> bool:
 
 def _rate_limit_detail(url: str, headers) -> str:
   host = urlparse(url).hostname or "upstream"
-  service = "GitHub" if "github" in host.lower() else host
+  service = "GitHub" if host in _GITHUB_RATE_LIMIT_HOSTS else host
   detail = f"{service} rate-limited this app request."
   retry_after = _header(headers, "retry-after")
   if retry_after:
