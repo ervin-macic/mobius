@@ -9,14 +9,12 @@ from collections import OrderedDict
 
 from PIL import Image
 
+from .image_limits import MAX_IMAGE_PIXELS, check_image_size
 
-# Pillow's default (~89M pixels) still permits a tiny hostile file to request
-# a very large allocation. App icons never need that headroom. This pixel
-# ceiling is the only size rule: any image within it is accepted and scaled
+# The shared pixel ceiling is the only size rule: images within it are scaled
 # down. Author-facing apply and publication reject invalid icons; imported
 # packages instead warn and omit/preserve them for historical compatibility.
 # Install and update-check digests both omit refused icons.
-MAX_ICON_PIXELS = 32_000_000
 
 
 class InvalidIcon(ValueError):
@@ -53,18 +51,15 @@ _normalized_lock = threading.Lock()
 
 def _normalize_uncached(raw: bytes) -> bytes:
   too_large = (
-    f"Icon has more than the {MAX_ICON_PIXELS // 1_000_000} million pixels "
+    f"Icon has more than the {MAX_IMAGE_PIXELS // 1_000_000} million pixels "
     "an icon may have. Use a smaller image; 1024x1024 is plenty."
   )
   try:
     # Refuse from the header before load() allocates the pixel buffer. Do not
     # rely on Pillow's process-global warning filters in concurrent workers.
     image = Image.open(io.BytesIO(raw))
-    if image.width * image.height > MAX_ICON_PIXELS:
-      raise InvalidIcon(too_large)
+    check_image_size(image)
     image.load()
-  except InvalidIcon:
-    raise
   except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
     raise InvalidIcon(too_large) from exc
   except Exception as exc:

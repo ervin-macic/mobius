@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from .image_limits import check_image_size
 
 PREVIEW_MAX_EDGE = 1024
 PREVIEW_WEBP_QUALITY = 72
@@ -184,6 +185,7 @@ def display_image_preview(file_path: Path, base: Path) -> Path | None:
     temp_path = None
     try:
       with Image.open(file_path) as source:
+        check_image_size(source)
         source.seek(0)
         image = ImageOps.exif_transpose(source)
         if image.mode not in {"RGB", "RGBA"}:
