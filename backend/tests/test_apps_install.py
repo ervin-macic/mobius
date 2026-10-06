@@ -49,7 +49,7 @@ def _stub_resolver_run_chat():
 @pytest.fixture
 def idle_resolver_runs(monkeypatch):
   """Model completed noop resolver turns in batch-rebinding tests."""
-  monkeypatch.setattr("app.run_state.has_running_run", lambda db, cid: False)
+  monkeypatch.setattr("app.run_state.has_nonterminal_run", lambda db, cid: False)
   monkeypatch.setattr("app.chat.is_chat_running", lambda cid: False)
 
 
@@ -3682,7 +3682,10 @@ def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
   assert [start["chat_id"] for start in starts] == [body["chat_id"]] * 2
 
 
-@pytest.mark.parametrize("running_check", ["durable", "in_process"])
+@pytest.mark.parametrize("running_check", [
+  "running", "parked", "resume_pending", "in_process",
+  "waiting_for_owner", "waiting_in_process",
+])
 @pytest.mark.parametrize("selection", ["overlap", "subset", "single"])
 def test_conflict_resolver_cannot_displace_a_running_batch(
   client, auth, bypass_url_validation, monkeypatch, running_check, selection,
@@ -3698,9 +3701,17 @@ def test_conflict_resolver_cannot_displace_a_running_batch(
   assert first.status_code == 200, first.text
   chat_id = first.json()["chat_id"]
   running = True
+  with SessionLocal() as db:
+    run = db.query(models.ChatRun).filter_by(chat_id=chat_id).one()
+    run.status = (
+      running_check if running_check in models.NONTERMINAL_RUN_STATUSES else "completed"
+    )
+    if running_check == "waiting_for_owner":
+      db.get(models.Chat, chat_id).pending_question_id = "resolver-owner-question"
+    db.commit()
   monkeypatch.setattr(
-    "app.run_state.has_running_run",
-    lambda db, cid: running_check == "durable" and running and cid == chat_id,
+    "app.questions.is_waiting",
+    lambda cid: running_check == "waiting_in_process" and running and cid == chat_id,
   )
   monkeypatch.setattr(
     "app.chat.is_chat_running",
@@ -3750,6 +3761,10 @@ def test_conflict_resolver_cannot_displace_a_running_batch(
     ] == original_bindings
 
   running = False
+  with SessionLocal() as db:
+    db.query(models.ChatRun).filter_by(chat_id=chat_id).one().status = "completed"
+    db.get(models.Chat, chat_id).pending_question_id = None
+    db.commit()
   admitted = request()
   assert admitted.status_code == 200, admitted.text
   assert admitted.json()["created"] is True
@@ -3800,7 +3815,7 @@ def test_conflict_resolver_start_is_serialized_with_overlapping_request(
 
     monkeypatch.setattr(fs_locks, "install_uninstall_lock", observed_lifecycle)
     monkeypatch.setattr(routes, "_start_conflict_resolver_turn", start_turn)
-    monkeypatch.setattr("app.run_state.has_running_run", lambda db, cid: cid in running)
+    monkeypatch.setattr("app.run_state.has_nonterminal_run", lambda db, cid: cid in running)
     monkeypatch.setattr("app.chat.is_chat_running", lambda cid: False)
     with SessionLocal() as first_db, SessionLocal() as second_db:
       first = asyncio.create_task(routes._create_conflict_resolver_chat(first_db, ids[:2]))

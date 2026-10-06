@@ -1757,13 +1757,72 @@ def _resolver_app_error(exc: HTTPException, app_id: int) -> HTTPException:
   return HTTPException(exc.status_code, {**detail, "app_id": app_id})
 
 
+def _check_conflict_resolver_bindings(
+  db: Session, apps: list[models.App],
+) -> tuple[models.Chat | None, list[models.App]]:
+  """Reuse only the exact batch; refuse to displace work that can resume."""
+  from app import questions
+  from app.chat import is_chat_running
+  from app.run_state import has_nonterminal_run
+
+  existing = None
+  existing_ids = {app.conflict_resolver_chat_id for app in apps}
+  if len(existing_ids) == 1 and None not in existing_ids:
+    existing_id = next(iter(existing_ids))
+    requested = {(app.id, app.upstream_commit) for app in apps}
+    bound = set(db.query(
+      models.App.id, models.App.conflict_resolver_upstream_commit,
+    ).filter(
+      models.App.conflict_resolver_chat_id == existing_id,
+      models.App.deleted_at.is_(None),
+    ).all())
+    # Include every binding, not just the requested apps: a subset must not
+    # reopen a chat whose seed also asks the agent to work on other apps.
+    if bound == requested:
+      existing = (
+        db.query(models.Chat)
+        .filter(models.Chat.id == existing_id)
+        .filter(models.Chat.deleted_at.is_(None))
+        .filter(models.Chat.created_by_app_id.is_(None))
+        .first()
+      )
+  if existing is not None:
+    return existing, []
+
+  # The old seed still covers its whole batch. Never take any of those
+  # apps away while that resolver is working in their private checkouts.
+  displaced = existing_ids - {None}
+  displaced_apps = db.query(models.App).filter(
+    models.App.conflict_resolver_chat_id.in_(displaced),
+  ).all() if displaced else []
+  for displaced_id in sorted(displaced):
+    chat = db.get(models.Chat, displaced_id)
+    if (
+      has_nonterminal_run(db, displaced_id) or is_chat_running(displaced_id)
+      or (chat is not None and chat.pending_question_id is not None)
+      or questions.is_waiting(displaced_id)
+    ):
+      bound_ids = sorted(
+        app.id for app in displaced_apps
+        if app.conflict_resolver_chat_id == displaced_id
+      )
+      raise HTTPException(409, {
+        "code": "conflict_resolver_running",
+        "message": (
+          f"Resolver chat {displaced_id} is still busy for apps "
+          f"{bound_ids}. Wait for it to finish before opening a different batch."
+        ),
+        "chat_id": displaced_id,
+        "app_ids": bound_ids,
+      })
+  return None, displaced_apps
+
+
 async def _create_conflict_resolver_chat(
   db: Session, app_ids: list[int],
 ) -> schemas.AppConflictResolverChatOut:
   """Prepare the exact selected batch, then open its owner-visible resolver."""
   from app import background_agents
-  from app.chat import is_chat_running
-  from app.run_state import has_running_run
 
   prepared = []
   async with fs_locks.install_uninstall_lock(), AsyncExitStack() as locks:
@@ -1797,49 +1856,9 @@ async def _create_conflict_resolver_chat(
         raise _resolver_app_error(exc, app.id) from exc
       prepared.append((app, repo, receipt, merge, upstream_version))
 
-    existing = None
-    existing_ids = {app.conflict_resolver_chat_id for app, *_ in prepared}
-    if len(existing_ids) == 1 and None not in existing_ids:
-      existing_id = next(iter(existing_ids))
-      requested = {(app.id, app.upstream_commit) for app, *_ in prepared}
-      bound = set(db.query(
-        models.App.id, models.App.conflict_resolver_upstream_commit,
-      ).filter(
-        models.App.conflict_resolver_chat_id == existing_id,
-        models.App.deleted_at.is_(None),
-      ).all())
-      # Include every binding, not just the requested apps: a subset must not
-      # reopen a chat whose seed also asks the agent to work on other apps.
-      if bound == requested:
-        existing = (
-          db.query(models.Chat)
-          .filter(models.Chat.id == existing_id)
-          .filter(models.Chat.deleted_at.is_(None))
-          .filter(models.Chat.created_by_app_id.is_(None))
-          .first()
-        )
-    if existing is None:
-      # The old seed still covers its whole batch. Never take any of those
-      # apps away while that resolver is working in their private checkouts.
-      displaced = existing_ids - {None}
-      displaced_apps = db.query(models.App).filter(
-        models.App.conflict_resolver_chat_id.in_(displaced),
-      ).all() if displaced else []
-      for displaced_id in sorted(displaced):
-        if has_running_run(db, displaced_id) or is_chat_running(displaced_id):
-          bound_ids = sorted(
-            app.id for app in displaced_apps
-            if app.conflict_resolver_chat_id == displaced_id
-          )
-          raise HTTPException(409, {
-            "code": "conflict_resolver_running",
-            "message": (
-              f"Resolver chat {displaced_id} is still running for apps "
-              f"{bound_ids}. Wait for it to finish before opening a different batch."
-            ),
-            "chat_id": displaced_id,
-            "app_ids": bound_ids,
-          })
+    existing, displaced_apps = _check_conflict_resolver_bindings(
+      db, [app for app, *_ in prepared],
+    )
 
     # Reuse must still restore a checkout removed by an earlier abort/retry.
     prompt_items = []
