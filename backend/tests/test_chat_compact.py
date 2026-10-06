@@ -53,15 +53,15 @@ def _connect_codex(monkeypatch):
   )
 
 
-def _write_summary(chat_id, text):
+def _write_digest(chat_id, text):
   note = (
     Path(get_settings().data_dir)
     / "shared" / "memory" / "chats" / chat_id / "index.md"
   )
   note.parent.mkdir(parents=True, exist_ok=True)
   note.write_text(
-    "---\ntype: chat\n---\n## Digest\nshort\n\n"
-    f"## Summary\n{text}\n\n## Facts & intent\n- private\n",
+    "---\ntype: chat\n---\n## Summary\nshort\n\n"
+    f"## Digest\n{text}\n\n## Facts & intent\n- private\n",
     encoding="utf-8",
   )
 
@@ -88,7 +88,7 @@ def test_incoming_provider_synthesizes_and_switches_atomically(
   row.session_id = "claude-session"
   row.agent_settings_json = {"model": "claude-sonnet-4-6"}
   db.commit()
-  _write_summary(chat_id, source)
+  _write_digest(chat_id, source)
 
   response = client.post(
     f"/api/chats/{chat_id}/provider-switch", headers=auth, json=_payload(),
@@ -100,7 +100,7 @@ def test_incoming_provider_synthesizes_and_switches_atomically(
   assert captured["provider_id"] == "codex"
   assert captured["model"] == "gpt-5.4"
   assert captured["effort"] == "high"
-  assert captured["source_summary"] == source
+  assert captured["source_digest"] == source
   assert body["provider"] == "codex"
   assert body["stored"]["switch_id"] == "switch-1"
   assert body["stored"]["from_provider"] == "claude"
@@ -253,7 +253,7 @@ def test_provider_switch_writer_rechecks_hidden_pin_at_commit(chat, db):
     settings_patch={"model": "gpt-5.5", "effort": "high"},
     summary="Incoming handoff",
     source_messages_hash=messages_fingerprint(source_messages),
-    source_summary_hash=None,
+    source_digest_hash=None,
     data_dir="/tmp",
     request_fingerprint="pinned",
   )).result(timeout=5)
@@ -285,7 +285,7 @@ def test_legacy_bodyless_compact_then_patch_remains_compatible(
   row = db.query(models.Chat).filter(models.Chat.id == chat_id).one()
   row.session_id = "claude-session"
   db.commit()
-  _write_summary(chat_id, "Older published summary")
+  _write_digest(chat_id, "Older published summary")
 
   compact = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
   assert compact.status_code == 200, compact.text
@@ -295,7 +295,7 @@ def test_legacy_bodyless_compact_then_patch_remains_compatible(
   assert row.provider == "claude"
   assert row.session_id is None
   assert chat_mod._latest_compaction_brief(row) == "portable legacy handoff"
-  assert captured["source_summary"] == "Older published summary"
+  assert captured["source_digest"] == "Older published summary"
 
   switched = client.patch(
     f"/api/chats/{chat_id}",
@@ -333,7 +333,7 @@ def test_manual_compact_guidance_uses_current_mobius_model(
   row.session_id = "mobius-session"
   row.agent_settings_json = {"model": "flow", "effort": "high"}
   db.commit()
-  _write_summary(chat_id, "Existing detailed summary")
+  _write_digest(chat_id, "Existing detailed summary")
 
   response = client.post(
     f"/api/chats/{chat_id}/compact",
@@ -345,7 +345,7 @@ def test_manual_compact_guidance_uses_current_mobius_model(
   assert captured["provider_id"] == "mobius"
   assert captured["model"] == "flow"
   assert captured["effort"] == "high"
-  assert captured["source_summary"] == "Existing detailed summary"
+  assert captured["source_digest"] == "Existing detailed summary"
   assert captured["custom_instructions"] == (
     "Keep UI decisions; omit routine command output."
   )
@@ -702,7 +702,7 @@ def test_summary_created_during_synthesis_forces_retry(
   ])
 
   async def _stub(_messages, **_kwargs):
-    _write_summary(chat_id, "new complete running summary")
+    _write_digest(chat_id, "new complete running summary")
     return "transcript-only handoff"
 
   monkeypatch.setattr(compaction, "summarize_chat", _stub)
@@ -862,27 +862,27 @@ def test_cumulative_chat_summary_is_unbounded_compaction_source(tmp_path):
   late = "LATE NEXT STEP"
   note.write_text(
     "---\ntype: chat\ndescription: work\n---\n"
-    "## Digest\nshort paragraph\n\n"
-    f"## Summary\n{early}\n{late}\n\n"
+    "## Summary\nshort paragraph\n\n"
+    f"## Digest\n{early}\n{late}\n\n"
     "## Facts & intent\n- private fact\n",
     encoding="utf-8",
   )
-  summary = compaction.load_cumulative_summary(str(tmp_path), "c1")
+  summary = compaction.load_full_digest(str(tmp_path), "c1")
   assert summary is not None
   assert early in summary
   assert late in summary
   assert "private fact" not in summary
 
 
-def test_cumulative_summary_keeps_markdown_h2_inside_handoff(tmp_path):
+def test_full_digest_keeps_markdown_h2_inside_handoff(tmp_path):
   note = tmp_path / "shared" / "memory" / "chats" / "c1" / "index.md"
   note.parent.mkdir(parents=True)
   note.write_text(
-    "## Summary\nOpening\n\n## Implementation\nKept detail\n\n"
+    "## Digest\nOpening\n\n## Implementation\nKept detail\n\n"
     "## Facts & intent\n- private\n",
     encoding="utf-8",
   )
-  assert compaction.load_cumulative_summary(str(tmp_path), "c1") == (
+  assert compaction.load_full_digest(str(tmp_path), "c1") == (
     "Opening\n\n## Implementation\nKept detail"
   )
 
@@ -924,7 +924,7 @@ async def test_synthesis_uses_summary_and_current_transcript(
     ],
     data_dir=str(tmp_path),
     provider_id="codex",
-    source_summary="complete early history",
+    source_digest="complete early history",
     model="gpt-5.4",
     effort="high",
   )
@@ -1023,7 +1023,7 @@ async def test_large_synthesis_progressively_reads_every_source_interval(
     ],
     data_dir=str(tmp_path),
     provider_id="codex",
-    source_summary="STALE_RUNNING_SUMMARY",
+    source_digest="STALE_RUNNING_SUMMARY",
   )
 
   assert len(prompts) > 1
@@ -1070,7 +1070,7 @@ async def test_synthesis_rejects_source_above_call_budget(monkeypatch, tmp_path)
       [],
       data_dir=str(tmp_path),
       provider_id="codex",
-      source_summary="x" * compaction._MAX_SYNTHESIS_SOURCE_BYTES,
+      source_digest="x" * compaction._MAX_SYNTHESIS_SOURCE_BYTES,
     )
   assert called is False
 
@@ -1332,11 +1332,11 @@ async def test_failed_codex_compaction_discards_partial_text_and_redacts_logs(
   assert "private prompt" not in caplog.text
 
 
-def _write_bound_manual_note(chat_id, messages, summary="Keep the original files."):
+def _write_bound_manual_note(chat_id, messages, digest="Keep the original files."):
   from app.chat_continuity import apply_checkpoint, checkpoint_coverage, note_path, write_note
   path = note_path(get_settings().data_dir, chat_id)
   note = apply_checkpoint(
-    None, name="Compaction fixture", summary=summary,
+    None, name="Compaction fixture", digest=digest,
     coverage=checkpoint_coverage(messages, "new-run"),
   )
   write_note(path, note)

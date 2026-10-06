@@ -64,6 +64,7 @@ from app.goals import admit_goal
 from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
 from app.json_safety import json_safe
+from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
   TOOL_OUTPUT_INLINE_THRESHOLD,
   build_assistant_message,
@@ -1091,7 +1092,7 @@ class SwitchProviderWithCompaction(_Command):
   settings_patch: dict = field(default_factory=dict)
   summary: str = ""
   source_messages_hash: str = ""
-  source_summary_hash: str | None = None
+  source_digest_hash: str | None = None
   data_dir: str = ""
   request_fingerprint: str = ""
 
@@ -3461,6 +3462,7 @@ class ChatWriterActor:
     if not resuming:
       _ensure_unique_ts(cmd.user_msg, existing)
       existing.append(cmd.user_msg)
+      claim_uploads(chat, cmd.user_msg.get("attachments"))
     chat.messages = existing
     # Allocate the current assistant's stable display id while history and the
     # queue are already in memory. Streaming snapshots can then update only the
@@ -4315,10 +4317,11 @@ class ChatWriterActor:
       )
       applied = True
     else:
-      metadata = (
-        {"selected_options": cmd.selected_options}
-        if cmd.selected_options is not None else None
-      )
+      metadata = {}
+      if cmd.selected_options is not None:
+        metadata["selected_options"] = cmd.selected_options
+      if cmd.answers and new_msg.get("attachments"):
+        metadata["attachments"] = new_msg["attachments"]
       applied = apply_answers_to_last_question(
         chat, cmd.answers, cmd.question_id, metadata=metadata,
       )
@@ -4356,6 +4359,7 @@ class ChatWriterActor:
     else:
       pending.append(new_msg)
     chat.pending_messages = pending
+    claim_uploads(chat, new_msg.get("attachments"))
     if applied:
       # Both a recovered answer and an early continuation-card answer use the
       # queue. Retire the question, but leave a still-running turn's browser
@@ -4538,15 +4542,15 @@ class ChatWriterActor:
       return {"status": "conflict", "reason": "provider_changed"}
     if messages_fingerprint(messages) != cmd.source_messages_hash:
       return {"status": "conflict", "reason": "chat_changed"}
-    from app.compaction import load_cumulative_summary
+    from app.compaction import load_full_digest
 
-    latest_summary = load_cumulative_summary(cmd.data_dir, cmd.chat_id)
-    latest_summary_hash = (
-      hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
-      if latest_summary is not None
+    latest_digest = load_full_digest(cmd.data_dir, cmd.chat_id)
+    latest_digest_hash = (
+      hashlib.sha256(latest_digest.encode("utf-8")).hexdigest()
+      if latest_digest is not None
       else None
     )
-    if latest_summary_hash != cmd.source_summary_hash:
+    if latest_digest_hash != cmd.source_digest_hash:
       return {"status": "conflict", "reason": "summary_changed"}
 
     new_msg = {
@@ -5179,6 +5183,7 @@ class ChatWriterActor:
     remaining = [m for m in pending if cid_of(m) != cmd.cid]
     if len(remaining) != len(pending):
       chat.pending_messages = remaining
+      release_uploads(chat, [m for m in pending if cid_of(m) == cmd.cid])
       chat.updated_at = datetime.now(UTC)
       if not _commit_or_rollback(db):
         raise _PersistFailed("CancelPending did not persist")
@@ -7085,7 +7090,7 @@ def _question_answer_fields(block: dict) -> dict:
   """Persisted settlement wins over stale streaming snapshots, even without Yes."""
   return {
     key: copy.deepcopy(block[key])
-    for key in ("answers", "answer_turn", "selected_options", "platform_action")
+    for key in ("answers", "answer_turn", "selected_options", "platform_action", "attachments")
     if key in block
   }
 

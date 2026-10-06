@@ -1792,6 +1792,8 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0083_retire_quiet_write_sessions",
     "0084_chat_media_directory",
     "0085_app_shell_shortcuts",
+    "0083_swap_chat_note_sections",
+    "0086_drop_chat_note_backup",
   ]
   assert second == first
 
