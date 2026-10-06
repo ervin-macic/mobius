@@ -64,8 +64,16 @@ def release_uploads(chat, removed_rows: list[dict]) -> None:
   names = set()
   for row in removed_rows:
     names |= attachment_names(row.get("attachments"))
+  if not names:
+    return
+  from sqlalchemy.orm import object_session
+
+  from app import transcript_rows
+
   live = chat.live_assistant
-  rows = [*(chat.messages or []), *([live] if isinstance(live, dict) else []),
+  # Only transcript rows flagged as naming attachments are read.
+  rows = [*transcript_rows.attachment_bodies(object_session(chat), chat),
+          *([live] if isinstance(live, dict) else []),
           *(chat.pending_messages or [])]
   for row in rows:
     names -= attachment_names(row.get("attachments"))
