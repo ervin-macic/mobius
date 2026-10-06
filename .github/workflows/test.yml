@@ -372,6 +372,11 @@ jobs:
           git fetch -q origin main
           # The release this change branches from (a manual run has no base).
           base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
+          # A manual run of a commit already on main is its own merge base;
+          # owners upgrade to it from the release before it.
+          if [ "$(git rev-parse "$base")" = "$(git rev-parse HEAD)" ]; then
+            base=$(git rev-parse HEAD^)
+          fi
           # Owners run the base's own image once main-image publishes it, so
           # wait for a publication that is under way rather than testing an
           # older updater. A commit merged in a batch never gets an image of
