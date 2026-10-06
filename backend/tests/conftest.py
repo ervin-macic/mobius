@@ -265,10 +265,20 @@ def _install_all_unconverted_mode():
   # The process fact would otherwise end every per-read marker check.
   mode_transcript_rows.mark_all_converted = lambda _db: None
 
+  import sys
+
+  def called_by_test_code() -> bool:
+    # A test seeding its own fixture state directly is not a production path.
+    frame = sys._getframe(2)
+    while frame is not None and frame.f_code.co_filename.endswith("transcript_rows.py"):
+      frame = frame.f_back
+    return frame is not None and "/tests/" in frame.f_code.co_filename
+
   def off_the_loop(function):
     @functools.wraps(function)
     def wrapper(*args, **kwargs):
-      assert not on_event_loop(), f"{function.__name__} ran on the event loop"
+      assert not on_event_loop() or called_by_test_code(), (
+        f"{function.__name__} ran on the event loop")
       return function(*args, **kwargs)
     return wrapper
 

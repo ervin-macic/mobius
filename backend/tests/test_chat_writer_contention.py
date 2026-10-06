@@ -388,6 +388,7 @@ def test_finalize_ack_only_after_commit(actor):
 
 @pytest.mark.parametrize("command", ["finalize", "question"])
 @pytest.mark.parametrize("provider", ["claude", "codex", "mobius"])
+@pytest.mark.converted_chats  # A converted chat's row-path statements.
 def test_hot_terminal_write_updates_only_owned_message(actor, command, provider):
   """A long chat's terminal boundary must not decode or rewrite its prefix."""
   from sqlalchemy import event
@@ -445,6 +446,7 @@ def test_hot_terminal_write_updates_only_owned_message(actor, command, provider)
   assert len(_load_chat()["messages"]) == 201
 
 
+@pytest.mark.converted_chats  # A converted chat's row-path statements.
 def test_question_answer_streams_from_the_tail_and_updates_one_row():
   from sqlalchemy import event
   from app.database import engine
