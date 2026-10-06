@@ -17,7 +17,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.deps import authorize_app_module_token, get_current_owner
 from app.http_caching import strip_range
-from app.net_utils import validate_url_safe
+from app.net_utils import MAX_REDIRECTS, validate_url_safe
 from app.resource_access import live_app, live_app_or_404
 
 
@@ -25,7 +25,6 @@ router = APIRouter()
 
 _DEVICE_ASSET_CAPABILITY = "device.asset-cache"
 _SPEECH_MODEL_CAPABILITY = "device.speech-models"
-_DEVICE_ASSET_MAX_REDIRECTS = 5
 _DEVICE_ASSET_USER_AGENT = "Mobius/1.0 (device asset relay)"
 
 
@@ -80,7 +79,7 @@ async def _open_device_asset_range(
   )
   expected_end = offset + length - 1
   try:
-    for hop in range(_DEVICE_ASSET_MAX_REDIRECTS + 1):
+    for hop in range(MAX_REDIRECTS + 1):
       pinned_url, host_header, sni_host = validate_url_safe(current_url)
       request = client.build_request(
         "GET",
@@ -106,7 +105,7 @@ async def _open_device_asset_range(
         await upstream.aclose()
         if not location:
           raise HTTPException(502, "Device asset redirect had no destination.")
-        if hop >= _DEVICE_ASSET_MAX_REDIRECTS:
+        if hop >= MAX_REDIRECTS:
           raise HTTPException(502, "Too many device asset redirects.")
         current_url = urljoin(current_url, location)
         if not _is_https_device_asset_url(current_url):
