@@ -269,7 +269,7 @@
 /* ── Bar-collapse mode (general apps: "look like a standalone app") ──
    Hide the toolbar, retaining only any top safe-area inset inside the web
    viewport. Its background is themed; the installed iOS status bar outside
-   that viewport remains opaque black in every theme. With no top inset the
+   that viewport is opaque and tinted to the active theme. With no top inset the
    strip collapses to zero and the app header reaches the viewport top. */
 .shell--barcollapsed .shell__bar {
   height: env(safe-area-inset-top, 0px);

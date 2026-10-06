@@ -33,6 +33,7 @@ import {
   providerAllowanceSummary,
 } from './providerUsage.js'
 import { PROVIDER_INFO, PROVIDER_ORDER, providerInfoFor, providerOrderFor } from '../ChatView/providerRegistry.jsx'
+import { isStandaloneDisplay } from '../../utils/installPlatform.js'
 import '../ui/StatusDot.css'
 import '../ui/ModelSheet.css'
 import './SettingsView.css'
@@ -880,17 +881,7 @@ export default function SettingsView({
     // theme queries; AppCanvas's useEffect picks that up and
     // postMessages `moebius:frame-theme` to live iframes.
     try {
-      // An installed iPhone app re-reads its status-bar colour only when the
-      // page loads or returns to the foreground; the shell's controlled reload
-      // keeps the current screen painted while the new document takes over.
-      // It starts the moment the server accepts the theme, not after the rest
-      // of the toggle's same-document bookkeeping.
-      const reloadForStatusBar = window.navigator.standalone === true
-        ? onStatusBarThemeReload
-        : null
-      await themeService.toggleTheme(queryClient, currentMode, api, {
-        onPersisted: reloadForStatusBar || undefined,
-      })
+      await themeService.toggleTheme(queryClient, currentMode, api)
     } catch {
       setThemeMode(currentMode)
       setThemeError(
@@ -902,8 +893,21 @@ export default function SettingsView({
       // picks it up, and themeMode stops disagreeing with the visible theme.
       themeQueries.mode.invalidate(queryClient)
       onThemeChange?.()  // reload original theme on error
+      return
     } finally {
       setThemeSwitching(false)
+    }
+
+    // An installed iPhone app re-reads its status-bar colour only when the
+    // document loads or returns to the foreground, so the saved theme reaches
+    // the bar through the shell's controlled reload. It runs after the save so
+    // a reload failure can never roll back a theme the server already holds.
+    // `navigator.standalone` exists only on iOS; display-mode excludes the
+    // in-app browser, where Apple leaks it as true.
+    if (isStandaloneDisplay() && window.navigator.standalone === true) {
+      Promise.resolve(onStatusBarThemeReload?.()).catch(() => {
+        // The theme is saved and painted; the bar catches up at next launch.
+      })
     }
   }
 

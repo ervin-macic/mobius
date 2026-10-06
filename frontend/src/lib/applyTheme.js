@@ -50,27 +50,6 @@ export function colorSchemeMetaContent(mode) {
   return mode === 'light' ? 'light dark' : 'dark light'
 }
 
-// Every theme-color tag (one per system colour scheme) follows the active
-// Möbius theme. Re-inserting a changed tag prompts iOS to re-read the opaque
-// status-bar colour without a reload.
-function refreshThemeColorMetas(doc, bg) {
-  const metas = typeof doc.querySelectorAll === 'function'
-    ? Array.from(doc.querySelectorAll('meta[name="theme-color"]'))
-    : []
-  if (!metas.length) {
-    const meta = doc.querySelector('meta[name="theme-color"]')
-    if (meta) metas.push(meta)
-  }
-  for (const meta of metas) {
-    const current = typeof meta.getAttribute === 'function' ? meta.getAttribute('content') : meta.content
-    setMetaContent(meta, bg)
-    if (current !== bg && doc.head && typeof meta.remove === 'function') {
-      meta.remove()
-      doc.head.appendChild(meta)
-    }
-  }
-}
-
 function setMetaContent(meta, value) {
   if (!meta) return
   if (typeof meta.setAttribute === 'function') meta.setAttribute('content', value)
@@ -205,7 +184,8 @@ export function applyTheme(theme, { doc = globalThis.document, store = ownerStor
   if (bg && HEX_RE.test(bg)) {
     doc.documentElement.style.background = bg
     if (doc.body) doc.body.style.background = bg
-    refreshThemeColorMetas(doc, bg)
+    const meta = doc.querySelector('meta[name="theme-color"]')
+    setMetaContent(meta, bg)
     doc.documentElement.style.setProperty('--bg', bg)
   }
 
@@ -339,8 +319,8 @@ export const PREPAINT_SRC = `(function () {
     root.style.setProperty('--bg', bg);
     root.setAttribute('data-theme', mode);
     root.style.colorScheme = mode;
-    var themeColorMetas = document.querySelectorAll('meta[name="theme-color"]');
-    for (var t = 0; t < themeColorMetas.length; t++) themeColorMetas[t].setAttribute('content', bg);
+    var themeColorMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeColorMeta) themeColorMeta.setAttribute('content', bg);
     var colorSchemeMeta = document.querySelector('meta[name="color-scheme"]');
     if (colorSchemeMeta) colorSchemeMeta.setAttribute('content', mode === 'light' ? 'light dark' : 'dark light');
     // Persist in the TOP-LEVEL SHELL ONLY for the next shell boot.

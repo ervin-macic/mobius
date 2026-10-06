@@ -2325,7 +2325,8 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   }, [visibleAppIds, apps, queryClient])
 
   // Immersive games request OS fullscreen to also drop the Android status bar
-  // and paint under the notch — but ENTER must come from the app, because the
+  // and paint under its cutout (installed iOS keeps its opaque status bar) —
+  // but ENTER must come from the app, because the
   // Fullscreen API needs the user gesture, and the gameplay tap lands in the
   // app's iframe, not here (see the building-apps "immersive" notes). EXIT
   // needs no gesture, so the shell owns it: when immersive is released (app

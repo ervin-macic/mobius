@@ -60,7 +60,7 @@ test('the two HTML files embed the IDENTICAL pre-paint script', () => {
 
 test('pre-paint updates theme-color and color-scheme metadata', () => {
   assert.ok(PREPAINT_SRC.includes('meta[name=\"theme-color\"]'))
-  assert.ok(/themeColorMetas\[t\]\.setAttribute\(['\"]content['\"], bg\)/.test(PREPAINT_SRC))
+  assert.ok(/themeColorMeta\.setAttribute\(['\"]content['\"], bg\)/.test(PREPAINT_SRC))
   assert.ok(PREPAINT_SRC.includes('meta[name=\"color-scheme\"]'))
   assert.ok(PREPAINT_SRC.includes("mode === 'light' ? 'light dark' : 'dark light'"))
 })
