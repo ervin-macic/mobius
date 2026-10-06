@@ -108,10 +108,10 @@ async function mount(page, { rejectFirst = false, loseFirstAck = false, creditPa
           || /^\/api\/events\/system\/[^/]+\/visible-apps$/.test(url.pathname)) {
         return route.fulfill({ json: {} })
       }
-      if (url.pathname.includes('upload')) return route.fulfill({ json: {
+      if (url.pathname.includes('upload')) return route.fulfill({ json: [{
         name: 'draft-note.txt', filename: 'draft-note.txt', size: 16,
         mime_type: 'text/plain', url: `${path}/uploads/draft-note.txt`,
-      } })
+      }] })
       unexpected.push(`${req.method()} ${url.pathname}`)
       return route.fulfill({ json: {} })
     }
