@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from app import app_apply, app_git, install, models
+from app import app_apply, app_git, install, models, transcript_rows
 from app.config import get_settings
 from test_app_fixtures import create_local_app
 
@@ -3974,7 +3974,7 @@ def test_conflict_resolver_never_reuses_a_different_batch(
       assert app.conflict_resolver_chat_id == response.json()["chat_id"]
       assert app.conflict_resolver_upstream_commit == app.upstream_commit
     chat = db.get(models.Chat, response.json()["chat_id"])
-    seed = chat.messages[0]["content"]
+    seed = list(transcript_rows.history(chat))[0]["content"]
     assert apps[0][2] not in seed
     assert all(apps[app_ids.index(app_id)][2] in seed for app_id in selected)
 
