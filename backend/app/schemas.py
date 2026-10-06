@@ -212,6 +212,7 @@ class AppOut(BaseModel):
   # Internal source for frame and storage-generation projections. App-scoped
   # JWTs separately carry this nonce as app_nonce.
   token_nonce: str | None = Field(default=None, exclude=True)
+  runtime_revision: str | None = Field(default=None, exclude=True)
   # The manifest version currently installed (e.g. "1.7.0"). Null for
   # user-built apps and for rows installed before the column existed
   # (they backfill on their next update). The store reads this to show
@@ -247,6 +248,7 @@ class AppOut(BaseModel):
 
     return app_frame_version(
       self.compiled_path, self.capability_contract, self.token_nonce,
+      self.runtime_revision,
     )
 
   @computed_field

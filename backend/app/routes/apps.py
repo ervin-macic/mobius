@@ -893,6 +893,7 @@ async def install_app(
     public_access_digest=app.public_access_digest,
     public_published_at=app.public_published_at,
     token_nonce=app.token_nonce,
+    runtime_revision=app.runtime_revision,
     theme_color=app.theme_color,
     background_color=app.background_color,
     display=app.display,

@@ -61,24 +61,29 @@ def app_frame_version(
   compiled_path: str | None,
   capability_contract: Mapping | None,
   token_nonce: str | None,
+  runtime_revision: str | None,
 ) -> str:
   """Identify what an app frame executes, for the shell's reload decision.
 
   A frame runs one content-addressed bundle (its file name carries the
   SHA-256, and the compile banner carries the runtime revision), initialized
-  with the accepted runtime declarations and bound to one storage generation.
+  with the accepted runtime declarations and published asset tree, and bound
+  to one storage generation.
   Ordinary row writes such as a pin, rename, icon, or permission change touch
   none of these, so the shell keeps the running frame and the app keeps its
-  place. Packaged /app-assets are excluded: changing only a static asset
-  does not reload an already-running frame. The raw nonce is not exposed by
-  this key (app-scoped JWTs separately carry it as app_nonce).
+  place. The published tree revision includes /app-assets: static-app updates
+  must reload even when their wrapper bundle stays unchanged. The raw nonce is
+  not exposed by this key (app-scoped JWTs separately carry it as app_nonce).
   """
   runtime = (
     capability_contract.get("runtime")
     if isinstance(capability_contract, Mapping) else None
   )
   identity = json.dumps(
-    [Path(compiled_path or "").name, runtime or {}, token_nonce or ""],
+    [
+      Path(compiled_path or "").name, runtime or {}, token_nonce or "",
+      runtime_revision or "",
+    ],
     sort_keys=True,
     separators=(",", ":"),
   )

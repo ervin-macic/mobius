@@ -21,26 +21,26 @@ CONTRACT = {
 
 
 def test_frame_version_tracks_bundle_runtime_and_storage_generation():
-  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1")
+  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1", "revision-1")
 
-  assert base == app_frame_version(BUNDLE, dict(CONTRACT), "nonce-1")
+  assert base == app_frame_version(BUNDLE, dict(CONTRACT), "nonce-1", "revision-1")
   assert len(base) == 20 and "nonce-1" not in base
   assert app_frame_version(
-    BUNDLE.replace("a" * 64, "b" * 64), CONTRACT, "nonce-1",
+    BUNDLE.replace("a" * 64, "b" * 64), CONTRACT, "nonce-1", "revision-1",
   ) != base
   assert app_frame_version(
-    BUNDLE, {**CONTRACT, "runtime": {}}, "nonce-1",
+    BUNDLE, {**CONTRACT, "runtime": {}}, "nonce-1", "revision-1",
   ) != base
-  assert app_frame_version(BUNDLE, CONTRACT, "nonce-2") != base
+  assert app_frame_version(BUNDLE, CONTRACT, "nonce-2", "revision-1") != base
 
 
 def test_frame_version_ignores_server_permissions_and_bundle_directory():
-  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1")
+  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1", "revision-1")
   granted = {**CONTRACT, "permissions": {"cross_app_access": "read"}}
 
-  assert app_frame_version(BUNDLE, granted, "nonce-1") == base
+  assert app_frame_version(BUNDLE, granted, "nonce-1", "revision-1") == base
   assert app_frame_version(
-    "/elsewhere/" + Path(BUNDLE).name, CONTRACT, "nonce-1",
+    "/elsewhere/" + Path(BUNDLE).name, CONTRACT, "nonce-1", "revision-1",
   ) == base
 
 
@@ -64,6 +64,7 @@ def test_settings_writes_keep_frame_version(client, auth):
   assert after["frame_version"] == before["frame_version"]
   assert after["storage_generation"] == before["storage_generation"]
   assert "token_nonce" not in after
+  assert "runtime_revision" not in after
 
 
 def test_code_change_and_data_wipe_rotate_frame_version(
@@ -100,3 +101,34 @@ def test_standalone_boot_uses_the_same_frame_version(client, auth, db):
   assert boot["frame_version"] == listed["frame_version"]
   assert boot["storage_generation"] == listed["storage_generation"]
   assert row.token_nonce not in str(boot)
+
+
+def test_assets_only_update_rotates_frame_version_but_settings_do_not(
+  client, auth, db,
+):
+  from app.routes.standalone import _standalone_boot_payload
+
+  app = create_local_app(client, auth, name="Static reader", description="test")
+  row = db.query(models.App).filter(models.App.id == app["id"]).one()
+  row.runtime_revision = "a" * 64
+  db.commit()
+  before = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+
+  # Static-app packaging keeps the wrapper bundle and declarations unchanged.
+  row.runtime_revision = "b" * 64
+  db.commit()
+  updated = client.get(f"/api/apps/{app['id']}", headers=auth).json()
+  assert updated["compiled_path"] == before["compiled_path"]
+  assert updated["capability_contract"] == before["capability_contract"]
+  assert updated["frame_version"] != before["frame_version"]
+  assert updated["storage_generation"] == before["storage_generation"]
+  assert "runtime_revision" not in updated
+  assert _standalone_boot_payload(row)["frame_version"] == updated["frame_version"]
+
+  pinned = client.patch(
+    f"/api/apps/{app['id']}", json={"pinned": True}, headers=auth,
+  )
+  assert pinned.status_code == 200, pinned.text
+  assert pinned.json()["frame_version"] == updated["frame_version"]
+  db.refresh(row)
+  assert row.runtime_revision == "b" * 64
