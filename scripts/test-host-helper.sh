@@ -408,10 +408,11 @@ if [[ $TRANSCRIPTS == 1 ]]; then
   serves_source baked "$PREVIOUS"
   tprobe dump >"$TPROOF/baked.json"
   tsame "the previous code reads every transcript exactly" "$TPROOF/target.json" "$TPROOF/baked.json"
-  tprobe write-old >/dev/null
+  wrote=$(tprobe write-old)
   tprobe dump >"$TPROOF/previous-wrote.json"
-  # The schema triggers mark exactly the chats the previous code changed.
-  tmarks '["bulk-0013", "from-previous-1"]'
+  # The schema triggers mark exactly the chats a pre-rows previous release
+  # changed; a row-based previous release keeps every chat converted.
+  tmarks "$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["expect_unconverted"]))' "$wrote")"
 
   echo "6. the source is repaired and the target release returns"
   docker exec -u mobius mobius git -C /data/platform reset -q --hard "$repaired" \
