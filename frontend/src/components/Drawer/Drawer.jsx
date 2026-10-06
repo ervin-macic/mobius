@@ -223,8 +223,9 @@ export default function Drawer({
   const listHoldRef = useRef(null)
   const tabSwitchScrollRef = useRef(null)
   const selectListTab = useCallback((tab) => {
-    // Capture the scroll position and extent before the swap so the layout
-    // effect below can keep the tab header stationary.
+    // Capture the scroll position and full extent before the swap. The row
+    // window re-renders more than once after a switch, so the effect below
+    // first holds the whole previous extent and the next frame trims it.
     const root = navigationScrollRef.current
     tabSwitchScrollRef.current = root
       ? { scrollTop: root.scrollTop, reach: root.scrollHeight }
@@ -326,21 +327,29 @@ export default function Drawer({
 
   // A shorter list shrinks the scrollable area, so the browser clamps
   // scrollTop and the tab header moves under the pointer. On a tab switch a
-  // trailing spacer pads the list back to the previous scroll extent and
+  // trailing spacer pads the list until the previous viewport is reachable and
   // scrollTop is restored. The spacer is trimmed once the row window has
   // settled and on each scroll, so it never leaves scrollable blank space.
   const listHoldRafRef = useRef(0)
+  const listHoldTargetRef = useRef(null)
   const syncListHold = useCallback(() => {
     listHoldRafRef.current = 0
     const root = navigationScrollRef.current
     const hold = listHoldRef.current
     if (!root || !hold) return
+    // The first sync after a switch re-establishes the captured position once
+    // the new list has finished rendering; later syncs only ever shrink.
+    const target = listHoldTargetRef.current
+    listHoldTargetRef.current = null
+    const current = parseFloat(hold.style.height) || 0
     const next = drawerListHoldHeight({
-      reach: root.scrollTop + root.clientHeight,
+      reach: (target ? target.scrollTop : root.scrollTop) + root.clientHeight,
       scrollHeight: root.scrollHeight,
-      holdHeight: parseFloat(hold.style.height),
+      holdHeight: current,
+      maxHeight: target ? Infinity : current,
     })
     hold.style.height = next > 0 ? `${next}px` : ''
+    if (target) root.scrollTop = target.scrollTop
   }, [])
   const scheduleListHoldSync = useCallback(() => {
     if (listHoldRafRef.current) return
@@ -368,6 +377,7 @@ export default function Drawer({
     if (next <= 0) return
     hold.style.height = `${next}px`
     root.scrollTop = saved.scrollTop
+    listHoldTargetRef.current = saved
     scheduleListHoldSync()
   }, [listTab, listWindow, listItems.length, scheduleListHoldSync])
   useEffect(() => {
@@ -1469,6 +1479,15 @@ export default function Drawer({
                   role="tabpanel"
                   aria-labelledby={`drawer-tab-${listTab}`}
                 >
+                  {showingArchived && archivedItems.length > 0 && (
+                    // The count lives inside the open list so the switch stays
+                    // quiet; the needs-you marker is its only signal.
+                    <p className="drawer__list-caption">
+                      {archivedItems.length === 1
+                        ? '1 archived chat'
+                        : `${archivedItems.length} archived chats`}
+                    </p>
+                  )}
                   <div ref={listRowsStartRef} aria-hidden="true" />
                   {listSpacers.before > 0 && (
                     <div

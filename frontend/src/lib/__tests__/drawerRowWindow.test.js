@@ -147,3 +147,23 @@ test('the list hold tolerates missing or non-finite metrics', () => {
     0,
   )
 })
+
+test('scrolling down never grows an existing list hold', () => {
+  // Viewport bottom sits in the 1px rounding slack of a 700px hold.
+  const once = drawerListHoldHeight({
+    reach: 1201,
+    scrollHeight: 1201,
+    holdHeight: 700,
+    maxHeight: 700,
+  })
+  assert.equal(once, 700)
+  assert.equal(
+    drawerListHoldHeight({
+      reach: 1260,
+      scrollHeight: 1200,
+      holdHeight: once,
+      maxHeight: once,
+    }),
+    once,
+  )
+})

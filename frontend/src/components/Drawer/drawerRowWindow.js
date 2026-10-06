@@ -103,10 +103,17 @@ export function sameDrawerRowWindow(left, right) {
  * viewport bottom must be able to hit, i.e. scrollTop + clientHeight) inside
  * the scrollable extent after the list shrinks. `holdHeight` is the spacer's
  * current height, so repeated calls converge and a spacer that is no longer
- * needed resolves to 0. The extra pixel absorbs the integer rounding of
- * `scrollHeight` under fractional zoom, which would otherwise clamp scrollTop. */
-export function drawerListHoldHeight({ reach, scrollHeight, holdHeight }) {
+ * needed resolves to 0. Pass `maxHeight` when resizing an existing spacer: it
+ * may only shrink, so scrolling down can never add blank space. One extra pixel
+ * absorbs the integer rounding of `scrollHeight` under fractional zoom, which
+ * would otherwise clamp scrollTop. */
+export function drawerListHoldHeight({
+  reach,
+  scrollHeight,
+  holdHeight,
+  maxHeight = Infinity,
+}) {
   const content = (Number(scrollHeight) || 0) - (Number(holdHeight) || 0)
   const gap = (Number(reach) || 0) - content
-  return gap > 0 ? Math.ceil(gap) + 1 : 0
+  return gap > 0 ? Math.min(Math.ceil(gap) + 1, maxHeight) : 0
 }
