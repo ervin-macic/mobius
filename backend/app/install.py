@@ -1529,80 +1529,12 @@ def package_content_digest_from_tree(
   when the manifest contract grows.
   """
   try:
-    manifest_bytes = tree["mobius.json"]
-    if manifest_bytes is None:
-      raise KeyError("mobius.json")
-    manifest = json.loads(_package_input_bytes(manifest_bytes))
-    validate_manifest_contract(manifest)
-  except (
-    KeyError, UnicodeDecodeError, json.JSONDecodeError, ManifestContractError,
-  ) as exc:
-    raise PackageContentError("invalid or missing mobius.json") from exc
-
-  def required_bytes(relative: str, field: str) -> PackageContentBytes:
-    try:
-      value = tree[relative]
-      if value is None:
-        raise KeyError(relative)
-      return value
-    except KeyError as exc:
-      raise PackageContentError(
-        f"missing declared {field} file ({relative})",
-      ) from exc
-
-  entry_bytes = required_bytes(manifest["entry"], "entry")
-  source_files = {
-    relative: required_bytes(relative, "source_files")
-    for relative in manifest.get("source_files") or []
-  }
-  schedule = manifest.get("schedule")
-  job_name = schedule.get("job") if isinstance(schedule, dict) else None
-  bundled_job = (
-    _package_input_bytes(required_bytes(job_name, "schedule job"))
-    if job_name else None
-  )
-  if bundled_job is not None:
-    try:
-      validate_schedule_job(manifest, bundled_job)
-    except ManifestContractError as exc:
-      raise PackageContentError(str(exc)) from exc
-
-  icon_processed = None
-  icon_name = manifest.get("icon")
-  if icon_name:
-    icon_bytes = _package_input_bytes(required_bytes(icon_name, "icon"))
-    try:
-      icon_processed = icon_assets.normalize_icon(icon_bytes)
-    except icon_assets.InvalidIcon:
-      # Install skips a refused icon with a warning and digests the package
-      # without it; digest it the same way so update checks stay comparable.
-      pass
-
-  static_assets = {
-    destination: required_bytes(relative, "static asset")
-    for destination, relative in static_asset_entries(
-      manifest.get("static_assets") or {},
-    ).items()
-  }
-  seeds: dict[str, PackageContentBytes] = {}
-  for destination, value in (manifest.get("storage_seeds") or {}).items():
-    seeds[destination] = (
-      json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-      ).encode("utf-8")
-      if _seed_value_is_inline(value)
-      else required_bytes(value, "storage seed")
-    )
-
-  return manifest["id"], package_content_digest(
-    manifest=manifest,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
+    inputs = _read_git_package_inputs(tree, strict=True)
+  except HTTPException as exc:
+    raise PackageContentError(str(exc.detail)) from exc
+  except ValueError as exc:
+    raise PackageContentError(str(exc)) from exc
+  return inputs.manifest["id"], inputs.content_digest()
 
 
 def package_content_digest_from_git(

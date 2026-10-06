@@ -279,3 +279,12 @@ def test_refused_icon_digests_like_install_instead_of_blocking_update_checks(rep
   digest = install.package_content_digest_from_tree(tree)
   assert digest == (json.loads(tree["mobius.json"])["id"], installed.content_digest())
   assert install.package_content_digest_from_git(repo, commit) == digest
+
+
+def test_digest_and_install_share_manifest_size_validation():
+  tree = _tree()
+  tree["mobius.json"] += b" " * install._MANIFEST_MAX_BYTES
+  with pytest.raises(install.PackageTooLarge):
+    install._read_git_package_inputs(tree, strict=True)
+  with pytest.raises(install.PackageContentError, match="manifest limit"):
+    install.package_content_digest_from_tree(tree)
