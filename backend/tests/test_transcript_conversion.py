@@ -83,6 +83,20 @@ def previous_release_inserts(source_id, chat_id, messages):
     )
 
 
+def count_body_decodes(monkeypatch):
+  """Record every transcript body decode.
+
+  SQLAlchemy caches a type's result processor on first use, so patching the
+  method itself goes unseen; the decode's module-level json lookup does not.
+  """
+  from types import SimpleNamespace
+  decoded = []
+  monkeypatch.setattr(models, "json", SimpleNamespace(
+    loads=lambda value: decoded.append(1) or json.loads(value), dumps=json.dumps,
+  ))
+  return decoded
+
+
 def convert_through_writer(chat_id):
   chat_writer.wait_ack(chat_writer.get_writer().submit(
     chat_writer.ConvertTranscript(chat_id=chat_id)))
@@ -399,10 +413,7 @@ def test_a_view_raises_for_a_position_that_has_since_vanished():
 def test_cid_lookup_and_timestamp_helpers_never_decode_history(monkeypatch):
   chat_id = seed(messages=[{"role": "user", "content": "x" * 1000, "ts": i, "cid": f"c{i}"}
                            for i in range(50)])
-  decoded = []
-  real = models.TranscriptJSONText.process_result_value
-  monkeypatch.setattr(models.TranscriptJSONText, "process_result_value",
-                      lambda self, value, dialect: decoded.append(1) or real(self, value, dialect))
+  decoded = count_body_decodes(monkeypatch)
   with SessionLocal() as db:
     assert rows.client_message_seq(db, chat_id, "c7") == 7
     assert rows.max_timestamp(db, chat_id) == 49
@@ -417,10 +428,7 @@ def test_upload_release_reads_only_rows_that_name_attachments(monkeypatch):
   ]}
   chat_id = seed(messages=[*({"role": "user", "content": "x" * 1000, "ts": i} for i in range(50)),
                            card, {"role": "user", "ts": 51, "attachments": [{"name": "sent.txt"}]}])
-  decoded = []
-  real = models.TranscriptJSONText.process_result_value
-  monkeypatch.setattr(models.TranscriptJSONText, "process_result_value",
-                      lambda self, value, dialect: decoded.append(1) or real(self, value, dialect))
+  decoded = count_body_decodes(monkeypatch)
   with SessionLocal() as db:
     chat = db.get(models.Chat, chat_id)
     chat.uploads = [{"name": name, "claimed": True} for name in ("shown.txt", "sent.txt", "gone.txt")]
