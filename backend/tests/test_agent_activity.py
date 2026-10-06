@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from app import models
 from app.agent_activity import (
   RESULT_PREFIX,
@@ -182,8 +184,9 @@ def _app(db, source_dir, slug, name):
   return app
 
 
+@pytest.mark.parametrize("legacy_templates", [False, True])
 def test_a_second_provider_enters_only_by_applied_contract(
-  db, tmp_path, monkeypatch,
+  db, tmp_path, monkeypatch, caplog, legacy_templates,
 ):
   accepted_roots = {}
   monkeypatch.setattr(
@@ -210,6 +213,9 @@ def test_a_second_provider_enters_only_by_applied_contract(
     (accepted / "mobius.json").write_text(json.dumps({
       "id": slug, "name": name, "version": "1.0.0",
       "description": "test", "entry": "index.jsx", "source_files": [entry],
+      **({"project_templates": [{
+        "id": "doc", "name": "Document", "files": {"README.md": "starter.md"},
+      }]} if legacy_templates else {}),
       "agent_activities": {activity_id: {
         "entry": entry, "arguments": 2, "running_label": running_label,
       }},
@@ -228,6 +234,9 @@ def test_a_second_provider_enters_only_by_applied_contract(
   assert brain["app_slug"] == "brain"
   assert brain["activity_id"] == "retrieve"
   assert brain["label"] == "Consulting Brain"
+  if legacy_templates:
+    assert "starter.md" in caplog.text
+    assert "source_files" in caplog.text
 
 
 # ── Activities triggered by an installed app's agent tool ────────────────
