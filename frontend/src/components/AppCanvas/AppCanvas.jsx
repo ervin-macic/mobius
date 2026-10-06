@@ -323,7 +323,7 @@ function CameraPreviewLayer({ preview }) {
 const AppCanvas = forwardRef(function AppCanvas({
   appId, version = 0, appName, appSlug, offlineCapable = false,
   capabilityContract = null,
-  managedAppEvent = null,
+  subscribeManagedAppEvents = null,
   // The shell's applied presentation for this app: full-bleed immersive,
   // status-bar-preserving chrome collapse, or null. One value keeps safe-area
   // forwarding and the runtime echo from observing contradictory booleans.
@@ -659,7 +659,7 @@ const AppCanvas = forwardRef(function AppCanvas({
     framesRef.current.get(v)?.contentWindow?.postMessage(message, '*')
   }
 
-  useManagedAppFrameForwarding(framesRef, managedAppEvent, capabilityContract)
+  useManagedAppFrameForwarding(framesRef, subscribeManagedAppEvents, capabilityContract)
 
   // A host that owns the browser-history cursor may ask the visible app to
   // follow it. Keep exact contentWindow selection here rather than making the

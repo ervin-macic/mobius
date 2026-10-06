@@ -1,40 +1,39 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 
-// The shell's latest app lifecycle event, sequenced so a repeated update of
-// the same app still changes state. app_updated always carries an app id.
-// `observe` takes every system event.
-export function useManagedAppEvent() {
-  const [event, setEvent] = useState(null)
+// Deliver each completion synchronously from the system-event handler. React
+// state would coalesce completions arriving in one SSE chunk to the last app.
+export function useManagedAppEvents() {
+  const listeners = useRef(new Set())
+  const sequence = useRef(0)
+  const subscribe = useCallback((listener) => {
+    listeners.current.add(listener)
+    return () => listeners.current.delete(listener)
+  }, [])
   const observe = useCallback((ev) => {
     if (ev?.type !== 'app_updated' || ev.appId == null) return
-    setEvent(current => ({
+    const event = {
       type: 'app_updated',
       appId: String(ev.appId),
-      sequence: (current?.sequence || 0) + 1,
-    }))
+      sequence: ++sequence.current,
+    }
+    for (const listener of listeners.current) listener(event)
   }, [])
-  return [event, observe]
+  return [subscribe, observe]
 }
 
-// App managers need the same lifecycle truth the shell already receives.
-// Forward only the deliberately narrow app_updated projection, and only to
-// frames whose reviewed contract grants manage_apps. This keeps the Store's
-// update review in step when a resolver chat finishes while the Store
-// iframe stays mounted.
+// Forward only the narrow app_updated projection to reviewed app managers.
+// Subscriptions do not replay: new frames fetch current state on mount.
 export function useManagedAppFrameForwarding(
-  framesRef, event, capabilityContract,
+  framesRef, subscribe, capabilityContract,
 ) {
-  const lastSequence = useRef(event?.sequence || 0)
   useEffect(() => {
-    if (event?.type !== 'app_updated' || event.sequence <= lastSequence.current) return
-    // Consume once even if there is no eligible frame yet: new frames fetch
-    // current state on mount, rather than replaying a stale lifecycle signal.
-    lastSequence.current = event.sequence
-    if (capabilityContract?.data?.manage_apps !== true) return
-    const message = { type: 'moebius:managed-app-event', event }
-    for (const frame of framesRef.current.values()) {
-      if (!frame?.contentWindow) continue
-      frame.contentWindow.postMessage(message, '*')
-    }
-  }, [capabilityContract, event, framesRef])
+    if (!subscribe || capabilityContract?.data?.manage_apps !== true) return
+    return subscribe((event) => {
+      const message = { type: 'moebius:managed-app-event', event }
+      for (const frame of framesRef.current.values()) {
+        if (!frame?.contentWindow) continue
+        frame.contentWindow.postMessage(message, '*')
+      }
+    })
+  }, [capabilityContract, subscribe, framesRef])
 }

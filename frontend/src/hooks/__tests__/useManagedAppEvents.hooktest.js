@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { renderHook } from '../../components/ChatView/hooks/__tests__/react-hook-shim.mjs'
+import { renderHook, __setRerender } from '../../components/ChatView/hooks/__tests__/react-hook-shim.mjs'
 import {
-  useManagedAppEvent,
+  useManagedAppEvents,
   useManagedAppFrameForwarding,
 } from '../useManagedAppEvents.js'
 
@@ -18,8 +18,8 @@ function fakeFrames() {
 
 function renderShellAndFrame(framesRef, capabilityContract) {
   return renderHook((contract) => {
-    const [event, observe] = useManagedAppEvent()
-    useManagedAppFrameForwarding(framesRef, event, contract)
+    const [subscribe, observe] = useManagedAppEvents()
+    useManagedAppFrameForwarding(framesRef, subscribe, contract)
     return observe
   }, capabilityContract)
 }
@@ -95,16 +95,55 @@ test('late manager capability does not replay a previously observed event', () =
   hook.unmount()
 })
 
-test('a newly mounted canvas does not replay the latest event', () => {
+test('a newly mounted canvas does not replay an earlier completion', () => {
   const { framesRef, posted } = fakeFrames()
-  const latest = { type: 'app_updated', appId: '7', sequence: 4 }
-  const hook = renderHook((event) => {
-    useManagedAppFrameForwarding(framesRef, event, { data: { manage_apps: true } })
-  }, latest)
+  const hook = renderHook((mounted) => {
+    const [subscribe, observe] = useManagedAppEvents()
+    useManagedAppFrameForwarding(
+      framesRef, mounted ? subscribe : null, { data: { manage_apps: true } },
+    )
+    return observe
+  }, false)
+  const observe = hook.result.current
+  observe({ type: 'app_updated', appId: 7 })
+  hook.rerender(true)
   assert.deepEqual(posted, [])
-  hook.rerender({ ...latest })
+  observe({ type: 'app_updated', appId: 8 })
+  assert.deepEqual(posted.map(item => item.message.event.sequence), [2])
+  hook.unmount()
+  observe({ type: 'app_updated', appId: 9 })
+  assert.equal(posted.length, 1)
+})
+
+test('two completions in one system-event batch both reach every manager frame without rendering', () => {
+  const { framesRef, posted } = fakeFrames()
+  const incoming = fakeFrames()
+  framesRef.current.set(1, incoming.framesRef.current.get(0))
+  const hook = renderShellAndFrame(framesRef, { data: { manage_apps: true } })
+  let pendingRenders = 0
+  // Hold state-driven renders until the network chunk has been handled, as
+  // React batching does. Delivery must not depend on an intermediate render.
+  __setRerender(() => { pendingRenders++ })
+  for (const appId of [7, 8]) hook.result.current({ type: 'app_updated', appId })
+  for (const messages of [posted, incoming.posted]) {
+    assert.deepEqual(messages.map(item => item.message), [
+      { type: 'moebius:managed-app-event', event: { type: 'app_updated', appId: '7', sequence: 1 } },
+      { type: 'moebius:managed-app-event', event: { type: 'app_updated', appId: '8', sequence: 2 } },
+    ])
+  }
+  assert.equal(pendingRenders, 0)
+  hook.unmount()
+})
+
+test('null app ids are dropped and capability revocation stops delivery', () => {
+  const { framesRef, posted } = fakeFrames()
+  const hook = renderShellAndFrame(framesRef, { data: { manage_apps: true } })
+  hook.result.current({ type: 'app_updated', appId: null })
+  hook.result.current({ type: 'app_updated' })
   assert.deepEqual(posted, [])
-  hook.rerender({ ...latest, sequence: 5 })
-  assert.deepEqual(posted.map(item => item.message.event.sequence), [5])
+  hook.result.current({ type: 'app_updated', appId: 7 })
+  hook.rerender({ data: { manage_apps: false } })
+  hook.result.current({ type: 'app_updated', appId: 8 })
+  assert.deepEqual(posted.map(item => item.message.event.sequence), [1])
   hook.unmount()
 })

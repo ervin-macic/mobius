@@ -29,7 +29,7 @@ import { requestChatQuestionReveal } from '../../lib/chatQuestionReveal.js'
 import { recordClientError } from '../../lib/errorLog.js'
 import { setChatCompacting } from '../ChatView/chatCompactionStore.js'
 import useSystemEventStream from '../../hooks/useSystemEventStream.js'
-import { useManagedAppEvent } from '../../hooks/useManagedAppEvents.js'
+import { useManagedAppEvents } from '../../hooks/useManagedAppEvents.js'
 import useTheme from '../../hooks/useTheme.js'
 import useProviderAuthStatus from '../../hooks/useProviderAuthStatus.js'
 import {
@@ -2952,7 +2952,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       chatsQuery.isFetchedAfterMount, dispatchWorkspace, applyModeDestination,
       requestEmptySingleNewChat, workspaceStateRef, activeChatIdRef])
 
-  const [managedAppEvent, observeManagedAppEvent] = useManagedAppEvent()
+  const [subscribeManagedAppEvents, observeManagedAppEvent] = useManagedAppEvents()
 
   // Handle non-content SSE events: theme changes, app updates, shell rebuilds.
   const handleSystemEvent = useCallback((ev) => {
@@ -4917,7 +4917,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               appSlug={app?.slug}
               offlineCapable={!!app?.offline_capable}
               capabilityContract={app?.capability_contract || null}
-              managedAppEvent={managedAppEvent}
+              subscribeManagedAppEvents={subscribeManagedAppEvents}
               pendingIntent={appIntents[String(id)] || null}
               immersiveMode={immersiveActive && String(immersiveAppId) === String(id)
                 ? immersiveMode
