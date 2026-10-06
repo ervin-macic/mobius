@@ -251,13 +251,12 @@ class AppOut(BaseModel):
     """Return the public source contract without exposing identity parsing."""
     if not self.manifest_url:
       return None
-    base, marker, manifest_id = self.manifest_url.rpartition("#manifest-id=")
-    if not marker or not base or not manifest_id:
+    from app.install import requested_manifest_source
+
+    url, manifest_id = requested_manifest_source(self.manifest_url)
+    if manifest_id is None:
       return None
-    return AppSourceManifest(
-      id=manifest_id,
-      url=f"{base.rstrip('/')}/mobius.json",
-    )
+    return AppSourceManifest(id=manifest_id, url=url)
 
   @computed_field
   @property
@@ -385,6 +384,7 @@ class AppPreviewOut(BaseModel):
 
 
 class ReconciliationReceiptOut(BaseModel):
+  kept_local_paths: list[str] = Field(default_factory=list)
   proven_present: list[str] = Field(default_factory=list)
   local_only_paths: list[str] = Field(default_factory=list)
   new_upstream_paths: list[str] = Field(default_factory=list)

@@ -361,8 +361,12 @@ def test_list_apps_does_not_hydrate_source_or_icon_payloads(client, auth, db):
   assert "apps.icon_override_png AS apps_icon_override_png" not in projection
 
 
+@pytest.mark.parametrize("base", [
+  "https://raw.githubusercontent.com/example/app/main",
+  "https://raw.githubusercontent.com/example/app/main/mobius.json?ref=main",
+])
 def test_list_apps_exposes_one_fetchable_source_manifest_contract(
-  client, auth, db,
+  client, auth, db, base,
 ):
   app = models.App(
     source_dir="/tmp/mobius-tests/source-manifest-contract",
@@ -370,10 +374,7 @@ def test_list_apps_exposes_one_fetchable_source_manifest_contract(
     description="Installed from a published manifest",
     jsx_source="export default function App() { return null }",
     slug="published-app",
-    manifest_url=(
-      "https://raw.githubusercontent.com/example/app/main"
-      "#manifest-id=published-app"
-    ),
+    manifest_url=base + "#manifest-id=published-app",
   )
   db.add(app)
   db.commit()

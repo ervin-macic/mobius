@@ -1442,11 +1442,11 @@ async def update_check(
   # A catalog-aware caller supplies the mutable discovery locator explicitly.
   # Direct/unlisted installs fall back to the stored canonical identity key,
   # whose raw manifest lives at <base>/mobius.json.
-  fetch_manifest_url = (
-    install.requested_manifest_source(manifest_url)[0]
-    if manifest_url is not None
-    else install.stored_manifest_fetch_url(installed_manifest_url)
+  fetch_manifest_url, bound_manifest_id = install.requested_manifest_source(
+    manifest_url if manifest_url is not None else installed_manifest_url,
   )
+  if manifest_url is None and bound_manifest_id is None:
+    fetch_manifest_url = install.stored_manifest_fetch_url(installed_manifest_url)
   # This lock owns both FETCH_HEAD and the response's linearization point. A
   # concurrent install cannot advance ``upstream`` or create a receipt between
   # fetching the candidate and comparing it with the recorded baseline.
@@ -1457,6 +1457,7 @@ async def update_check(
       candidate = await asyncio.to_thread(
         install.fetch_git_package_summary, repo, fetch_manifest_url,
       )
+      install.require_bound_manifest(candidate.manifest, bound_manifest_id)
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,
       )
@@ -1585,11 +1586,11 @@ async def update_candidate_preview(
   # Release the request session before upstream network I/O, matching the
   # update-check route's connection-pool discipline.
   db.close()
-  fetch_manifest_url = (
-    install.requested_manifest_source(manifest_url)[0]
-    if manifest_url is not None
-    else install.stored_manifest_fetch_url(installed_manifest_url)
+  fetch_manifest_url, bound_manifest_id = install.requested_manifest_source(
+    manifest_url if manifest_url is not None else installed_manifest_url,
   )
+  if manifest_url is None and bound_manifest_id is None:
+    fetch_manifest_url = install.stored_manifest_fetch_url(installed_manifest_url)
   async with fs_locks.source_dir_lock(str(repo)):
     try:
       candidate = await _fetch_update_candidate(
@@ -1597,6 +1598,7 @@ async def update_candidate_preview(
         fetch_manifest_url,
         strict=True,
       )
+      install.require_bound_manifest(candidate.manifest, bound_manifest_id)
       if manifest_url is not None and not _update_candidate_matches_installed(
         installed_manifest_url, manifest_url, candidate.manifest,
       ):

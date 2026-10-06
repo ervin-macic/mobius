@@ -59,7 +59,7 @@ from app import (
 )
 from app import app_cron
 from app.app_capabilities import contract_and_digest
-from app.app_source_check import check_app_source
+from app.app_source_check import SourceCheckResult, check_app_source
 from app.compiler import (
   CompileError,
   compile_jsx,
@@ -69,6 +69,7 @@ from app.compiler import (
 )
 from app.config import get_settings
 from app.manifest_contract import (
+  MANIFEST_FIELD_KINDS,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
   SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
@@ -784,13 +785,14 @@ def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
   The fetched package must still carry that id (or name it as `previous_id`),
   so the key keeps meaning one package. Any other URL passes through as is.
   """
-  _, marker, manifest_id = manifest_url.rpartition(_MANIFEST_ID_MARKER)
-  if not marker or not manifest_id:
+  base, marker, manifest_id = manifest_url.rpartition(_MANIFEST_ID_MARKER)
+  if not marker or not base or not manifest_id:
     return manifest_url, None
   return stored_manifest_fetch_url(manifest_url), manifest_id
 
 
-def _require_bound_manifest(manifest: dict, bound_id: str | None) -> None:
+def require_bound_manifest(manifest: dict, bound_id: str | None) -> None:
+  """A stored address names this package or its declared predecessor only."""
   if bound_id is not None and bound_id not in (
     manifest.get("id"), manifest.get("previous_id"),
   ):
@@ -1321,13 +1323,14 @@ def _update_package_paths(
   None protects every path when the local package contract cannot be read.
   """
   try:
-    local_manifest = json.loads(
-      app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b"",
-    )
+    raw = app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b""
+    if len(raw) > _MANIFEST_MAX_BYTES:
+      return None
+    local_manifest = json.loads(raw)
     validate_manifest_contract(local_manifest)
   except (
     OSError, subprocess.SubprocessError, UnicodeDecodeError,
-    json.JSONDecodeError, ManifestContractError,
+    json.JSONDecodeError, ManifestContractError, RecursionError,
   ):
     return None
   paths = {"mobius.json"}
@@ -1344,37 +1347,15 @@ def _benign_source_complete(
 ) -> bool:
   """Only keep ancillary conflicts for fully checked JavaScript packages.
 
-  Extra manifest fields may introduce runtime dependencies the JS checker does
-  not understand. New features therefore need explicit admission here before
-  their ancillary conflicts can auto-resolve.
+  Executable or unknown fields may introduce dependencies the JS checker
+  cannot establish. The shared manifest contract owns their classification.
   """
-  understood_fields = {
-    "id", "name", "version", "description", "entry", "icon", "source_files",
-    "static_assets", "storage_seeds", "package_id", "previous_id",
-    "previous_manifest_url", "moved_to", "requires", "permissions",
-    "offline", "offline_capable", "theme_color", "background_color", "display",
-    "embeds_agent", "shell_shortcuts",
-  }
-  if not manifest.keys() <= understood_fields:
+  if any(
+    MANIFEST_FIELD_KINDS.get(field) not in {"metadata", "declared_files"}
+    for field in manifest
+  ):
     return False
-  # The bundler follows CSS @import and url() references; the JS checker does
-  # not. Keep packages containing CSS on the conservative resolver path.
-  if any(Path(rel).suffix.lower() == ".css" for rel in (*tree, *static_assets)):
-    return False
-  files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
-  # These are the actual bytes activation writes, not placeholders: static JS
-  # modules can themselves import a missing or undeclared sibling.
-  files.update({
-    f"static/{dest}": data.decode("utf-8", "replace")
-    for dest, data in static_assets.items()
-  })
-  result = check_app_source(
-    files,
-    entry=manifest["entry"],
-    source_files=manifest.get("source_files") or [],
-    static_assets=(f"static/{dest}" for dest in static_assets),
-  )
-  return not result.errors
+  return not _source_completeness(tree, manifest, static_assets).errors
 
 
 def committed_pending_resolution(
@@ -2374,14 +2355,30 @@ def _regenerate_skills_index(skills_dir: Path) -> None:
     log.warning("skills index regeneration failed", exc_info=True)
 
 
+def _source_completeness(
+  tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
+) -> SourceCheckResult:
+  """Check imports against the exact source and served static-asset bytes."""
+  files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
+  files.update({
+    f"static/{dest}": data.decode("utf-8", "replace")
+    for dest, data in static_assets.items()
+  })
+  return check_app_source(
+    files,
+    entry=manifest["entry"],
+    source_files=manifest.get("source_files") or [],
+    job=(manifest.get("schedule") or {}).get("job"),
+    static_assets=(f"static/{dest}" for dest in static_assets),
+  )
+
+
 def _check_source_completeness(
   *,
   app_name: str,
   manifest: dict,
   source_tree: dict[str, bytes],
-  entry_key: str,
-  static_dests: list[str],
-  job_name: str | None,
+  static_assets: Mapping[str, bytes],
 ) -> None:
   """Assert the source tree the manifest declares is self-contained.
 
@@ -2403,20 +2400,7 @@ def _check_source_completeness(
   directory so source checks see the exact path compilation sees. For example,
   logical destination ``logo.js`` is importable as ``./static/logo.js``.
   """
-  files: dict[str, str] = {
-    rel: data.decode("utf-8", "replace") for rel, data in source_tree.items()
-  }
-  static_source_paths = [f"static/{dest}" for dest in static_dests]
-  for path in static_source_paths:
-    files.setdefault(path, "")
-
-  result = check_app_source(
-    files,
-    entry=entry_key,
-    source_files=manifest.get("source_files") or [],
-    job=job_name,
-    static_assets=static_source_paths,
-  )
+  result = _source_completeness(source_tree, manifest, static_assets)
   for warning in result.warnings:
     log.warning(
       "install: %s external-host reference in %s — %s",
@@ -2487,7 +2471,7 @@ async def preview_manifest_capabilities(
       manifest=manifest,
       raw_base=raw_base,
     )
-  _require_bound_manifest(loaded, bound_manifest_id)
+  require_bound_manifest(loaded, bound_manifest_id)
   contract, digest = contract_and_digest(loaded)
   return loaded, normalized_base, contract, digest
 
@@ -3985,9 +3969,7 @@ async def _activate_install_source(
         # declare; checking that merged tree makes every later synthetic
         # fallback misdiagnose those preserved edits as a broken release.
         source_tree=plan.published_source_tree,
-        entry_key=plan.entry_key,
-        static_dests=list(plan.static_assets),
-        job_name=plan.job_name,
+        static_assets=plan.static_assets,
       )
 
   _write_static_assets(
@@ -4275,7 +4257,7 @@ async def install_from_manifest(
       expected_candidate_digest=expected_candidate_digest,
     )
 
-  _require_bound_manifest(candidate.manifest, bound_manifest_id)
+  require_bound_manifest(candidate.manifest, bound_manifest_id)
 
   # Phase 2: immutable identity/update decision. No writes occur here.
   target = _select_install_target(
@@ -4855,12 +4837,12 @@ async def _install_candidate(
               divergence = "clean_merge"
               merge_applied = True
               warnings.append(
-                "auto-resolved a benign update conflict "
-                "(no semantic overlap between local edits and upstream)"
+                "auto-resolved an update conflict; package edits reconciled"
               )
               if benign.kept_local:
                 warnings.append(
-                  "kept local edits to files outside the app package: "
+                  "kept local edits to files outside the app package "
+                  "(upstream edits dropped): "
                   + ", ".join(benign.kept_local)
                 )
               reconciliation = app_git.ReconciliationReceipt(
@@ -4869,6 +4851,7 @@ async def _install_candidate(
                 new_upstream_paths=reconciliation.new_upstream_paths,
                 compatible_paths=reconciliation.compatible_paths,
                 provenance_refs_used=reconciliation.provenance_refs_used,
+                kept_local_paths=benign.kept_local,
               )
               # Resolved package files use merge modes; ancillary files keep
               # the owner's local mode as well as their bytes.
@@ -5151,6 +5134,7 @@ async def _install_candidate(
       app_id=app.id,
       slug=app.slug,
       source=source,
+      reconciliation=reconciliation.as_dict(),
     )
 
     # Success: drop any .bak snapshots we made — the new bundle is

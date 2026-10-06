@@ -362,6 +362,30 @@ def static_asset_entries(value) -> dict[str, str]:
   _fail("Manifest `static_assets` must be an object or array.")
 
 
+# Classify the top-level contract once by its source dependencies. Metadata
+# (including UI/grant/offline settings) introduces no executable dependencies.
+# Declared-file fields are covered by package_input_paths or required in
+# source_files.
+# Executable/runtime fields may reach dependencies the JS checker cannot prove.
+MANIFEST_FIELD_KINDS = {
+  **dict.fromkeys((
+    "id", "name", "version", "description", "author", "license", "homepage",
+    "runtime", "package_id", "previous_id", "previous_manifest_url", "moved_to",
+    "requires", "permissions", "offline", "offline_capable", "theme_color",
+    "background_color", "display", "embeds_agent", "shell_shortcuts",
+    "capabilities", "public_access",
+  ), "metadata"),
+  **dict.fromkeys((
+    "entry", "icon", "source_files", "static_assets", "storage_seeds", "skills",
+    "system_prompt",
+  ), "declared_files"),
+  **dict.fromkeys((
+    "service", "setup", "schedule", "python", "agent_activities", "tools",
+    "project_templates", "model_provider",
+  ), "executable"),
+}
+
+
 def package_input_paths(manifest: Mapping) -> Iterator[str]:
   """Yield every repo-relative file declared by a validated manifest.
 

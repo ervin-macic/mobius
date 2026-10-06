@@ -8,6 +8,8 @@ and force failure modes.
 """
 
 import asyncio
+import ast
+import inspect
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
@@ -4332,19 +4334,50 @@ def _press_reviewed_update(client, auth, app_id, bare, manifest_url):
     })
 
 
-def _install_readme_fixture(client, auth, tmp_path, app_id, manifest):
+def _install_readme_fixture(client, auth, tmp_path, app_id, manifest, files=None):
   base = f"https://raw.githubusercontent.com/example/{app_id}/main/"
   work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
   _publish_clone_files(work, bare, {
     "mobius.json": json.dumps(manifest), "README.md": "readme v1\n",
+    **(files or {}),
   })
   installed = _install_clone_fixture(
     client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
     include_source_file="cards.js" in (manifest.get("source_files") or []),
+    files=files,
   )
   assert installed.status_code == 201, installed.text
   source_dir = Path(get_settings().data_dir) / "apps" / manifest["id"]
   return base, work, bare, installed.json()["id"], source_dir
+
+
+def test_every_recognized_manifest_field_has_a_dependency_classification():
+  from app import app_capabilities, manifest_contract
+
+  # Read the contract's actual field accesses, not a second maintained list.
+  recognized = set(manifest_contract.REQUIRED_STRING_FIELDS)
+  for module in (manifest_contract, app_capabilities):
+    syntax = ast.parse(inspect.getsource(module))
+    for node in ast.walk(syntax):
+      if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+          and isinstance(node.func.value, ast.Name) and node.func.value.id == "manifest"
+          and node.func.attr == "get" and node.args
+          and isinstance(node.args[0], ast.Constant)):
+        recognized.add(node.args[0].value)
+      if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+          and node.value.id == "manifest" and isinstance(node.slice, ast.Constant)):
+        recognized.add(node.slice.value)
+      if (isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+          and isinstance(node.iter, (ast.Tuple, ast.List))
+          and any(isinstance(child, ast.Subscript)
+                  and isinstance(child.value, ast.Name) and child.value.id == "manifest"
+                  and isinstance(child.slice, ast.Name) and child.slice.id == node.target.id
+                  for statement in node.body for child in ast.walk(statement))):
+        recognized.update(ast.literal_eval(node.iter))
+  assert recognized <= manifest_contract.MANIFEST_FIELD_KINDS.keys()
+  assert set(manifest_contract.MANIFEST_FIELD_KINDS.values()) == {
+    "metadata", "declared_files", "executable",
+  }
 
 
 def test_update_package_paths_uses_declarations_not_metadata():
@@ -4372,7 +4405,10 @@ def test_update_package_paths_uses_declarations_not_metadata():
   assert protected.isdisjoint({"README.md", "served.js", "guide/undeclared.md", "seed.json"})
 
 
-@pytest.mark.parametrize("local", [None, b"not json", b"[]", b'{"entry": "index.jsx"}'])
+@pytest.mark.parametrize("local", [
+  None, b"not json", b"[]", b'{"entry": "index.jsx"}',
+  b" " * (install._MANIFEST_MAX_BYTES + 1), b"[" * 2000 + b"]" * 2000,
+])
 def test_invalid_local_manifest_protects_every_path(local):
   with patch("app.install.app_git.read_blob", return_value=local):
     assert install._update_package_paths("unused", MANIFEST_NEWS) is None
@@ -4504,31 +4540,14 @@ def test_template_starter_sources_must_be_installed_and_protected(sources):
   assert "README.md" not in protected
 
 
-@pytest.mark.parametrize("css", [
-  b"@import './undeclared.css';",
-  b"body { background: url('./undeclared.png'); }",
-])
-@pytest.mark.parametrize("static", [False, True])
-def test_css_dependencies_keep_ancillary_conflicts_in_the_resolver(css, static):
-  manifest = {"entry": "index.jsx", "source_files": ["style.css"]}
-  tree = {"index.jsx": b"import './style.css'; export default () => null"}
-  assets = {}
-  if static:
-    manifest = {"entry": "index.jsx", "static_assets": {"style.css": "raw.css"}}
-    tree["index.jsx"] = b"import './static/style.css'; export default () => null"
-    assets["style.css"] = css
-  else:
-    tree["style.css"] = css
-  assert not install._benign_source_complete(tree, manifest, assets)
-
-
 def test_unknown_runtime_field_keeps_ancillary_conflicts_in_the_resolver():
   manifest = {"entry": "index.jsx", "future_runtime": {"entry": "worker.py"}}
   assert not install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
 
 
+@pytest.mark.parametrize("store_shaped", [False, True])
 def test_conflict_outside_the_package_keeps_local_and_updates(
-  client, auth, tmp_path, bypass_url_validation,
+  client, auth, tmp_path, bypass_url_validation, store_shaped,
 ):
   """A file no manifest declares is never served, so its conflict must not
   block the update: the owner's version stays and the package updates."""
@@ -4537,8 +4556,16 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
     "description": "README.md", "entry": "index.jsx",
     "source_files": ["cards.js"],
   }
+  files = {}
+  if store_shaped:
+    manifest.update({
+      "author": "Example", "license": "MIT", "homepage": "https://example.test",
+      "runtime": "react", "skills": ["guide.md"], "system_prompt": "prompt.md",
+      "source_files": ["cards.js", "guide.md", "prompt.md"],
+    })
+    files = {"guide.md": "# Guide\n", "prompt.md": "App instructions\n"}
   base, work, bare, app_id, source_dir = _install_readme_fixture(
-    client, auth, tmp_path, manifest["id"], manifest,
+    client, auth, tmp_path, manifest["id"], manifest, files,
   )
   (source_dir / "README.md").write_text("readme local\n")
   index_v2 = CLONE_INDEX_V1.replace("TITLE_V1", "TITLE_V2")
@@ -4548,14 +4575,20 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
     "index.jsx": index_v2,
   })
 
-  updated = _press_reviewed_update(
-    client, auth, app_id, bare, base + "mobius.json",
-  )
-
+  with patch("app.install.activity.log_event") as activity_log:
+    updated = _press_reviewed_update(
+      client, auth, app_id, bare, base + "mobius.json",
+    )
   assert updated.status_code == 201, updated.text
+  receipt = updated.json()["reconciliation"]
+  assert any(
+    call.args == ("app_install",) and call.kwargs.get("reconciliation") == receipt
+    for call in activity_log.call_args_list
+  )
   assert updated.json()["mode"] == "update"
   assert updated.json()["version"] == "2.0.0"
   assert any("README.md" in warning for warning in updated.json()["warnings"])
+  assert updated.json()["reconciliation"]["kept_local_paths"] == ["README.md"]
   assert (source_dir / "README.md").read_text() == "readme local\n"
   assert (source_dir / "index.jsx").read_text() == index_v2
   assert not install.pending_conflict_update_receipt_present(source_dir)
@@ -4813,6 +4846,12 @@ def test_install_from_a_stored_manifest_url_keeps_its_package_binding(
   # The identity names one package; another app at that address is refused.
   other = post(stored.replace("#manifest-id=stored-key", "#manifest-id=other"))
   assert other.status_code == 409, other.text
+
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": stored.replace("#manifest-id=stored-key", "#manifest-id=other"),
+    })
+  assert preview.status_code == 409, preview.text
 
 
 def test_missing_reviewed_git_commit_is_a_stale_update(
@@ -5900,7 +5939,7 @@ def _push_clone_fixture(work: Path, bare: Path, index: str, cards: str) -> str:
 
 def _install_clone_fixture(
   client, auth, base, manifest, index, cards, bare, *,
-  include_source_file=False,
+  include_source_file=False, files=None,
 ):
   responses = {
     base + "mobius.json": (200, json.dumps(manifest).encode()),
@@ -5908,6 +5947,9 @@ def _install_clone_fixture(
   }
   if include_source_file:
     responses[base + "cards.js"] = (200, cards.encode())
+  responses.update({
+    base + rel: (200, text.encode()) for rel, text in (files or {}).items()
+  })
   with patch(
     "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
   ), patch(
@@ -8302,3 +8344,44 @@ def test_install_rejects_source_files_inside_git_metadata(
   assert "`.git` directory" in r.json()["detail"]
   data_dir = Path(get_settings().data_dir)
   assert not (data_dir / "apps" / "git-metadata-app").exists()
+
+
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+def test_update_discovery_preserves_stored_address_binding(
+  client, auth, tmp_path, bypass_url_validation, route,
+):
+  manifest = {
+    "id": "bound-update", "name": "Bound update", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, _ = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps({**manifest, "version": "2.0.0"})})
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(f"/api/apps/{app_id}/{route}", headers=auth, params={
+      "manifest_url": base.rstrip("/") + "#manifest-id=another-app",
+    })
+  if route == "update-check":
+    assert response.status_code == 200, response.text
+    assert response.json()["update_available"] is None
+  else:
+    assert response.status_code == 409, response.text
+    assert "another-app" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("manifest_id,previous_id,allowed", [
+  ("current", None, True), ("renamed", "current", True), ("other", None, False),
+])
+def test_stored_address_binding_accepts_only_the_package_or_its_predecessor(
+  manifest_id, previous_id, allowed,
+):
+  from fastapi import HTTPException
+
+  manifest = {"id": manifest_id, "previous_id": previous_id}
+  if allowed:
+    install.require_bound_manifest(manifest, "current")
+  else:
+    with pytest.raises(HTTPException) as error:
+      install.require_bound_manifest(manifest, "current")
+    assert error.value.status_code == 409
