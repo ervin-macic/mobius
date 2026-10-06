@@ -7,8 +7,8 @@ from fastapi import HTTPException
 
 from app.routes import chats_stream
 from app.schemas import SendMessage
-from app import models
-from app.chat_writer import apply_answers_to_last_question, _question_answer_fields
+from app import models, transcript_rows
+from app.chat_writer import apply_answers_to_last_question, _question_answer_fields, create_chat
 
 
 def test_question_attachments_resolve_once_per_upload(tmp_path, monkeypatch):
@@ -59,19 +59,21 @@ def test_agent_card_answer_still_cannot_attach_arbitrary_upload():
 
 
 def test_answered_card_keeps_attachment_for_reopen(db):
-  chat = models.Chat(
+  chat = create_chat(
     id="question-photo", title="Photo answer",
     messages=[{"role": "assistant", "blocks": [{
       "type": "question", "question_id": "card-q",
       "questions": [{"id": "q", "question": "Show me", "options": []}],
     }]}],
   )
+  db.add(chat)
+  db.commit()
   attached = [{"name": "photo.png", "size": 5, "mime_type": "image/png"}]
   assert apply_answers_to_last_question(
     chat, {"Show me": "Attached 1 file"}, "card-q",
     metadata={"attachments": attached},
   )
-  saved = chat.messages[0]["blocks"][0]
+  saved = transcript_rows.at(db, chat, 0)["blocks"][0]
   assert _question_answer_fields(saved)["attachments"] == attached
 
 
@@ -140,7 +142,7 @@ def test_saved_card_route_canonical_attachments(
   assert res.status_code == (202 if valid and mode != "native" else 409), res.text
   with SessionLocal() as db:
     row = db.get(models.Chat, chat.id)
-    card = next(b for m in row.messages for b in m.get("blocks", []) if b.get("question_id") == "saved-files")
+    card = next(b for m in transcript_rows.read_all(db, row) for b in m.get("blocks", []) if b.get("question_id") == "saved-files")
     if not valid or mode == "native":
       if mode == "native":
         # Provider-native questions are retired and refuse files outright.
@@ -199,7 +201,7 @@ def test_quiet_close_answer_refuses_files(client, auth, chat, monkeypatch, tmp_p
   assert "closes the card without sending files" in res.json()["detail"]
   with SessionLocal() as db:
     row = db.get(models.Chat, chat.id)
-    card = next(b for m in row.messages for b in m.get("blocks", []) if b.get("question_id") == "quiet-files")
+    card = next(b for m in transcript_rows.read_all(db, row) for b in m.get("blocks", []) if b.get("question_id") == "quiet-files")
     assert "answers" not in card
     assert row.uploads[0]["claimed"] is False
 

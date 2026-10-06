@@ -5278,6 +5278,7 @@ async def spawn_platform_conflict_chat(
 
   from app import models, providers
   from app.chat_start import start_programmatic_chat_turn
+  from app.chat_writer import create_chat
   from app.config import get_settings
   from app.push import notify_owner
   from app.run_state import running_chat_ids
@@ -5318,7 +5319,7 @@ async def spawn_platform_conflict_chat(
   )
 
   chat_id = str(uuid.uuid4())
-  chat = models.Chat(
+  chat = create_chat(
     id=chat_id, title=title, messages=[], pending_messages=[],
     provider=provider, agent_settings_json=agent_settings,
     created_by_app_id=None,

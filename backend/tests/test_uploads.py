@@ -5,7 +5,7 @@ import pytest
 
 from PIL import Image
 
-from app import models
+from app import models, transcript_rows
 
 
 def test_upload_single_file(client, db, auth, chat):
@@ -604,7 +604,7 @@ def test_cancel_keeps_files_an_answered_card_still_shows(client, db, auth, chat,
   if where == "live":
     chat.live_assistant = card
   else:
-    chat.messages = [card]
+    transcript_rows.replace_all(db, chat, [card])
   db.commit()
   get_writer().submit(AppendPending(chat_id=chat.id, user_msg={
     "role": "user", "content": "answer", "cid": "c-answer",
