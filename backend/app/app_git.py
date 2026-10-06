@@ -3983,7 +3983,7 @@ class BenignResolution:
 def resolve_benign_conflict(
   source_dir: str | Path, conflict_paths: list[str],
   *, merge_base: str | None = None,
-  is_package_path: Callable[[str], bool] = lambda _rel: True,
+  package_paths: set[str] | None = None,
 ) -> BenignResolution | None:
   """Full merged source tree with every BENIGN conflict auto-resolved, or None
   when any conflicting file carries a genuine overlap.
@@ -4003,9 +4003,9 @@ def resolve_benign_conflict(
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
 
-  A conflicting path for which ``is_package_path`` is false belongs to no
-  package the update installs, so it keeps the local version, a local deletion
-  included. The owner's edit survives and the update serves nothing from it.
+  A conflicting path outside ``package_paths`` keeps the local version,
+  including a local deletion. None protects every path. The caller must check
+  dependency completeness before accepting these ancillary resolutions.
   """
   repo = Path(source_dir)
   if not conflict_paths:
@@ -4048,7 +4048,7 @@ def resolve_benign_conflict(
   kept_local: list[str] = []
   for rel in merge_conflicts:
     ours = read_blob(repo, LOCAL_BRANCH, rel)
-    if not is_package_path(rel):
+    if package_paths is not None and rel not in package_paths:
       resolved[rel] = ours
       kept_local.append(rel)
       continue

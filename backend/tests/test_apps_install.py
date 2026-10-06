@@ -4347,24 +4347,75 @@ def _install_readme_fixture(client, auth, tmp_path, app_id, manifest):
   return base, work, bare, installed.json()["id"], source_dir
 
 
-def test_names_path_covers_every_way_a_manifest_names_a_file():
-  from app.manifest_contract import names_path
-
+def test_update_package_paths_uses_declarations_not_metadata():
   manifest = {
-    "entry": "index.jsx",
-    "skills": ["guide/"],
-    "source_files": ["guide/SKILL.md"],
-    "static_assets": {"logo.png": "art/logo%20v2.png"},
+    "id": "declarations", "name": "README.md", "description": "README.md",
+    "version": "1.0.0", "entry": "index.jsx", "icon": "logo.png",
+    "source_files": ["service.py", "setup.sh", "requirements.lock", "prompt.md",
+                     "guide/SKILL.md", "guide/notes.md"],
+    "service": {"entry": "service.py"},
     "setup": {"steps": ["setup.sh"]},
-    "schedule": {"cron": "0 * * * *", "job": "job.sh"},
+    "python": {"lock": "requirements.lock"},
+    "system_prompt": "prompt.md", "skills": ["guide/"],
+    "schedule": {"default": "0 * * * *", "job": "job.sh"},
+    "static_assets": {"served.js": "art/module.js"},
+    "storage_seeds": {"seed.json": "seed-source.json", "inline.json": {"text": "README.md"}},
   }
-  for path in (
-    "index.jsx", "guide/SKILL.md", "guide/notes.md", "art/logo v2.png",
-    "logo.png", "setup.sh", "job.sh",
-  ):
-    assert names_path(manifest, path), path
-  for path in ("README.md", "guide", "art/other.png"):
-    assert not names_path(manifest, path), path
+  local = {**manifest, "source_files": [*manifest["source_files"], "local.js"]}
+  with patch("app.install.app_git.read_blob", return_value=json.dumps(local).encode()):
+    protected = install._update_package_paths("unused", manifest)
+  assert protected == {
+    "mobius.json", "index.jsx", "logo.png", "job.sh", "service.py", "setup.sh",
+    "requirements.lock", "prompt.md", "guide/SKILL.md", "guide/notes.md", "local.js",
+    "art/module.js", "static/served.js", "seed-source.json",
+  }
+  assert protected.isdisjoint({"README.md", "served.js", "guide/undeclared.md", "seed.json"})
+
+
+@pytest.mark.parametrize("local", [None, b"not json", b"[]", b'{"entry": "index.jsx"}'])
+def test_invalid_local_manifest_protects_every_path(local):
+  with patch("app.install.app_git.read_blob", return_value=local):
+    assert install._update_package_paths("unused", MANIFEST_NEWS) is None
+
+
+def test_unreadable_local_manifest_protects_every_path():
+  with patch("app.install.app_git.read_blob", side_effect=OSError("unreadable")):
+    assert install._update_package_paths("unused", MANIFEST_NEWS) is None
+
+
+@pytest.mark.parametrize("files,declared", [
+  ({"index.jsx": b"import './missing.js'"}, []),
+  ({"index.jsx": b"import './sibling.js'", "sibling.js": b"export default 1"}, []),
+  ({"index.jsx": b"export default 1"}, ["missing.js"]),
+])
+def test_incomplete_source_cannot_auto_keep_ancillary_conflicts(files, declared):
+  manifest = {"entry": "index.jsx", "source_files": declared}
+  assert not install._benign_source_complete(files, manifest, {})
+
+
+@pytest.mark.parametrize("module,complete", [
+  (b"export default 1", True),
+  (b"import './missing.js'", False),
+])
+def test_benign_completeness_checks_actual_static_alias_bytes(module, complete):
+  manifest = {"entry": "index.jsx", "static_assets": {"module.js": "art/module.js"}}
+  files = {"index.jsx": b"import './static/module.js'"}
+  assert install._benign_source_complete(files, manifest, {"module.js": module}) is complete
+
+
+@pytest.mark.parametrize("runtime", [
+  {"service": {"entry": "service.py"}},
+  {"schedule": {"job": "job.sh"}},
+  {"schedule": {"job": "job.py"}},
+  {"schedule": {"job": "job"}},
+  {"schedule": {"job": "job.js"}},
+  {"setup": {"steps": ["setup.sh"]}},
+  {"agent_activities": {"build": {"entry": "build.sh"}}},
+  {"project_templates": [{"artifact_types": [{"script": "build.sh"}]}]},
+])
+def test_unchecked_runtime_dependencies_keep_the_resolver_fallback(runtime):
+  manifest = {"entry": "index.jsx", **runtime}
+  assert not install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
 
 
 def test_conflict_outside_the_package_keeps_local_and_updates(
@@ -4374,7 +4425,7 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
   block the update: the owner's version stays and the package updates."""
   manifest = {
     "id": "undeclared-conflict", "name": "Undeclared", "version": "1.0.0",
-    "description": "README conflict", "entry": "index.jsx",
+    "description": "README.md", "entry": "index.jsx",
     "source_files": ["cards.js"],
   }
   base, work, bare, app_id, source_dir = _install_readme_fixture(
@@ -4417,6 +4468,72 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
   assert (source_dir / "index.jsx").read_text() == index_v3
 
 
+@pytest.mark.parametrize("missing_import", [False, True])
+def test_static_alias_completeness_controls_ancillary_conflict_fallback(
+  client, auth, tmp_path, bypass_url_validation, missing_import,
+):
+  manifest = {
+    "id": "static-completeness", "name": "Static completeness", "version": "1.0.0",
+    "description": "Static imports", "entry": "index.jsx",
+    "static_assets": {"module.js": "raw_module.js"},
+  }
+  index = "import value from './static/module.js'; export default () => <div>{value}</div>"
+  module = "export default 'original'"
+  base = "https://raw.githubusercontent.com/example/static-completeness/main/"
+  work, bare, _ = _make_clone_fixture(tmp_path, index, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps(manifest), "README.md": "original\n", "raw_module.js": module,
+  })
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, index.encode()),
+    base + "raw_module.js": (200, module.encode()),
+  }
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")), patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ):
+    installed = client.post("/api/apps/install", headers=auth, json={"manifest_url": base + "mobius.json"})
+  assert installed.status_code == 201, installed.text
+  source_dir = Path(installed.json()["source_dir"])
+  (source_dir / "README.md").write_text("local\n")
+  updated_module = "import './missing.js'; export default 'updated'" if missing_import else "export default 'updated'"
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "README.md": "upstream\n", "raw_module.js": updated_module,
+  })
+
+  updated = _press_reviewed_update(client, auth, installed.json()["id"], bare, base + "mobius.json")
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == ("conflict" if missing_import else "update")
+  assert (source_dir / "README.md").read_text() == "local\n"
+  assert (source_dir / "static/module.js").read_text() == (module if missing_import else updated_module)
+
+
+def test_ancillary_conflict_preserves_local_deletion(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  manifest = {
+    "id": "local-delete", "name": "Local delete", "version": "1.0.0",
+    "description": "Deletion preservation", "entry": "index.jsx", "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  (source_dir / "README.md").unlink()
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "README.md": "upstream edit\n",
+  })
+
+  updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert not (source_dir / "README.md").exists()
+  assert app_git.read_blob(source_dir, "main", "README.md") is None
+
+
 @pytest.mark.parametrize("declared_by", ["incoming", "local"])
 def test_conflict_in_a_declared_file_still_needs_the_resolver(
   client, auth, tmp_path, bypass_url_validation, declared_by,
@@ -4455,8 +4572,9 @@ def test_conflict_in_a_declared_file_still_needs_the_resolver(
   assert "<<<<<<<" in (checkout / "README.md").read_text()
 
 
+@pytest.mark.parametrize("local_deleted", [False, True])
 def test_conflict_in_an_undeclared_import_still_needs_the_resolver(
-  client, auth, tmp_path, bypass_url_validation,
+  client, auth, tmp_path, bypass_url_validation, local_deleted,
 ):
   """A Git install can bundle an imported file its manifest omits, so that
   file stays part of what the update must reconcile."""
@@ -4467,9 +4585,12 @@ def test_conflict_in_an_undeclared_import_still_needs_the_resolver(
   base, work, bare, app_id, source_dir = _install_readme_fixture(
     client, auth, tmp_path, manifest["id"], manifest,
   )
-  (source_dir / "cards.js").write_text(
-    CLONE_CARDS_V1.replace("CARD_V1", "CARD_LOCAL"),
-  )
+  if local_deleted:
+    (source_dir / "cards.js").unlink()
+  else:
+    (source_dir / "cards.js").write_text(
+      CLONE_CARDS_V1.replace("CARD_V1", "CARD_LOCAL"),
+    )
   _publish_clone_files(work, bare, {
     "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
     "cards.js": CLONE_CARDS_V1.replace("CARD_V1", "CARD_UPSTREAM"),

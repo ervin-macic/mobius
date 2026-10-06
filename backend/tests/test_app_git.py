@@ -3654,7 +3654,7 @@ def test_conflict_outside_the_package_keeps_the_local_side(tmp_path):
 
   assert app_git.resolve_benign_conflict(repo, merge.conflict_paths) is None
   res = app_git.resolve_benign_conflict(
-    repo, merge.conflict_paths, is_package_path=lambda rel: rel == "index.jsx",
+    repo, merge.conflict_paths, package_paths={"index.jsx"},
   )
   assert res is not None
   assert sorted(res.kept_local) == ["notes.md", "todo.md"]

@@ -75,7 +75,7 @@ from app.manifest_contract import (
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
-  names_path,
+  package_input_paths,
   package_bytes,
   package_limit_message,
   python_lock,
@@ -1315,44 +1315,66 @@ def committed_conflict_marker_paths(
 
 def _update_package_paths(
   source_dir: str | Path, incoming_manifest: dict,
-) -> Callable[[str], bool]:
-  """Which conflicting paths an update must reconcile rather than keep local.
+) -> set[str] | None:
+  """Protect declarations on either side and installed static destinations.
 
-  A path belongs to the package when the incoming or the local manifest could
-  declare it, so a file one side newly declares is never set aside. The
-  manifest itself always belongs, and an unreadable local manifest makes every
-  path belong, as before this distinction existed.
+  None protects every path when the local package contract cannot be read.
   """
   try:
     local_manifest = json.loads(
       app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b"",
     )
-  except (UnicodeDecodeError, json.JSONDecodeError):
-    local_manifest = None
-  if not isinstance(local_manifest, dict):
-    return lambda _rel: True
-  return lambda rel: rel == "mobius.json" or any(
-    names_path(side, rel) for side in (incoming_manifest, local_manifest)
-  )
+    validate_manifest_contract(local_manifest)
+  except (
+    OSError, subprocess.SubprocessError, UnicodeDecodeError,
+    json.JSONDecodeError, ManifestContractError,
+  ):
+    return None
+  paths = {"mobius.json"}
+  for side in (incoming_manifest, local_manifest):
+    paths.update(package_input_paths(side))
+    paths.update(
+      f"static/{dest}" for dest in static_asset_entries(side.get("static_assets"))
+    )
+  return paths
 
 
-def _undeclared_imports(tree: Mapping[str, bytes], manifest: dict) -> set[str]:
-  """Undeclared files the entry or job imports from this exact source tree.
+def _benign_source_complete(
+  tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
+) -> bool:
+  """Only keep ancillary conflicts when the installed source is complete.
 
-  A Git install may run such a file even though no manifest field names it, so
-  an update cannot set it aside as outside the package.
+  The source checker follows JavaScript imports, not dependencies of Python
+  services, setup scripts, scheduled jobs, activities or artifact builders. Those
+  packages keep the resolver fallback rather than guessing their dependencies.
   """
-  schedule = manifest.get("schedule")
+  schedule = manifest.get("schedule") or {}
+  job = schedule.get("job")
+  if (
+    manifest.get("service")
+    or manifest.get("setup", {}).get("steps")
+    or manifest.get("agent_activities")
+    or any(
+      template.get("artifact_types")
+      for template in manifest.get("project_templates") or []
+    )
+    or job
+  ):
+    return False
+  files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
+  # These are the actual bytes activation writes, not placeholders: static JS
+  # modules can themselves import a missing or undeclared sibling.
+  files.update({
+    f"static/{dest}": data.decode("utf-8", "replace")
+    for dest, data in static_assets.items()
+  })
   result = check_app_source(
-    {rel: data.decode("utf-8", "replace") for rel, data in tree.items()},
+    files,
     entry=manifest["entry"],
     source_files=manifest.get("source_files") or [],
-    job=schedule.get("job") if isinstance(schedule, dict) else None,
+    static_assets=(f"static/{dest}" for dest in static_assets),
   )
-  return {
-    finding.path for finding in result.errors
-    if finding.code == "undeclared_source"
-  }
+  return not result.errors
 
 
 def committed_pending_resolution(
@@ -4810,14 +4832,14 @@ async def _install_candidate(
             # rule. Any remaining overlap leaves the whole update untouched
             # for the owner to resolve. A path outside the package keeps the
             # owner's version.
-            is_package_path = await asyncio.to_thread(
+            package_paths = await asyncio.to_thread(
               _update_package_paths, git_source_dir, manifest,
             )
             benign = await asyncio.to_thread(
               app_git.resolve_benign_conflict,
               git_source_dir, merge.conflict_paths,
               merge_base=git_merge_base_override,
-              is_package_path=is_package_path,
+              package_paths=package_paths,
             )
             resolved_source = None
             if benign is not None:
@@ -4825,9 +4847,9 @@ async def _install_candidate(
                 rel: data for rel, data in benign.tree.items()
                 if rel not in _MERGED_NON_SOURCE
               }
-              if benign.kept_local and _undeclared_imports(
-                resolved_source, manifest,
-              ).intersection(benign.kept_local):
+              if benign.kept_local and not _benign_source_complete(
+                resolved_source, manifest, static_assets_fetched,
+              ):
                 resolved_source = None
             if resolved_source is not None and entry_key in resolved_source:
               source_tree = resolved_source
@@ -4855,6 +4877,7 @@ async def _install_candidate(
                 app_git.read_tree_exec_paths,
                 git_source_dir, benign.tree_oid,
               )
+
             else:
               # Never rebase local. The app stays served with its current
               # bundle + source; the new upstream is recorded for a later
