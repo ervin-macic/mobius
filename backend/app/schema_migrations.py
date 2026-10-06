@@ -6047,6 +6047,78 @@ def _move_chat_media_out_of_generated(eng) -> None:
       )
 
 
+def _swap_chat_note_sections(eng) -> None:
+  """Name each chat note's sections for what they hold.
+
+  ``## Digest`` used to hold the short, replaceable chat summary and
+  ``## Summary`` the append-only full record. Each note keeps its content and
+  order; the two platform headings the old readers recognised (the first line
+  of each) trade names, and the recovery-coverage hash key follows the full
+  record. Every note is first copied to ``backups/chat-notes-before-0083`` and
+  each rewrite derives from that copy, so a crash part-way reruns to the same
+  result; ``0086_drop_chat_note_backup`` deletes the copy once this is
+  recorded. A note that is not valid UTF-8 is still renamed, byte for byte,
+  rather than stopping boot.
+  """
+  import shutil
+
+  del eng
+  root = Path(os.environ.get("DATA_DIR", "/data"))
+  chats_dir = root / "shared" / "memory" / "chats"
+  backup = root / "backups" / "chat-notes-before-0083"
+  complete = backup / ".complete"
+  renamed = {"## digest": "## Summary", "## summary": "## Digest"}
+
+  def swapped(note: str) -> str:
+    lines = note.split("\n")
+    body_start = 0
+    if note.startswith("---\n"):
+      end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+      if end is not None:
+        body_start = end + 1
+        for i in range(1, end):
+          if lines[i].startswith("recovery_coverage:"):
+            lines[i] = lines[i].replace('"summary_sha256"', '"digest_sha256"')
+    seen: set[str] = set()
+    for i in range(body_start, len(lines)):
+      key = lines[i].strip().lower()
+      if key in renamed and key not in seen:
+        seen.add(key)
+        lines[i] = renamed[key]
+    return "\n".join(lines)
+
+  if not complete.exists():
+    shutil.rmtree(backup, ignore_errors=True)
+    for note in chats_dir.glob("*/index.md"):
+      target = backup / note.parent.name / "index.md"
+      target.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(note, target)
+    backup.mkdir(parents=True, exist_ok=True)
+    complete.touch()
+  for saved in backup.glob("*/index.md"):
+    live = chats_dir / saved.parent.name / "index.md"
+    if not live.parent.is_dir():
+      continue
+    temporary = live.with_name(".index.migrating")
+    note = saved.read_text(encoding="utf-8", errors="surrogateescape")
+    temporary.write_text(swapped(note), encoding="utf-8", errors="surrogateescape")
+    os.replace(temporary, live)
+
+
+def _drop_chat_note_backup(eng) -> None:
+  """Delete the note copy ``0083_swap_chat_note_sections`` made.
+
+  The copy only made a crash during that migration safe to rerun. The ledger
+  records it first, and keeping the copy would let a purged chat's note
+  outlive the chat.
+  """
+  import shutil
+
+  del eng
+  root = Path(os.environ.get("DATA_DIR", "/data"))
+  shutil.rmtree(root / "backups" / "chat-notes-before-0083", ignore_errors=True)
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6148,6 +6220,10 @@ _SCHEMA_MIGRATIONS = (
   ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
   ("0084_chat_media_directory", _move_chat_media_out_of_generated),
   ("0085_app_shell_shortcuts", _add_app_shell_shortcuts),
+  # Shipped to an instance under this id before 0084/0085 existed; renumbering
+  # would rerun it there and swap the headings back.
+  ("0083_swap_chat_note_sections", _swap_chat_note_sections),
+  ("0086_drop_chat_note_backup", _drop_chat_note_backup),
 )
 
 

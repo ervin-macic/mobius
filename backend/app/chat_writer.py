@@ -1092,7 +1092,7 @@ class SwitchProviderWithCompaction(_Command):
   settings_patch: dict = field(default_factory=dict)
   summary: str = ""
   source_messages_hash: str = ""
-  source_summary_hash: str | None = None
+  source_digest_hash: str | None = None
   data_dir: str = ""
   request_fingerprint: str = ""
 
@@ -4542,15 +4542,15 @@ class ChatWriterActor:
       return {"status": "conflict", "reason": "provider_changed"}
     if messages_fingerprint(messages) != cmd.source_messages_hash:
       return {"status": "conflict", "reason": "chat_changed"}
-    from app.compaction import load_cumulative_summary
+    from app.compaction import load_full_digest
 
-    latest_summary = load_cumulative_summary(cmd.data_dir, cmd.chat_id)
-    latest_summary_hash = (
-      hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
-      if latest_summary is not None
+    latest_digest = load_full_digest(cmd.data_dir, cmd.chat_id)
+    latest_digest_hash = (
+      hashlib.sha256(latest_digest.encode("utf-8")).hexdigest()
+      if latest_digest is not None
       else None
     )
-    if latest_summary_hash != cmd.source_summary_hash:
+    if latest_digest_hash != cmd.source_digest_hash:
       return {"status": "conflict", "reason": "summary_changed"}
 
     new_msg = {

@@ -37,6 +37,10 @@ test('a file-only question answer can submit and ordinary cards offer upload', (
     }))
     assert.match(submitted, /aria-label="Files for this answer"/)
     assert.match(submitted, /chat__attachments/)
+    // The attach row stays with the Submitted action row, so answering never
+    // moves the card; it only stops taking files.
+    assert.match(submitted, /class="qcard__attach"[^>]*disabled=""/)
+    assert.match(submitted, /class="qcard__file-input"[^>]*disabled=""/)
     const restart = renderToStaticMarkup(createElement(QuestionCard, {
       chatId: 'restart', questionId: 'restart-q', questions,
       platformAction: { type: 'restart', version: 2, status: 'awaiting_owner' },
