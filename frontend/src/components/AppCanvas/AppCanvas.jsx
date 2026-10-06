@@ -926,6 +926,7 @@ const AppCanvas = forwardRef(function AppCanvas({
         const nav = frameNavRef.current.get(srcVersion)
         if (!nav) return
         const location = validNavLocationText(msg.location)
+        if (msg.location !== null && location === null) return
         if (srcVersion === liveVersionRef.current && nav.mounted) {
           writeValidatedAppNavLocation(appId, nav.instanceId, location)
           // A live report can arrive before the promotion effect flushes.

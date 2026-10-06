@@ -1145,7 +1145,8 @@ its current place with `nav.setLocation(value)`.
   it. Mount the app before awaiting restoration; do not add timers to retry it.
 - The shell keeps one location per app installation for the current browser
   tab. It survives a shell reload, not closing the tab, and is cleared on sign
-  out or an app data wipe. Other apps never receive it.
+  out, or when this shell wipes app data or uninstalls the app. Other apps never
+  receive it.
 - Feature-detect with `typeof window.mobius?.nav?.setLocation === 'function'`
   (or `window.mobius.runtimeFeatures.navLocation`); without it the app starts at
   its home view as before.

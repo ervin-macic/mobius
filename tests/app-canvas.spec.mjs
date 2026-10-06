@@ -1051,6 +1051,25 @@ async function expectDetail(frame) {
 }
 
 test.describe('AppCanvas location lifecycle', () => {
+  test('malformed location reports cannot erase the saved place', async ({ page }) => {
+    const state = await setupLocationRoutes(page)
+    const frame = await locationFrame(page)
+    await frame.evaluate(() => window.openDetail())
+    await expectDetail(frame)
+    await expect.poll(async () => (await storedLocation(page))?.location)
+      .toBe('{"detail":"notes"}')
+    for (const location of [undefined, '{broken', { detail: 'object' }, 'null', '"' + 'x'.repeat(4096) + '"']) {
+      await frame.evaluate(location => {
+        window.parent.postMessage({ type: 'moebius:nav-location', location }, window.location.origin)
+      }, location)
+      // The subsequent app-open request crosses the same ordered message channel.
+      await refetchLocationApps(page, state, frame)
+      expect((await storedLocation(page)).location).toBe('{"detail":"notes"}')
+    }
+    await frame.evaluate(() => window.nav.setLocation(null))
+    await expect.poll(() => storedLocation(page)).toBeNull()
+  })
+
   test('bookmark restoration owns Back through version swap and shell refresh', async ({ page }) => {
     const state = await setupLocationRoutes(page)
     let frame = await locationFrame(page)

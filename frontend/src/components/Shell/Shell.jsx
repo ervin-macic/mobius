@@ -1,5 +1,6 @@
 import { fetchFreshShellList, letSystemStreamOwnListRefresh } from './shellListReconciliation.js'
 import { requestChatChanges } from '../../lib/chatChangesNavigation.js'
+import { clearAppNavLocation } from '../../lib/appNavLocationStore.js'
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useReducer, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -4407,6 +4408,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     // CLOSE_TAB(reason:'deleted') owns the view transition — the derived triple
     // follows the workspace to its recent tab or collapsed sibling; no global demote.
     retireAppHistory(id, 'deleted')
+    clearAppNavLocation(id)
     tombstoneRoute('app', id)
     const sid = String(id)
     dropFromWarmLru(cid => String(cid) === sid)
@@ -4453,6 +4455,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     // retire the old frame's physical history — its replacement starts with an
     // empty internal nav stack (contract §4.1.5) — and drop any warm-only frame.
     retireAppHistory(id, 'data-reset')
+    clearAppNavLocation(id)
     const sid = String(id)
     dropFromWarmLru(cid => String(cid) === sid)
     clearAppFrameStorage(id)

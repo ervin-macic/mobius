@@ -40,6 +40,10 @@ export function writeValidatedAppNavLocation(appId, instanceId, location, store 
   }
 }
 
+export function clearAppNavLocation(appId, store = sessionStore()) {
+  try { store?.removeItem(keyFor(appId)) } catch {}
+}
+
 export function clearAppNavLocations(store = sessionStore()) {
   try {
     for (let index = (store?.length || 0) - 1; index >= 0; index -= 1) {

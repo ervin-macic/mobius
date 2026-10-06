@@ -7,6 +7,7 @@ import {
   validNavLocationText,
 } from '../appNavLocation.js'
 import {
+  clearAppNavLocation,
   clearAppNavLocations,
   readAppNavLocation,
   writeValidatedAppNavLocation,
@@ -74,4 +75,14 @@ test('logout clears every app location and nothing else', () => {
   writeValidatedAppNavLocation(2, null, '{"view":"two"}', store)
   clearAppNavLocations(store)
   assert.deepEqual([...store.items.keys()], ['unrelated'])
+})
+
+test('app data wipe or uninstall clears only that app bookmark', () => {
+  const store = memoryStore({ unrelated: 'keep' })
+  writeValidatedAppNavLocation(1, 'generation-a', '{"view":"one"}', store)
+  writeValidatedAppNavLocation(2, 'generation-b', '{"view":"two"}', store)
+  clearAppNavLocation(1, store)
+  assert.equal(store.getItem('mobius:app-nav-location:1'), null)
+  assert.equal(readAppNavLocation(2, 'generation-b', store), '{"view":"two"}')
+  assert.equal(store.getItem('unrelated'), 'keep')
 })
