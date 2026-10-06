@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 // The shell's latest app lifecycle event, sequenced so a repeated update of
-// the same app still changes state. `observe` takes every system event.
+// the same app still changes state. app_updated always carries an app id.
+// `observe` takes every system event.
 export function useManagedAppEvent() {
   const [event, setEvent] = useState(null)
   const observe = useCallback((ev) => {
-    if (ev?.type !== 'app_updated') return
+    if (ev?.type !== 'app_updated' || ev.appId == null) return
     setEvent(current => ({
       type: 'app_updated',
-      appId: ev.appId == null ? null : String(ev.appId),
+      appId: String(ev.appId),
       sequence: (current?.sequence || 0) + 1,
     }))
   }, [])
@@ -23,15 +24,17 @@ export function useManagedAppEvent() {
 export function useManagedAppFrameForwarding(
   framesRef, event, capabilityContract,
 ) {
-  const delivered = useRef(new WeakMap())
+  const lastSequence = useRef(event?.sequence || 0)
   useEffect(() => {
-    if (event?.type !== 'app_updated'
-      || capabilityContract?.data?.manage_apps !== true) return
+    if (event?.type !== 'app_updated' || event.sequence <= lastSequence.current) return
+    // Consume once even if there is no eligible frame yet: new frames fetch
+    // current state on mount, rather than replaying a stale lifecycle signal.
+    lastSequence.current = event.sequence
+    if (capabilityContract?.data?.manage_apps !== true) return
     const message = { type: 'moebius:managed-app-event', event }
     for (const frame of framesRef.current.values()) {
-      if (!frame?.contentWindow || delivered.current.get(frame) === event.sequence) continue
+      if (!frame?.contentWindow) continue
       frame.contentWindow.postMessage(message, '*')
-      delivered.current.set(frame, event.sequence)
     }
   }, [capabilityContract, event, framesRef])
 }
