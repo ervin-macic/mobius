@@ -15,9 +15,10 @@ function keyFor(appId) {
 }
 
 export function readAppNavLocation(appId, instanceId, store = sessionStore()) {
+  if (!instanceId) return null
   try {
     const entry = JSON.parse(store?.getItem(keyFor(appId)) || 'null')
-    if (!entry || entry.instance !== (instanceId || null)) return null
+    if (!entry || entry.instance !== instanceId) return null
     return validNavLocationText(entry.location)
   } catch {
     return null
@@ -26,13 +27,15 @@ export function readAppNavLocation(appId, instanceId, store = sessionStore()) {
 
 /** Persist a report already validated at the frame-message boundary. */
 export function writeValidatedAppNavLocation(appId, instanceId, location, store = sessionStore()) {
+  // A loading frame has no app row yet and cannot own an installation's place.
+  if (!instanceId) return
   try {
     if (location === null) {
       store?.removeItem(keyFor(appId))
       return
     }
     store?.setItem(keyFor(appId), JSON.stringify({
-      instance: instanceId || null,
+      instance: instanceId,
       location,
     }))
   } catch {

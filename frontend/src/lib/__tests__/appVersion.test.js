@@ -16,8 +16,17 @@ test('appFrameVersion follows frame_version, not updated_at', () => {
 
 test('appFrameVersion has a stable missing-row fallback', () => {
   assert.equal(appFrameVersion(undefined), '0')
-  assert.equal(appFrameVersion({ updated_at: '2026-06-04T12:00:00Z' }), '0')
-  assert.equal(appFrameVersion({ frame_version: ' ' }), '0')
+  assert.equal(appFrameVersion(null), '0')
+})
+
+test('appFrameVersion preserves updates while the old backend awaits restart', () => {
+  const before = { updated_at: '2026-06-04T12:00:00Z' }
+  const after = { updated_at: '2026-06-04T12:00:09Z' }
+  assert.equal(appFrameVersion(before), before.updated_at)
+  assert.equal(appFrameVersion(after), after.updated_at)
+  assert.notEqual(appFrameVersion(before), appFrameVersion(after))
+  assert.equal(appFrameVersion({ ...after, frame_version: ' ' }), after.updated_at)
+  assert.equal(moduleVersionKey(`${appFrameVersion(after)}-a1b2c3d4e5f67890`), after.updated_at)
 })
 
 import { moduleVersionKey } from '../appVersion.js'

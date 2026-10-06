@@ -282,6 +282,14 @@ def test_install_fresh_app_writes_everything(client, auth, tmp_path, bypass_url_
   assert row["display"] == "fullscreen"
   assert payload["frame_version"] == row["frame_version"]
   assert payload["storage_generation"] == row["storage_generation"]
+  install_fields = {
+    "mode", "upstream_version", "warnings", "conflict_paths", "divergence",
+    "reconciliation",
+  }
+  assert {k: v for k, v in payload.items() if k not in install_fields} == row
+  assert set(payload) == set(row) | install_fields
+  assert "token_nonce" not in payload
+  assert "runtime_revision" not in payload
 
 
 def test_install_fresh_service_app_syncs_aliases_during_activation(

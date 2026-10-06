@@ -1,10 +1,12 @@
 // An app frame reloads only when this key changes. The server derives
 // frame_version from what the frame executes (bundle, runtime declarations,
 // storage generation), so settings writes that advance updated_at keep the
-// running frame and its place. '0' is the missing-row sentinel.
+// running frame and its place. During deployment the old backend may still
+// serve rows without frame_version; keep its updated_at reload key until restart.
+// '0' is the missing-row sentinel.
 export function appFrameVersion(app) {
   const value = typeof app?.frame_version === 'string' ? app.frame_version.trim() : ''
-  return value || '0'
+  return value || app?.updated_at || '0'
 }
 
 // The frame ?v is `<appFrameVersion>-<frameRev>` where frameRev is the shared

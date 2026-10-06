@@ -38,8 +38,8 @@ test('locations stay per app and per installation', () => {
 
 test('a cleared report removes the entry', () => {
   const store = memoryStore()
-  writeValidatedAppNavLocation(1, null, '{"view":"one"}', store)
-  writeValidatedAppNavLocation(1, null, null, store)
+  writeValidatedAppNavLocation(1, 'generation-a', '{"view":"one"}', store)
+  writeValidatedAppNavLocation(1, 'generation-a', null, store)
   assert.equal(store.items.size, 0)
 })
 
@@ -71,8 +71,8 @@ test('the size bound counts UTF-8 bytes of the JSON text', () => {
 
 test('logout clears every app location and nothing else', () => {
   const store = memoryStore({ unrelated: 'keep' })
-  writeValidatedAppNavLocation(1, null, '{"view":"one"}', store)
-  writeValidatedAppNavLocation(2, null, '{"view":"two"}', store)
+  writeValidatedAppNavLocation(1, 'generation-a', '{"view":"one"}', store)
+  writeValidatedAppNavLocation(2, 'generation-b', '{"view":"two"}', store)
   clearAppNavLocations(store)
   assert.deepEqual([...store.items.keys()], ['unrelated'])
 })
@@ -85,4 +85,18 @@ test('app data wipe or uninstall clears only that app bookmark', () => {
   assert.equal(store.getItem('mobius:app-nav-location:1'), null)
   assert.equal(readAppNavLocation(2, 'generation-b', store), '{"view":"two"}')
   assert.equal(store.getItem('unrelated'), 'keep')
+})
+
+test('a frame without a known storage generation cannot overwrite or clear the saved place', () => {
+  const store = memoryStore()
+  const location = '{"view":"saved"}'
+  writeValidatedAppNavLocation(1, 'generation-a', location, store)
+  for (const generation of [null, undefined, '']) {
+    writeValidatedAppNavLocation(1, generation, '{"view":"loading"}', store)
+    writeValidatedAppNavLocation(1, generation, null, store)
+    writeValidatedAppNavLocation(2, generation, '{"view":"loading"}', store)
+    assert.equal(readAppNavLocation(1, 'generation-a', store), location)
+    assert.equal(readAppNavLocation(1, generation, store), null)
+    assert.equal(store.items.size, 1)
+  }
 })
