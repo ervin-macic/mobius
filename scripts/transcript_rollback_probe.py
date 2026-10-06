@@ -152,17 +152,36 @@ def write_new():
 
 
 def write_old():
+  """The previous release's own writes. A pre-rows release edits the legacy
+  column directly, so exactly the chats it touched lose their conversion
+  marker. A previous release that already stores rows writes through its own
+  writer and keeps every chat converted. Returns the marks to expect."""
   from app import models
-  from sqlalchemy.orm.attributes import flag_modified
+  appended = {"role": "user", "content": "appended by previous", "ts": 500}
+  target = f"bulk-{ROUND * 10 + 3:04d}"
+  if candidate():
+    from app import chat_writer, transcript_rows
+    chat_writer.start_writer()
+    with session() as db:
+      messages = list(transcript_rows.history(db.get(models.Chat, target)))
+    chat_writer.wait_ack(chat_writer.get_writer().submit(
+      chat_writer.ReplaceTranscript(chat_id=target, messages=messages + [appended])))
+    chat_writer.stop_writer()
+    expected = []
+  else:
+    from sqlalchemy.orm.attributes import flag_modified
+    with session() as db:
+      chat = db.get(models.Chat, target)
+      chat.messages = list(chat.messages) + [appended]
+      flag_modified(chat, "messages")
+      db.commit()
+    expected = [target, f"from-previous-{ROUND}"]
   with session() as db:
-    chat = db.get(models.Chat, f"bulk-{ROUND * 10 + 3:04d}")
-    chat.messages = list(chat.messages) + [{"role": "user", "content": "appended by previous", "ts": 500}]
-    flag_modified(chat, "messages")
     db.add(new_chat(f"from-previous-{ROUND}", "Previous chat", [{"role": "user", "content": "previous born"}]))
     db.get(models.Chat, f"bulk-{ROUND * 10 + 4:04d}").title = "Renamed by previous"
     db.commit()
   purge(f"bulk-{ROUND * 10 + 5:04d}")
-  return {"written": "previous"}
+  return {"written": "previous", "expect_unconverted": sorted(expected)}
 
 
 def mirror_exact():
