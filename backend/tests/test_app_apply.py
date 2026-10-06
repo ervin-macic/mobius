@@ -378,10 +378,16 @@ def test_local_apply_refuses_an_oversized_package_before_reading_it(
     app_apply, "PACKAGE_MAX_BYTES", package_bytes_on_disk(source, manifest) - 1,
   )
 
+  def read_assets(*_args):
+    raise AssertionError("static assets were read before the size check")
+
+  monkeypatch.setattr(app_apply, "_snapshot_static_assets", read_assets)
+
   rejected = _apply(client, auth, source)
 
   assert rejected.status_code == 422, rejected.text
   assert rejected.json()["detail"]["code"] == "package_too_large"
+  assert "MiB app package limit" in rejected.json()["detail"]["message"]
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == accepted_head
   assert not (source / "static" / "data.bin").exists()
 
