@@ -1662,21 +1662,37 @@ test.describe('Workspace view-mode toggle', () => {
     const builderScroll = builderSurface.locator('.chat__scroll')
     await expect(builderScroll).toBeVisible({ timeout: 15000 })
 
-    const previousWriteAt = await page.evaluate(
-      id => JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]?.at || 0,
-      String(a.id),
-    )
-    await builderScroll.evaluate((scroll) => {
+    // One reader scroll: pointer contact around a scrollTop write. It returns
+    // the last saved-position time read in the same task, before the gesture,
+    // so an earlier write that lands late cannot pass for this gesture's.
+    const readerScroll = target => builderScroll.evaluate((scroll, { id, target }) => {
+      const previousAt =
+        JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]?.at || 0
       scroll.dispatchEvent(new PointerEvent('pointerdown', {
         bubbles: true,
         pointerType: 'mouse',
       }))
-      scroll.scrollTop = Math.floor(scroll.scrollHeight / 3)
+      scroll.scrollTop = target === 'top' ? 0 : Math.floor(scroll.scrollHeight / 3)
       scroll.dispatchEvent(new PointerEvent('pointerup', {
         bubbles: true,
         pointerType: 'mouse',
       }))
-    })
+      return previousAt
+    }, { id: String(a.id), target })
+
+    // Builder can restore through the anchor-addressed read, whose window
+    // starts one row above the saved tail row. There every scrollTop is the
+    // physical tail, so a "one third" gesture correctly becomes FOLLOW_BOTTOM.
+    // Page in the whole seeded history so one third is a real reading position.
+    await expect.poll(async () => {
+      if (await builderSurface.locator('.chat__msg[data-key="workspace-reading-0"]').count()) {
+        return true
+      }
+      await readerScroll('top')
+      return false
+    }, { timeout: 15000 }).toBe(true)
+
+    const previousWriteAt = await readerScroll('third')
     await page.waitForFunction(({ id, after }) => (
       (JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]?.at || 0) > after
     ), { id: String(a.id), after: previousWriteAt })
@@ -1695,6 +1711,8 @@ test.describe('Workspace view-mode toggle', () => {
       }
     }, String(a.id))
     const before = await readBuilderState()
+    // The round trip must preserve a reader-chosen hold, not live follow.
+    expect(before.saved.kind).toBe('ANCHOR_AT')
 
     await brand.focus()
     await page.keyboard.press('Shift+Enter')
