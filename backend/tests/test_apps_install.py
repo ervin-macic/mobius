@@ -4510,6 +4510,41 @@ def test_static_alias_completeness_controls_ancillary_conflict_fallback(
   assert (source_dir / "static/module.js").read_text() == (module if missing_import else updated_module)
 
 
+@pytest.mark.parametrize("local_executable", [False, True])
+def test_ancillary_conflict_preserves_local_executable_mode(
+  client, auth, tmp_path, bypass_url_validation, local_executable,
+):
+  manifest = {
+    "id": "local-mode", "name": "Local mode", "version": "1.0.0",
+    "description": "Mode preservation", "entry": "index.jsx", "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  readme = source_dir / "README.md"
+  readme.write_text("local mode and content\n")
+  readme.chmod(0o755 if local_executable else 0o644)
+  # Exercise both directions of disagreement with the upstream mode.
+  if local_executable:
+    app_git._run(source_dir, "update-index", "--chmod=+x", "README.md")
+    app_git.commit_local(source_dir, "local executable")
+    (work / "README.md").chmod(0o644)
+  else:
+    (work / "README.md").chmod(0o755)
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "README.md": "upstream mode and content\n",
+  })
+
+  updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert readme.read_text() == "local mode and content\n"
+  assert bool(readme.stat().st_mode & 0o111) is local_executable
+  assert ("README.md" in app_git.read_tree_exec_paths(source_dir, "main")) is local_executable
+
+
 def test_ancillary_conflict_preserves_local_deletion(
   client, auth, tmp_path, bypass_url_validation,
 ):

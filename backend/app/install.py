@@ -4871,13 +4871,20 @@ async def _install_candidate(
                 compatible_paths=reconciliation.compatible_paths,
                 provenance_refs_used=reconciliation.provenance_refs_used,
               )
-              # Exec bits come from the same merged tree the resolution was
-              # built on, mirroring the clean-merge branch above.
+              # Resolved package files use merge modes; ancillary files keep
+              # the owner's local mode as well as their bytes.
               git_exec_paths = await asyncio.to_thread(
                 app_git.read_tree_exec_paths,
                 git_source_dir, benign.tree_oid,
               )
-
+              if benign.kept_local:
+                local_exec_paths = await asyncio.to_thread(
+                  app_git.read_tree_exec_paths, git_source_dir, app_git.LOCAL_BRANCH,
+                )
+                git_exec_paths = (
+                  git_exec_paths.difference(benign.kept_local)
+                  | local_exec_paths.intersection(benign.kept_local)
+                )
             else:
               # Never rebase local. The app stays served with its current
               # bundle + source; the new upstream is recorded for a later
