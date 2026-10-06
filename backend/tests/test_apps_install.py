@@ -49,7 +49,7 @@ def _stub_resolver_run_chat():
 @pytest.fixture
 def idle_resolver_runs(monkeypatch):
   """Model completed noop resolver turns in batch-rebinding tests."""
-  monkeypatch.setattr("app.run_state.has_nonterminal_run", lambda db, cid: False)
+  monkeypatch.setattr("app.run_state.has_run_in", lambda db, cid, statuses: False)
   monkeypatch.setattr("app.chat.is_chat_running", lambda cid: False)
 
 
@@ -3684,7 +3684,7 @@ def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
 
 @pytest.mark.parametrize("running_check", [
   "running", "parked", "resume_pending", "in_process",
-  "waiting_for_owner", "waiting_in_process",
+  "waiting_for_owner", "waiting_in_process", "queued_owner",
 ])
 @pytest.mark.parametrize("selection", ["overlap", "subset", "single"])
 def test_conflict_resolver_cannot_displace_a_running_batch(
@@ -3709,6 +3709,11 @@ def test_conflict_resolver_cannot_displace_a_running_batch(
     if running_check == "waiting_for_owner":
       db.get(models.Chat, chat_id).pending_question_id = "resolver-owner-question"
     db.commit()
+  if running_check == "queued_owner":
+    from app.chat_writer import AppendPending, ClearPending, get_writer
+    get_writer().submit(AppendPending(
+      chat_id=chat_id, user_msg={"role": "user", "content": "Please continue", "ts": 1},
+    )).result(timeout=5)
   monkeypatch.setattr(
     "app.questions.is_waiting",
     lambda cid: running_check == "waiting_in_process" and running and cid == chat_id,
@@ -3725,7 +3730,7 @@ def test_conflict_resolver_cannot_displace_a_running_batch(
       for app_id in ids
     ]
 
-  # Exact retries still reuse X, but a different batch cannot take its apps.
+  # A busy chat is reusable even for a subset, without touching its checkout.
   exact = client.post(
     "/api/apps/conflict-resolver-batch", headers=auth,
     json={"app_ids": ids[:2]},
@@ -3747,11 +3752,17 @@ def test_conflict_resolver_cannot_displace_a_running_batch(
   with monkeypatch.context() as guard:
     guard.setattr("app.routes.apps._park_pending_update", cannot_park)
     blocked = request()
+  if selection != "overlap":
+    assert blocked.status_code == 200, blocked.text
+    assert blocked.json() == {"chat_id": chat_id, "created": False, "started": False}
+    return
   assert blocked.status_code == 409, blocked.text
   detail = blocked.json()["detail"]
   assert detail["code"] == "conflict_resolver_running"
   assert detail["chat_id"] == chat_id
   assert detail["app_ids"] == ids[:2]
+  assert apps[0][2] in detail["message"]
+  assert "Wait" not in detail["message"]
   with SessionLocal() as db:
     assert db.query(models.Chat).count() == chat_count
     assert [
@@ -3761,6 +3772,8 @@ def test_conflict_resolver_cannot_displace_a_running_batch(
     ] == original_bindings
 
   running = False
+  if running_check == "queued_owner":
+    get_writer().submit(ClearPending(chat_id=chat_id)).result(timeout=5)
   with SessionLocal() as db:
     db.query(models.ChatRun).filter_by(chat_id=chat_id).one().status = "completed"
     db.get(models.Chat, chat_id).pending_question_id = None
@@ -3815,7 +3828,7 @@ def test_conflict_resolver_start_is_serialized_with_overlapping_request(
 
     monkeypatch.setattr(fs_locks, "install_uninstall_lock", observed_lifecycle)
     monkeypatch.setattr(routes, "_start_conflict_resolver_turn", start_turn)
-    monkeypatch.setattr("app.run_state.has_nonterminal_run", lambda db, cid: cid in running)
+    monkeypatch.setattr("app.run_state.has_run_in", lambda db, cid, statuses: cid in running)
     monkeypatch.setattr("app.chat.is_chat_running", lambda cid: False)
     with SessionLocal() as first_db, SessionLocal() as second_db:
       first = asyncio.create_task(routes._create_conflict_resolver_chat(first_db, ids[:2]))
@@ -4324,7 +4337,7 @@ def _finish(client, auth, app_dir, replay):
 
 
 def test_finishing_installs_only_a_committed_resolution(
-  client, auth, bypass_url_validation,
+  client, auth, bypass_url_validation, idle_resolver_runs,
 ):
   """Finish never stages on the resolver's behalf: uncommitted work, committed
   markers, and an answer without the update are all refused."""
@@ -4349,7 +4362,7 @@ def test_finishing_installs_only_a_committed_resolution(
   assert incomplete.status_code == 409, incomplete.text
   assert incomplete.json()["detail"]["code"] == "resolution_incomplete"
 
-  # Opening the resolver again restarts the abandoned merge.
+  # Reopening an idle resolver restarts its abandoned merge.
   reopened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert reopened.status_code == 200, reopened.text
   assert app_git.merge_in_progress(checkout)
@@ -4420,7 +4433,7 @@ def _conflicted_app_with_local_file(client, auth, base, slug):
 
 
 def test_resolver_checkout_removed_after_validation_requires_a_fresh_plan(
-  client, auth, bypass_url_validation,
+  client, auth, bypass_url_validation, idle_resolver_runs,
 ):
   from app.database import SessionLocal
   from app.routes import apps as routes
@@ -4432,7 +4445,7 @@ def test_resolver_checkout_removed_after_validation_requires_a_fresh_plan(
   with SessionLocal() as db:
     receipt = routes._pending_store_update_receipt(db.get(models.App, app_id), str(repo))
   merge = routes._validate_pending_update(repo, receipt)
-  assert merge is None  # validation expected to reuse the in-progress merge
+  assert merge.checkout is not None  # plan reuses the in-progress merge
   app_git.remove_overlay_worktree(repo, install.pending_update_worktree(repo))
   with pytest.raises(HTTPException) as caught:
     routes._park_pending_update(repo, receipt, merge)
@@ -8529,3 +8542,48 @@ def test_install_rejects_source_files_inside_git_metadata(
   assert "`.git` directory" in r.json()["detail"]
   data_dir = Path(get_settings().data_dir)
   assert not (data_dir / "apps" / "git-metadata-app").exists()
+
+
+@pytest.mark.parametrize("selection", ["exact", "single"])
+def test_busy_resolver_retry_does_not_recreate_aborted_checkout(
+  client, auth, bypass_url_validation, monkeypatch, selection,
+):
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
+  ids = [item[0] for item in apps]
+  opened = client.post("/api/apps/conflict-resolver-batch", headers=auth,
+                       json={"app_ids": ids})
+  assert opened.status_code == 200, opened.text
+  chat_id = opened.json()["chat_id"]
+  monkeypatch.setattr("app.chat.is_chat_running", lambda cid: cid == chat_id)
+  checkout = install.pending_update_worktree(apps[0][1])
+  app_git.remove_overlay_worktree(apps[0][1], checkout)
+  retry = client.post(
+    "/api/apps/conflict-resolver-batch" if selection == "exact" else
+    f"/api/apps/{ids[0]}/conflict-resolver-chat", headers=auth,
+    json={"app_ids": ids} if selection == "exact" else {},
+  )
+  assert retry.status_code == 200, retry.text
+  assert retry.json() == {"chat_id": chat_id, "created": False, "started": False}
+  assert not checkout.exists()
+
+
+def test_stale_resolver_binding_does_not_block_current_revision(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  from app.database import SessionLocal
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
+  app_id = apps[0][0]
+  opened = client.post("/api/apps/conflict-resolver-batch", headers=auth,
+                       json={"app_ids": [item[0] for item in apps]})
+  assert opened.status_code == 200, opened.text
+  chat_id = opened.json()["chat_id"]
+  with SessionLocal() as db:
+    db.get(models.App, app_id).conflict_resolver_upstream_commit = "old-revision"
+    db.commit()
+  monkeypatch.setattr("app.chat.is_chat_running", lambda cid: cid == chat_id)
+  retry = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
+  assert retry.status_code == 200, retry.text
+  assert retry.json()["created"] is True
+  assert retry.json()["chat_id"] != chat_id
+  with SessionLocal() as db:
+    assert db.get(models.App, apps[1][0]).conflict_resolver_chat_id == chat_id

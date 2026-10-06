@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import uuid
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Literal
@@ -1064,21 +1065,37 @@ def _earlier_resolver_merge(repo: Path) -> HTTPException:
   )
 
 
-def _validate_pending_update(repo: Path, receipt: dict) -> app_git.MergeResult | None:
-  """Check parking preconditions before creating or removing a checkout."""
+@dataclass
+class _PendingUpdatePlan:
+  merge: app_git.MergeResult | None = None
+  conflict_paths: list[str] | None = None
+  checkout: Path | None = None
+
+
+def _validate_pending_update(repo: Path, receipt: dict) -> _PendingUpdatePlan:
+  """Plan parking once, before creating or removing any batch checkout."""
   from app import install
 
   if app_git.merge_in_progress(repo):
     raise _earlier_resolver_merge(repo)
   upstream = receipt["upstream_commit"]
   if install.pending_update_resolved(repo, upstream):
-    return None
+    return _PendingUpdatePlan(conflict_paths=[])
   worktree = install.pending_update_worktree(repo)
-  if (worktree / ".git").exists() and (
-    app_git.merge_in_progress(worktree)
-    or app_git.ref_is_ancestor(worktree, upstream, "HEAD") is True
-  ):
-    return None
+  if (worktree / ".git").exists():
+    if app_git.merge_in_progress(worktree):
+      return _PendingUpdatePlan(
+        conflict_paths=_unmerged_status_paths(worktree), checkout=worktree,
+      )
+    if app_git.ref_is_ancestor(worktree, upstream, "HEAD") is True:
+      marked = install.committed_conflict_marker_paths(worktree, "HEAD", upstream) or []
+      changed = app_git._run(
+        worktree, "status", "--porcelain=v1", "-z", "--no-renames",
+      ).stdout.split("\0")
+      return _PendingUpdatePlan(
+        conflict_paths=sorted(set(marked) | {entry[3:] for entry in changed if len(entry) > 3}),
+        checkout=worktree,
+      )
   override = receipt.get("merge_base_override")
   merge = (
     app_git.merge_refs(
@@ -1088,42 +1105,23 @@ def _validate_pending_update(repo: Path, receipt: dict) -> app_git.MergeResult |
   )
   if merge.status != "conflict" or not merge.conflict_paths:
     raise _conflict_state_changed()
-  return merge
+  return _PendingUpdatePlan(merge=merge)
 
 
 def _park_pending_update(
-  repo: Path, receipt: dict, merge: app_git.MergeResult | None,
+  repo: Path, receipt: dict, plan: _PendingUpdatePlan,
 ) -> list[str]:
-  """Open or reuse a private merge checkout after validation under source lock.
-
-  The served source is untouched. Preparation is retryable, not transactional:
-  a later Git/filesystem failure can leave earlier private checkouts parked.
-  """
+  """Consume a validated plan; preparation is retryable, not transactional."""
   from app import install
 
-  upstream = receipt["upstream_commit"]
-  if install.pending_update_resolved(repo, upstream):
-    return []
+  if plan.conflict_paths is not None:
+    # Resolver Git operations do not take route locks. A removed checkout
+    # invalidates a reuse plan rather than silently recreating agent work.
+    if plan.checkout is not None and not (plan.checkout / ".git").exists():
+      raise _conflict_state_changed()
+    return plan.conflict_paths
+  merge = plan.merge
   worktree = install.pending_update_worktree(repo)
-  if (worktree / ".git").exists():
-    if app_git.merge_in_progress(worktree):
-      return _unmerged_status_paths(worktree)
-    if app_git.ref_is_ancestor(worktree, upstream, "HEAD") is True:
-      # Merged but not yet a clean answer: uncommitted edits or committed
-      # markers are the remaining work.
-      marked = install.committed_conflict_marker_paths(
-        worktree, "HEAD", upstream,
-      ) or []
-      changed = app_git._run(
-        worktree, "status", "--porcelain=v1", "-z", "--no-renames",
-      ).stdout.split("\0")
-      return sorted(
-        set(marked) | {entry[3:] for entry in changed if len(entry) > 3}
-      )
-  # Git work by the resolver is outside these route locks. If it aborted or
-  # removed a reusable checkout after validation, retry with a fresh plan.
-  if merge is None:
-    raise _conflict_state_changed()
   if (worktree / ".git").exists():
     app_git.remove_overlay_worktree(repo, worktree)
   worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1244,8 +1242,7 @@ async def _start_conflict_resolver_turn(
   db: Session, chat_id: str, title: str, content: str, provider: str,
 ) -> bool:
   """Start the resolver turn only while the chat is empty and idle."""
-  from app.chat import is_chat_running
-  from app.run_state import has_running_run
+  from app.chat import is_chat_busy
 
   chat = (
     db.query(models.Chat)
@@ -1253,8 +1250,7 @@ async def _start_conflict_resolver_turn(
     .first()
   )
   if (
-    chat is None or chat.messages or has_running_run(db, chat_id) or
-    is_chat_running(chat_id)
+    chat is None or chat.messages or is_chat_busy(db, chat)
   ):
     return False
   return await start_programmatic_chat_turn(
@@ -1760,61 +1756,48 @@ def _resolver_app_error(exc: HTTPException, app_id: int) -> HTTPException:
 def _check_conflict_resolver_bindings(
   db: Session, apps: list[models.App],
 ) -> tuple[models.Chat | None, list[models.App]]:
-  """Reuse only the exact batch; refuse to displace work that can resume."""
-  from app import questions
-  from app.chat import is_chat_running
-  from app.run_state import has_nonterminal_run
+  """Reuse busy current bindings, or an idle chat for the exact batch only."""
+  from app.chat import is_chat_busy
 
-  existing = None
-  existing_ids = {app.conflict_resolver_chat_id for app in apps}
-  if len(existing_ids) == 1 and None not in existing_ids:
-    existing_id = next(iter(existing_ids))
-    requested = {(app.id, app.upstream_commit) for app in apps}
-    bound = set(db.query(
-      models.App.id, models.App.conflict_resolver_upstream_commit,
-    ).filter(
-      models.App.conflict_resolver_chat_id == existing_id,
-      models.App.deleted_at.is_(None),
-    ).all())
-    # Include every binding, not just the requested apps: a subset must not
-    # reopen a chat whose seed also asks the agent to work on other apps.
-    if bound == requested:
-      existing = (
-        db.query(models.Chat)
-        .filter(models.Chat.id == existing_id)
-        .filter(models.Chat.deleted_at.is_(None))
-        .filter(models.Chat.created_by_app_id.is_(None))
-        .first()
-      )
-  if existing is not None:
-    return existing, []
-
-  # The old seed still covers its whole batch. Never take any of those
-  # apps away while that resolver is working in their private checkouts.
-  displaced = existing_ids - {None}
+  current = [app for app in apps if (
+    app.conflict_resolver_chat_id is not None
+    and app.conflict_resolver_upstream_commit == app.upstream_commit
+  )]
+  current_ids = {app.conflict_resolver_chat_id for app in current}
+  displaced_ids = {app.conflict_resolver_chat_id for app in apps} - {None}
   displaced_apps = db.query(models.App).filter(
-    models.App.conflict_resolver_chat_id.in_(displaced),
-  ).all() if displaced else []
-  for displaced_id in sorted(displaced):
-    chat = db.get(models.Chat, displaced_id)
-    if (
-      has_nonterminal_run(db, displaced_id) or is_chat_running(displaced_id)
-      or (chat is not None and chat.pending_question_id is not None)
-      or questions.is_waiting(displaced_id)
-    ):
-      bound_ids = sorted(
-        app.id for app in displaced_apps
-        if app.conflict_resolver_chat_id == displaced_id
-      )
+    models.App.conflict_resolver_chat_id.in_(displaced_ids),
+  ).all() if displaced_ids else []
+  requested_ids = {app.id for app in apps}
+  for chat_id in sorted(displaced_ids):
+    chat = db.get(models.Chat, chat_id)
+    if chat is None or chat.deleted_at is not None or chat.created_by_app_id is not None:
+      continue
+    bound = [app for app in displaced_apps if (
+      app.conflict_resolver_chat_id == chat_id and app.deleted_at is None
+    )]
+    if is_chat_busy(db, chat):
+      if chat_id not in current_ids:
+        # A stale requested binding does not own this revision. Leave other
+        # apps with the live resolver instead of invalidating its whole batch.
+        displaced_apps = [app for app in displaced_apps if (
+          app.conflict_resolver_chat_id != chat_id or app.id in requested_ids
+        )]
+        continue
+      if len(current) == len(apps) and len(current_ids) == 1:
+        return chat, []
+      names = ", ".join(app.name for app in bound)
+      verb = "is" if len(bound) == 1 else "are"
       raise HTTPException(409, {
         "code": "conflict_resolver_running",
-        "message": (
-          f"Resolver chat {displaced_id} is still busy for apps "
-          f"{bound_ids}. Wait for it to finish before opening a different batch."
-        ),
-        "chat_id": displaced_id,
-        "app_ids": bound_ids,
+        "message": f"{names} {verb} already being resolved in another chat; open it from there.",
+        "chat_id": chat_id,
+        "app_ids": sorted(app.id for app in bound),
       })
+    if {(app.id, app.conflict_resolver_upstream_commit) for app in bound} == {
+      (app.id, app.upstream_commit) for app in apps
+    }:
+      return chat, []
   return None, displaced_apps
 
 
@@ -1839,33 +1822,46 @@ async def _create_conflict_resolver_chat(
     for source_dir in sorted({str(repo) for _, repo in selected}):
       await locks.enter_async_context(fs_locks.source_dir_lock(source_dir))
 
-    # Validate every receipt and parking precondition before changing any
-    # checkout. Later Git/I/O failures can still leave a partially parked
-    # batch; those private checkouts are safe to reuse on retry.
+    # Validate every receipt before reuse, and every parking plan before any
+    # checkout changes. Later Git/I/O failures can leave a private partial
+    # batch that is safe to reuse on retry.
     for app, repo in selected:
       try:
         if not app_git.is_repo(repo):
           raise HTTPException(400, f"{app.name} is not a git repo.")
         app = _pending_store_update_app(db, app.source_dir, app_id=app.id)
         receipt = _pending_store_update_receipt(app, str(repo))
-        merge = await asyncio.to_thread(_validate_pending_update, repo, receipt)
-        upstream_version = await asyncio.to_thread(
-          _upstream_version, repo, app.upstream_commit,
-        )
       except HTTPException as exc:
         raise _resolver_app_error(exc, app.id) from exc
-      prepared.append((app, repo, receipt, merge, upstream_version))
+      prepared.append((app, repo, receipt))
 
     existing, displaced_apps = _check_conflict_resolver_bindings(
       db, [app for app, *_ in prepared],
     )
 
-    # Reuse must still restore a checkout removed by an earlier abort/retry.
+    from app.chat import is_chat_busy
+    if existing is not None and is_chat_busy(db, existing):
+      return schemas.AppConflictResolverChatOut(
+        chat_id=existing.id, created=False, started=False,
+      )
+
+    plans = []
+    for app, repo, receipt in prepared:
+      try:
+        plan = await asyncio.to_thread(_validate_pending_update, repo, receipt)
+        upstream_version = await asyncio.to_thread(
+          _upstream_version, repo, app.upstream_commit,
+        )
+      except HTTPException as exc:
+        raise _resolver_app_error(exc, app.id) from exc
+      plans.append((app, repo, receipt, plan, upstream_version))
+
+    # Only idle retries may restore a checkout removed by an earlier abort.
     prompt_items = []
-    for app, repo, receipt, merge, upstream_version in prepared:
+    for app, repo, receipt, plan, upstream_version in plans:
       try:
         conflict_paths = await asyncio.to_thread(
-          _park_pending_update, repo, receipt, merge,
+          _park_pending_update, repo, receipt, plan,
         )
       except HTTPException as exc:
         raise _resolver_app_error(exc, app.id) from exc

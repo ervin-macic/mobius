@@ -49,6 +49,7 @@ from app.chat import (
   _finish_run,
   bump_run_generation,
   is_chat_running,
+  is_chat_busy,
   mark_chat_deleted,
   recover_chat_generation,
   stop_chat_for,
@@ -90,7 +91,6 @@ from app.resource_access import (
   require_active_chat_access,
 )
 from app.run_state import (
-  has_nonterminal_run,
   has_running_run,
   running_chat_ids,
   running_goal_objective,
@@ -1572,11 +1572,7 @@ async def patch_chat(
       and latest_message.get("from_provider") == (chat.provider or "claude")
     )
     if provider_changing:
-      if (
-        is_chat_running(chat_id)
-        or chat.pending_messages
-        or has_nonterminal_run(db, chat_id)
-      ):
+      if is_chat_busy(db, chat):
         raise HTTPException(
           status_code=409,
           detail="Chat is busy — finish or stop the current turn before switching.",
@@ -2783,11 +2779,8 @@ async def _compact_chat_locked(
     raise HTTPException(
       status_code=409, detail="This chat already uses that provider."
     )
-  if (
-    is_chat_running(chat_id)
-    or chat.pending_messages
-    or has_running_run(db, chat_id)
-  ):
+  # A provider handoff deliberately supersedes parked continuations.
+  if is_chat_busy(db, chat, run_statuses=("running",)):
     raise HTTPException(
       status_code=409,
       detail="Chat is busy — finish or stop the current turn before switching.",
@@ -2951,11 +2944,7 @@ async def compact_chat(
           "provider; its provider can't be switched."
         ),
       )
-    if (
-      is_chat_running(chat_id)
-      or chat.pending_messages
-      or has_nonterminal_run(db, chat_id)
-    ):
+    if is_chat_busy(db, chat):
       raise HTTPException(
         status_code=409,
         detail="Chat is busy — finish or stop the current turn before compacting.",
@@ -3271,11 +3260,8 @@ def _app_chat_started(chat: models.Chat, db: Session) -> bool:
   return bool(
     chat.has_messages
     or chat.messages
-    or chat.pending_messages
-    or chat.pending_question_id
     or chat.session_id
-    or is_chat_running(chat.id)
-    or has_nonterminal_run(db, chat.id)
+    or is_chat_busy(db, chat)
     or (goal and goal.get("status") in {"active", "paused", "completed", "cannot_complete", "cancelled"})
   )
 
@@ -3597,9 +3583,8 @@ async def patch_app_chat(
       if (
         chat.system_prompt_snapshot_id
         or chat.messages
-        or chat.pending_messages
         or chat.session_id
-        or has_nonterminal_run(db, chat_id)
+        or is_chat_busy(db, chat)
       ):
         raise HTTPException(
           status_code=409,
@@ -3632,11 +3617,9 @@ async def patch_app_chat(
         # the creating app may still correct an empty chat's provider before
         # its first turn. Once work starts, the lifecycle gate below pins it.
         if (
-          is_chat_running(chat_id)
-          or chat.pending_messages
-          or chat.messages
+          chat.messages
           or chat.session_id
-          or has_nonterminal_run(db, chat_id)
+          or is_chat_busy(db, chat)
         ):
           raise HTTPException(
             status_code=409,
