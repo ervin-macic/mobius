@@ -61,7 +61,7 @@ import { isDrawerAppShareEligible } from './appShareState.js'
 import { recentsProjectChip } from '../../lib/recentsProjectChip.js'
 import {
   clampDrawerRowWindow,
-  drawerListHoldHeight,
+  drawerListMinHeight,
   drawerRowSpacerHeights,
   drawerRowWindow,
   drawerRowWindowForIndex,
@@ -99,6 +99,11 @@ function writeListTab(tab) {
 const EMPTY_SET = new Set()
 const EMPTY_LIST = []
 const TOUCH_CONTEXT_MENU_PROVENANCE_MS = 1500
+
+// Content still below the viewport bottom, in the scroller's own units.
+function scrollBelowViewport(root) {
+  return root.scrollHeight - root.scrollTop - root.clientHeight
+}
 
 export default function Drawer({
   open,
@@ -220,16 +225,16 @@ export default function Drawer({
   // machinery below; each device remembers which one it shows.
   const [listTab, setListTab] = useState(readListTab)
   const showingArchived = listTab === 'archived'
-  const listHoldRef = useRef(null)
-  const tabSwitchScrollRef = useRef(null)
+  const [listMinHeight, setListMinHeight] = useState(0)
   const selectListTab = useCallback((tab) => {
-    // Capture the scroll position and full extent before the swap. The row
-    // window re-renders more than once after a switch, so the effect below
-    // first holds the whole previous extent and the next frame trims it.
+    // A shorter list would shrink the scroll extent and the browser would clamp
+    // scrollTop, so floor the lists section at the height that keeps the
+    // current viewport bottom reachable.
     const root = navigationScrollRef.current
-    tabSwitchScrollRef.current = root
-      ? { scrollTop: root.scrollTop, reach: root.scrollHeight }
-      : null
+    const section = listSectionRef.current
+    setListMinHeight(root && section
+      ? drawerListMinHeight(section.offsetHeight, scrollBelowViewport(root))
+      : 0)
     setListTab(tab)
     writeListTab(tab)
   }, [])
@@ -325,78 +330,6 @@ export default function Drawer({
     ))
   }, [listItems.length])
 
-  // A shorter list shrinks the scrollable area, so the browser clamps
-  // scrollTop and the tab header moves under the pointer. On a tab switch a
-  // trailing spacer pads the list until the previous viewport is reachable and
-  // scrollTop is restored. The spacer is trimmed once the row window has
-  // settled and on each scroll, so it never leaves scrollable blank space.
-  const listHoldRafRef = useRef(0)
-  const listHoldTargetRef = useRef(null)
-  const syncListHold = useCallback(() => {
-    listHoldRafRef.current = 0
-    const root = navigationScrollRef.current
-    const hold = listHoldRef.current
-    if (!root || !hold) return
-    // The first sync after a switch re-establishes the captured position once
-    // the new list has finished rendering; later syncs only ever shrink.
-    const target = listHoldTargetRef.current
-    listHoldTargetRef.current = null
-    const current = parseFloat(hold.style.height) || 0
-    const next = drawerListHoldHeight({
-      reach: (target ? target.scrollTop : root.scrollTop) + root.clientHeight,
-      scrollHeight: root.scrollHeight,
-      holdHeight: current,
-      maxHeight: target ? Infinity : current,
-    })
-    hold.style.height = next > 0 ? `${next}px` : ''
-    if (target) root.scrollTop = target.scrollTop
-  }, [])
-  const scheduleListHoldSync = useCallback(() => {
-    if (listHoldRafRef.current) return
-    listHoldRafRef.current = requestAnimationFrame(syncListHold)
-  }, [syncListHold])
-  useLayoutEffect(() => {
-    const root = navigationScrollRef.current
-    const hold = listHoldRef.current
-    const saved = tabSwitchScrollRef.current
-    if (!root || !hold || !saved) return
-    // The row window still describes the previous list. Settle it first so the
-    // extent measured below is the new list's own.
-    const settled = clampDrawerRowWindow(listWindow, listItems.length)
-    if (!sameDrawerRowWindow(listWindow, settled)) {
-      setListWindow(settled)
-      return
-    }
-    tabSwitchScrollRef.current = null
-    hold.style.height = ''
-    const next = drawerListHoldHeight({
-      reach: saved.reach,
-      scrollHeight: root.scrollHeight,
-      holdHeight: 0,
-    })
-    if (next <= 0) return
-    hold.style.height = `${next}px`
-    root.scrollTop = saved.scrollTop
-    listHoldTargetRef.current = saved
-    scheduleListHoldSync()
-  }, [listTab, listWindow, listItems.length, scheduleListHoldSync])
-  useEffect(() => {
-    if (!open) return undefined
-    const root = navigationScrollRef.current
-    const hold = listHoldRef.current
-    if (!root || !hold) return undefined
-    const onScroll = () => {
-      if (hold.style.height) scheduleListHoldSync()
-    }
-    root.addEventListener('scroll', onScroll, { passive: true })
-    return () => {
-      root.removeEventListener('scroll', onScroll)
-      cancelAnimationFrame(listHoldRafRef.current)
-      listHoldRafRef.current = 0
-      hold.style.height = ''
-    }
-  }, [open, scheduleListHoldSync])
-
   // Measure once before an opened drawer paints, then update the small row
   // window at most once per animation frame while it scrolls. The scroll path
   // reads only scrollTop/clientHeight; section geometry is refreshed on open or
@@ -422,6 +355,17 @@ export default function Drawer({
         setListWindow(current => (
           sameDrawerRowWindow(current, next) ? current : next
         ))
+        // The floor from a tab switch only ever shrinks as the owner scrolls.
+        // Measure the section itself: this frame may predate the render that
+        // applies the floor.
+        const section = listSectionRef.current
+        if (section) {
+          const floor = drawerListMinHeight(
+            section.offsetHeight,
+            scrollBelowViewport(root),
+          )
+          setListMinHeight(current => Math.min(current, floor))
+        }
       })
     }
     root.addEventListener('scroll', onScroll, { passive: true })
@@ -431,6 +375,10 @@ export default function Drawer({
       listWindowRafRef.current = 0
     }
   }, [listItems.length, open])
+  // A floor left from a tab switch must not outlive the drawer being open.
+  useEffect(() => {
+    if (!open) setListMinHeight(0)
+  }, [open])
 
   // The always-visible desktop sidebar follows chat selections made elsewhere.
   // The phone drawer instead preserves its last manual scroll position: opening
@@ -1427,6 +1375,7 @@ export default function Drawer({
               <section
                 ref={listSectionRef}
                 className="drawer__section drawer__section--lists"
+                style={listMinHeight ? { minHeight: listMinHeight } : undefined}
                 aria-label="Chats"
               >
                 <div
@@ -1552,7 +1501,6 @@ export default function Drawer({
                       aria-hidden="true"
                     />
                   )}
-                  <div ref={listHoldRef} aria-hidden="true" />
                 </div>
               </section>
             </div>
