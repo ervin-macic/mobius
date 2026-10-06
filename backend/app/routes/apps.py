@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from contextlib import AsyncExitStack
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Literal
@@ -1800,76 +1801,70 @@ def _batch_conflict_resolver_prompt(
   ])
 
 
-@router.post(
-  "/conflict-resolver-batch",
-  response_model=schemas.AppConflictResolverChatOut,
-  dependencies=[
-    Depends(reject_cross_site),
-    Depends(require_nondelegated_owner_or_app_control),
-  ],
-)
-async def create_conflict_resolver_batch_chat(
-  body: schemas.AppConflictResolverBatchChatRequest,
-  db: Session = Depends(get_db),
-  owner: models.Owner = Depends(get_owner_or_app_with_manage_apps),
-):
-  """Create one owner-visible resolver turn for all selected app conflicts."""
-  app_ids = list(dict.fromkeys(body.app_ids))
-  prepared: list[tuple[models.App, Path]] = []
+async def _create_conflict_resolver_chat(
+  db: Session, app_ids: list[int],
+) -> schemas.AppConflictResolverChatOut:
+  """Prepare the exact selected batch, then open its owner-visible resolver."""
+  from app import background_agents, install
 
-  async with fs_locks.install_uninstall_lock():
-    for app_id in app_ids:
+  prepared: list[tuple[models.App, Path, dict]] = []
+  async with fs_locks.install_uninstall_lock(), AsyncExitStack() as locks:
+    # Hold each app's locks through preparation, and validate the whole batch
+    # before creating any checkout. A stale later receipt must not leave the
+    # earlier apps half-prepared.
+    for app_id in sorted(set(app_ids)):
       app = live_app_or_404(db, app_id, populate=True)
       repo = Path(app.source_dir)
       if not app_git.is_repo(repo):
         raise HTTPException(status_code=400, detail=f"{app.name} is not a git repo.")
-      prepared.append((app, repo))
+      await locks.enter_async_context(fs_locks.app_storage_lock(app_id))
+      await locks.enter_async_context(fs_locks.source_dir_lock(str(repo)))
+      app = _pending_store_update_app(db, str(repo), app_id=app_id)
+      receipt = _pending_store_update_receipt(app, str(repo))
+      prepared.append((app, repo, receipt))
 
-    # Materialize every selected app's chosen policy before deciding whether
-    # an existing resolver chat can be reused, so reuse never skips the real
-    # on-disk merge an earlier abort or retry may have removed.
+    # Reuse must still restore a checkout removed by an earlier abort/retry.
     prompt_items: list[tuple[models.App, Path, list[str], str | None]] = []
-    for app, repo in prepared:
-      async with (
-        fs_locks.app_storage_lock(app.id),
-        fs_locks.source_dir_lock(str(repo)),
-      ):
-        app = _pending_store_update_app(db, str(repo), app_id=app.id)
-        receipt = _pending_store_update_receipt(app, str(repo))
-        conflict_paths = await asyncio.to_thread(
-          _park_pending_update, repo, receipt,
-        )
-        upstream_version = await asyncio.to_thread(
-          _upstream_version, repo, app.upstream_commit,
-        )
-        prompt_items.append((app, repo, conflict_paths, upstream_version))
-
-    title = (
-      f"Resolve {prompt_items[0][0].name} update conflict"
-      if len(prompt_items) == 1
-      else f"Resolve {len(prompt_items)} app update conflicts"
-    )
-    content = _batch_conflict_resolver_prompt(prompt_items)
-    existing = None
-    existing_ids = {app.conflict_resolver_chat_id for app, *_ in prompt_items}
-    if len(existing_ids) == 1 and all(
-      app.conflict_resolver_chat_id
-      and app.conflict_resolver_upstream_commit == app.upstream_commit
-      for app, *_ in prompt_items
-    ):
-      existing = (
-        db.query(models.Chat)
-        .filter(models.Chat.id == next(iter(existing_ids)))
-        .filter(models.Chat.deleted_at.is_(None))
-        .filter(models.Chat.created_by_app_id.is_(None))
-        .first()
+    for app, repo, receipt in prepared:
+      conflict_paths = await asyncio.to_thread(_park_pending_update, repo, receipt)
+      upstream_version = await asyncio.to_thread(
+        _upstream_version, repo, app.upstream_commit,
       )
+      prompt_items.append((app, repo, conflict_paths, upstream_version))
+
+    if len(prompt_items) == 1:
+      app, repo, conflict_paths, upstream_version = prompt_items[0]
+      title = f"Resolve {app.name} update conflict"
+      content = _conflict_resolver_prompt(
+        app, install.pending_update_worktree(repo), conflict_paths,
+        upstream_version,
+      )
+    else:
+      title = f"Resolve {len(prompt_items)} app update conflicts"
+      content = _batch_conflict_resolver_prompt(prompt_items)
+
+    existing = None
+    existing_ids = {app.conflict_resolver_chat_id for app, *_ in prepared}
+    if len(existing_ids) == 1 and None not in existing_ids:
+      existing_id = next(iter(existing_ids))
+      requested = {(app.id, app.upstream_commit) for app, *_ in prepared}
+      bound = set(db.query(
+        models.App.id, models.App.conflict_resolver_upstream_commit,
+      ).filter(models.App.conflict_resolver_chat_id == existing_id).all())
+      # Include every binding, not just the requested apps: a subset must not
+      # reopen a chat whose seed also asks the agent to work on other apps.
+      if bound == requested:
+        existing = (
+          db.query(models.Chat)
+          .filter(models.Chat.id == existing_id)
+          .filter(models.Chat.deleted_at.is_(None))
+          .filter(models.Chat.created_by_app_id.is_(None))
+          .first()
+        )
     if existing is not None:
       chat, created, provider = existing, False, existing.provider
     else:
-      # Same provider choice as the single-app resolver: the owner's
-      # background-agents list, walked to the first entry with usage quota.
-      from app import background_agents
+      # Walk the owner's background-agent choices to the first with quota.
       choice = background_agents.resolve_background_chat_choice(
         get_settings().data_dir, db,
       )
@@ -1884,21 +1879,37 @@ async def create_conflict_resolver_batch_chat(
         created_by_app_id=None,
       )
       db.add(chat)
-      for app, *_ in prompt_items:
+      for app, *_ in prepared:
         app.conflict_resolver_chat_id = chat.id
         app.conflict_resolver_upstream_commit = app.upstream_commit
       db.commit()
       created = True
     chat_id = chat.id
 
-  # Starting is idempotent, so a chat left empty by an interrupted earlier
-  # request starts on the next open.
+  # Only an empty, idle chat starts; interrupted creation is retryable.
   started = await _start_conflict_resolver_turn(
     db, chat_id, title, content, provider,
   )
   return schemas.AppConflictResolverChatOut(
     chat_id=chat_id, created=created, started=started,
   )
+
+
+@router.post(
+  "/conflict-resolver-batch",
+  response_model=schemas.AppConflictResolverChatOut,
+  dependencies=[
+    Depends(reject_cross_site),
+    Depends(require_nondelegated_owner_or_app_control),
+  ],
+)
+async def create_conflict_resolver_batch_chat(
+  body: schemas.AppConflictResolverBatchChatRequest,
+  db: Session = Depends(get_db),
+  owner: models.Owner = Depends(get_owner_or_app_with_manage_apps),
+):
+  """Create one owner-visible resolver turn for all selected app conflicts."""
+  return await _create_conflict_resolver_chat(db, body.app_ids)
 
 
 @router.post(
@@ -1916,75 +1927,7 @@ async def create_conflict_resolver_chat(
   owner: models.Owner = Depends(get_owner_or_app_with_manage_apps),
 ):
   """Create or return the owner-visible resolver chat for an app conflict."""
-  app = live_app_or_404(db, app_id, populate=True)
-  repo = Path(app.source_dir)
-  if not app_git.is_repo(repo):
-    raise HTTPException(status_code=400, detail="App is not a git repo.")
-
-  async with (
-    fs_locks.install_uninstall_lock(),
-    fs_locks.app_storage_lock(app_id),
-    fs_locks.source_dir_lock(str(repo)),
-  ):
-    app = _pending_store_update_app(db, str(repo), app_id=app_id)
-    receipt = _pending_store_update_receipt(app, str(repo))
-    conflict_paths = await asyncio.to_thread(
-      _park_pending_update, repo, receipt,
-    )
-    upstream_version = await asyncio.to_thread(
-      _upstream_version, repo, app.upstream_commit,
-    )
-
-    from app import background_agents, install
-    title = f"Resolve {app.name} update conflict"
-    content = _conflict_resolver_prompt(
-      app, install.pending_update_worktree(repo), conflict_paths,
-      upstream_version,
-    )
-    existing = None
-    if app.conflict_resolver_upstream_commit == app.upstream_commit:
-      existing = (
-        db.query(models.Chat)
-        .filter(models.Chat.id == app.conflict_resolver_chat_id)
-        .filter(models.Chat.deleted_at.is_(None))
-        .filter(models.Chat.created_by_app_id.is_(None))
-        .first()
-      )
-    if existing is not None:
-      chat, created, provider = existing, False, existing.provider
-    else:
-      # Automatic app-agent work: resolve the provider from the owner's
-      # background-agents list, walked to the first entry with usage quota, so
-      # a resolver never starts on a provider the owner has already exhausted.
-      # The owner can switch it in-chat afterwards (this chat is owner-visible).
-      choice = background_agents.resolve_background_chat_choice(
-        get_settings().data_dir, db,
-      )
-      provider = choice["provider"]
-      chat = models.Chat(
-        id=str(uuid.uuid4()),
-        title=title,
-        messages=[],
-        pending_messages=[],
-        provider=provider,
-        agent_settings_json=choice["agent_settings"],
-        created_by_app_id=None,
-      )
-      db.add(chat)
-      app.conflict_resolver_chat_id = chat.id
-      app.conflict_resolver_upstream_commit = app.upstream_commit
-      db.commit()
-      created = True
-    chat_id = chat.id
-
-  # Starting is idempotent (only an empty, idle chat starts), so a chat left
-  # empty by an interrupted earlier request starts on the next open.
-  started = await _start_conflict_resolver_turn(
-    db, chat_id, title, content, provider,
-  )
-  return schemas.AppConflictResolverChatOut(
-    chat_id=chat_id, created=created, started=started,
-  )
+  return await _create_conflict_resolver_chat(db, [app_id])
 
 
 @router.post(

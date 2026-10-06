@@ -3567,14 +3567,9 @@ def test_conflict_resolver_merges_in_private_checkout_before_its_turn(
   assert not (app_dir / ".git" / "MERGE_HEAD").exists()
 
 
-def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
-  client, auth, bypass_url_validation, monkeypatch,
-):
-  # The published App Store's "Fix with an agent" sends every blocked update
-  # in one request. This drives that route end to end, including each app's
-  # recorded upstream version in the seed message.
+def _prepare_conflict_resolver_apps(client, auth, suffixes):
   apps = []
-  for suffix in ("one", "two"):
+  for suffix in suffixes:
     base = f"https://batch-conflict-{suffix}.test/repo/"
     manifest = {
       **MANIFEST_NEWS,
@@ -3599,6 +3594,15 @@ def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
     assert updated.status_code == 201, updated.text
     assert updated.json()["mode"] == "conflict"
     apps.append((installed.json()["id"], app_dir, manifest["name"]))
+  return apps
+
+
+def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  # The published Store sends every blocked update in one request. Exercise
+  # real preparation and each recorded upstream version in the seed message.
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
   app_ids = [app_id for app_id, _path, _name in apps]
 
   starts = []
@@ -3656,7 +3660,7 @@ def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
   repeated = client.post(
     "/api/apps/conflict-resolver-batch",
     headers=auth,
-    json={"app_ids": app_ids, "resolution_policy": "preserve_local"},
+    json={"app_ids": [*reversed(app_ids), app_ids[0]]},
   )
   assert repeated.status_code == 200, repeated.text
   assert repeated.json() == {
@@ -3665,6 +3669,93 @@ def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
     "started": False,
   }
   assert [start["chat_id"] for start in starts] == [body["chat_id"]] * 2
+
+
+@pytest.mark.parametrize("selection", ["subset", "single", "overlap"])
+def test_conflict_resolver_never_reuses_a_different_batch(
+  client, auth, bypass_url_validation, selection,
+):
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two", "three"))
+  app_ids = [app_id for app_id, _path, _name in apps]
+  first = client.post(
+    "/api/apps/conflict-resolver-batch", headers=auth,
+    json={"app_ids": app_ids[:2]},
+  )
+  assert first.status_code == 200, first.text
+  original_chat_id = first.json()["chat_id"]
+
+  selected = app_ids[1:] if selection == "overlap" else app_ids[1:2]
+  if selection == "single":
+    response = client.post(
+      f"/api/apps/{selected[0]}/conflict-resolver-chat", headers=auth,
+    )
+  else:
+    response = client.post(
+      "/api/apps/conflict-resolver-batch", headers=auth,
+      json={"app_ids": selected},
+    )
+  assert response.status_code == 200, response.text
+  assert response.json()["created"] is True
+  assert response.json()["chat_id"] != original_chat_id
+
+  from app.database import SessionLocal
+  with SessionLocal() as db:
+    assert db.get(models.App, app_ids[0]).conflict_resolver_chat_id == original_chat_id
+    for app_id in selected:
+      app = db.get(models.App, app_id)
+      assert app.conflict_resolver_chat_id == response.json()["chat_id"]
+      assert app.conflict_resolver_upstream_commit == app.upstream_commit
+    chat = db.get(models.Chat, response.json()["chat_id"])
+    seed = chat.messages[0]["content"]
+    assert apps[0][2] not in seed
+    assert all(apps[app_ids.index(app_id)][2] in seed for app_id in selected)
+
+
+def test_conflict_resolver_batch_does_not_reuse_stale_revision_bindings(
+  client, auth, bypass_url_validation,
+):
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
+  app_ids = [app_id for app_id, _path, _name in apps]
+  first = client.post(
+    "/api/apps/conflict-resolver-batch", headers=auth,
+    json={"app_ids": app_ids},
+  )
+  assert first.status_code == 200, first.text
+  from app.database import SessionLocal
+  with SessionLocal() as db:
+    db.get(models.App, app_ids[1]).conflict_resolver_upstream_commit = "old-revision"
+    db.commit()
+
+  response = client.post(
+    "/api/apps/conflict-resolver-batch", headers=auth,
+    json={"app_ids": app_ids},
+  )
+  assert response.status_code == 200, response.text
+  assert response.json()["created"] is True
+  assert response.json()["chat_id"] != first.json()["chat_id"]
+
+
+def test_conflict_resolver_validates_all_receipts_before_parking_any_app(
+  client, auth, bypass_url_validation,
+):
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
+  install.pending_update_receipt_file(apps[1][1]).unlink()
+  response = client.post(
+    "/api/apps/conflict-resolver-batch", headers=auth,
+    json={"app_ids": [app_id for app_id, _path, _name in apps]},
+  )
+  assert response.status_code == 409, response.text
+  assert response.json()["detail"]["code"] == "pending_update_missing"
+  assert all(
+    not install.pending_update_worktree(path).exists()
+    for _id, path, _name in apps
+  )
+  from app.database import SessionLocal
+  with SessionLocal() as db:
+    assert all(
+      db.get(models.App, app_id).conflict_resolver_chat_id is None
+      for app_id, _path, _name in apps
+    )
 
 
 def _resolve_in(checkout: Path, files: dict[str, str]) -> None:
