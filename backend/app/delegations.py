@@ -67,7 +67,9 @@ class RunPolicy:
     return (
       "You are a delegated subagent running as a durable child task inside "
       "Möbius. Complete only the bounded user task in this child conversation "
-      "and return a clear result to the parent. When parallelism or local "
+      "and return a clear result to the parent. The parent receives only your "
+      "final message, so write your complete report last, after any tool "
+      "calls. When parallelism or local "
       "decomposition materially helps, start your own helpers with the Möbius "
       "spawn_agent tool with stable names; you remain responsible for checking your own "
       "completion condition after they settle, and their results reach you by "
@@ -584,66 +586,30 @@ def parent_root_run_id(
   return (run.goal_id or run.root_run_id or run.id) if run is not None else None
 
 
-def _assistant_result(chat: models.Chat, *, run_ids: set[str] | None = None) -> str:
-  """Return the latest child assistant outcome as plain text."""
-  from app.chat_message_identity import assistant_message_run_id
-  parts: list[str] = []
+def _assistant_result(chat: models.Chat) -> str:
+  """Return the latest child assistant outcome as plain text.
+
+  The outcome is the message's last text block (the report; earlier text
+  blocks are progress narration split off by tools or provider items) plus
+  its latest error, so a failed or stopped helper stays actionable.
+  """
   for message in reversed(list(chat.messages or [])):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
-    if run_ids is not None and assistant_message_run_id(message.get("id")) not in run_ids:
-      continue
+    blocks = message.get("blocks")
+    blocks = blocks if isinstance(blocks, list) else []
+    texts = [b["content"].strip() for b in blocks if isinstance(b, dict)
+             and b.get("type") == "text" and isinstance(b.get("content"), str)
+             and b["content"].strip()]
+    errors = [b["message"].strip() for b in blocks if isinstance(b, dict)
+              and b.get("type") == "error" and isinstance(b.get("message"), str)
+              and b["message"].strip()]
+    if texts or errors:
+      return "\n\n".join(texts[-1:] + errors[-1:])
     content = message.get("content")
     if isinstance(content, str) and content.strip():
       return content.strip()
-    blocks = message.get("blocks")
-    if not isinstance(blocks, list):
-      continue
-    for block in blocks:
-      if not isinstance(block, dict):
-        continue
-      if block.get("type") == "text" and isinstance(block.get("content"), str):
-        parts.append(block["content"])
-      elif block.get("type") == "error" and isinstance(block.get("message"), str):
-        parts.append(block["message"])
-    if parts:
-      return "\n".join(part.strip() for part in parts if part.strip()).strip()
   return ""
-
-
-def _result_with_write_repair(db: Session, chat: models.Chat, run: models.ChatRun | None) -> str:
-  """Bookkeeping repair appends status; it never replaces the task's result.
-
-  Follow only exact physical continuation lineage. Fresh follow-ups and manual
-  Resume keep the ordinary latest-result meaning, even within the same root.
-  Resource/restart resumes of the repair retain its substantive predecessor.
-  """
-  current = run
-  repair_runs: set[str] = set()
-  while current is not None and current.id not in repair_runs:
-    repair_runs.add(current.id)
-    control = current.continuation_json or {}
-    reason = control.get("reason")
-    if reason not in {"quiet_write_failure", "restart", "usage_limit", "memory",
-                      "storage", "model_capacity"}:
-      break
-    previous = db.get(models.ChatRun, control.get("supersedes_run_token")) if control.get("supersedes_run_token") else None
-    if (previous is None or previous.id in repair_runs or previous.chat_id != current.chat_id
-        or (previous.root_run_id or previous.id) != (current.root_run_id or current.id)
-        or previous.initiated_by_app_id != current.initiated_by_app_id
-        or previous.browser_grant_id != current.browser_grant_id):
-      break
-    if reason == "quiet_write_failure":
-      if control.get("source_work_id") != previous.id:
-        break
-      substantive = _assistant_result(chat, run_ids={previous.id})
-      repair = _assistant_result(chat, run_ids=repair_runs)
-      if substantive:
-        return substantive + ("\n\nWrite repair status:\n" + repair
-                              if repair and repair != substantive else "")
-      break
-    current = previous
-  return _assistant_result(chat)
 
 
 def derived_status(
@@ -655,7 +621,7 @@ def derived_status(
     db.query(models.Chat).filter(models.Chat.id == row.child_chat_id).first()
     if load_result else None
   )
-  result = _result_with_write_repair(db, chat, run) if chat is not None else ""
+  result = _assistant_result(chat) if chat is not None else ""
   return _project_delegation_status(row, run, result)
 
 

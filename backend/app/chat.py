@@ -54,7 +54,6 @@ from app.chat_event_sink import (
   active_sink_memory_diagnostics,
   commit_steer_cut,
   get_active_sink,
-  get_owned_sink,
   register_active_sink,
   steer_delivery_failed_event,
   steered_into_turn_event,
@@ -82,6 +81,11 @@ from app.chat_logging import (
   safe_commit as _safe_commit,
 )
 from app.goal_commands import goal_request_for_agent, is_goal_continue
+from app.provider_errors import (
+  ProviderErrorKind,
+  classify_provider_error,
+  is_workspace_credits_exhausted,
+)
 from app.chat_writer import (
   AcknowledgeProviderSuccess,
   AdmitProviderExecution,
@@ -127,6 +131,7 @@ from app.providers import (
   provider_runtime_kind,
 )
 from app.runner_registry import registry
+from app.session_links import resume_retired
 
 
 NO_AGENT_CONNECTED_MESSAGE = (
@@ -3120,9 +3125,6 @@ async def _stop_chat_for_locked(
   # Fence the terminal drain before yielding to writer persistence: otherwise
   # cancellation could release A's hold just as the old turn promotes B.
   bump_run_generation(chat_id)
-  sink = get_owned_sink(chat_id)
-  if sink is not None:
-    sink.interrupt_write_delivery()
   handles = registry.get_handles(chat_id)
   if handles:
     _clear_after_terminal_generation[chat_id] = stopped_gen
@@ -3674,19 +3676,6 @@ async def _terminal_setup_error_cleanup(
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
 
 
-_LIMIT_ERROR_MARKERS = (
-  "rate limit",
-  "rate_limit",
-  "usage limit",
-  "usage_limit",
-  "weekly limit",
-  "session limit",
-  "overloaded",
-  "quota",
-  "too many requests",
-  "429",
-)
-
 # A model-capacity response is not an account quota: it means the selected
 # model is temporarily saturated. Keep this deliberately narrow so an
 # unrelated "capacity" error (for example storage capacity) is never retried
@@ -3698,60 +3687,12 @@ _MODEL_CAPACITY_ERROR_MARKERS = (
 )
 
 
-# The provider's exhausted-workspace-credits rejection as plain error text, for
-# failures without the runner's structured ``credits_depleted`` flag. It is not
-# a timed limit: nothing resets on its own, so it is a manual pause the owner
-# continues after adding credits. Matched exactly so unrelated payment failures
-# keep the error card.
-_WORKSPACE_CREDITS_ERROR = "your workspace is out of credits. add credits to continue."
-
-
-def _is_workspace_credits_error_text(text: str | None) -> bool:
-  """Whether a provider rejected the turn because workspace credits ran out."""
-  return (text or "").strip().lower() == _WORKSPACE_CREDITS_ERROR
-
-
-def _is_limit_error_text(text: str | None) -> bool:
-  """Whether an error string names a provider rate/usage-limit exhaustion.
-
-  Substring match on the display error. A false positive only parks the queue
-  for manual resend; a false negative reinstates the limit storm. A transient
-  one-off error does not match, so the queue flows through a blip.
-
-  The marker list is grounded in the ACTUAL Anthropic limit strings seen in
-  prod chat.log: "You've hit your weekly limit · resets ...", "... session
-  limit ...", "Server is temporarily limiting requests ... Rate limited". The
-  `limit`+`resets` compound catches the whole "hit your <period> limit · resets
-  <time>" family (weekly / session / usage / 5-hour) without matching a random
-  error that merely contains the word "limit".
-  """
-  if not text:
-    return False
-  low = text.lower()
-  if any(marker in low for marker in _LIMIT_ERROR_MARKERS):
-    return True
-  return "limit" in low and "resets" in low
-
-
 def _is_model_capacity_error_text(text: str | None) -> bool:
   """Whether a provider says the specifically selected model is busy."""
   if not text:
     return False
   low = text.lower()
   return any(marker in low for marker in _MODEL_CAPACITY_ERROR_MARKERS)
-
-
-def _is_limit_terminal(runner_result: dict) -> bool:
-  """Whether a success-path terminal result was a rate/usage-limit kill.
-
-  Keys on the structured `api_error_status` (Claude surfaces 429 there — see
-  claude_sdk_runner ResultMessage handling) first, then the display error
-  string. Codex results carry no `api_error_status`, so they fall back to the
-  string check.
-  """
-  if runner_result.get("api_error_status") == 429:
-    return True
-  return _is_limit_error_text(runner_result.get("error"))
 
 
 # Provider-limit parking (design §2.4). When the reset time can't be parsed
@@ -4055,13 +3996,15 @@ def _park_exit(
   """
   if getattr(sink, "chat_id", None) in _restart_draining_chats:
     return {"parked": False}
+  # Claude reports 413 and 429 as `api_error_status`, and the Codex runner
+  # turns a reached rate-limit window into 429. Results without a status, and
+  # exception exits, classify by the error text.
+  error_kind = classify_provider_error(
+    error_text, status=(runner_result or {}).get("api_error_status"),
+  )
   if (
-    (runner_result or {}).get("api_error_status") == 413
+    error_kind is ProviderErrorKind.TOO_LARGE
     or (runner_result or {}).get("context_window_exceeded") is True
-    or any(marker in (error_text or "").lower() for marker in (
-      "request body is too large", "request body too large",
-      "request entity too large", "payload too large",
-    ))
   ):
     size_message = (
       "This conversation exceeds the model's context window."
@@ -4079,17 +4022,18 @@ def _park_exit(
     })
     return {"parked": False, "oversized": True}
   # Checked before the limit branch: Codex reports depleted credits as a
-  # reached rate limit (429), but no reset time will refill them.
+  # reached rate limit (429), but no reset time will refill them, so it is a
+  # manual pause the owner resumes after adding credits. Other credit
+  # failures are shown as plain errors.
   if (
     (runner_result or {}).get("credits_depleted") is True
-    or _is_workspace_credits_error_text(error_text)
+    or is_workspace_credits_exhausted(error_text)
   ):
     sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
     return {"parked": False}
-  if runner_result is not None:
-    limit = _is_limit_terminal(runner_result)
-  else:
-    limit = _is_limit_error_text(error_text)
+  # A false positive only parks the queue for manual resend; a false negative
+  # reinstates the limit storm.
+  limit = error_kind is ProviderErrorKind.USAGE_LIMIT
   model_capacity = _is_model_capacity_error_text(error_text)
   failed = bool(error_text) or runner_result is None
   if model_capacity:
@@ -4348,21 +4292,10 @@ async def _complete_turn(
   """
   # The turn is over — drop the live sink so a late steer can't reach a
   # finalizing turn. Identity-keyed, so a successor that already registered
-  # its own sink is untouched. Close steering before terminal awaits, while
-  # retaining Stop ownership through joined write draining. A late steer queues
-  # instead of splitting a turn already committing its terminal state.
-  sink.end_provider_stream()
-  write_delivery_error = None
-  try:
-    await sink.finish_write_delivery(interrupted=(
-      parked or bool(sink._last_error) or _run_generation_superseded(chat_id, run_gen)
-    ))
-  except asyncio.CancelledError:
-    raise  # The delivery owner has already joined its worker cleanup.
-  except Exception as exc:
-    write_delivery_error = exc
-  finally:
-    unregister_active_sink(chat_id, sink)
+  # its own sink is untouched. Done before the finalize await so a steer
+  # landing during finalize falls back to the queue rather than splitting a
+  # turn that is already committing its terminal state.
+  unregister_active_sink(chat_id, sink)
   if close_browser:
     await _close_turn_browser(chat_id, run_gen)
   # Recheck transcript ownership AFTER the asynchronous browser teardown.
@@ -4436,8 +4369,6 @@ async def _complete_turn(
     ending_status == "completed" and bool(activity_results)
   )
   try:
-    if write_delivery_error is not None:
-      raise write_delivery_error
     await sink.finalize(
       incorporate_activity_delivery=incorporate_activity_delivery,
     )
@@ -4848,17 +4779,10 @@ async def run_chat(
           )
   finally:
     browser_cancelled = None
-    sink = get_owned_sink(chat_id) if chat_id else None
+    sink = get_active_sink(chat_id) if chat_id else None
     if run_token and sink is not None and getattr(sink, "run_token", None) == run_token:
-      # Unexpected setup/provider cancellation can bypass _complete_turn.
-      # Join only this run's writes before releasing runtime ownership.
-      sink.interrupt_write_delivery()
-      try:
-        await sink.finish_write_delivery(interrupted=True)
-      except asyncio.CancelledError as exc:
-        browser_cancelled = exc
-      except Exception:
-        _get_logger().exception("quiet-write cleanup could not persist chat_id=%s", chat_id)
+      # Unexpected setup/provider cancellation can bypass _complete_turn;
+      # release only this run's identity-keyed sink.
       unregister_active_sink(chat_id, sink)
     if chat_id and not runtime_settled:
       # Cancellation or an unexpected provider/setup exception may bypass
@@ -5038,7 +4962,6 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
-  write_failure_receipts: tuple[tuple[str, str], ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
 
@@ -5061,12 +4984,6 @@ async def _acknowledge_provider_success(
       ),
       wait_results=wait_results,
     )))
-    if write_failure_receipts:
-      from app.chat_writer import AcknowledgeAgentWriteFailures
-      await _await_ack(get_writer().submit(AcknowledgeAgentWriteFailures(
-        chat_id=chat_id, run_token=run_token,
-        reports=write_failure_receipts,
-      )))
     if wait_results:
       from app.chat_waits import (
         _broadcast_changed,
@@ -5440,6 +5357,17 @@ async def _run_chat_impl_with_db(
   from app.delegations import policy_for_chat
   run_policy = policy_for_chat(db, chat_id) if chat_row is not None else None
   provider = get_provider(provider_id)
+  # A retired session is not resumed: its own history would keep the model
+  # following a withdrawn instruction. A top-level chat starts fresh and is
+  # reseeded from its transcript, exactly as for a lost session. (A retired
+  # helper has no session pointer left, so it gets the no-replay refusal.)
+  session_retired = (
+    run_policy is None
+    and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
+    and resume_retired(db, session_id)
+  )
+  # The provider sees this turn as its first: it gets the first-turn context.
+  starts_fresh = not session_id or session_retired
   codex_native_skills_ready = False
   if provider.name == "Codex":
     try:
@@ -5489,7 +5417,7 @@ async def _run_chat_impl_with_db(
   # the command's length limit. Keep it out of the persisted prompt snapshot as
   # well, so later turns reuse the stable constitution bytes.
   startup_context = ""
-  if not session_id and run_policy is None:
+  if starts_fresh and run_policy is None:
     # `build_memory_block` is pure; the activity emit + envelope live here.
     ordered_chat_ids = recent_chat_digest_order(db)
     block = memory.build_memory_block(
@@ -5548,13 +5476,13 @@ async def _run_chat_impl_with_db(
 
   if app_context_block and run_policy is None:
     # The report BODY goes right after the </app_context> line, but only on
-    # the FIRST turn (`not session_id`): the small app-context id/path lines
+    # the FIRST turn (`starts_fresh`): the small app-context id/path lines
     # are cheap and stay per-turn, while the report body is large and
     # unchanging, so re-sending it every message would just waste the context
     # window. Compose app-context + report into one block so the report keeps
     # its place right AFTER </app_context>.
     block = app_context_block
-    if not session_id:
+    if starts_fresh:
       report_block = _build_app_report_block(db, chat_id, settings.data_dir)
       if report_block:
         block = f"{app_context_block}\n\n{report_block}"
@@ -5617,7 +5545,7 @@ async def _run_chat_impl_with_db(
     if activity_delivery.text:
       user_message = f"{activity_delivery.text}\n\n{user_message}"
 
-  if not session_id and run_policy is None:
+  if starts_fresh and run_policy is None:
     compaction_brief = _latest_compaction_brief(chat_row)
     if compaction_brief:
       block = (
@@ -5888,10 +5816,6 @@ async def _run_chat_impl_with_db(
   # the provider's path.
   from app.agent_activity_provider import resolve_agent_activity_binding
   agent_activity_binding = resolve_agent_activity_binding(db)
-  from app.agent_write_context import prepare_write_context
-  write_context = prepare_write_context(db, chat_id=chat_id, run_id=run_token or "",
-    top_level=run_policy is None, coordination_enabled=coordination_tools_enabled)
-  user_message = write_context.prompt + "\n\n" + user_message
 
   # Snapshot owner-managed MCP connections while this request session is still
   # live. Provider turns can wait for hours, so neither runner may query the
@@ -6070,8 +5994,6 @@ async def _run_chat_impl_with_db(
       run_token=run_token,
       agent_activity_binding=agent_activity_binding,
     )
-    sink.attach_write_delivery(nonce=write_context.nonce, env=base_env,
-                               eligible_tools=write_context.eligible_tools)
     register_active_sink(chat_id, sink)
     runner_result: dict = {}
     # The provider can run for hours.  Everything needed to launch it is now
@@ -6094,9 +6016,18 @@ async def _run_chat_impl_with_db(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
           provider_id=provider_id, cost_usd=0, close_browser=False,
         )
+      codex_session_id = session_id
+      if session_retired:
+        log.warning(
+          "codex session %s for chat %s is retired; "
+          "starting fresh and reseeding from DB transcript", session_id, chat_id,
+        )
+        codex_session_id = None
+        if resumed_context_fallback:
+          user_message = f"{resumed_context_fallback}\n\n{user_message}"
       runner_result = await run_codex_sdk_turn(
         user_message=user_message,
-        session_id=session_id,
+        session_id=codex_session_id,
         base_env=sdk_env,
         cwd=cwd,
         chat_id=chat_id,
@@ -6122,7 +6053,6 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
-          write_failure_receipts=write_context.failure_receipts,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -6229,9 +6159,9 @@ async def _run_chat_impl_with_db(
     claude_session_id = session_id
     # A helper on a shared host resumes through its host (or is reseeded
     # there); only a private Claude session needs a resumable transcript.
-    if helper_host_key is None and session_id and not _resumable(
+    if helper_host_key is None and session_id and (session_retired or not _resumable(
       session_id, cwd, sdk_env.get("CLAUDE_CONFIG_DIR")
-    ):
+    )):
       if run_policy is not None:
         return await _refuse_delegated_write_replay(
           bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
@@ -6239,9 +6169,10 @@ async def _run_chat_impl_with_db(
           agent_activity_binding=agent_activity_binding,
         )
       log.warning(
-        "claude session %s for chat %s has no resumable transcript; "
+        "claude session %s for chat %s is %s; "
         "starting fresh and reseeding from DB transcript",
         session_id, chat_id,
+        "retired" if session_retired else "not resumable",
       )
       resumed_block = resumed_context_fallback
       if resumed_block:
@@ -6257,8 +6188,6 @@ async def _run_chat_impl_with_db(
       run_token=run_token,
       agent_activity_binding=agent_activity_binding,
     )
-    sink.attach_write_delivery(nonce=write_context.nonce, env=base_env,
-                               eligible_tools=write_context.eligible_tools)
     register_active_sink(chat_id, sink)
     # As in the Codex path, do not pin a pooled connection while the provider
     # is thinking or waiting for user input.  Resume fallback has already
@@ -6317,7 +6246,6 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
-          write_failure_receipts=write_context.failure_receipts,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

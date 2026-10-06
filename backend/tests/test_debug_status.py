@@ -83,17 +83,6 @@ def test_debug_status_shape_matches_golden(client, auth):
   assert payload == expected
 
 
-def test_debug_status_surfaces_media_migration_failure(client, auth):
-  client.app.state.media_migration_failed = True
-  try:
-    response = client.get("/api/debug/status", headers=auth)
-  finally:
-    client.app.state.media_migration_failed = False
-
-  assert response.status_code == 200
-  assert response.json()["media_migration_failed"] is True
-
-
 def test_debug_memory_report_is_authenticated_and_bounded(client, auth):
   assert client.get("/api/debug/memory").status_code == 401
 

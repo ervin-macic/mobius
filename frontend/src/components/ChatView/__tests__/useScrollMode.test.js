@@ -342,7 +342,7 @@ test('expanding a historical disclosure holds its header instead of dragging to 
   }
   const disclosure = {
     closest(selector) {
-      if (selector === '[data-active-assistant="true"]') return null
+      if (selector === '[data-current-response="true"]') return null
       return row
     },
   }
@@ -397,7 +397,7 @@ test('expanding the live assistant at the physical tail preserves follow', () =>
   }
   const disclosure = {
     closest(selector) {
-      if (selector === '[data-active-assistant="true"]') return liveRow
+      if (selector === '[data-current-response="true"]') return liveRow
       if (selector.startsWith('button.chat__')) return this
       if (selector === '.chat__msg[data-key]') return liveRow
       return null
@@ -428,6 +428,29 @@ test('expanding the live assistant at the physical tail preserves follow', () =>
     }),
     { kind: 'ANCHOR_AT', key: 'assistant-live', offset: -300 },
     'a stale follow mode away from the physical tail cannot regain follow',
+  )
+})
+
+test('live activity presented in an earlier row of the active reply preserves follow', () => {
+  // A hidden helper delivery joins the live tools onto an earlier source row.
+  // That row is not the streaming one, but it is still the current response.
+  const earlierRow = { dataset: { key: 'run:assistant:1' }, offsetTop: 900, offsetHeight: 300 }
+  const reply = { dataset: { currentResponse: 'true' } }
+  const disclosure = {
+    closest(selector) {
+      if (selector === '[data-current-response="true"]') return reply
+      if (selector === '[data-active-assistant="true"]') return null
+      if (selector.startsWith('button.chat__')) return this
+      if (selector === '.chat__msg[data-key]') return earlierRow
+      return null
+    },
+  }
+  const follow = { kind: 'FOLLOW_BOTTOM' }
+  const atTail = { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600, querySelectorAll: () => [earlierRow] }
+  assert.equal(
+    modeForDisclosureToggle(atTail, follow, { target: disclosure, nextOpen: true }),
+    follow,
+    'opening the live header after a hidden delivery keeps live-tail follow',
   )
 })
 

@@ -346,6 +346,42 @@ def test_park_exit_non_limit_error_stays_plain():
   assert sink.events[-1] == {"type": "error", "message": "syntax error"}
 
 
+@pytest.mark.parametrize("error", [
+  "quota exceeded",
+  "model overloaded, try again",
+  "You've hit your weekly limit · resets 1:40am",
+])
+def test_park_exit_parks_on_shared_usage_limit_kind(error):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {"error": error}, error)["parked"] is True
+
+
+@pytest.mark.parametrize("error", [
+  # Out of credits does not reset by itself, even when it mentions a quota.
+  "insufficient_quota: You exceeded your current quota",
+  "Credit balance is too low",
+  # A request id that happens to contain 429 is not a rate limit.
+  "request id req_14290 failed",
+])
+def test_park_exit_does_not_park_non_limits(error):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {"error": error}, error) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": error}
+
+
+@pytest.mark.parametrize("error", [
+  "payload too large",
+  "unexpected status 413 Payload Too Large",
+  "context_length_exceeded",
+  "request_body_too_large",
+])
+def test_park_exit_treats_shared_size_refusals_as_oversized(error):
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, {"error": error}, error)
+  assert kwargs == {"parked": False, "oversized": True}
+  assert "too large to send" in sink.events[-1]["message"]
+
+
 @pytest.mark.parametrize("runner_result", [
   None,
   {},

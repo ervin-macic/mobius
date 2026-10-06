@@ -75,6 +75,25 @@ def _delete(client, auth, db, resource):
   return receipt
 
 
+def test_dismissing_a_deletion_notice_keeps_the_resource_recoverable(client, auth, db, resource):
+  """One × removes only the receipt; the chat, app or project stays recoverable."""
+  kind, row, url = resource
+  receipt = _delete(client, auth, db, resource)
+  receipt_id = receipt.id
+  deleted_at = row.deleted_at
+  response = client.delete(f"/api/notifications/{receipt_id}", headers=auth)
+  assert response.status_code == 200, response.text
+  assert response.json() == {"deleted": 1}
+  db.expire_all()
+  assert db.get(models.Notification, receipt_id) is None
+  assert db.get(type(row), row.id).deleted_at == deleted_at
+  assert all(n["id"] != receipt_id for n in client.get("/api/notifications", headers=auth).json())
+  recovered = client.post(f"{url}/recover", headers=auth)
+  assert recovered.status_code == 200, recovered.text
+  db.expire_all()
+  assert db.get(type(row), row.id).deleted_at is None
+
+
 @pytest.mark.parametrize("resource", ["app"], indirect=True)
 def test_app_receipt_uses_the_app_lifecycle_expiry(
   client, auth, db, resource, monkeypatch,

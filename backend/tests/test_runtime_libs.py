@@ -7,17 +7,21 @@ would work online and fail on a cold offline load.
 """
 
 import json
+import math
+import re
 import subprocess
 from pathlib import Path
 
 from app.app_compile_contract import (
   BUNDLED_RUNTIME_LIBS,
+  COMPILED_MODULE_MAX_BYTES,
   COMPILED_RUNTIME_ABI,
   COMPILED_RUNTIME_ARTIFACT_REVISION,
   COMPILED_RUNTIME_BANNER,
   ROLLDOWN_TIMEOUT_SECS,
   mobius_runtime_path,
   rolldown_command,
+  rolldown_report_contract_error,
   rolldown_runner_path,
   runtime_library_aliases,
   runtime_inject_path,
@@ -51,6 +55,7 @@ STANDALONE_APP = (
   / "StandaloneApp.jsx"
 )
 INJECT = REPO_ROOT / "backend" / "app" / "app_runtime_inject.js"
+MODULE_BROKER = REPO_ROOT / "frontend" / "src" / "lib" / "appModuleBroker.js"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 
 
@@ -137,6 +142,8 @@ export default function NamedFixture() {
   ]
   assert len(entry_outputs) == 1
   assert entry_outputs[0].get("imports") == []
+  # The size the contract checks is exactly the module the shell downloads.
+  assert entry_outputs[0]["bytes"] == output.stat().st_size
   assert output.stat().st_size < 400_000
   compiled = output.read_text()
   assert compiled.startswith(COMPILED_RUNTIME_BANNER)
@@ -290,6 +297,29 @@ def test_compiler_and_shared_frame_agree_on_runtime_abi():
     f"artifact-revision:{COMPILED_RUNTIME_ARTIFACT_REVISION}"
     in COMPILED_RUNTIME_BANNER
   )
+
+
+def test_compiler_refuses_modules_the_shell_would_not_load():
+  """Install, apply and validation all compile through this contract, so a
+  bundle the shell's loader would refuse fails there, with a reason."""
+  declared = re.search(
+    r"export const APP_MODULE_MAX_BYTES = ([\d *]+)\n", MODULE_BROKER.read_text(),
+  )
+  assert declared
+  assert math.prod(int(n) for n in declared.group(1).split("*")) == (
+    COMPILED_MODULE_MAX_BYTES
+  )
+
+  def report(size):
+    return {"outputs": [{
+      "type": "chunk", "isEntry": True, "exports": ["default"],
+      "imports": [], "dynamicImports": [], "bytes": size,
+    }]}
+
+  assert rolldown_report_contract_error(report(COMPILED_MODULE_MAX_BYTES)) is None
+  error = rolldown_report_contract_error(report(COMPILED_MODULE_MAX_BYTES + 1))
+  assert "the shell can load" in error
+  assert "static_assets" in error
 
 
 def test_codemirror_direct_imports_remain_supported():

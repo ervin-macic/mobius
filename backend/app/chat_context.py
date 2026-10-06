@@ -501,6 +501,21 @@ def _latest_compaction_brief(chat_row) -> str | None:
 _RESUME_CONTEXT_CHAR_BUDGET = 12000
 
 
+# Retired quiet-write frames that leaked into saved replies. A reseeded session
+# must not see itself writing them, or it keeps copying the withdrawn protocol.
+_WRITE_FRAME = re.compile(
+  r"<MOBIUS_WRITE\b[^>]*/>"  # A self-closing tag.
+  r"|<MOBIUS_WRITE\b[^>]*>.*?</MOBIUS_WRITE>"  # A complete frame.
+  r"|<MOBIUS_WRITE\b[^>]*>\s*\{(?:(?!\n[ \t]*\n).)*"  # An unclosed one, to its paragraph end.
+  r"|</?MOBIUS_WRITE\b[^>]*>",  # Any stray tag.
+  re.DOTALL,
+)
+
+
+def _without_write_frames(text: str) -> str:
+  return _WRITE_FRAME.sub("", text) if "MOBIUS_WRITE" in text else text
+
+
 def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
   """Compact prior-transcript block for a chat whose provider session is gone.
 
@@ -536,6 +551,10 @@ def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
     content = msg.get("content")
     if not isinstance(content, str) or not content.strip():
       continue
+    if role == "assistant":
+      content = _without_write_frames(content)
+      if not content.strip():
+        continue
     if is_continuation_message(msg):
       speaker = continuation_actor_label(msg)
     else:

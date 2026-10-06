@@ -19,7 +19,6 @@ from app.deps import (
   Principal, get_principal, get_owner_or_app_with_connect_manage,
   require_installation_owner_control, reject_cross_site,
 )
-from app.timeutil import now_naive_utc
 
 router = APIRouter(prefix="/api/connect/browser-access", tags=["connect"])
 _limiter = Limiter(key_func=get_remote_address)
@@ -339,47 +338,12 @@ async def revoke_browser_access(
   return JSONResponse(body, status_code=202, headers=_NO_STORE)
 
 
-# ── Link invitations (one-time secret; no mobius.you account needed) ──
-
-
-class InviteRequest(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-  label: str = Field(min_length=1, max_length=128)
+# ── Link invitations (retired; redemption of already-issued links only) ──
 
 
 class RedeemRequest(BaseModel):
   model_config = ConfigDict(extra="forbid")
   invite: str = Field(min_length=20, max_length=256)
-
-
-def _invitation_response(db: Session, origin: str, grant, secret: str, expires_at) -> JSONResponse:
-  return JSONResponse({
-    "grant": _grant_view(db, grant),
-    "join_url": origin + "/shell/shared#invite=" + secret,
-    "invite_expires_at": expires_at.isoformat() + "Z",
-  }, headers=_SECRET_HEADERS)
-
-
-@router.post("", dependencies=[Depends(reject_cross_site)])
-def invite_browser_recipient(
-  body: InviteRequest, owner: models.Owner = Depends(_manager), db: Session = Depends(get_db),
-):
-  origin = access.runtime_origin()
-  label = body.label.strip()
-  if not label:
-    raise HTTPException(422, "Enter a name for this recipient.")
-  grant, secret = access.create_invitation(db, owner, label)
-  return _invitation_response(db, origin, grant, secret, grant.created_at + access.INVITATION_TTL)
-
-
-@router.post("/{grant_id}/invitation", dependencies=[Depends(reject_cross_site)])
-def reissue_browser_invitation(
-  grant_id: str, owner: models.Owner = Depends(_manager), db: Session = Depends(get_db),
-):
-  origin = access.runtime_origin()
-  secret = access.reissue_invitation(db, owner, grant_id)
-  grant = db.get(access.BrowserAccessGrant, grant_id)
-  return _invitation_response(db, origin, grant, secret, now_naive_utc() + access.INVITATION_TTL)
 
 
 @router.post("/session/redeem")

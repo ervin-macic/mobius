@@ -15,9 +15,9 @@ from app import chat_event_sink
 from app import models
 from app.broadcast import ChatBroadcast
 from app.chat_event_sink import ChatEventSink
-from app.chat_media import fix_forward_chat_media
 from app.chat_retention import purge_expired_chat_tombstones
 from app.config import get_settings
+from app.schema_migrations import _move_chat_media_out_of_generated
 from app.agent_activity import EMPTY_AGENT_ACTIVITY_BINDING
 
 
@@ -760,7 +760,7 @@ def test_deliverables_namespace_survives_legacy_media_fix_forward(db, chat):
   stored_name = _stored_file(chat, content=b"stable")
   _write_row(db, chat, name="report.pdf", path=stored_name)
 
-  assert fix_forward_chat_media(db, settings.data_dir) == 0
+  _move_chat_media_out_of_generated(db.get_bind())
   assert (
     gf.stored_dir(settings.data_dir, chat.id) / stored_name
   ).read_bytes() == b"stable"

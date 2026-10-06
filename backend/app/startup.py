@@ -20,7 +20,6 @@ from app.storage_io import atomic_write
 
 
 class StartupState(Protocol):
-  media_migration_failed: bool
   reconciliation_failed: bool
 
 
@@ -326,18 +325,6 @@ def _backfill_prompt_snapshots(context: StartupContext) -> None:
       "captured system prompt snapshots for %s existing chats",
       count,
     )
-
-
-def _fix_forward_chat_media(context: StartupContext) -> None:
-  from app.chat_media import fix_forward_chat_media
-
-  context.app.state.media_migration_failed = False
-  try:
-    with SessionLocal() as db:
-      fix_forward_chat_media(db, context.settings.data_dir)
-  except Exception:
-    context.app.state.media_migration_failed = True
-    raise
 
 
 def _read_restart_authorization(context: StartupContext) -> None:
@@ -696,7 +683,6 @@ DATABASE_STARTUP_TASKS = (
   StartupTask("purge expired chat tombstones", _purge_expired_chats),
   StartupTask("backfill session links", _backfill_session_links),
   StartupTask("backfill prompt snapshots", _backfill_prompt_snapshots),
-  StartupTask("fix forward chat media", _fix_forward_chat_media),
   # A checkout that cannot be placed relative to its update must not resume
   # work (images without the boot transaction reach this path).
   StartupTask(

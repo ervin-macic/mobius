@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   SHELL_SHORTCUTS,
   SHORTCUT_OVERRIDES_STORAGE_KEY,
+  appFrameShortcutBindings,
   findShellShortcut,
   frameShortcutBindings,
   readShortcutOverrides,
@@ -31,6 +32,13 @@ test('search uses the conventional Cmd/Ctrl+K chord without stealing variants', 
   assert.equal(shortcutMatches({ ctrlKey: true, altKey: true, key: 'k' }, shortcut), false)
   assert.equal(shortcutMatches({ key: 'k' }, shortcut), false)
   assert.equal(shortcutMatches({ metaKey: true, key: 'k', repeat: true }, shortcut), false)
+})
+
+test('AltGr never matches a Ctrl+Alt binding', () => {
+  const binding = { key: '2', mod: true, alt: true }
+  const event = { ctrlKey: true, altKey: true, key: '2' }
+  assert.equal(shortcutMatches(event, binding), true)
+  assert.equal(shortcutMatches({ ...event, getModifierState: state => state === 'AltGraph' }, binding), false)
 })
 
 test('keyboard help uses Cmd/Ctrl+slash as a separate shell surface', () => {
@@ -161,4 +169,16 @@ test('shortcut labels adapt to the owner platform', () => {
   assert.equal(shortcutLabel(SHELL_SHORTCUTS.toggleBuilder, 'MacIntel'), '⇧↵')
   assert.equal(shortcutLabel(SHELL_SHORTCUTS.toggleBuilder, 'Linux x86_64'), 'Shift+Enter')
   assert.equal(shortcutLabel({ key: ',', mod: true }, 'MacIntel'), '⌘,')
+})
+
+test('every app frame receives shell chords unless its manifest opts out', () => {
+  const bindings = [{ actionId: 'search.open', binding: SHELL_SHORTCUTS.openSearch }]
+  assert.equal(appFrameShortcutBindings({ shell_shortcuts: true }, bindings), bindings)
+  assert.equal(appFrameShortcutBindings({}, bindings), bindings)
+  assert.deepEqual(appFrameShortcutBindings({ shell_shortcuts: false }, bindings), [])
+  assert.equal(
+    appFrameShortcutBindings({ shell_shortcuts: false }, bindings),
+    appFrameShortcutBindings({ shell_shortcuts: false }, []),
+    'the opted-out list is stable so the frame is not re-sent every render',
+  )
 })

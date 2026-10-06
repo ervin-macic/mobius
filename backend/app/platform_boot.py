@@ -21,13 +21,79 @@ decides whether served source may run on it:
 
 A nonzero exit means this image cannot establish a state it may serve from
 ``/data/platform``; the entrypoint then refuses to serve that tree.
+
+Every run is also appended to ``BOOT_LOG``. The container's console is outside
+the app container, so this durable record is the only place an agent repairing
+the platform can read why a boot transaction failed.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+BOOT_LOG = Path("/data/logs/platform-boot.jsonl")
+_BOOT_LOG_RECORDS = 200
+_STDERR_CHARS = 2000
+
+
+def failure_detail(exc: BaseException) -> str:
+  """The exception, plus the stderr of every failed command in its chain.
+
+  ``CalledProcessError``'s repr names only the exit code and argv; Git's
+  explanation ("Entry … not uptodate. Cannot merge.") is in its stderr.
+  """
+  parts = [repr(exc)]
+  seen: set[int] = set()
+  current: BaseException | None = exc
+  while current is not None and id(current) not in seen:
+    seen.add(id(current))
+    if isinstance(current, subprocess.CalledProcessError):
+      stderr = current.stderr
+      if isinstance(stderr, bytes):
+        stderr = os.fsdecode(stderr)
+      stderr = (stderr or "").strip()
+      if stderr:
+        parts.append(f"stderr: {stderr[-_STDERR_CHARS:]}")
+    current = current.__cause__ or current.__context__
+  return "; ".join(parts)
+
+
+def record_boot_run(command: str, *, ok: bool, detail: str, log: Path | None = None) -> None:
+  """Append this run to the bounded boot log; never fails the boot.
+
+  The log is diagnostics on the boot's critical path: a run that settled the
+  platform must not exit nonzero because its record could not be written, or
+  every later boot would refuse to start on the same file. Earlier lines are
+  read leniently, so a damaged byte ages out instead of stopping the log.
+  """
+  log = log or BOOT_LOG
+  record = {
+    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "boot_id": os.environ.get("MOBIUS_BOOT_ID"),
+    "command": command,
+    "ok": ok,
+    "detail": detail,
+  }
+  staged = log.with_name(f".{log.name}.{os.getpid()}.tmp")
+  try:
+    lines = (
+      log.read_text(encoding="utf-8", errors="replace").splitlines()
+      if log.exists() else []
+    )
+    lines = [*lines[-(_BOOT_LOG_RECORDS - 1):], json.dumps(record)]
+    staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(staged, log)
+  except Exception as exc:  # noqa: BLE001 - recording must never fail the boot
+    with contextlib.suppress(OSError):
+      staged.unlink(missing_ok=True)
+    print(f"platform boot: could not record this run in {log}: {exc!r}", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -53,14 +119,18 @@ def main(argv: list[str]) -> int:
     elif command == "revert":
       if not platform_update.revert_failed_update(repo):
         print("platform boot revert: no swapped-in update to revert", file=sys.stderr)
+        record_boot_run(command, ok=False, detail="no swapped-in update to revert")
         return 1
       outcome = "reverted"
     else:
       outcome = platform_update.boot_guard_sync()
   except Exception as exc:  # noqa: BLE001 - any failure must refuse the tree
-    print(f"platform boot {command} failed: {exc!r}", file=sys.stderr)
+    detail = failure_detail(exc)
+    print(f"platform boot {command} failed: {detail}", file=sys.stderr)
+    record_boot_run(command, ok=False, detail=detail)
     return 1
   print(f"platform boot {command}: {outcome}")
+  record_boot_run(command, ok=True, detail=str(outcome))
   return 0
 
 

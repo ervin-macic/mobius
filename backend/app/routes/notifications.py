@@ -311,7 +311,11 @@ def dismiss_notification(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Delete one ordinary notification without removing an Undo receipt."""
+  """Delete one notification the owner chose to dismiss.
+
+  Recovery receipts are dismissible too: the deleted chat, app or project stays
+  recoverable through its own recover route until its lifecycle window ends.
+  """
   notification = (
     db.query(models.Notification)
     .filter(
@@ -322,12 +326,6 @@ def dismiss_notification(
   )
   if notification is None:
     raise HTTPException(status_code=404, detail="Notification not found.")
-  actions = notification.actions if isinstance(notification.actions, list) else []
-  if any(_is_recovery_action(action) for action in actions):
-    raise HTTPException(
-      status_code=409,
-      detail="Undo notifications cannot be dismissed individually.",
-    )
   db.delete(notification)
   db.commit()
   return {"deleted": 1}

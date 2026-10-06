@@ -196,7 +196,6 @@ def _app_repo(tmp_path, *, source="export default function App(){return null}"):
     "description": "A test.",
     "version": "1.0.0",
     "entry": "index.jsx",
-    "source_files": ["index.jsx"],
   }))
   (repo / "index.jsx").write_text(source)
   _git(repo, "add", "mobius.json", "index.jsx")
@@ -252,12 +251,53 @@ def test_snapshot_rejects_tracked_environment_files(tmp_path):
 
 def test_snapshot_enforces_the_host_release_size_limit(tmp_path, monkeypatch):
   repo, app, _ = _app_repo(tmp_path, source="export default 1")
-  monkeypatch.setattr("app.community_publish.MAX_SOURCE_BYTES", 1)
+  monkeypatch.setattr("app.community_publish.PACKAGE_MAX_BYTES", 1)
 
   with pytest.raises(CommunityPublicationError) as raised:
     build_public_snapshot(app)
 
   assert raised.value.code == "payload_too_large"
+
+
+def test_snapshot_bounds_what_install_writes_not_only_the_tree(
+  tmp_path, monkeypatch,
+):
+  """Install writes every static-asset destination separately, so pointing
+  many destinations at one file must not let an accepted snapshot fail to
+  install. Publication bounds the same declared sum install charges."""
+  repo, app, _ = _app_repo(tmp_path)
+  manifest = json.loads((repo / "mobius.json").read_text())
+  manifest["static_assets"] = {f"copy-{n}.bin": "data.bin" for n in range(8)}
+  (repo / "mobius.json").write_text(json.dumps(manifest))
+  (repo / "data.bin").write_bytes(b"x" * 1000)
+  _git(repo, "add", "mobius.json", "data.bin")
+  _git(repo, "commit", "-m", "fan out one file")
+  app.source_commit = _git(repo, "rev-parse", "HEAD")
+  tree_bytes = sum(
+    len(path.read_bytes()) for path in repo.iterdir() if path.is_file()
+  )
+  monkeypatch.setattr("app.community_publish.PACKAGE_MAX_BYTES", tree_bytes + 1000)
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "payload_too_large"
+  assert "declares" in raised.value.detail
+
+
+def test_snapshot_refuses_a_manifest_install_would_refuse(tmp_path):
+  repo, app, _ = _app_repo(tmp_path)
+  manifest = json.loads((repo / "mobius.json").read_text())
+  manifest["source_files"] = ["index.jsx"]
+  (repo / "mobius.json").write_text(json.dumps(manifest))
+  _git(repo, "add", "mobius.json")
+  _git(repo, "commit", "-m", "entry listed as a module")
+  app.source_commit = _git(repo, "rev-parse", "HEAD")
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "invalid_manifest"
 
 
 def test_snapshot_rejects_symlink_instead_of_following_it(tmp_path):

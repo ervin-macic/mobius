@@ -29,7 +29,9 @@ class _FakeTimer:
     self.started = True
 
 
-def _write_probe_fixture(root: Path, *, broken: bool) -> None:
+def _write_probe_fixture(
+  root: Path, *, broken: bool, selftest: str | None = None,
+) -> None:
   app = root / "backend" / "app"
   routes = app / "routes"
   routes.mkdir(parents=True, exist_ok=True)
@@ -44,6 +46,11 @@ def _write_probe_fixture(root: Path, *, broken: bool) -> None:
     f"  {verdict}\n",
     encoding="utf-8",
   )
+  selftest_path = app / "startup_selftest.py"
+  if selftest is None:
+    selftest_path.unlink(missing_ok=True)
+  else:
+    selftest_path.write_text(selftest, encoding="utf-8")
 
 
 def test_restart_source_validation_matches_the_boot_router_verdict(
@@ -60,6 +67,49 @@ def test_restart_source_validation_matches_the_boot_router_verdict(
     raise AssertionError("broken router verdict was accepted")
 
   _write_probe_fixture(tmp_path, broken=False)
+  ru.validate_restart_source()
+
+
+def test_restart_source_validation_rejects_a_failing_startup_selftest(
+  monkeypatch, tmp_path,
+):
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path))
+  _write_probe_fixture(tmp_path, broken=False, selftest=(
+    "import app.main\nraise RuntimeError('provider resolution broke')\n"
+  ))
+
+  try:
+    ru.validate_restart_source()
+  except ru.RestartSourceInvalid as exc:
+    assert "provider resolution broke" in str(exc)
+  else:
+    raise AssertionError("failing startup selftest was accepted")
+
+
+def test_restart_source_validation_runs_the_router_verdict_after_the_selftest(
+  monkeypatch, tmp_path,
+):
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path))
+  _write_probe_fixture(tmp_path, broken=True, selftest="import app.main\n")
+
+  try:
+    ru.validate_restart_source()
+  except ru.RestartSourceInvalid as exc:
+    assert "dangling restart contract" in str(exc)
+  else:
+    raise AssertionError("broken router verdict was accepted")
+
+
+def test_restart_source_without_selftest_gets_import_only_validation(
+  monkeypatch, tmp_path,
+):
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path))
+  _write_probe_fixture(tmp_path, broken=False)
+  # Not imported by app.main: only a present selftest would reach it.
+  (tmp_path / "backend/app/providers.py").write_text(
+    "raise RuntimeError('not part of import-only')\n", encoding="utf-8",
+  )
+
   ru.validate_restart_source()
 
 

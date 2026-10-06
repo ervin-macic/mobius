@@ -403,3 +403,28 @@ test('grouped replies carry authoritative manual recovery to their existing acti
     assert.doesNotMatch(manual, /will continue automatically|Trying again shortly/)
   }
 })
+
+test('live tools joined into an earlier row stay inside the marked current response', () => {
+  const tool = (id, status = 'done') => ({ type: 'tool', tool: 'Bash', input: `echo ${id}`, tool_use_id: id, status })
+  const first = { role: 'assistant', id: 'rt-join:assistant:1', blocks: [tool('inspect')], ts: 2 }
+  const next = { role: 'assistant', id: 'rt-join:assistant:2', blocks: [], ts: 4 }
+  const group = assistantReplyGroups([
+    first,
+    { role: 'user', hidden: true, steered: true, kind: 'delegation_result', source_work_id: 'goal-root', ts: 3 },
+    next,
+  ]).get(0)
+  assert.equal(group.rows.length, 2)
+  const props = { replyGroup: group, activeMirrorMsg: next, activitySourceBlocks: [], useDbActivePayload: false,
+    hasLivePayload: true, streamItems: [tool('continue', 'running')], chatId: 'chat', isStreaming: true }
+  const html = render(Active, { ...props, activeRowIndex: 1 }, { tools: new Map(), positions: new Map() })
+  const reply = html.indexOf('data-current-response="true"')
+  const earlierRow = html.indexOf('data-key="rt-join:assistant:1"')
+  assert.ok(reply >= 0 && reply < earlierRow, 'the active reply as a whole is the current response')
+  assert.doesNotMatch(html.slice(earlierRow, html.indexOf('>', earlierRow)), /data-active-assistant/)
+  const live = html.indexOf('in progress"')
+  assert.ok(live > earlierRow && live < html.indexOf('data-active-assistant="true"'),
+    'the live activity header is presented in the earlier, unmarked row')
+  const settled = render(Active, { ...props, activeRowIndex: -1, useDbActivePayload: true, hasLivePayload: false, isStreaming: false },
+    { tools: new Map(), positions: new Map() })
+  assert.doesNotMatch(settled, /data-current-response/)
+})

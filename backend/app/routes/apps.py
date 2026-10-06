@@ -874,6 +874,7 @@ async def install_app(
     share_with_apps=app.share_with_apps,
     offline_capable=app.offline_capable,
     embeds_agent=app.embeds_agent,
+    shell_shortcuts=app.shell_shortcuts,
     manage_apps=app.manage_apps,
     github_access=app.github_access,
     manage_skills=app.manage_skills,

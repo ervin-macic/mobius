@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -33,7 +34,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +49,7 @@ from app import (
   activity,
   app_git,
   app_python_env,
+  applied_app_runtime,
   data_git,
   drawer_pins,
   fs_locks,
@@ -68,20 +69,13 @@ from app.compiler import (
 )
 from app.config import get_settings
 from app.manifest_contract import (
-  ENTRY_MAX_BYTES as _CONTRACT_ENTRY_MAX_BYTES,
-  ICON_MAX_BYTES as _CONTRACT_ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
-  SEED_MAX_BYTES as _CONTRACT_SEED_MAX_BYTES,
-  SEEDS_COUNT_MAX as _CONTRACT_SEEDS_COUNT_MAX,
-  SEEDS_TOTAL_MAX as _CONTRACT_SEEDS_TOTAL_MAX,
+  PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
   SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
-  SOURCE_FILES_TOTAL_MAX as _CONTRACT_SOURCE_FILES_TOTAL_MAX,
-  STATIC_ASSET_MAX_BYTES as _CONTRACT_STATIC_ASSET_MAX_BYTES,
-  STATIC_ASSETS_COUNT_MAX as _CONTRACT_STATIC_ASSETS_COUNT_MAX,
-  STATIC_ASSETS_TOTAL_MAX as _CONTRACT_STATIC_ASSETS_TOTAL_MAX,
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
+  package_bytes,
   python_lock,
   skill_member_paths,
   static_asset_entries,
@@ -137,13 +131,9 @@ def _publish_install_bundle(
 # the safety net against malicious URLs streaming GB of data.
 _MANIFEST_MAX_BYTES = _CONTRACT_MANIFEST_MAX_BYTES
 
-# Entry JSX cap. Real apps run 5-50 KB; 1 MB is enough headroom for
-# anything reasonable while bounding worst-case install cost.
-_ENTRY_MAX_BYTES = _CONTRACT_ENTRY_MAX_BYTES
-
-# Seed file cap (per file). Storage seeds are prompts, default
-# configs, sample images — never huge.
-_SEED_MAX_BYTES = _CONTRACT_SEED_MAX_BYTES
+# Total bytes one install may download for every file the manifest declares.
+# See `manifest_contract.PACKAGE_MAX_BYTES`; `_PackageDownload` enforces it.
+_PACKAGE_MAX_BYTES = _CONTRACT_PACKAGE_MAX_BYTES
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -189,28 +179,13 @@ def _compile_error_detail(app_name: str, exc: CompileError) -> str:
   return f"{app_name} failed to compile: {detail}"
 
 
-# Aggregate caps across ALL seeds in one manifest. The per-file cap alone
-# leaves the total unbounded (a manifest can list many seeds), so a small
-# manifest could still force large memory growth holding them all (Codex
-# review round-10 #6). These bound the count and the summed bytes.
-_SEEDS_COUNT_MAX = _CONTRACT_SEEDS_COUNT_MAX
-_SEEDS_TOTAL_MAX = _CONTRACT_SEEDS_TOTAL_MAX
-
 # Static site assets declared by a manifest. These are for prebuilt apps that
 # need durable files below /data/apps/<slug>/static (served at /app-assets/...),
 # not one-off files dropped into the platform frontend.
-_STATIC_ASSET_MAX_BYTES = _CONTRACT_STATIC_ASSET_MAX_BYTES
-_STATIC_ASSETS_COUNT_MAX = _CONTRACT_STATIC_ASSETS_COUNT_MAX
-_STATIC_ASSETS_TOTAL_MAX = _CONTRACT_STATIC_ASSETS_TOTAL_MAX
 _STATIC_ASSETS_MANIFEST = managed_paths.STATIC_ASSETS_MANIFEST
 _STATIC_ASSETS_BACKUP_ASSET_PREFIX = "assets"
 _STATIC_ASSETS_BACKUP_METADATA_PREFIX = "metadata"
 _PENDING_UPDATE_DIR = "mobius-pending-update"
-
-# Sibling source modules a multi-file mini-app declares alongside `entry`
-# (`cards.js`, `utils.js`, …) so Rolldown can bundle the import graph. The shared
-# manifest contract bounds the list by bytes; fetch caps per-file and summed bytes.
-_SOURCE_FILES_TOTAL_MAX = _CONTRACT_SOURCE_FILES_TOTAL_MAX
 
 # Shared skill files an app declares via manifest `skills`: a root-level
 # `<id>.md` or a `<id>/` folder (SKILL.md + sibling markdown) whose
@@ -259,9 +234,6 @@ def _prune_empty_skill_folder(root: Path, rel: str) -> None:
 # time). Excluding these keeps the source-write loop from rewriting an
 # install-managed artifact a clean merge happened to carry on `main`.
 _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
-
-# Icon cap matches the icon-upload route's 12 MB ceiling.
-_ICON_MAX_BYTES = _CONTRACT_ICON_MAX_BYTES
 
 _HTTP_TIMEOUT = 15.0
 
@@ -865,6 +837,45 @@ async def _http_get(
   # Recurse outside the stream context so the previous connection is
   # already released by the time we open the next one.
   return await _http_get(client, next_url, max_bytes, _hops + 1)
+
+
+class _PackageDownload:
+  """Read one app package's declared files under `_PACKAGE_MAX_BYTES`.
+
+  Every read is one declaration and is charged in full, exactly as
+  `manifest_contract.package_bytes` counts them, because each declaration is
+  written separately. A file declared more than once is downloaded once, and
+  a first download stops streaming the moment it would cross the bound.
+  """
+
+  def __init__(self, client: httpx.AsyncClient, raw_base: str) -> None:
+    self._client = client
+    self._raw_base = raw_base
+    self._files: dict[str, bytes] = {}
+    self._total = 0
+
+  def _over_limit(self, rel: str) -> HTTPException:
+    return HTTPException(
+      413,
+      f"This app is larger than the {_PACKAGE_MAX_BYTES // (1024 * 1024)} "
+      f"MiB app package limit (reached while downloading {rel}).",
+    )
+
+  async def read(self, rel: str) -> bytes:
+    remaining = _PACKAGE_MAX_BYTES - self._total
+    data = self._files.get(rel)
+    if data is None:
+      try:
+        data = await _http_get(self._client, self._raw_base + rel, remaining)
+      except HTTPException as exc:
+        if exc.status_code != 413:
+          raise
+        raise self._over_limit(rel) from exc
+      self._files[rel] = data
+    elif len(data) > remaining:
+      raise self._over_limit(rel)
+    self._total += len(data)
+    return data
 
 
 async def _resolve_source_identity(
@@ -1481,6 +1492,12 @@ class PackageContentError(ValueError):
 def _package_input_bytes(value: PackageContentBytes) -> bytes:
   # Parsing manifest/icon/job syntax requires bytes; opaque assets do not.
   return value.read_bytes() if isinstance(value, app_git.GitTreeBlob) else value
+
+
+def _package_input_size(value: PackageContentBytes | None) -> int:
+  if value is None:
+    return 0
+  return value.size if isinstance(value, app_git.GitTreeBlob) else len(value)
 
 
 def package_content_digest_from_tree(
@@ -2276,91 +2293,6 @@ def _check_source_completeness(
     )
 
 
-@dataclass
-class FetchedUpstream:
-  """The manifest + source bytes install would record, fetched read-only.
-
-  `source_files` and `job_bytes` mirror what `install_from_manifest` records on
-  the per-app `upstream` branch — canonical ``index.jsx``, its declared sibling
-  modules, and the schedule job script."""
-  manifest: dict
-  entry_bytes: bytes
-  source_files: dict[str, bytes]
-  job_name: str | None
-  job_bytes: bytes | None
-
-
-async def fetch_upstream_source(
-  manifest_url: str, *, strict: bool = True,
-) -> FetchedUpstream:
-  """Fetch a manifest and its source files read-only — no install, DB, or git.
-
-  The read-only twin of `install_from_manifest`'s fetch phase: GET the manifest
-  at `manifest_url`, then the entry JSX, every declared `source_files` sibling,
-  and the schedule job script — exactly the files install records on the
-  per-app `upstream` branch. Reuses the same `_http_get` (SSRF-validated,
-  size-capped, manual-redirect) source requests that install uses, so
-  the fetched bytes match install's byte-for-byte and a later content compare
-  against the recorded upstream tree is apples-to-apples.
-
-  Storage seeds, static assets, and the icon are deliberately NOT fetched: none
-  of them are tracked source (seeds land in the id-keyed storage tree, static
-  assets under gitignored `static/`, the icon as a processed PNG), so they never
-  appear on the `upstream` branch an update-check compares against.
-
-  Raises HTTPException on any fetch or validation failure. The caller decides
-  whether that is a hard error or a degrade-to-unknown.
-
-  By default, the full install contract applies. Only passive update detection
-  passes ``strict=False`` to ignore installation-only metadata; identity and
-  source validation remain shared with install."""
-  # follow_redirects=False — _http_get walks the chain manually so every hop is
-  # re-validated against SSRF, matching install_from_manifest's client setup.
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT, follow_redirects=False,
-  ) as cli:
-    raw = await _http_get(cli, manifest_url, _MANIFEST_MAX_BYTES)
-    try:
-      manifest = json.loads(raw)
-    except json.JSONDecodeError as exc:
-      raise HTTPException(400, f"Manifest is not valid JSON: {exc}")
-    if strict:
-      _validate_manifest(manifest)
-    else:
-      _validate_discovery_manifest(manifest)
-    raw_base = _normalize_raw_base(_derive_raw_base(manifest_url))
-
-    entry_bytes = await _http_get(
-      cli, raw_base + manifest["entry"], _ENTRY_MAX_BYTES,
-    )
-
-    source_files: dict[str, bytes] = {}
-    source_files_total = 0
-    for rel in manifest.get("source_files") or []:
-      data = await _http_get(cli, raw_base + rel, _ENTRY_MAX_BYTES)
-      source_files_total += len(data)
-      if source_files_total > _SOURCE_FILES_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest source_files exceed {_SOURCE_FILES_TOTAL_MAX} bytes total.",
-        )
-      source_files[rel] = data
-
-    sched = manifest.get("schedule")
-    job_name = sched.get("job") if isinstance(sched, dict) else None
-    job_bytes: bytes | None = None
-    if job_name:
-      job_bytes = await _http_get(cli, raw_base + job_name, _ENTRY_MAX_BYTES)
-
-  return FetchedUpstream(
-    manifest=manifest,
-    entry_bytes=entry_bytes,
-    source_files=source_files,
-    job_name=job_name,
-    job_bytes=job_bytes,
-  )
-
-
 async def _fetch_and_validate_manifest(
   cli: httpx.AsyncClient,
   *,
@@ -2530,6 +2462,12 @@ def _read_git_package_inputs(
     _validate_manifest(manifest)
   else:
     _validate_discovery_manifest(manifest)
+  size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
+  if size > _PACKAGE_MAX_BYTES:
+    raise ValueError(
+      f"candidate package is {size} bytes, more than the "
+      f"{_PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit",
+    )
 
   entry_bytes = required(manifest["entry"], "entry")
   source_files = {
@@ -2784,11 +2722,13 @@ class InstallJournal:
     self.created_paths.clear()
 
   def rollback_materialization(self) -> None:
-    """Undo pre-commit filesystem work; never undo a durable install."""
+    """Undo pre-commit filesystem work once; never undo a durable install."""
     if self.durable:
       return
     _run_rollback_actions(self.rollback_actions)
     _cleanup(self.created_paths)
+    self.rollback_actions.clear()
+    self.created_paths.clear()
 
   def cleanup_superseded(self) -> None:
     """Remove backups/artifacts made obsolete by a successful commit."""
@@ -2866,93 +2806,55 @@ async def _fetch_install_candidate(
         },
       )
 
-    entry_bytes = await _http_get(
-      cli, raw_base + manifest["entry"], _ENTRY_MAX_BYTES,
-    )
+    package = _PackageDownload(cli, raw_base)
+    entry_bytes = await package.read(manifest["entry"])
 
     icon_processed: bytes | None = None
     icon_warning: str | None = None
     if manifest.get("icon"):
       try:
-        icon_raw = await _http_get(
-          cli, raw_base + manifest["icon"], _ICON_MAX_BYTES,
-        )
+        icon_raw = await package.read(manifest["icon"])
         icon_processed = icon_assets.normalize_icon(icon_raw)
       except icon_assets.InvalidIcon as exc:
         icon_warning = f"icon: {exc}"
         log.info("install: icon skipped — %s", exc)
       except HTTPException as exc:
-        # A broken optional icon must not block an otherwise valid app.
+        # A broken optional icon must not block an otherwise valid app, but
+        # the package budget binds the icon like every declared file.
+        if exc.status_code == 413:
+          raise
         icon_warning = f"icon: {exc.detail}"
         log.info("install: icon skipped — %s", exc.detail)
 
     schedule = manifest.get("schedule")
     bundled_job = None
     if schedule and schedule.get("job"):
-      bundled_job = await _http_get(
-        cli, raw_base + schedule["job"], _ENTRY_MAX_BYTES,
-      )
+      bundled_job = await package.read(schedule["job"])
       try:
         validate_schedule_job(manifest, bundled_job)
       except ManifestContractError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    static_assets: dict[str, bytes] = {}
-    static_assets_total = 0
-    for dest, src in static_asset_entries(
-      manifest.get("static_assets") or {},
-    ).items():
-      if len(static_assets) >= _STATIC_ASSETS_COUNT_MAX:
-        raise HTTPException(
-          400,
-          "Manifest has too many static_assets "
-          f"(max {_STATIC_ASSETS_COUNT_MAX}).",
-        )
-      data = await _http_get(
-        cli, raw_base + src, _STATIC_ASSET_MAX_BYTES,
-      )
-      static_assets_total += len(data)
-      if static_assets_total > _STATIC_ASSETS_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          "Manifest static_assets exceed "
-          f"{_STATIC_ASSETS_TOTAL_MAX} bytes total.",
-        )
-      static_assets[dest] = data
+    static_assets = {
+      dest: await package.read(src)
+      for dest, src in static_asset_entries(
+        manifest.get("static_assets") or {},
+      ).items()
+    }
+    source_files = {
+      rel: await package.read(rel)
+      for rel in manifest.get("source_files") or []
+    }
 
-    source_files: dict[str, bytes] = {}
-    source_files_total = 0
-    for rel in manifest.get("source_files") or []:
-      data = await _http_get(cli, raw_base + rel, _ENTRY_MAX_BYTES)
-      source_files_total += len(data)
-      if source_files_total > _SOURCE_FILES_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest source_files exceed {_SOURCE_FILES_TOTAL_MAX} bytes total.",
-        )
-      source_files[rel] = data
-
+    # Inline seeds are part of the manifest, which its own cap already bounds.
     seeds: dict[str, bytes] = {}
-    seeds_total = 0
     for sub, value in (manifest.get("storage_seeds") or {}).items():
-      if len(seeds) >= _SEEDS_COUNT_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest has too many storage_seeds (max {_SEEDS_COUNT_MAX}).",
-        )
       if _seed_value_is_inline(value):
-        data = json.dumps(
+        seeds[sub] = json.dumps(
           value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
       else:
-        data = await _http_get(cli, raw_base + value, _SEED_MAX_BYTES)
-      seeds_total += len(data)
-      if seeds_total > _SEEDS_TOTAL_MAX:
-        raise HTTPException(
-          400,
-          f"Manifest storage_seeds exceed {_SEEDS_TOTAL_MAX} bytes total.",
-        )
-      seeds[sub] = data
+        seeds[sub] = await package.read(value)
 
   candidate_digest = _install_candidate_digest(
     manifest=manifest,
@@ -3623,6 +3525,7 @@ async def _prepare_app_row(
     connect_manage=bool(permissions.get("connect_manage", False)),
     offline_capable=bool(manifest.get("offline_capable", False)),
     embeds_agent=bool(manifest.get("embeds_agent", False)),
+    shell_shortcuts=bool(manifest.get("shell_shortcuts", True)),
     offline_contract=manifest.get("offline") or None,
     system_prompt_file=manifest.get("system_prompt") or None,
     capability_contract=capability_contract,
@@ -3681,74 +3584,85 @@ class ActivationPlan:
   capability_contract: dict
   package_id: str | None
   source_identity: str | None
-  # Built from the fetched package before the row's write transaction.
-  python_env: app_python_env.StagedEnv | None = None
+  # Set on the second pass of an install whose manifest declares a Python lock.
+  python_check: CheckedPythonTree | None = None
 
 
-async def _stage_install_python_env(
-  data_dir: Path,
-  manifest: dict,
-  package_tree: dict[str, bytes],
-  app_id: int | None,
-  journal: InstallJournal,
-) -> app_python_env.StagedEnv | None:
-  """Build the package's declared Python env before any row is written.
+@dataclass(frozen=True)
+class CheckedPythonTree:
+  """A reconciled source tree whose Python entries passed outside the locks."""
 
-  A build takes minutes at worst, so it must not run inside the install's
-  SQLite write transaction. The reconciled tree exists only inside that
-  transaction, so this builds from the fetched package (its lock and service)
-  and ``_publish_install_python_env`` requires the reconciled lock to match.
+  # The source-dir tree both passes snapshot at the same point, before compile
+  # and commit; with the same candidate's assets and manifest it fixes every
+  # served byte.
+  tree_oid: str
+  env: app_python_env.StagedEnv
+
+
+class _UncheckedPythonTree(Exception):
+  """The first pass's reconciled tree, handed out once its locks are released.
+
+  Building and smoke-running an env takes minutes at worst, so it must not run
+  inside the install's SQLite write transaction or source-dir lock. The first
+  pass therefore stops before anything durable: the install rolls its source
+  writes back under the source-dir lock, checks this tree, and reconciles again.
   """
-  if python_lock(manifest) is None:
-    return None
 
-  def build():
-    with tempfile.TemporaryDirectory(prefix="mobius-install-env-") as tmp:
-      root = Path(tmp)
-      for relative, content in package_tree.items():
-        (root / relative).parent.mkdir(parents=True, exist_ok=True)
-        (root / relative).write_bytes(content)
-      (root / "mobius.json").write_text(json.dumps(manifest, sort_keys=True))
-      return app_python_env.prepare_env(data_dir, app_id, root)
+  def __init__(
+    self,
+    tree_oid: str,
+    runtime: applied_app_runtime.PreparedRuntime,
+    app_id: int | None,
+  ) -> None:
+    super().__init__("reconciled Python tree needs checking")
+    self.tree_oid = tree_oid
+    self.runtime = runtime
+    self.app_id = app_id
 
+
+async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPythonTree:
+  """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
+  data_dir = Path(get_settings().data_dir)
   try:
-    staged = await asyncio.to_thread(build)
+    env = await asyncio.to_thread(
+      app_python_env.prepare_env, data_dir, pending.app_id, pending.runtime.root,
+    )
   except app_python_env.PythonEnvBuildError as exc:
     raise HTTPException(422, detail={
       "code": "python_env_failed",
       "message": f"Could not build the app's Python environment. {exc}",
     }) from exc
-  journal.rollback_actions.append(lambda: app_python_env.discard_env(staged))
-  return staged
+  except Exception as exc:
+    log.exception("install: unexpected failure while checking the Python environment")
+    raise HTTPException(
+      500, "Install failed due to an unexpected server error.",
+    ) from exc
+  finally:
+    shutil.rmtree(pending.runtime.root, ignore_errors=True)
+  return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
-def _publish_install_python_env(
-  app: models.App,
-  staged: app_python_env.StagedEnv | None,
-  runtime_root: Path,
-  journal: InstallJournal,
-  data_dir: Path,
+def _require_package_python_lock(
+  manifest: dict, package_tree: dict[str, bytes], runtime_root: Path,
 ) -> None:
-  """Link the staged env for the reconciled tree, before its pointer is published."""
+  """Refuse a reconciled tree whose Python lock is not the reviewed package's."""
   try:
     key = app_python_env.declared_key(runtime_root)
   except app_python_env.PythonEnvUnavailable as exc:
     raise HTTPException(422, detail={
       "code": "python_env_failed", "message": str(exc),
     }) from exc
-  if key != (staged.key if staged is not None else None):
+  package_lock = package_tree.get(python_lock(manifest))
+  if package_lock is None or key != app_python_env.env_key(package_lock):
     # Only a local edit to the lock merged into the update can differ here.
     raise HTTPException(409, detail={
       "code": "python_lock_diverged",
       "message": (
-        "This app's local source changes its Python lock, so the environment "
-        "built for the update does not match it. The update was not "
-        "installed; reconcile the lock in the app source, Apply it, and retry."
+        "This app's local source changes its Python lock, so it no longer "
+        "matches the update's. The update was not installed; reconcile the "
+        "lock in the app source, Apply it, and retry."
       ),
     })
-  if staged is not None:
-    published = app_python_env.publish_env(data_dir, app.id, staged)
-    journal.rollback_actions.append(lambda: app_python_env.unpublish_env(published))
 
 
 def _apply_manifest_metadata(
@@ -3813,6 +3727,7 @@ def _apply_manifest_metadata(
     app.offline_capable = bool(manifest["offline_capable"])
   if "embeds_agent" in manifest:
     app.embeds_agent = bool(manifest["embeds_agent"])
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.capability_contract = capability_contract
@@ -3837,6 +3752,10 @@ async def _activate_install_source(
   the caller commits the row. Every filesystem mutation is registered with the
   journal before this function returns, so the outer transaction retains one
   rollback boundary.
+
+  A tree that declares a Python lock is published only on a second pass: the
+  first pass writes the reconciled source, freezes its exact runtime tree, and
+  raises ``_UncheckedPythonTree`` so the install can roll back and check it.
   """
   entry_source = plan.source_tree[plan.entry_key].decode("utf-8")
   _apply_manifest_metadata(
@@ -3855,6 +3774,7 @@ async def _activate_install_source(
 
   _reject_if_source_dir_taken(db, str(source_dir), exclude_id=app.id)
   source_dir.mkdir(parents=True, exist_ok=True)
+  python_declared = python_lock(manifest) is not None
   jsx_file = source_dir / "index.jsx"
   if not plan.cloned_install:
     for rel, content in plan.source_tree.items():
@@ -3904,6 +3824,36 @@ async def _activate_install_source(
     journal.rollback_actions,
     journal.commit_actions,
   )
+  # The source dir now holds exactly what the commit below records.
+  runtime_manifest = json.dumps(manifest, sort_keys=True).encode()
+  if python_declared:
+    # Both passes snapshot here, before anything is compiled or committed, so
+    # a stale second pass is refused while it has nothing durable to undo.
+    snapshot = await asyncio.to_thread(app_git.snapshot_worktree, source_dir)
+    if plan.python_check is None:
+      runtime = await asyncio.to_thread(
+        applied_app_runtime.prepare_runtime, source_dir, snapshot.tree_oid,
+        static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
+      )
+      try:
+        _require_package_python_lock(
+          manifest, plan.published_source_tree, runtime.root,
+        )
+      except BaseException:
+        shutil.rmtree(runtime.root)
+        raise
+      raise _UncheckedPythonTree(
+        snapshot.tree_oid, runtime, app.id if plan.updating else None,
+      )
+    if snapshot.tree_oid != plan.python_check.tree_oid:
+      raise HTTPException(409, detail={
+        "code": "python_check_stale",
+        "message": (
+          "The app's source changed while its Python code was being checked. "
+          "The update was not installed; try again."
+        ),
+      })
+
   await compile_jsx(
     entry_source,
     out_path=staged_bundle,
@@ -3931,19 +3881,21 @@ async def _activate_install_source(
   app.source_commit = await asyncio.to_thread(
     app_git.head_sha, source_dir, app_git.LOCAL_BRANCH,
   )
-  from app import applied_app_runtime
   runtime_staged = await asyncio.to_thread(
     applied_app_runtime.prepare_runtime, source_dir, app.source_commit,
-    static_assets=plan.static_assets,
-    runtime_manifest=json.dumps(manifest, sort_keys=True).encode(),
+    static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
   )
-  try:
-    _publish_install_python_env(
-      app, plan.python_env, runtime_staged.root, journal, data_dir,
+  if plan.python_check is not None:
+    try:
+      published_env = app_python_env.publish_env(
+        data_dir, app.id, plan.python_check.env,
+      )
+    except BaseException:
+      shutil.rmtree(runtime_staged.root)
+      raise
+    journal.rollback_actions.append(
+      lambda: app_python_env.unpublish_env(published_env)
     )
-  except BaseException:
-    shutil.rmtree(runtime_staged.root)
-    raise
   applied_app_runtime.publish_runtime(app, runtime_staged)
   return equivalence_target
 
@@ -4001,6 +3953,9 @@ async def install_from_manifest(
       still hidden, then revives it in one short drawer-serialized commit. If
       revival fails, the durable prepared source remains hidden and a retry can
       recover it without exposing a half-installed pinned item.
+    - A declared Python lock is checked against the exact reconciled tree
+      between two passes, outside the transaction. A failed check (422) or a
+      tree that changed meanwhile (409) leaves the previous revision live.
     - FastAPI surfaces each HTTPException with its proper status code;
       we never catch + swallow anything that would land the DB or
       filesystem in a half state.
@@ -4139,6 +4094,58 @@ async def install_from_manifest(
       expected_upstream_commit=expected_upstream_commit,
       expected_candidate_digest=expected_candidate_digest,
     )
+
+  # Phase 2: immutable identity/update decision. No writes occur here.
+  target = _select_install_target(
+    db,
+    candidate=candidate,
+    manifest_url=manifest_url,
+    source=source,
+    expected_app_id=reviewed_app_id or expected_app_id,
+    publication_handoff_app_id=publication_handoff_app_id,
+  )
+  await _authorize_source_handoff(target, candidate)
+
+  # Phases 3 and 4. A declared Python lock takes two passes: the first stops
+  # with the exact reconciled runtime tree and rolls back, that tree's env is
+  # built and smoke-run holding no lock, and the second publishes only if it
+  # reconciles the same source tree.
+  install_candidate = functools.partial(
+    _install_candidate,
+    db,
+    candidate=candidate,
+    target=target,
+    manifest_url=manifest_url,
+    source=source,
+    reviewed_upstream_commit=reviewed_upstream_commit,
+    expected_upstream_commit=expected_upstream_commit,
+    publication_handoff_app_id=publication_handoff_app_id,
+  )
+  try:
+    return await install_candidate(python_check=None)
+  except _UncheckedPythonTree as unchecked:
+    pending = unchecked
+  python_check = await _check_reconciled_python(pending)
+  return await install_candidate(python_check=python_check)
+
+
+async def _install_candidate(
+  db: Session,
+  *,
+  candidate: InstallCandidate,
+  target: InstallTarget,
+  manifest_url: str | None,
+  source: str,
+  reviewed_upstream_commit: str | None,
+  expected_upstream_commit: str | None,
+  publication_handoff_app_id: int | None,
+  python_check: CheckedPythonTree | None,
+) -> InstallResult:
+  """Reconcile and activate one selected candidate in one transaction.
+
+  ``python_check`` is the second pass's checked tree. It owns that env until
+  publication links it, discarding it on rollback or conflict.
+  """
   manifest = candidate.manifest
   raw_base = candidate.raw_base
   entry_bytes = candidate.entry_bytes
@@ -4152,17 +4159,7 @@ async def install_from_manifest(
   fetched_capability_digest = candidate.capability_digest
   candidate_digest = candidate.candidate_digest
   sched = manifest.get("schedule")
-
-  # Phase 2: immutable identity/update decision. No writes occur here.
-  target = _select_install_target(
-    db,
-    candidate=candidate,
-    manifest_url=manifest_url,
-    source=source,
-    expected_app_id=reviewed_app_id or expected_app_id,
-    publication_handoff_app_id=publication_handoff_app_id,
-  )
-  await _authorize_source_handoff(target, candidate)
+  python_env = python_check.env if python_check is not None else None
   existing = target.existing
   revive_after_commit = bool(existing and existing.deleted_at is not None)
   mode = target.mode
@@ -4259,11 +4256,10 @@ async def install_from_manifest(
   journal = InstallJournal()
   data_dir = Path(get_settings().data_dir)
 
+  if python_env is not None:
+    journal.rollback_actions.append(lambda: app_python_env.discard_env(python_env))
+
   try:
-    python_env = await _stage_install_python_env(
-      data_dir, manifest, published_source_tree,
-      existing.id if existing is not None else None, journal,
-    )
     app = await _prepare_app_row(
       db,
       candidate=candidate,
@@ -4334,6 +4330,12 @@ async def install_from_manifest(
             "install: restored %s upstream ref to DB-recorded commit %s",
             git_source_dir, prev_upstream_commit,
           )
+        # A rolled-back pass, including the first pass of a Python check,
+        # leaves `upstream` where it found it for the next reconciliation.
+        journal.rollback_actions.append(
+          lambda d=git_source_dir, c=prev_upstream_commit:
+            app_git.restore_upstream_ref(d, c)
+        )
         previous_upstream_paths = await asyncio.to_thread(
           _read_upstream_source_paths, git_source_dir, prev_upstream_commit,
         )
@@ -4824,7 +4826,7 @@ async def install_from_manifest(
             capability_contract=capability_contract,
             package_id=target.package_id,
             source_identity=target.source_identity,
-            python_env=python_env,
+            python_check=python_check,
           ),
           journal=journal,
           data_dir=data_dir,
@@ -4832,6 +4834,14 @@ async def install_from_manifest(
       else:
         # A conflict activates nothing, so its build is never linked.
         journal.commit_actions.append(lambda: app_python_env.discard_env(python_env))
+    except Exception:
+      # Undo this pass's source writes and upstream ref while the lock still
+      # excludes other writers, so a commit cannot land in between and then be
+      # overwritten. This includes the first pass of a Python check. The outer
+      # handlers still shape the response; their rollback then has nothing left.
+      db.rollback()
+      journal.rollback_materialization()
+      raise
     finally:
       # Release the per-source-dir lock (held across the merge + write for the
       # git path) BEFORE the seeds block takes app_storage_lock, preserving the
@@ -4951,7 +4961,7 @@ async def install_from_manifest(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
-  except HTTPException:
+  except (HTTPException, _UncheckedPythonTree):
     db.rollback()
     journal.rollback_materialization()
     raise
@@ -5022,5 +5032,5 @@ def _run_rollback_actions(actions: list[Callable[[], None]]) -> None:
   for action in reversed(actions):
     try:
       action()
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
       log.warning("install rollback: %s", exc)

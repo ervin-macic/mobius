@@ -35,8 +35,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import app_git, platform_activation, platform_boot
+from app import app_git, platform_activation, platform_boot, restart_util
 from app import platform_update as pu
+from tests.test_app_git import bump_ctime_without_changing_bytes
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -64,6 +65,18 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 # test can delete `foo` upstream to make a text-clean merge import-broken.
 _MAIN_PY = "import app.foo\n\nVALUE = app.foo.VALUE\nLINE_A = 1\nLINE_B = 2\nLINE_C = 3\n"
 _FOO_PY = "VALUE = 'foo'\n"
+# Keep the definition and caller in separate merge hunks for the semantic-merge test.
+_PROVIDERS_PY = (
+  "def sync_app_model_providers(data_dir):\n  return None\n"
+  + "\n" * 20
+  + "def get_provider():\n  return 'ready'\n"
+)
+
+# Fixture clones stub restart admission's check; tests needing it capture it.
+_REAL_VALIDATE_RESTART_SOURCE = restart_util.validate_restart_source
+# The candidate-owned selftest imports the server itself, as the real one does.
+_SELFTEST_PY = "import app.main\nfrom app.providers import get_provider\nget_provider()\n"
+_ROUTES_PY = "def require_all_routers_loaded():\n  return None\n"
 
 
 def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FOO_PY):
@@ -71,6 +84,10 @@ def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FO
   app_dir.mkdir(parents=True, exist_ok=True)
   (app_dir / "__init__.py").write_text("")
   (app_dir / "main.py").write_text(main_py)
+  (app_dir / "providers.py").write_text(_PROVIDERS_PY)
+  (app_dir / "startup_selftest.py").write_text(_SELFTEST_PY)
+  (app_dir / "routes").mkdir(exist_ok=True)
+  (app_dir / "routes" / "__init__.py").write_text(_ROUTES_PY)
   if foo_py is not None:
     (app_dir / "foo.py").write_text(foo_py)
 
@@ -194,8 +211,8 @@ def clone_env(tmp_path, monkeypatch):
   monkeypatch.setattr(
     pu, "PREPARED_UPDATE_PATH", tmp_path / ".prepared-update.json",
   )
-  # The real startup check imports the full platform; these fixture clones
-  # carry only a minimal backend, so the check is exercised separately.
+  # Restart admission's check is exercised separately; a test that needs it on
+  # these minimal clones restores _REAL_VALIDATE_RESTART_SOURCE.
   monkeypatch.setattr(
     "app.restart_util.validate_restart_source", lambda platform_root=None: None,
   )
@@ -203,6 +220,7 @@ def clone_env(tmp_path, monkeypatch):
   # This boot's image runs the boot transaction; tests of images before it
   # remove the marker. ``_boot_image`` chooses the running image's revision.
   monkeypatch.setattr(pu, "BOOT_TRANSACTION_MARKER", tmp_path / ".boot-transaction")
+  monkeypatch.setattr(platform_boot, "BOOT_LOG", tmp_path / "platform-boot.jsonl")
   pu.BOOT_TRANSACTION_MARKER.write_text("1\n")
   monkeypatch.setenv("MOBIUS_BUILD_INFO_PATH", str(tmp_path / "build-info.json"))
   origin = _make_origin(tmp_path)
@@ -989,6 +1007,44 @@ def test_late_edits_merge_back_before_the_server_imports_the_update(
   assert pu.read_prepared_update() is None
 
 
+def _bump_ctime_of_every_tracked_file(repo: Path) -> None:
+  """What a boot-time ownership or mode repair does to every tracked file."""
+  bump_ctime_without_changing_bytes(*(
+    repo / path for path in _git(repo, "ls-files", "-z").stdout.split("\0")
+    if path and os.path.lexists(repo / path)
+  ))
+
+
+def test_boot_merge_back_survives_a_metadata_only_repair_of_every_file(clone_env):
+  """The 2026-10-03 crash loop: a restart-only update was swapped in at
+  shutdown with a late commit and uncommitted edits, then the boot's no-op
+  chown left every index entry stat-dirty. The merge-back checkout rejected
+  an unchanged file as "not uptodate" on every boot. Unchanged bytes must
+  stay unchanged to the checkout, whatever their metadata."""
+  origin, platform = clone_env
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'LATE'\n"})
+  (platform / "backend/app/wip.py").write_text("WIP = 1\n")
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+
+  _bump_ctime_of_every_tracked_file(platform)
+  # The trigger is real: Git's cached stat data matches no tracked file,
+  # including every file the merge-back rewrites.
+  stale = _git(platform, "diff-files", "--name-only", "-z").stdout.split("\0")
+  tracked = _git(platform, "ls-files", "-z").stdout.split("\0")
+  assert set(stale) - {""} == set(tracked) - {""}
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'LATE'\n"
+  assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  # The uncommitted edit comes back uncommitted, as after any merge-back.
+  assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
+    "?? backend/app/wip.py",
+  ]
+
+
 def test_a_merged_back_tree_that_cannot_start_returns_to_the_previous_state(
   clone_env, tmp_path,
 ):
@@ -1258,6 +1314,29 @@ def test_an_answer_that_fails_the_startup_check_is_never_prepared(
   assert worktree.exists() and pu.CONFLICT_FLAG.exists()
 
 
+def test_prepared_overlay_rejects_text_clean_merge_that_fails_the_selftest(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  monkeypatch.setattr(
+    "app.restart_util.validate_restart_source", _REAL_VALIDATE_RESTART_SOURCE,
+  )
+  _local_commit(platform, edits={"backend/app/providers.py": _PROVIDERS_PY.replace(
+    "sync_app_model_providers(data_dir):", "sync_app_model_providers():",
+  )}, msg="local signature")
+  _advance_origin(origin, edits={"backend/app/providers.py": _PROVIDERS_PY.replace(
+    "return 'ready'", "sync_app_model_providers('/data')\n  return 'ready'",
+  )}, msg="upstream caller")
+  served, _target, worktree = _park_resolved_line_a_conflict(platform, origin)
+
+  with pytest.raises(pu.PlatformUpdateError, match="TypeError"):
+    pu.continue_platform_overlay_update(platform)
+
+  assert pu.read_prepared_update() is None
+  assert _served_sha(platform) == served
+  assert worktree.exists() and pu.CONFLICT_FLAG.exists()
+
+
 def test_a_failed_swap_keeps_the_live_checkout_and_the_prepared_update(
   clone_env, monkeypatch,
 ):
@@ -1267,19 +1346,19 @@ def test_a_failed_swap_keeps_the_live_checkout_and_the_prepared_update(
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
   (platform / "backend/app/new_mod.py").write_text("NEW = True\n")
-  original_git = pu._git
+  original_checkout = app_git.merge_trees_into_worktree
   failed = False
 
-  def fail_first_candidate_checkout(*args, **kwargs):
+  def fail_first_candidate_checkout(repo, *trees, **kwargs):
     nonlocal failed
-    if not failed and kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
+    if not failed and repo == platform and not kwargs.get("dry_run"):
       failed = True
       raise RuntimeError("candidate checkout failed after the branch moved")
-    return original_git(*args, **kwargs)
+    return original_checkout(repo, *trees, **kwargs)
 
-  monkeypatch.setattr(pu, "_git", fail_first_candidate_checkout)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", fail_first_candidate_checkout)
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
-  monkeypatch.setattr(pu, "_git", original_git)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original_checkout)
 
   assert _served_sha(platform) == served
   assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
@@ -1302,21 +1381,21 @@ def test_boot_recovers_the_live_state_after_a_swap_killed_midway(
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
-  original_git = pu._git
+  original_checkout = app_git.merge_trees_into_worktree
 
   class Killed(BaseException):
     pass
 
-  def kill_after_branch_move(*args, **kwargs):
-    if kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
+  def kill_after_branch_move(repo, *trees, **kwargs):
+    if repo == platform and not kwargs.get("dry_run"):
       raise Killed()
-    return original_git(*args, **kwargs)
+    return original_checkout(repo, *trees, **kwargs)
 
   # A SIGKILL runs no cleanup: the branch has moved, the checkout has not.
-  monkeypatch.setattr(pu, "_git", kill_after_branch_move)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", kill_after_branch_move)
   with pytest.raises(Killed):
     pu.swap_in_prepared_update(cutover=True, repo=platform)
-  monkeypatch.setattr(pu, "_git", original_git)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original_checkout)
   assert _served_sha(platform) != served
 
   pu.boot_guard_clean_served_tree(platform)
@@ -1343,22 +1422,22 @@ def test_an_incomplete_swap_rollback_leaves_the_live_state_for_boot(
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
-  original_git = pu._git
+  original_checkout = app_git.merge_trees_into_worktree
   resets = 0
 
-  def fail_activation_and_rollback(*args, **kwargs):
+  def fail_activation_and_rollback(repo, *trees, **kwargs):
     nonlocal resets
-    if kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
+    if repo == platform and not kwargs.get("dry_run"):
       resets += 1
       if resets == 1:
         dirty.write_text("VALUE = 'PARTIAL CHECKOUT'\n")
         raise RuntimeError("activation checkout failed")
       return SimpleNamespace(returncode=1, stdout="", stderr="checkout blocked")
-    return original_git(*args, **kwargs)
+    return original_checkout(repo, *trees, **kwargs)
 
-  monkeypatch.setattr(pu, "_git", fail_activation_and_rollback)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", fail_activation_and_rollback)
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
-  monkeypatch.setattr(pu, "_git", original_git)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original_checkout)
 
   assert pu.RECONCILE_PRE_FLAG.exists()
   receipt = pu.boot_guard_clean_served_tree(platform)
@@ -1526,6 +1605,79 @@ def test_import_broken_merge_rolls_back(clone_env):
   assert _served_sha(platform) == pre
 
 
+def test_candidate_smoke_can_rename_internal_provider_function(clone_env):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={
+    "backend/app/providers.py": "def select_provider():\n  return 'ready'\n",
+    "backend/app/startup_selftest.py": (
+      "import app.main\nfrom app.providers import select_provider\nselect_provider()\n"
+    ),
+  })
+  result = pu.reconcile_clone(platform)
+  assert result.status == "updated", result.error
+  assert pu._import_probe(platform) == (True, "")
+  assert "select_provider" in (platform / "backend/app/providers.py").read_text()
+
+
+@pytest.mark.parametrize("smoke", [
+  "raise RuntimeError('candidate smoke failed')\n",
+  "import missing_candidate_smoke_dependency\n",
+])
+def test_candidate_smoke_failure_rolls_back(clone_env, smoke):
+  origin, platform = clone_env
+  pre = _served_sha(platform)
+  _advance_origin(origin, edits={"backend/app/startup_selftest.py": smoke})
+  result = pu.reconcile_clone(platform)
+  assert result.status == "rolled_back"
+  assert _served_sha(platform) == pre
+
+
+def test_candidate_without_selftest_uses_import_only(clone_env):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={
+    "backend/app/providers.py": "raise RuntimeError('not imported by main')\n",
+  }, deletes=["backend/app/startup_selftest.py"])
+  result = pu.reconcile_clone(platform)
+  assert result.status == "updated", result.error
+  assert not (platform / "backend/app/startup_selftest.py").exists()
+  assert pu._import_probe(platform) == (True, "")
+  (platform / "backend/app/main.py").write_text("raise RuntimeError('bad main')\n")
+  ok, error = pu._import_probe(platform)
+  assert not ok
+  assert "bad main" in error
+
+
+def test_update_rolls_back_when_the_router_registry_reports_a_failure(clone_env):
+  origin, platform = clone_env
+  pre = _served_sha(platform)
+  _advance_origin(origin, edits={"backend/app/routes/__init__.py": (
+    "def require_all_routers_loaded():\n"
+    "  raise RuntimeError('Router imports failed: chat')\n"
+  )})
+
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "rolled_back"
+  assert "Router imports failed: chat" in (result.error or "")
+  assert _served_sha(platform) == pre
+
+
+def test_candidate_smoke_rejects_text_clean_provider_signature_merge(clone_env):
+  origin, platform = clone_env
+  local = _PROVIDERS_PY.replace("sync_app_model_providers(data_dir):", "sync_app_model_providers():")
+  upstream = _PROVIDERS_PY.replace("return 'ready'", "sync_app_model_providers('/data')\n  return 'ready'")
+  pre = _local_commit(platform, edits={"backend/app/providers.py": local}, msg="local signature")
+  _advance_origin(origin, edits={"backend/app/providers.py": upstream}, msg="upstream caller")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "rolled_back"
+  assert "TypeError" in (res.error or "")
+  assert _served_sha(platform) == pre
+  assert pu.ROLLED_BACK_FLAG.exists()
+  assert not pu.CONFLICT_FLAG.exists()
+
+
 def test_activation_compare_and_swap_never_rewinds_a_concurrent_writer(
   clone_env, monkeypatch,
 ):
@@ -1556,7 +1708,7 @@ def test_failed_candidate_never_rolls_back_a_newer_concurrent_writer(
   _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'update'\n"})
   raced: dict[str, str] = {}
 
-  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT):
+  def fail_after_concurrent_commit(repo=platform):
     raced["sha"] = _local_commit(
       platform, edits={"concurrent.txt": "newer owner\n"},
       msg="concurrent writer after activation",
@@ -5992,6 +6144,29 @@ def test_entrypoint_settles_guards_and_probes_before_any_served_code_runs():
   assert "cd /app/platform-baked/backend" in script
 
 
+def test_entrypoint_repairs_metadata_without_rewriting_what_is_already_right():
+  """chown and chmod update ctime even as no-ops, and Git's index caches it.
+  A recursive sweep on every boot would leave every served and app checkout
+  stat-dirty, so boot repairs only ownership and modes that are wrong."""
+  script = (
+    Path(__file__).resolve().parents[1] / "scripts" / "entrypoint.sh"
+  ).read_text(encoding="utf-8")
+  for unconditional in (
+    "chown -R mobius:mobius /data ", "chown -R mobius:mobius /data/platform",
+    "chmod -R go-w /data/platform", "chown -R mobius:mobius /data/.git",
+    "chown -R mobius:mobius /data/db", "chown -R mobius:mobius /data/cron-logs",
+    "chmod -R 777 /data/db",
+  ):
+    assert unconditional not in script
+  helper = script[script.index("_own_as_mobius() {"):]
+  helper = helper[:helper.index("}\n") + 2]
+  assert "! -user mobius -o ! -group mobius" in helper
+  assert "chown -h mobius:mobius" in helper
+  assert "if ! _own_as_mobius /data 2>/dev/null; then" in script
+  assert "_own_as_mobius /data/platform" in script
+  assert "find /data/platform ! -type l -perm /022 -exec chmod go-w {} +" in script
+
+
 def test_a_second_finish_cannot_rebind_an_update_already_bound(clone_env):
   """Two concurrent Finish requests: the first binding wins, so the request
   that is published is the one that can confirm the update."""
@@ -6295,7 +6470,7 @@ def test_rollback_preserves_uncommitted_edits_arriving_after_activation(
   _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
   path = platform / 'backend/app/foo.py'
 
-  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT):
+  def changed_then_fail(repo=platform):
     path.write_text("VALUE = 'arrived after activation'\n")
     return False, 'candidate rejected'
 
@@ -6360,17 +6535,17 @@ def test_checkout_rechecks_a_write_after_its_non_destructive_preflight(
   _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
   before = _served_sha(platform)
   path = platform / 'backend/app/foo.py'
-  original = pu._git
+  original = app_git.merge_trees_into_worktree
   edited = False
 
-  def edit_before_checkout(*args, **kwargs):
+  def edit_before_checkout(repo, *trees, **kwargs):
     nonlocal edited
-    if not edited and kwargs.get('repo') == platform and args[:3] == ('read-tree', '-m', '-u'):
+    if not edited and repo == platform and not kwargs.get("dry_run"):
       edited = True
       path.write_text("VALUE = 'newer than preflight'\n")
-    return original(*args, **kwargs)
+    return original(repo, *trees, **kwargs)
 
-  monkeypatch.setattr(pu, '_git', edit_before_checkout)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", edit_before_checkout)
   result = pu.reconcile_clone(platform)
   assert result.status == 'error'
   assert _served_sha(platform) == before
@@ -6385,22 +6560,22 @@ def test_reverse_checkout_success_does_not_clear_partial_source_marker(clone_env
   before = _served_sha(platform)
   tip = _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'candidate'\n"})
   _git(platform, 'fetch', '-q', 'origin')
-  original = pu._git
+  original = app_git.merge_trees_into_worktree
   forward = True
-  def half_written(*args, **kwargs):
+  def half_written(repo, *trees, **kwargs):
     nonlocal forward
-    if forward and kwargs.get('repo') == platform and args[:3] == ('read-tree', '-m', '-u'):
+    if forward and repo == platform and not kwargs.get("dry_run"):
       forward = False
       (platform / 'backend/app/foo.py').write_text("VALUE = 'candidate'\n")
       raise RuntimeError('interrupted before index write')
-    return original(*args, **kwargs)
-  monkeypatch.setattr(pu, '_git', half_written)
+    return original(repo, *trees, **kwargs)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", half_written)
   with pytest.raises(RuntimeError, match='interrupted'):
     pu._activate_candidate(platform, pu._local_branch(platform), before, tip)
   assert _served_sha(platform) == before
   assert (platform / 'backend/app/foo.py').read_text() == "VALUE = 'candidate'\n"
   assert pu.RECONCILE_PRE_FLAG.exists()
-  monkeypatch.setattr(pu, '_git', original)
+  monkeypatch.setattr(app_git, "merge_trees_into_worktree", original)
   receipt = pu.boot_guard_clean_served_tree(platform)
   saved = receipt.split(' saved_work=', 1)[1].split()[0]
   assert _git(platform, 'show', saved + ':backend/app/foo.py').stdout == "VALUE = 'candidate'\n"
@@ -6807,15 +6982,15 @@ def test_activation_preserves_late_ignored_file_and_directory_collisions(
 
     monkeypatch.setattr(pu, "_activate_candidate", write_then_activate)
   else:
-    git = pu._git
+    git = app_git.merge_trees_into_worktree
 
-    def write_after_native_preflight(*args, **kwargs):
-      proc = git(*args, **kwargs)
-      if kwargs.get("repo") == platform and args[:4] == ("read-tree", "-n", "-m", "-u"):
+    def write_after_native_preflight(repo, *trees, **kwargs):
+      proc = git(repo, *trees, **kwargs)
+      if repo == platform and kwargs.get("dry_run"):
         write_ignored_work()
       return proc
 
-    monkeypatch.setattr(pu, "_git", write_after_native_preflight)
+    monkeypatch.setattr(app_git, "merge_trees_into_worktree", write_after_native_preflight)
 
   result = pu.reconcile_clone(platform)
 

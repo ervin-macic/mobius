@@ -46,6 +46,7 @@ from app.continuations import (
   WAIT_RESULT_MESSAGE_KIND,
 )
 from app.timeutil import now_naive_utc
+from app.wait_checks import GitHubChecks, read_check_observation
 
 _LOG = logging.getLogger("moebius.chat_waits")
 
@@ -164,6 +165,7 @@ def declare_wait(
   interval_secs: int | None = None,
   deadline_secs: int | None = None,
   created_by_run_id: str | None = None,
+  github_checks: dict | None = None,
 ) -> models.ChatWait:
   """Validate and persist one armed wait for `chat_id`."""
   description = (description or "").strip()
@@ -172,13 +174,28 @@ def declare_wait(
   condition_owner = (condition_owner or "").strip()
   if len(condition_owner) > 160:
     raise WaitValidationError("condition_owner must not exceed 160 characters")
-  if kind not in ("command", "timer"):
-    raise WaitValidationError("kind must be 'command' or 'timer'")
+  if kind not in ("command", "timer", "github_checks"):
+    raise WaitValidationError("kind must be 'command', 'timer', or 'github_checks'")
+  condition = None
+  if kind == "github_checks":
+    if command or delay_secs is not None:
+      raise WaitValidationError("GitHub checks cannot also specify a command or timer")
+    try:
+      spec = GitHubChecks.model_validate(github_checks)
+    except ValueError as exc:
+      raise WaitValidationError("github_checks needs repository, pull_request, and head_sha") from exc
+    condition_owner = condition_owner or "GitHub"
+    # Store the typed spec, not a command line: the checker's interpreter and
+    # script path are resolved at each check so an image update cannot break
+    # an armed wait.
+    condition = spec.model_dump()
+  elif github_checks is not None:
+    raise WaitValidationError("github_checks is only valid for a GitHub wait")
   condition_owner = (condition_owner or "").strip() or None
   if kind == "command" and condition_owner is None:
     raise WaitValidationError("command waits need a condition owner")
-  if kind == "command" and deadline_secs is None:
-    raise WaitValidationError("command waits need an explicit deadline")
+  if kind in ("command", "github_checks") and deadline_secs is None:
+    raise WaitValidationError("command and GitHub waits need an explicit deadline")
 
   now = now_naive_utc()
   interval = int(
@@ -198,9 +215,10 @@ def declare_wait(
     )
 
   due_at = None
-  if kind == "command":
-    command = command if isinstance(command, str) else ""
-    if not command.strip():
+  if kind in ("command", "github_checks"):
+    if kind == "github_checks":
+      command = None
+    elif not (isinstance(command, str) and command.strip()):
       raise WaitValidationError("command waits need a check command")
     # Probe on the next supervisor tick. A malformed check should fail visibly
     # now, not after its whole polling interval, and an already-met condition
@@ -245,6 +263,7 @@ def declare_wait(
     ),
     kind=kind,
     command=command,
+    condition_json=condition,
     due_at=due_at,
     interval_secs=interval,
     deadline_at=deadline_at,
@@ -661,6 +680,7 @@ def _compose_resume_notice(row: models.ChatWait, outcome: str) -> str:
     "outcome": outcome,
     "kind": row.kind,
     "command": row.command,
+    **({"github_checks": row.condition_json} if row.kind == "github_checks" else {}),
     "checks_count": row.checks_count,
     "last_exit_code": row.last_exit_code,
     "declared_at": row.created_at.isoformat() if row.created_at else None,
@@ -1050,6 +1070,7 @@ async def _check_one(row_id: str) -> bool:
       return False
     kind = row.kind
     command = row.command
+    condition = row.condition_json
     due_at = row.due_at
     deadline_at = row.deadline_at
     interval = int(row.interval_secs or DEFAULT_INTERVAL_SECS)
@@ -1073,6 +1094,14 @@ async def _check_one(row_id: str) -> bool:
     met = verdict == "met"
     check_failed = verdict == "failed"
     exit_code = 0 if met else (2 if check_failed else 1)
+  elif kind == "github_checks":
+    exit_code, output = await _run_check(
+      GitHubChecks.model_validate(condition).command(), wait_id=row_id,
+    )
+    observation = read_check_observation(exit_code, output)
+    met = observation.state == "met"
+    check_failed = observation.state == "failed"
+    output = observation.model_dump_json()
   else:
     exit_code, output = await _run_check(command or "false", wait_id=row_id)
     met = exit_code == 0
@@ -1080,7 +1109,7 @@ async def _check_one(row_id: str) -> bool:
     # predicate is silent exit 1; output is reserved for diagnostics or a met
     # result. This catches shell quoting, missing auth/environment, missing
     # executables, timeouts, and provider errors without guessing from brittle
-    # message substrings.
+    # message substrings. Only the typed GitHub checker reports progress.
     check_failed = not met and not (
       exit_code == 1 and not (output or "").strip()
     )
