@@ -1,6 +1,6 @@
 """Dependency-free manifest contract shared by install and preflight."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 import json
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -361,29 +361,43 @@ def static_asset_entries(value) -> dict[str, str]:
   _fail("Manifest `static_assets` must be an object or array.")
 
 
-def package_bytes(manifest: Mapping, size_of: Callable[[str], int]) -> int:
-  """Bytes installing this package downloads and writes, per declaration.
+def package_input_paths(manifest: Mapping) -> Iterator[str]:
+  """Yield every repo-relative file declared by a validated manifest.
 
-  Counts the entry, icon and job, every source file, and the file behind every
-  static-asset destination and file seed. A file named by several declarations
-  counts once for each, because each is written separately, so one file cannot
-  stand in for thousands of destinations. Install charges its download budget
-  the same way, and local apply, the validator, Git installs and Store
-  publication bound this same sum by `PACKAGE_MAX_BYTES`, so a package the
-  Store accepts installs everywhere. Inline seeds live in the manifest, which
-  its own cap bounds. `size_of` gives a declared file's size, or 0 when it is
-  missing (its own check reports that).
+  Order is entry, icon, schedule job, source_files, static-asset sources, then
+  file seeds; collections keep declaration order and repeated paths are kept.
+  Static destinations and inline JSON seeds are not source files. mobius.json
+  itself is excluded: its bytes have a separate manifest cap. Other file-backed
+  features (services, setup, prompts, skills) must appear in source_files.
   """
   schedule = manifest.get("schedule")
-  declared = [
+  static_assets = manifest.get("static_assets") or {}
+  static_sources = (
+    static_assets if isinstance(static_assets, list)
+    else static_asset_entries(static_assets).values()
+  )
+  declared = (
     manifest.get("entry"),
     manifest.get("icon"),
     schedule.get("job") if isinstance(schedule, Mapping) else None,
     *(manifest.get("source_files") or []),
-    *static_asset_entries(manifest.get("static_assets")).values(),
+    *static_sources,
     *(manifest.get("storage_seeds") or {}).values(),
-  ]
-  return sum(size_of(rel) for rel in declared if isinstance(rel, str) and rel)
+  )
+  for rel in declared:
+    if isinstance(rel, str) and rel:
+      yield rel
+
+
+def package_bytes(manifest: Mapping, size_of: Callable[[str], int]) -> int:
+  """Sum declared inputs per declaration, including repeated paths.
+
+  Each alias consumes the budget again because each destination is written
+  separately. Install, local apply, validation and publication use this same
+  sum. Inline seeds are bounded by the manifest cap. `size_of` returns 0 for a
+  missing file; the caller's content validation reports that missing input.
+  """
+  return sum(size_of(rel) for rel in package_input_paths(manifest))
 
 
 def size_on_disk(root: Path, rel: str) -> int:

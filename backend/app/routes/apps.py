@@ -979,16 +979,9 @@ def _diff_preview_trees(
     shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _recorded_runtime_paths(previous_tree: dict[str, bytes]) -> set[str]:
+def _recorded_runtime_paths(manifest: dict) -> set[str]:
   """Recover the prior cloned package's declared runtime-source paths."""
   paths = {"index.jsx"}
-  raw_manifest = previous_tree.get("mobius.json")
-  if raw_manifest is None:
-    return paths
-  try:
-    manifest = json.loads(raw_manifest)
-  except (UnicodeDecodeError, json.JSONDecodeError):
-    return paths
   for rel in manifest.get("source_files") or []:
     if isinstance(rel, str):
       paths.add(rel)
@@ -1260,7 +1253,8 @@ async def _start_conflict_resolver_turn(
 
 
 def _recorded_update_source(
-  previous_tree: dict[str, bytes], candidate_tree: dict[str, bytes],
+  previous_tree: dict[str, bytes | app_git.GitTreeBlob | None],
+  candidate_tree: dict[str, bytes],
 ) -> dict[str, bytes]:
   """Project recorded Git history onto both old and new package sources.
 
@@ -1270,12 +1264,28 @@ def _recorded_update_source(
   """
   from app import install
 
-  paths = (
-    set(candidate_tree) | _recorded_runtime_paths(previous_tree)
-    if "mobius.json" in previous_tree
-    else set(previous_tree) - install._MERGED_NON_SOURCE
-  )
-  return {rel: data for rel, data in previous_tree.items() if rel in paths}
+  if "mobius.json" in previous_tree:
+    manifest = install._read_git_package_manifest(previous_tree, strict=False)
+    paths = set(candidate_tree) | _recorded_runtime_paths(manifest)
+  else:
+    # Pre-manifest installs recorded only runtime source. Keep their explicit
+    # fallback, but bound it too before materializing any source bodies.
+    paths = set(previous_tree) - install._MERGED_NON_SOURCE
+  size = sum(install._package_input_size(previous_tree.get(rel)) for rel in paths)
+  if size > install._PACKAGE_MAX_BYTES:
+    raise install.PackageTooLarge(install.package_limit_message(size))
+  return {
+    rel: install._package_input_bytes(data)
+    for rel, data in previous_tree.items() if rel in paths and data is not None
+  }
+
+
+def _read_recorded_update_source(
+  repo: Path, candidate_tree: dict[str, bytes],
+) -> dict[str, bytes]:
+  """Keep the baseline spool alive until only preview source is materialized."""
+  with app_git.open_ref_tree(repo, app_git.UPSTREAM_BRANCH) as tree:
+    return _recorded_update_source(tree, candidate_tree)
 
 
 async def _fetch_update_candidate(
@@ -1641,20 +1651,21 @@ async def update_candidate_preview(
         raise HTTPException(
           409, "Requested update source does not match the installed app.",
         )
-      previous_tree = await asyncio.to_thread(
-        app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+      previous_source = await asyncio.to_thread(
+        _read_recorded_update_source, repo, candidate.runtime_tree,
       )
     except HTTPException:
       raise
     except install.PackageTooLarge as exc:
-      raise HTTPException(413, str(exc)) from exc
+      raise HTTPException(
+        413, detail={"code": "package_too_large", "message": str(exc)},
+      ) from exc
     except (
       OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
     ) as exc:
       raise HTTPException(
         409, "This app does not have a usable Git update source.",
       ) from exc
-  previous_source = _recorded_update_source(previous_tree, candidate.runtime_tree)
   upstream_diff = await asyncio.to_thread(
     _diff_preview_trees, previous_source, candidate.runtime_tree,
   )

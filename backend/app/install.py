@@ -2380,7 +2380,7 @@ class InstallCandidate:
 
 
 class PackageTooLarge(ValueError):
-  """A Git package candidate declares more than `_PACKAGE_MAX_BYTES`.
+  """A Git package exceeds its manifest or declared-input size bound.
 
   A `ValueError`, so callers that treat any unusable candidate as unknown keep
   doing so, while preview and apply can tell the owner the actual reason.
@@ -2460,6 +2460,30 @@ class _GitPackageInputs:
     )
 
 
+def _read_git_package_manifest(
+  tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
+) -> dict:
+  """Validate a Git manifest, checking its metadata before materialization."""
+  raw_manifest = tree.get("mobius.json")
+  if raw_manifest is None:
+    raise ValueError("candidate Git tree is missing manifest mobius.json")
+  size = _package_input_size(raw_manifest)
+  if size > _MANIFEST_MAX_BYTES:
+    raise PackageTooLarge(
+      f"This app's mobius.json is {size} bytes, more than the "
+      f"{_MANIFEST_MAX_BYTES} byte manifest limit.",
+    )
+  try:
+    manifest = json.loads(_package_input_bytes(raw_manifest))
+  except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    raise ValueError("candidate Git manifest is invalid") from exc
+  if strict:
+    _validate_manifest(manifest)
+  else:
+    _validate_discovery_manifest(manifest)
+  return manifest
+
+
 def _read_git_package_inputs(
   tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
 ) -> _GitPackageInputs:
@@ -2474,14 +2498,7 @@ def _read_git_package_inputs(
     except KeyError as exc:
       raise ValueError(f"candidate Git tree is missing {field} {relative}") from exc
 
-  try:
-    manifest = json.loads(_package_input_bytes(required("mobius.json", "manifest")))
-  except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-    raise ValueError("candidate Git manifest is invalid") from exc
-  if strict:
-    _validate_manifest(manifest)
-  else:
-    _validate_discovery_manifest(manifest)
+  manifest = _read_git_package_manifest(tree, strict=strict)
   size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
   if size > _PACKAGE_MAX_BYTES:
     raise PackageTooLarge(package_limit_message(size))
