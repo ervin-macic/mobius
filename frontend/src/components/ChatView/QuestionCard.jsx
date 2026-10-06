@@ -211,6 +211,7 @@ export default function QuestionCard({
   const answered = Boolean(submitted) || !!answeredMap || completedAction
   const locallyQueued = !answered && Boolean(localAnswer)
   const selectionLocked = answered || locallyQueued
+  const attachLocked = selectionLocked || submitting || disabled
   const displayAnswers = answeredMap || localAnswer?.body?.answers || submitted?.answers || {}
   const grouped = questions.length > 1
   const restartAction = isRestartCardAction(platformAction)
@@ -552,18 +553,21 @@ export default function QuestionCard({
         })}
       </div>
       {grouped && answerFiles}
-      {!platformAction && !selectionLocked && !disabled && (
+      {/* The attach row lives as long as the action row below it, so Submit,
+          queueing and the Submitted state never move the card; once the
+          answer is locked the row only stops taking files. */}
+      {!platformAction && (answered || !disabled) && (
         <div className="qcard__attachments">
           <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
-            disabled={submitting}
+            disabled={attachLocked}
             aria-label="Attach files to your answer"
             onChange={e => {
               const selected = Array.from(e.target.files || [])
               e.target.value = ''
-              if (!submitting) addAnswerFiles(selected)
+              if (!attachLocked) addAnswerFiles(selected)
             }} />
           <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
-            title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>
+            title="Attach a photo or file" disabled={attachLocked} onClick={() => fileInputRef.current?.click()}>
             <Paperclip width={18} height={18} aria-hidden="true" />
           </button>
           <span>Files for {grouped ? 'all answers' : 'this answer'} · attach or paste</span>
