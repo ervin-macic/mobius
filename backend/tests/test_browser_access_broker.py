@@ -9,8 +9,9 @@ from sqlalchemy.orm import Session
 from starlette.requests import Request
 
 from app import access_signal, connectors, models
-from app.browser_access import create_invitation, revoke_grant
+from app.browser_access import revoke_grant
 from app.routes import connectors as routes
+from tests.browser_access_fixtures import link_grant
 
 
 def test_bound_capability_rechecks_owner_and_browser_grant(tmp_path):
@@ -20,7 +21,7 @@ def test_bound_capability_rechecks_owner_and_browser_grant(tmp_path):
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'recipient')
+    grant, _ = link_grant(db, owner, 'recipient')
     cap = connectors.mint_broker_capability(
       7, 'x' * 64, owner_id=owner.id, owner_epoch=owner.token_epoch,
       browser_grant_id=grant.id,
@@ -107,7 +108,7 @@ def test_turn_plan_issues_bound_broker_token_from_run_session(tmp_path):
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'recipient')
+    grant, _ = link_grant(db, owner, 'recipient')
     connector = models.Connector(
       slug='docs', name='Docs', url='https://docs.example/mcp',
       enabled=True, status='ok', tools_json=[], est_tokens=0,
@@ -171,7 +172,7 @@ def test_open_stream_lineage_recheck_sees_fresh_revocation(tmp_path, monkeypatch
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'recipient')
+    grant, _ = link_grant(db, owner, 'recipient')
     connector = models.Connector(
       slug='docs', name='Docs', url='https://docs.example/mcp',
       enabled=True, status='ok', tools_json=[], est_tokens=0,
@@ -205,7 +206,7 @@ def test_only_committed_access_changes_wake_open_broker_streams(tmp_path):
     )
     db.add_all([owner, connector])
     db.commit()
-    grant, _ = create_invitation(db, owner, 'recipient')
+    grant, _ = link_grant(db, owner, 'recipient')
 
     def bumps(change) -> bool:
       before = access_signal.current_revision()
