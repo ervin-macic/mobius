@@ -473,3 +473,24 @@ def test_snapshot_applies_the_same_icon_rule_as_apply(tmp_path):
 
   assert raised.value.code == "invalid_icon"
   assert "icon.png" in raised.value.detail
+
+
+@pytest.mark.parametrize("credential", [
+  "AIza" + "A" * 35,
+  "sk-ant-" + "A" * 20,
+  "sk-proj-" + "A" * 20,
+  "rk_live_" + "A" * 20,
+  "sk_live_" + "A" * 20,
+  "xoxb-" + "A" * 10,
+])
+def test_snapshot_refuses_additional_recognizable_credential_patterns(
+  tmp_path, credential,
+):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {"config.js": f"const key = '{credential}';".encode()})
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "secret_detected"
+  assert credential not in raised.value.detail

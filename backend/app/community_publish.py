@@ -54,11 +54,17 @@ _SENSITIVE_FILES = {
   "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa",
   "credentials.json", "service-account.json",
 }
+# Heuristics catch recognizable credentials, not every possible secret.
+# Authors still need to review the accepted source before publication.
 _SECRET_PATTERNS = (
   re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
   re.compile(r"\bgh[pousr]_[A-Za-z0-9]{24,}\b"),
   re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b"),
   re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+  re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+  re.compile(r"\bsk-(?:ant-|proj-)[A-Za-z0-9_-]{20,}"),
+  re.compile(r"\b[rs]k_live_[A-Za-z0-9]{20,}\b"),
+  re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
 )
 _JOURNAL_STATES = {"listing_pending", "failed", "live"}
 _LOCAL_APP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
