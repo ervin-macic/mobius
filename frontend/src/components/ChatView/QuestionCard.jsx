@@ -36,6 +36,9 @@ import {
 
 
 const CUSTOM_ANSWER_MAX_HEIGHT = 180
+// The server's bound on one answer's files; checked here so the owner hears
+// it when attaching rather than as a failed submit.
+const MAX_ANSWER_FILES = 20
 
 
 function resizeCustomAnswer(textarea) {
@@ -184,6 +187,11 @@ export default function QuestionCard({
   if (initialFilesRef.current === null) initialFilesRef.current = readQuestionDraft(draftKey).files
   const { files, addFiles, removeFile, clearFiles, discardFiles } = useFileUpload({ chatId, initialFiles: initialFilesRef.current })
   const readyFiles = files.filter(file => file.status === 'done')
+  function addAnswerFiles(list) {
+    const room = MAX_ANSWER_FILES - files.length
+    if (list.length > room) setSubmitError(`Attach at most ${MAX_ANSWER_FILES} files to one answer.`)
+    return room > 0 ? addFiles(list.slice(0, room)) : Promise.resolve()
+  }
   // Like the composer: wait for uploads in flight; a failed one shows its
   // error on the chip and is simply not sent.
   const pendingFiles = files.some(file => file.status === 'uploading')
@@ -528,7 +536,7 @@ export default function QuestionCard({
                     ? 'Or tell me what you’d like to do instead…'
                     : hasOptions ? undefined : 'Type your answer…'}
                   onChange={text => setOtherText(q.question, text)}
-                  onPasteFiles={platformAction || inactive ? undefined : addFiles}
+                  onPasteFiles={platformAction || inactive ? undefined : addAnswerFiles}
                   onSubmitShortcut={(questionCard) => {
                     if (canSubmit) handleSubmit(questionCard, null)
                   }}
@@ -552,7 +560,7 @@ export default function QuestionCard({
             onChange={e => {
               const selected = Array.from(e.target.files || [])
               e.target.value = ''
-              if (!submitting) addFiles(selected)
+              if (!submitting) addAnswerFiles(selected)
             }} />
           <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
             title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>

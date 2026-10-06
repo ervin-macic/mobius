@@ -3,6 +3,7 @@
 
 import os
 import re
+import tempfile
 from datetime import UTC, datetime
 import pathlib
 from typing import List
@@ -20,10 +21,10 @@ from app.deps import (
   Principal, get_owner_or_chat_embed_principal, reject_cross_site,
   require_chat_embed_operation, resolve_media_or_header_owner,
 )
-from app.image_previews import discard_image_preview, display_image_preview
+from app.image_previews import display_image_preview
 from app.path_utils import validate_chat_id, validate_path_within_base
 from app.resource_access import get_active_chat_for_principal
-from app.upload_lifecycle import is_draft, partition_expired_drafts
+from app.upload_lifecycle import is_draft, remove_upload_files, take_expired_drafts
 
 router = APIRouter(prefix="/api/chats", tags=["uploads"])
 
@@ -132,9 +133,9 @@ async def upload_files(
   except BaseException:
     # A later file over the cap, or a commit failure, must not leave this
     # request's files on disk with no metadata row.
-    await run_in_threadpool(_remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
+    await run_in_threadpool(remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
     raise
-  await run_in_threadpool(_remove_upload_files, upload_dir, expired)
+  await run_in_threadpool(remove_upload_files, upload_dir, expired)
   return saved
 
 
@@ -160,53 +161,37 @@ async def _read_capped(file: UploadFile) -> bytes:
 
 
 def _create_upload_file(upload_dir: pathlib.Path, filename: str, content: bytes) -> pathlib.Path:
-  """Write content under a name no other file holds, claimed by exclusive create."""
-  while True:
-    dest = upload_dir / _unique_name(upload_dir, filename)
-    try:
-      fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-      continue
-    try:
-      with os.fdopen(fd, "wb") as f:
-        f.write(content)
-        f.flush()
-        os.fsync(f.fileno())
-    except BaseException:
-      dest.unlink(missing_ok=True)
-      raise
-    return dest
+  """Write content to a temp file, then link it under a free name.
+
+  The link fails if the name is taken, so concurrent uploads of one name stay
+  apart without the chat lock, and a crash never leaves a partial file under
+  a real name.
+  """
+  fd, tmp = tempfile.mkstemp(dir=upload_dir, prefix=".upload-", suffix=".tmp")
+  try:
+    with os.fdopen(fd, "wb") as f:
+      f.write(content)
+      f.flush()
+      os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    while True:
+      dest = upload_dir / _unique_name(upload_dir, filename)
+      try:
+        os.link(tmp, dest)
+      except FileExistsError:
+        continue
+      return dest
+  finally:
+    os.unlink(tmp)
 
 
 def _record_uploads(db: Session, chat: models.Chat, saved: list[dict]) -> list[pathlib.Path]:
   """Append new drafts and drop expired ones; the caller holds the chat lock."""
   db.refresh(chat)
-  kept, expired = partition_expired_drafts(chat.uploads or [])
-  chat.uploads = kept + saved
+  expired = take_expired_drafts(chat)
+  chat.uploads = list(chat.uploads or []) + saved
   db.commit()
-  return [pathlib.Path(e.get("path") or "") for e in expired]
-
-
-def _sweep_expired(db: Session, chat: models.Chat, keep: set[str]) -> list[pathlib.Path]:
-  kept, expired = partition_expired_drafts(chat.uploads or [], keep=keep)
-  if not expired:
-    return []
-  chat.uploads = kept
-  db.commit()
-  return [pathlib.Path(e.get("path") or "") for e in expired]
-
-
-async def sweep_expired_uploads(
-  db: Session, chat: models.Chat, keep: set[str] = frozenset(),
-) -> None:
-  """Drop drafts past their TTL when a message arrives; caller holds the chat lock.
-
-  `keep` names the arriving message's own files, which it is about to claim.
-  """
-  expired = await run_in_threadpool(_sweep_expired, db, chat, keep)
-  if expired:
-    upload_dir = pathlib.Path(get_settings().data_dir) / "chats" / chat.id / "uploads"
-    await run_in_threadpool(_remove_upload_files, upload_dir, expired)
+  return expired
 
 
 @router.get("/{chat_id}/uploads")
@@ -254,7 +239,7 @@ async def delete_upload(
   async with chat_queue.get_lock(chat_id):
     removed = await run_in_threadpool(_forget_draft, db, chat, filename)
   if removed:
-    await run_in_threadpool(_remove_upload_files, upload_dir, [file_path])
+    await run_in_threadpool(remove_upload_files, upload_dir, [file_path])
   return Response(status_code=204)
 
 
@@ -266,17 +251,6 @@ def _forget_draft(db: Session, chat: models.Chat, filename: str) -> bool:
   chat.uploads = [u for u in uploads if u.get("name") != filename]
   db.commit()
   return True
-
-
-def _remove_upload_files(upload_dir: pathlib.Path, paths: list[pathlib.Path]) -> None:
-  for path in paths:
-    try:
-      safe = validate_path_within_base(path.name, upload_dir)
-    except HTTPException:
-      continue
-    if safe.is_file():
-      safe.unlink()
-      discard_image_preview(safe, upload_dir)
 
 
 @router.get("/{chat_id}/uploads/{filename}")

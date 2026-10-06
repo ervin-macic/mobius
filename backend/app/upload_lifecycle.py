@@ -14,7 +14,15 @@ its file the same way an abandoned one does.
 
 from __future__ import annotations
 
+import pathlib
 from datetime import UTC, datetime, timedelta
+
+from fastapi import HTTPException
+from fastapi.concurrency import run_in_threadpool
+
+from app.config import get_settings
+from app.image_previews import discard_image_preview
+from app.path_utils import validate_path_within_base
 
 UNCLAIMED_UPLOAD_TTL = timedelta(days=7)
 
@@ -85,3 +93,43 @@ def _uploaded_before(entry: dict, cutoff: datetime) -> bool:
     return datetime.fromisoformat(entry["uploaded_at"]) < cutoff
   except (KeyError, TypeError, ValueError):
     return False
+
+
+def take_expired_drafts(chat, keep: set[str] = frozenset()) -> list[pathlib.Path]:
+  """Drop drafts past the TTL from `chat.uploads`; return their files to remove."""
+  kept, expired = partition_expired_drafts(chat.uploads or [], keep=keep)
+  if expired:
+    chat.uploads = kept
+  return [pathlib.Path(e.get("path") or "") for e in expired]
+
+
+def upload_dir(chat_id: str) -> pathlib.Path:
+  return pathlib.Path(get_settings().data_dir) / "chats" / chat_id / "uploads"
+
+
+def remove_upload_files(directory: pathlib.Path, paths: list[pathlib.Path]) -> None:
+  """Delete upload files (and image previews), never outside `directory`."""
+  for path in paths:
+    try:
+      safe = validate_path_within_base(path.name, directory)
+    except HTTPException:
+      continue
+    if safe.is_file():
+      safe.unlink()
+      discard_image_preview(safe, directory)
+
+
+async def sweep_expired_uploads(db, chat, keep: set[str] = frozenset()) -> None:
+  """Drop expired drafts when a message arrives; the caller holds the chat lock.
+
+  `keep` names the arriving message's own files, which it is about to claim.
+  """
+  def drop() -> list[pathlib.Path]:
+    expired = take_expired_drafts(chat, keep)
+    if expired:
+      db.commit()
+    return expired
+
+  expired = await run_in_threadpool(drop)
+  if expired:
+    await run_in_threadpool(remove_upload_files, upload_dir(chat.id), expired)

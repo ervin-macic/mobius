@@ -60,8 +60,7 @@ from app.database import get_db
 from app.memory_observability import record_memory_checkpoint_once
 from app.goal_commands import goal_clear_requested
 from app.owner_input import publish_owner_input_changed
-from app.routes.uploads import sweep_expired_uploads
-from app.upload_lifecycle import attachment_names, is_draft
+from app.upload_lifecycle import attachment_names, is_draft, sweep_expired_uploads
 from app.deps import (
   Principal, get_chat_view_principal, get_owner_or_chat_embed_principal,
   get_current_owner, reject_cross_site,

@@ -216,3 +216,24 @@ test('answer paste matches the composer: Markdown by default, plain on the short
   assert.deepEqual(paste({ plainShortcut: true }), { changes: ['ahib'], prevented: true })
   assert.deepEqual(paste({ answered: true }), { changes: [], prevented: false })
 })
+
+
+test('an answer takes at most 20 files and says so when more are attached', async () => {
+  const originalFetch = globalThis.fetch
+  let uploads = 0
+  globalThis.fetch = (url, options) => {
+    if (options?.method === 'POST') uploads += 1
+    return new Promise(() => {})
+  }
+  const card = renderHook(QuestionCard, {
+    chatId: 'limit-chat', questionId: 'limit-card', questions: questions.slice(0, 1),
+  })
+  try {
+    const many = Array.from({ length: 21 }, (_, i) => new File(['x'], `f${i}.txt`))
+    editor(card.result.current, 'First?').props.onPasteFiles(many)
+    assert.equal(chips(card.result.current).props.files.length, 20)
+    assert.equal(uploads, 1, 'uploads run one at a time')
+    const error = find(card.result.current, node => node.props?.className === 'qcard__submit-error')
+    assert.equal(error.props.children, 'Attach at most 20 files to one answer.')
+  } finally { card.unmount(); globalThis.fetch = originalFetch }
+})

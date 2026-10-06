@@ -614,3 +614,17 @@ def test_cancel_keeps_files_an_answered_card_still_shows(client, db, auth, chat,
 
   db.refresh(chat)
   assert chat.uploads[0]["claimed"] is True
+
+
+def test_failed_upload_write_leaves_no_file_behind(tmp_path, monkeypatch):
+  """A write that dies part-way never leaves a partial file or temp file."""
+  import os
+  from app.routes import uploads
+
+  def broken_fsync(fd):
+    raise OSError("disk full")
+
+  monkeypatch.setattr(os, "fsync", broken_fsync)
+  with pytest.raises(OSError):
+    uploads._create_upload_file(tmp_path, "report.pdf", b"data")
+  assert list(tmp_path.iterdir()) == []
