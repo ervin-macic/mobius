@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import uuid
 
+import pytest
+
 from app import auth as auth_mod, models
 from app.delegations import RunPolicy, delegation_execution_token
 from app.timeutil import now_naive_utc
@@ -829,3 +831,18 @@ def test_overlapping_exact_agent_answer_is_acknowledged_after_lock(
   assert chat.messages[-1]["blocks"][0]["selected_options"] == {
     "choice": ["yes"],
   }
+
+
+@pytest.mark.parametrize("route, body", [
+  ("/api/apps/999/conflict-resolver-chat", {}),
+  ("/api/apps/conflict-resolver-batch", {"app_ids": [999]}),
+])
+def test_delegated_bearer_cannot_launch_owner_app_conflict_resolver(
+  client, owner_token, db, route, body,
+):
+  _chats, delegated_auth, _top_level_auth = _delegated_and_top_level_auth(
+    client, owner_token, db,
+  )
+  response = client.post(route, json=body, headers=delegated_auth)
+  assert response.status_code == 403, response.text
+  assert "Delegated agents" in response.json()["detail"]

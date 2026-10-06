@@ -532,9 +532,7 @@ class AppConflictResolverChatOut(BaseModel):
 
 
 class AppConflictResolverChatRequest(BaseModel):
-  # The published App Store still names the one resolution there is: keep
-  # local work while taking the update. Any other choice is refused rather
-  # than silently replaced.
+  # Accepted for compatibility with the published Store's request.
   resolution_policy: Literal["preserve_local"] | None = None
 
 
@@ -544,6 +542,7 @@ class AppConflictResolverBatchChatRequest(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   app_ids: list[int] = Field(min_length=1, max_length=50)
+  # Accepted for compatibility with the published Store's request.
   resolution_policy: Literal["preserve_local"] | None = None
 
 
