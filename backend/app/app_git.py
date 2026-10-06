@@ -426,12 +426,15 @@ def _run(
       stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
       # Git removes its locks on SIGTERM; stop transport children with it.
-      os.killpg(process.pid, signal.SIGTERM)
       try:
-        process.communicate(timeout=1)
-      except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+          process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+          os.killpg(process.pid, signal.SIGKILL)
+          process.communicate()
+      except ProcessLookupError:
+        pass  # The whole group exited on its own in the meantime.
       raise
     if check and process.returncode:
       raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
