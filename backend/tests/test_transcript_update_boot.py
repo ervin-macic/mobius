@@ -67,12 +67,21 @@ def _boot_context():
   )
 
 
-def test_the_live_working_set_names_running_queued_goal_and_helper_chats():
+def test_the_live_working_set_is_only_work_in_flight():
   _seed("live-running")
   _seed_helper("live-parent", "live-child")
   with SessionLocal() as db:
     db.add(create_chat(id="live-queued", title="q", pending_messages=[{"role": "user", "content": "x"}]))
     db.add(create_chat(id="live-idle", title="i", messages=[{"role": "user", "content": "x"}]))
+    # An idle open Goal with an old helper is not in flight: its next turn,
+    # wake or steer converts what it reads.
+    db.add(create_chat(id="idle-goal", title="g", messages=[{"role": "user", "content": "x"}]))
+    db.add(models.ChatGoal(id="idle-goal-1", chat_id="idle-goal", objective="later", status="open"))
+    db.add(create_chat(id="idle-goal-helper", title="h", messages=[]))
+    db.add(models.Delegation(
+      id="idle-deleg", parent_chat_id="idle-goal", parent_root_run_id="idle-root",
+      task_key="t", child_chat_id="idle-goal-helper", provider="codex", scope="write", cwd="/data",
+      startup_prompt="task", prompt_sha256=hashlib.sha256(b"task").hexdigest()))
     db.commit()
   _unconvert()
   with SessionLocal() as db:
@@ -279,3 +288,76 @@ def test_a_legacy_null_converts_to_an_empty_transcript():
     assert conn.exec_driver_sql(
       "SELECT COUNT(*) FROM chat_transcript_damage WHERE chat_id = 'null-chat'").scalar() == 0
   assert _converted("null-chat")
+
+
+def _fail_conversion_of(monkeypatch, content):
+  real = transcript_rows.attributes
+
+  def failing(body):
+    if isinstance(body, dict) and body.get("content") == content:
+      raise RuntimeError("simulated conversion bug")
+    return real(body)
+
+  monkeypatch.setattr(transcript_rows, "attributes", failing)
+
+
+@pytest.mark.asyncio
+async def test_one_unconvertible_helper_never_breaks_its_parent(monkeypatch):
+  """A parent whose old helper cannot convert still starts turns, and its
+  wake and steer notices report that helper's result as unavailable."""
+  from app.delegations import (
+    _compose_wake_notice, active_parent_context, derived_status, ensure_parent_helpers_converted,
+  )
+  _seed_helper()
+  with SessionLocal() as db:
+    db.add(create_chat(id="old-helper", title="Old", provider="codex",
+                       messages=[{"role": "assistant", "content": "unconvertible"}]))
+    db.add(models.Delegation(
+      id="old-deleg", parent_chat_id="up-parent", parent_root_run_id="up-parent-run",
+      task_key="old", child_chat_id="old-helper", provider="codex", scope="write", cwd="/data",
+      startup_prompt="task", prompt_sha256=hashlib.sha256(b"task").hexdigest()))
+    db.commit()
+  _unconvert("old-helper", "up-child")
+  _fail_conversion_of(monkeypatch, "unconvertible")
+  # Turn start: never raises for one helper.
+  await ensure_parent_helpers_converted("up-parent")
+  assert _converted("up-child") and not _converted("old-helper")
+  assert "old-helper" in chat_writer.transcript_conversion_status["failed"]
+  with SessionLocal() as db:
+    context = active_parent_context(db, "up-parent", "up-parent-run")
+    assert "old-deleg" in context
+    old = db.get(models.Delegation, "old-deleg")
+    _status, _run, result = derived_status(db, old)
+    assert result.startswith("Result unavailable") and "simulated conversion bug" in result
+    # Wake and steer compose the same notice.
+    notice = _compose_wake_notice(db, [old], {old.id: None})
+    assert "Result unavailable" in notice
+
+
+def test_a_reader_that_skipped_conversion_still_fails_loudly():
+  """Only a recorded conversion failure becomes "result unavailable"; a chat
+  nobody tried to convert still trips the event-loop guard."""
+  from app.delegations import derived_status
+  _seed_helper()
+  _unconvert("up-child")
+
+  async def on_loop():
+    with SessionLocal() as db:
+      with pytest.raises(transcript_rows.TranscriptNotConverted):
+        derived_status(db, db.get(models.Delegation, "up-child-deleg"))
+
+  import asyncio
+  asyncio.run(on_loop())
+
+
+def test_search_reports_how_many_chats_are_searchable_by_title_only(client, auth):
+  _seed_helper()
+  _unconvert("up-child")
+  response = client.get("/api/chats/search?q=helper", headers=auth)
+  assert response.status_code == 200
+  assert isinstance(response.json(), list)
+  # The count the request saw (audit mode unconverts every chat before it).
+  with SessionLocal() as db:
+    count = transcript_rows.unconverted_count(db)
+  assert count >= 1
+  assert response.headers["X-Search-Unindexed-Chats"] == str(count)

@@ -252,26 +252,27 @@ def convert(db, chat_id: str) -> bool:
 
 
 def live_working_set(db) -> list[str]:
-  """Unconverted chats boot recovery, sweeps and resumed turns will read.
+  """Unconverted chats that boot recovery and the startup sweeps read.
 
   Unconverted chats only come into existence while older code runs, so they
-  all exist at boot: converting this set before recovery means no event-loop
-  reader meets one of these chats unconverted. The set is chats with a
-  non-terminal run, chats with queued messages, chats with an open Goal, and
-  both ends of every delegation touching one of those.
+  all exist at boot. This set is the work actually in flight: chats with a
+  non-terminal run, chats with queued messages, and both ends of every
+  delegation whose parent or child has a non-terminal run. Its size is
+  bounded by in-flight work, not by history (an idle open Goal is not in
+  flight: its next turn, wake or steer converts what it reads first).
+  Everything else is converted by its first reader or in the background.
   """
   if not legacy_present(db) or conversion_settled(db.get_bind()):
     return []
   m = models
-  live = set(db.execute(select(m.ChatRun.chat_id).where(
+  running = set(db.execute(select(m.ChatRun.chat_id).where(
     m.ChatRun.status.in_(m.NONTERMINAL_RUN_STATUSES),
   )).scalars())
-  live |= set(db.execute(select(m.Chat.id).where(
+  live = running | set(db.execute(select(m.Chat.id).where(
     m.Chat.pending_messages.cast(Text).not_in(("[]", "null")),
   )).scalars())
-  live |= set(db.execute(select(m.ChatGoal.chat_id).where(m.ChatGoal.status == "open")).scalars())
   for parent, child in db.execute(select(m.Delegation.parent_chat_id, m.Delegation.child_chat_id)).all():
-    if parent in live or child in live:
+    if parent in running or child in running:
       live.update(chat for chat in (parent, child) if chat)
   return sorted(chat_id for chat_id in live if needs_conversion(db, chat_id))
 
@@ -286,7 +287,7 @@ def next_unconverted(db, after: str | None) -> str | None:
 
 
 def unconverted_count(db) -> int:
-  if not legacy_present(db):
+  if not legacy_present(db) or conversion_settled(db.get_bind()):
     return 0
   return db.execute(text(
     "SELECT COUNT(*) FROM chats c WHERE NOT EXISTS "

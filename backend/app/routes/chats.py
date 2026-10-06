@@ -1014,20 +1014,30 @@ def mark_chat_failure_seen(
   return Response(status_code=204)
 
 
+# Chats whose titles are searchable but whose message text is not yet: the
+# previous release wrote them and they are not converted. Additive to the
+# result list, which stays the response body.
+SEARCH_UNINDEXED_HEADER = "X-Search-Unindexed-Chats"
+
+
 @router.get("/search")
 def search_chats(
+  response: Response,
   q: str = Query("", max_length=256),
   _: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
   """Full-text search over chat titles and conversation prose.
 
-  Registered before ``/{chat_id}`` so the literal path wins. The index is
-  derived data reconciled inside the request (see ``chat_search``); the first
-  query on an existing instance pays a one-time backfill, after which only
-  changed chats are touched. Snippets mark matches with private-use
-  sentinels U+E000/U+E001; the drawer converts them to highlight marks.
+  Registered before ``/{chat_id}`` so the literal path wins. Search entries
+  are maintained by schema triggers with every write (see ``chat_search``).
+  A chat the previous release wrote is searchable by title at once and by
+  message text once converted; ``X-Search-Unindexed-Chats`` counts those
+  still waiting, so the shell can say results may be incomplete. Snippets
+  mark matches with private-use sentinels U+E000/U+E001; the drawer converts
+  them to highlight marks.
   """
+  response.headers[SEARCH_UNINDEXED_HEADER] = str(transcript_rows.unconverted_count(db))
   query = q.strip()
   if not query:
     return []

@@ -225,6 +225,9 @@ def _install_unconverted_request_audit():
   def unconvert_every_chat():
     with engine.begin() as connection:
       connection.exec_driver_sql("DELETE FROM chat_transcript_state")
+    # The process-level "all converted" fact would otherwise hide these chats.
+    from app import transcript_rows as audit_transcript_rows
+    audit_transcript_rows.reset_conversion_facts()
 
   @app.middleware("http")
   async def unconvert_before_request(request, call_next):

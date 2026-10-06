@@ -593,9 +593,19 @@ def _assistant_result(chat: models.Chat) -> str:
 
   The outcome is the message's last text block (the report; earlier text
   blocks are progress narration split off by tools or provider items) plus
-  its latest error, so a failed or stopped helper stays actionable.
+  its latest error, so a failed or stopped helper stays actionable. A helper
+  whose transcript could not be converted reports that, with the recorded
+  error, instead of failing the parent's read.
   """
-  for message in reversed(transcript_rows.history(chat)):
+  try:
+    history = transcript_rows.history(chat)
+  except (transcript_rows.TranscriptNotConverted, transcript_rows.TranscriptUnavailable):
+    from app.chat_writer import transcript_conversion_status
+    error = transcript_conversion_status["failed"].get(chat.id)
+    if error is None:
+      raise  # Not a recorded failure: a reader that skipped its conversion.
+    return f"Result unavailable: this helper's transcript could not be prepared ({error})."
+  for message in reversed(history):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
     blocks = message.get("blocks")
@@ -628,11 +638,17 @@ async def ensure_parent_helpers_converted(parent_chat_id: str, db: Session | Non
     with SessionLocal() as own:
       await ensure_parent_helpers_converted(parent_chat_id, own)
     return
+  await transcript_rows.ensure_converted_async(parent_chat_id, db)
   children = [row[0] for row in db.query(models.Delegation.child_chat_id).filter(
     models.Delegation.parent_chat_id == parent_chat_id,
   )]
-  for chat_id in (parent_chat_id, *children):
-    await transcript_rows.ensure_converted_async(chat_id, db)
+  for chat_id in children:
+    try:
+      await transcript_rows.ensure_converted_async(chat_id, db)
+    except transcript_rows.TranscriptUnavailable as exc:
+      # One helper that cannot convert must never break its parent: readers
+      # report that helper's result as unavailable (_assistant_result).
+      _LOG.warning("helper transcript unavailable for parent %s: %s", parent_chat_id, exc)
 
 
 def derived_status(

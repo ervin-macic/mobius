@@ -10,6 +10,7 @@ their bytes. Raw SQL stands in for the previous release, which writes only
 
 import asyncio
 import json
+import os
 import math
 import threading
 
@@ -497,6 +498,8 @@ async def test_boot_on_a_previous_release_database_converts_in_the_background(ca
     await task
   assert "TranscriptNotConverted" not in caplog.text
   assert "start transcript conversion" not in context.failed_tasks
+  if os.environ.get("MOBIUS_TEST_UNCONVERT_ON_REQUEST") == "1":
+    return  # The audit mode unconverts again before each later sweep.
   assert all(converted(chat_id) for chat_id in ids)
   assert stored_rows(ids[0]) == [{"role": "user", "content": f"boot {ids[0]}"}]
 
