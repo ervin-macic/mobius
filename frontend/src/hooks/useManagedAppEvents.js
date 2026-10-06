@@ -1,8 +1,4 @@
 import { useCallback, useEffect, useState } from 'react'
-import {
-  managedAppEventForShellEvent,
-  managedAppFrameMessage,
-} from '../lib/managedAppEvents.js'
 
 // The shell's latest app lifecycle event, sequenced so a repeated update of
 // the same app still changes state. `observe` takes every system event.
@@ -10,9 +6,11 @@ export function useManagedAppEvent() {
   const [event, setEvent] = useState(null)
   const observe = useCallback((ev) => {
     if (ev?.type !== 'app_updated') return
-    setEvent(current => managedAppEventForShellEvent(
-      ev, current?.sequence || 0,
-    ))
+    setEvent(current => ({
+      type: 'app_updated',
+      appId: ev.appId == null ? null : String(ev.appId),
+      sequence: (current?.sequence || 0) + 1,
+    }))
   }, [])
   return [event, observe]
 }
@@ -26,8 +24,9 @@ export function useManagedAppFrameForwarding(
   framesRef, event, capabilityContract,
 ) {
   useEffect(() => {
-    const message = managedAppFrameMessage(event, capabilityContract)
-    if (!message) return
+    if (event?.type !== 'app_updated'
+      || capabilityContract?.data?.manage_apps !== true) return
+    const message = { type: 'moebius:managed-app-event', event }
     for (const frame of framesRef.current.values()) {
       frame?.contentWindow?.postMessage(message, '*')
     }

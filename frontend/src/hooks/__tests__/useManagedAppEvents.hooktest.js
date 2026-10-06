@@ -49,11 +49,25 @@ test('a finished app update reaches a manager frame in the Store shape', () => {
 })
 
 test('frames without manage_apps never receive app lifecycle events', () => {
-  for (const contract of [null, { data: { manage_apps: false } }]) {
+  for (const contract of [
+    null, { data: {} }, { data: { manage_apps: false } },
+    { data: { manage_apps: 'true' } },
+  ]) {
     const { framesRef, posted } = fakeFrames()
     const hook = renderShellAndFrame(framesRef, contract)
     hook.result.current({ type: 'app_updated', appId: 7 })
     assert.deepEqual(posted, [])
     hook.unmount()
   }
+})
+
+test('a completion without an app id remains an authoritative refresh signal', () => {
+  const { framesRef, posted } = fakeFrames()
+  const hook = renderShellAndFrame(framesRef, { data: { manage_apps: true } })
+  hook.result.current({ type: 'app_updated', unrelated: 'not forwarded' })
+  assert.deepEqual(posted[0].message, {
+    type: 'moebius:managed-app-event',
+    event: { type: 'app_updated', appId: null, sequence: 1 },
+  })
+  hook.unmount()
 })
