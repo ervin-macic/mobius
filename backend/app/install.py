@@ -73,7 +73,6 @@ from app.manifest_identity import (
   canonical_manifest_base as _canonical_base,
   canonical_manifest_identity_key as _canonical_identity_key,
   requested_manifest_source,
-  stored_manifest_fetch_url,
   require_bound_manifest as _require_bound_manifest,
 )
 from app.manifest_contract import (
@@ -2374,13 +2373,16 @@ async def _fetch_and_validate_manifest(
 
   Preview and install intentionally share this exact boundary.  The preview is
   therefore not a second, weaker interpretation that can drift from what the
-  installer eventually applies.
+  installer eventually applies. Stored identity addresses are normalized and
+  bound here, before any package assets are fetched.
   """
   if (manifest_url is None) == (manifest is None):
     raise HTTPException(
       400, "Provide exactly one of `manifest_url` or `manifest`.",
     )
+  bound_manifest_id = None
   if manifest_url is not None:
+    manifest_url, bound_manifest_id = requested_manifest_source(manifest_url)
     raw = await _http_get(cli, manifest_url, _MANIFEST_MAX_BYTES)
     try:
       loaded = json.loads(raw)
@@ -2397,6 +2399,10 @@ async def _fetch_and_validate_manifest(
     raise HTTPException(400, "Manifest root must be a JSON object.")
 
   _validate_manifest(manifest)
+  try:
+    _require_bound_manifest(manifest, bound_manifest_id)
+  except ValueError as exc:
+    raise HTTPException(409, str(exc)) from exc
   return manifest, _normalize_raw_base(raw_base)
 
 
@@ -2407,9 +2413,6 @@ async def preview_manifest_capabilities(
   raw_base: str | None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
-  bound_manifest_id = None
-  if manifest_url is not None:
-    manifest_url, bound_manifest_id = requested_manifest_source(manifest_url)
   async with httpx.AsyncClient(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
@@ -2420,10 +2423,6 @@ async def preview_manifest_capabilities(
       manifest=manifest,
       raw_base=raw_base,
     )
-  try:
-    _require_bound_manifest(loaded, bound_manifest_id)
-  except ValueError as exc:
-    raise HTTPException(409, str(exc)) from exc
   contract, digest = contract_and_digest(loaded)
   return loaded, normalized_base, contract, digest
 
@@ -2883,7 +2882,10 @@ async def _fetch_install_candidate(
       manifest=manifest,
       raw_base=raw_base,
     )
-    source_url = manifest_url if manifest_url is not None else raw_base
+    source_url = (
+      requested_manifest_source(manifest_url)[0]
+      if manifest_url is not None else raw_base
+    )
     source_identity = None
     predecessor_source_identity = None
     canonical_source_url = raw_base
@@ -3075,14 +3077,13 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  old_manifest_url = stored_manifest_fetch_url(existing.manifest_url)
   async with httpx.AsyncClient(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
   ) as cli:
     old_manifest, _ = await _fetch_and_validate_manifest(
       cli,
-      manifest_url=old_manifest_url,
+      manifest_url=existing.manifest_url,
       manifest=None,
       raw_base=None,
     )
@@ -4083,9 +4084,6 @@ async def install_from_manifest(
       raise ValueError("publication handoff requires its dedicated source")
     if expected_app_id is not None:
       raise ValueError("publication handoff cannot be a pending replay")
-  bound_manifest_id = None
-  if manifest_url is not None:
-    manifest_url, bound_manifest_id = requested_manifest_source(manifest_url)
   # Phase 1: immutable, review-bound candidate. A Store update and a conflict
   # replay both read the exact Git commit already selected by Review; fresh
   # installs keep the ordinary URL/inline package path.
@@ -4097,8 +4095,8 @@ async def install_from_manifest(
     reviewed_app = db.get(models.App, reviewed_id)
     if reviewed_app is None or not app_git.is_repo(reviewed_app.source_dir):
       raise HTTPException(409, "Reviewed app source is no longer available.")
-    reviewed_source_url = manifest_url or (
-      _normalize_raw_base(raw_base or "") + "mobius.json"
+    reviewed_source_url, bound_manifest_id = requested_manifest_source(
+      manifest_url or (_normalize_raw_base(raw_base or "") + "mobius.json")
     )
     try:
       has_manifest = await asyncio.to_thread(
@@ -4156,6 +4154,10 @@ async def install_from_manifest(
           },
         ) from exc
       candidate = git_candidate.candidate
+      try:
+        _require_bound_manifest(candidate.manifest, bound_manifest_id)
+      except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if git_candidate is not None and manifest is not None and manifest != candidate.manifest:
       raise HTTPException(409, "Pending update manifest changed.")
     if (
@@ -4209,10 +4211,8 @@ async def install_from_manifest(
       expected_candidate_digest=expected_candidate_digest,
     )
 
-  try:
-    _require_bound_manifest(candidate.manifest, bound_manifest_id)
-  except ValueError as exc:
-    raise HTTPException(409, str(exc)) from exc
+  if manifest_url is not None:
+    manifest_url, _ = requested_manifest_source(manifest_url)
 
   # Phase 2: immutable identity/update decision. No writes occur here.
   target = _select_install_target(
