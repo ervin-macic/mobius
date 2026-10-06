@@ -305,6 +305,10 @@ test.describe('Message rendering', () => {
     )
     await createChat(page)
     await sendMessage(page, 'Render markdown')
+    // sendMessage returns once the user row paints; the reply is still being
+    // fetched and typed out. Its `done` flushes the text and ends the turn,
+    // which retires Stop, so only then is the rendered markdown complete.
+    await expect(page.locator('[data-chat-surface="painted"] .chat__stop')).toHaveCount(0)
 
     const result = await page.evaluate(() => {
       const assistant = document.querySelector('[data-chat-surface="painted"] .chat__msg--assistant')

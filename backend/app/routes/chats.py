@@ -38,7 +38,7 @@ from app.chat_visibility import (
 )
 from app.chat_event_sink import active_sink_assistant_message_id
 from app.chat_activity import chat_activity_page
-from app.chat_context import recent_chat_digest_order
+from app.chat_context import recent_chat_summary_order
 from app.chat_waits import (
   outstanding_wait_chat_ids,
   outstanding_waits_for_chat,
@@ -2261,7 +2261,7 @@ def get_chat_agent_context(
     _latest_compaction_brief,
     _read_skill_text,
   )
-  from app.compaction import load_cumulative_summary
+  from app.compaction import load_full_digest
   from app.providers import get_skill_origin
   from app.system_prompts import prompt_for_chat
 
@@ -2278,9 +2278,9 @@ def get_chat_agent_context(
   app_context_block, _env = _build_app_context(db, chat_id, data_dir)
   app_report_block = _build_app_report_block(db, chat_id, data_dir)
   compaction_brief = _latest_compaction_brief(chat)
-  chat_summary = load_cumulative_summary(data_dir, chat_id)
+  chat_digest = load_full_digest(data_dir, chat_id)
   chat_summary_metadata = memory.load_chat_summary_metadata(data_dir, chat_id)
-  ordered_chat_ids = recent_chat_digest_order(db)
+  ordered_chat_ids = recent_chat_summary_order(db)
   recent_chat_block = memory.build_memory_block(
     data_dir,
     ordered_chat_ids=ordered_chat_ids,
@@ -2306,8 +2306,8 @@ def get_chat_agent_context(
     # turn publishes its note. Once published, expose the one-line summary
     # itself so the owner can inspect all three summary layers together.
     "chat_description": chat_summary_metadata["description"] or chat.title,
-    "chat_digest": chat_summary_metadata["digest"],
-    "chat_summary": chat_summary,
+    "chat_summary": chat_summary_metadata["summary"],
+    "chat_digest": chat_digest,
   }
 
 
@@ -2687,7 +2687,7 @@ async def switch_chat_provider(
 ):
   """Have the incoming provider prepare and atomically commit a handoff.
 
-  The selected provider reads the detailed per-chat ``## Summary`` plus the
+  The selected provider reads the full per-chat ``## Digest`` plus the
   complete visible transcript and synthesizes its own compact starting context
   in bounded disposable sessions. The writer then appends that context, changes
   provider/settings, and clears the outgoing session in one transaction. Any
@@ -2711,7 +2711,7 @@ async def _compact_chat_locked(
     messages_fingerprint,
   )
   from app.compaction import (
-    CompactionError, load_cumulative_summary, summarize_chat,
+    CompactionError, load_full_digest, summarize_chat,
   )
 
   chat = get_active_chat_or_404(db, chat_id)
@@ -2803,10 +2803,10 @@ async def _compact_chat_locked(
   with compacting(chat_id, "provider_switch"):
     messages = list(chat.messages or [])
     source_messages_hash = messages_fingerprint(messages)
-    source_summary = load_cumulative_summary(data_dir, chat_id)
-    source_summary_hash = (
-      hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
-      if source_summary is not None
+    source_digest = load_full_digest(data_dir, chat_id)
+    source_digest_hash = (
+      hashlib.sha256(source_digest.encode("utf-8")).hexdigest()
+      if source_digest is not None
       else None
     )
     try:
@@ -2814,7 +2814,7 @@ async def _compact_chat_locked(
         messages,
         data_dir=data_dir,
         provider_id=body.provider,
-        source_summary=source_summary,
+        source_digest=source_digest,
         model=settings_patch.get("model"),
         effort=settings_patch.get("effort"),
       )
@@ -2832,13 +2832,13 @@ async def _compact_chat_locked(
     # The note is a separate file the agent saves as it works. If it was
     # rewritten while synthesis ran, retry from the fresh detailed source rather
     # than committing a handoff the incoming provider derived from stale data.
-    latest_summary = load_cumulative_summary(data_dir, chat_id)
+    latest_digest = load_full_digest(data_dir, chat_id)
     latest_hash = (
-      hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
-      if latest_summary is not None
+      hashlib.sha256(latest_digest.encode("utf-8")).hexdigest()
+      if latest_digest is not None
       else None
     )
-    if latest_hash != source_summary_hash:
+    if latest_hash != source_digest_hash:
       raise HTTPException(
         status_code=409,
         detail=(
@@ -2855,7 +2855,7 @@ async def _compact_chat_locked(
         settings_patch=settings_patch,
         summary=summary,
         source_messages_hash=source_messages_hash,
-        source_summary_hash=source_summary_hash,
+        source_digest_hash=source_digest_hash,
         data_dir=data_dir,
         request_fingerprint=request_fingerprint,
       )
@@ -2931,7 +2931,7 @@ async def compact_chat(
   """
   from app.chat_queue import get_transition_lock
   from app.chat_continuity import note_path, recovery_source
-  from app.chat_notes import extract_cumulative_summary
+  from app.chat_notes import extract_full_digest
   from app.chat_writer import (
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
@@ -2971,11 +2971,11 @@ async def compact_chat(
           note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
         except OSError:
           note = ""
-        source_summary = extract_cumulative_summary(note)
+        source_digest = extract_full_digest(note)
         source_messages = messages
         source_note_hash = None
         try:
-          source_summary, source_messages = recovery_source(note, messages)
+          source_digest, source_messages = recovery_source(note, messages)
         except ValueError:
           # Legacy or changed notes cannot replace history. Preserve the old
           # full-transcript backstop, including its existing work limits.
@@ -2988,7 +2988,7 @@ async def compact_chat(
           source_messages,
           data_dir=data_dir,
           provider_id=source_provider,
-          source_summary=source_summary,
+          source_digest=source_digest,
           model=settings_obj.get("model"),
           effort=settings_obj.get("effort"),
           custom_instructions=instructions,
