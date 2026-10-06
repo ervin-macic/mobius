@@ -88,14 +88,27 @@ the additions. Its own search tables are left to it; it reconciles them from
   of them exist at boot; afterwards the only unconverted chats are those
   whose conversion failed or was deferred. Before boot recovery, sweeps or
   any resume, a startup step (`convert live transcripts`) converts the live
-  working set (`transcript_rows.live_working_set`): chats with a non-terminal
-  run, chats with queued messages, chats with an open Goal, and both ends of
-  every delegation touching those. It is request-serving conversion: no disk
-  tier, no dependence on background progress. Later event-loop readers of
-  other chats await them first (`delegations.ensure_parent_helpers_converted`:
-  resumed turns, wake and steer paths, the continuation and wedged sweeps),
-  and each continuation-sweep candidate is isolated, so one chat never stops
-  every resume.
+  working set (`transcript_rows.live_working_set`): only work actually in
+  flight, namely chats with a non-terminal run, chats with queued messages,
+  and both ends of every delegation whose parent or child has a non-terminal
+  run. Startup tasks run before the server answers, so this set is bounded by
+  in-flight work, never by history: on this instance 31 chats and 10.8 MB
+  (under a second), where including idle open Goals would pull in 539 chats
+  and 340 MB (25–30 s before the server answers). An idle open Goal is not
+  in flight; its next turn, wake or steer converts what it reads first. It
+  is request-serving conversion: no disk tier, no dependence on background
+  progress. Later event-loop readers of other chats await them first
+  (`delegations.ensure_parent_helpers_converted`: resumed turns, wake and
+  steer paths, the continuation and wedged sweeps), and each
+  continuation-sweep candidate is isolated, so one chat never stops every
+  resume. One helper whose conversion fails never breaks its parent: the
+  parent's own conversion is required, each helper's is not, and a helper
+  with a recorded conversion failure reads as "Result unavailable" with that
+  error in results, wake and steer notices.
+- Search reads only converted chats' message text (titles are indexed for
+  every chat). The search response carries `X-Search-Unindexed-Chats`, the
+  number of chats not yet converted, and the shell shows a quiet note when it
+  is above zero; there is no fallback read of the previous release's index.
 - A legacy JSON `null` converts to an empty transcript, as the previous
   release displayed it.
 - Any conversion that fails while serving a request raises
