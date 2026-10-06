@@ -20,28 +20,38 @@ CONTRACT = {
 }
 
 
-def test_frame_version_tracks_bundle_runtime_and_storage_generation():
-  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1", "revision-1")
+def frame_app(**overrides):
+  return models.App(**{
+    "compiled_path": BUNDLE,
+    "capability_contract": CONTRACT,
+    "token_nonce": "nonce-1",
+    "runtime_revision": "revision-1",
+    **overrides,
+  })
 
-  assert base == app_frame_version(BUNDLE, dict(CONTRACT), "nonce-1", "revision-1")
+
+def test_frame_version_tracks_bundle_runtime_and_storage_generation():
+  base = app_frame_version(frame_app())
+
+  assert base == app_frame_version(frame_app(capability_contract=dict(CONTRACT)))
   assert len(base) == 20 and "nonce-1" not in base
-  assert app_frame_version(
-    BUNDLE.replace("a" * 64, "b" * 64), CONTRACT, "nonce-1", "revision-1",
-  ) != base
-  assert app_frame_version(
-    BUNDLE, {**CONTRACT, "runtime": {}}, "nonce-1", "revision-1",
-  ) != base
-  assert app_frame_version(BUNDLE, CONTRACT, "nonce-2", "revision-1") != base
+  assert app_frame_version(frame_app(
+    compiled_path=BUNDLE.replace("a" * 64, "b" * 64),
+  )) != base
+  assert app_frame_version(frame_app(
+    capability_contract={**CONTRACT, "runtime": {}},
+  )) != base
+  assert app_frame_version(frame_app(token_nonce="nonce-2")) != base
 
 
 def test_frame_version_ignores_server_permissions_and_bundle_directory():
-  base = app_frame_version(BUNDLE, CONTRACT, "nonce-1", "revision-1")
+  base = app_frame_version(frame_app())
   granted = {**CONTRACT, "permissions": {"cross_app_access": "read"}}
 
-  assert app_frame_version(BUNDLE, granted, "nonce-1", "revision-1") == base
-  assert app_frame_version(
-    "/elsewhere/" + Path(BUNDLE).name, CONTRACT, "nonce-1", "revision-1",
-  ) == base
+  assert app_frame_version(frame_app(capability_contract=granted)) == base
+  assert app_frame_version(frame_app(
+    compiled_path="/elsewhere/" + Path(BUNDLE).name,
+  )) == base
 
 
 def test_settings_writes_keep_frame_version(client, auth):

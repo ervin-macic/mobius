@@ -1021,8 +1021,10 @@ target**:
 
 - `owned` — the current AppCanvas host installed it; render the nested view.
 - `rejected` — the shell refused the request, so no back target exists; stay on
-  the current view.
-- `timeout` — shell ownership is unknown. Stay on the current view; the helper
+  the current view. With navigation-ready hosts, a hidden cached frame waits
+  until visible before sending; being hidden alone does not reject the request.
+- `timeout` — shell ownership is unknown after a sent request times out (the
+  visibility wait has no timeout). Stay on the current view; the helper
   keeps the request correlation briefly and removes a late-installed target.
 - `error` — the request could not be sent, so no back target exists; stay on the
   current view.
@@ -1143,6 +1145,8 @@ its current place with `nav.setLocation(value)`.
   `nav.open` waits until the frame is promoted and visible before requesting
   history ownership; its timeout starts then. Closing an unsent handle cancels
   it. Mount the app before awaiting restoration; do not add timers to retry it.
+  Restoring several nested levels in the shell can leave inactive browser
+  history slots, requiring extra Back presses after the restored views close.
 - The shell keeps one location per app installation for the current browser
   tab. It survives a shell reload, not closing the tab, and is cleared on sign
   out, or when this shell wipes app data or uninstalls the app. Other apps never

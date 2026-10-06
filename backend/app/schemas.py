@@ -246,10 +246,7 @@ class AppOut(BaseModel):
     """The app frame's reload key; see app_compile_contract.app_frame_version."""
     from app.app_compile_contract import app_frame_version
 
-    return app_frame_version(
-      self.compiled_path, self.capability_contract, self.token_nonce,
-      self.runtime_revision,
-    )
+    return app_frame_version(self)
 
   @computed_field
   @property

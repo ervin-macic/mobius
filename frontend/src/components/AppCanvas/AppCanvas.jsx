@@ -731,7 +731,7 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
-        navLocation: readAppNavLocation(appId, frameNavRef.current.get(v).instanceId),
+        navLocation: readAppNavLocation(appId, frameNavRef.current.get(v)?.instanceId),
       },
       '*',
     )
