@@ -1091,6 +1091,10 @@ export default function ChatView({
   // snapshot while app context, settings, or the POST is still in flight;
   // that snapshot cannot retire this locally-owned start.
   const localStartRequestRef = useRef(null)
+  // The one Resume POST this view has in flight. Its acknowledgement commits
+  // the continuation row that replaces the recovery card; a runtime read that
+  // lands first would retire the card with no row in its place.
+  const resumeRequestRef = useRef(null)
   // Terminal drain events are a wake-up hint for one exact attempt, never a
   // replacement for inspecting the durable outbox. Retain the hint only while
   // its cid + draft identity still name the mounted composer owner.
@@ -1643,6 +1647,11 @@ export default function ChatView({
       // never loaded; a resumed reply would then look like the whole chat.
       if (!activationSettledRef.current) return null
       if (fetchGenRef.current !== gen) return null
+      // While Resume awaits its acknowledgement, that request owns the
+      // recovery-to-running transition and refreshes the transcript when it
+      // settles. Adopting a successor observed by this poll first would remove
+      // the recovery card before its continuation row exists.
+      if (resumeRequestRef.current?.chatId === String(chatId)) return null
       const runtimeTransition = inspectRuntimeSnapshot(data)
       if (!runtimeTransition.adopt) return null
       const serverPending = data.pending_messages || []
@@ -4007,7 +4016,7 @@ export default function ChatView({
       // Mint a cid for symmetry so the persisted hidden row carries a stable
       // identity for reload dedup. It is inert here — a hidden answer send
       // renders no visible user bubble and never pins.
-      const response = await streamSend(text, undefined, {
+      const response = await streamSend(text, questionSubmissionContext?.attachments, {
         hidden: true,
         cid: silentCid,
         answers: resolvedAnswers,
@@ -4055,7 +4064,7 @@ export default function ChatView({
             msg.blocks = (msg.blocks || []).map(b => {
               if (b.type !== 'question') return b
               if (questionId && b.question_id !== questionId) return b
-              return { ...b, ...questionAnswerPatch(response.answers || resolvedAnswers, response) }
+              return { ...b, ...questionAnswerPatch(response.answers || resolvedAnswers, { ...response, attachments: questionSubmissionContext?.attachments }) }
             })
             updated[lastIdx] = msg
           }
@@ -4066,7 +4075,7 @@ export default function ChatView({
         })
         // A mid-turn question may still live in streamItems rather than the
         // durable message list. Keep both render sources in agreement.
-        patchQuestionAnswers(questionId, response.answers || resolvedAnswers, response)
+        patchQuestionAnswers(questionId, response.answers || resolvedAnswers, { ...response, attachments: questionSubmissionContext?.attachments })
       }
       // Acceptance and visible response activity are deliberately separate.
       // Keep the card fixed through this answer-only commit; the stream hook
@@ -4285,10 +4294,19 @@ export default function ChatView({
   const resumeBlocked = useCallback(() => (
     isProviderSwitchBlocking(chatId) || sendingRef.current || serverRunningRef.current
   ), [chatId])
+  const sendResume = useCallback(async (text, attachments, options) => {
+    const request = { chatId: String(chatId) }
+    resumeRequestRef.current = request
+    try {
+      return await sendAfterSettingsSaved(text, attachments, options)
+    } finally {
+      if (resumeRequestRef.current === request) resumeRequestRef.current = null
+    }
+  }, [chatId, sendAfterSettingsSaved])
   const { resume: handleResume, state: resumeState } = useResume({
     chatId,
     runId: recoveryRunId,
-    send: sendAfterSettingsSaved,
+    send: sendResume,
     onAccepted: acceptResume,
     onRefresh: refreshResume,
     blocked: resumeBlocked,
@@ -5830,7 +5848,7 @@ export default function ChatView({
     chatId,
     goalId: goalPresentation?.id,
     goalRevision: goalPresentation?.revision,
-    send: sendAfterSettingsSaved,
+    send: sendResume,
     onAccepted: acceptResume,
     onRefresh: refreshResume,
     blocked: goalResumeBlocked,
@@ -6019,7 +6037,7 @@ export default function ChatView({
     >
       {fileDropActive && (
         <div className="chat__file-drop-target" aria-hidden="true">
-          <div className="chat__file-drop-card">Drop files to attach</div>
+          <div className="chat__file-drop-card">Drop files into the message composer</div>
         </div>
       )}
       {/* Single polite live region — announces state transitions only.

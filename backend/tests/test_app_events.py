@@ -230,10 +230,11 @@ async def test_cross_app_principal_is_rejected_before_streaming(
 
 @pytest.mark.asyncio
 async def test_guest_app_events_stop_after_grant_revocation(client, owner_token, db):
-  from app.browser_access import BrowserLineage, create_invitation, revoke_grant
+  from app.browser_access import BrowserLineage, revoke_grant
+  from tests.browser_access_fixtures import link_grant
   app_id = _make_app(client, owner_token)
   owner = db.query(models.Owner).one()
-  grant, _ = create_invitation(db, owner, "Guest")
+  grant, _ = link_grant(db, owner, "Guest")
   db.refresh(owner)  # Invitation creation commits; reload before stream detaches it.
   principal = Principal(owner=owner, app_id=app_id,
                         browser=BrowserLineage(grant.id))

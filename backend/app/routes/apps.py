@@ -979,25 +979,6 @@ def _diff_preview_trees(
     shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _recorded_runtime_paths(previous_tree: dict[str, bytes]) -> set[str]:
-  """Recover the prior cloned package's declared runtime-source paths."""
-  paths = {"index.jsx"}
-  raw_manifest = previous_tree.get("mobius.json")
-  if raw_manifest is None:
-    return paths
-  try:
-    manifest = json.loads(raw_manifest)
-  except (UnicodeDecodeError, json.JSONDecodeError):
-    return paths
-  for rel in manifest.get("source_files") or []:
-    if isinstance(rel, str):
-      paths.add(rel)
-  schedule = manifest.get("schedule")
-  if isinstance(schedule, dict) and isinstance(schedule.get("job"), str):
-    paths.add(schedule["job"])
-  return paths
-
-
 def _accepted_local_distribution_package(app: models.App) -> tuple[str, str]:
   """Return accepted manifest identity + origin-independent package digest.
 
@@ -1259,25 +1240,6 @@ async def _start_conflict_resolver_turn(
   )
 
 
-def _recorded_update_source(
-  previous_tree: dict[str, bytes], candidate_tree: dict[str, bytes],
-) -> dict[str, bytes]:
-  """Project recorded Git history onto both old and new package sources.
-
-  Origin clones include repository-only files; HTTP imports record the package
-  sources directly. Taking the union of declared paths preserves deletions in
-  checks and previews without reporting README/workflow churn as an update.
-  """
-  from app import install
-
-  paths = (
-    set(candidate_tree) | _recorded_runtime_paths(previous_tree)
-    if "mobius.json" in previous_tree
-    else set(previous_tree) - install._MERGED_NON_SOURCE
-  )
-  return {rel: data for rel, data in previous_tree.items() if rel in paths}
-
-
 async def _fetch_update_candidate(
   repo: Path,
   manifest_url: str,
@@ -1513,14 +1475,19 @@ async def update_check(
       # executable-source comparison, while ordinary packages stream bytes.
       recorded_tree = None
       if recorded_package is None:
-        recorded_tree = await asyncio.to_thread(
-          app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
-        )
         # Only real pre-manifest owner data needs source bytes. Re-read the
         # immutable candidate already fetched above, never another network ref.
         legacy_candidate = await asyncio.to_thread(
           install.read_git_install_candidate,
           repo, candidate.commit, fetch_manifest_url, strict=False,
+        )
+        recorded_tree = await asyncio.to_thread(
+          install.read_recorded_update_source, repo, legacy_candidate.runtime_tree,
+        )
+        trusted_origin = await asyncio.to_thread(
+          install.trusted_catalog_checkout,
+          installed_manifest_url, repo, fetch_manifest_url,
+          candidate.manifest.get("id"),
         )
     except (
       HTTPException, OSError, subprocess.SubprocessError, RuntimeError,
@@ -1537,11 +1504,7 @@ async def update_check(
       update_available = recorded_digest != candidate.source_digest
     elif install.replaces_migration_bridge(
       recorded_tree,
-      trusted_origin=await asyncio.to_thread(
-        install.trusted_catalog_checkout,
-        installed_manifest_url, repo, fetch_manifest_url,
-        candidate.manifest.get("id"),
-      ),
+      trusted_origin=trusted_origin,
     ):
       update_available = True
     else:
@@ -1552,8 +1515,7 @@ async def update_check(
       except (AttributeError, KeyError, TypeError, ValueError, HTTPException):
         return _unknown()
       update_available = (
-        _recorded_update_source(recorded_tree, legacy_candidate.runtime_tree)
-        != legacy_candidate.runtime_tree
+        recorded_tree != legacy_candidate.runtime_tree
         or any(
           capability_changes[key]
           for key in ("added", "removed", "changed")
@@ -1641,18 +1603,21 @@ async def update_candidate_preview(
         raise HTTPException(
           409, "Requested update source does not match the installed app.",
         )
-      previous_tree = await asyncio.to_thread(
-        app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+      previous_source = await asyncio.to_thread(
+        install.read_recorded_update_source, repo, candidate.runtime_tree,
       )
     except HTTPException:
       raise
+    except install.PackageTooLarge as exc:
+      raise HTTPException(
+        413, detail={"code": "package_too_large", "message": str(exc)},
+      ) from exc
     except (
       OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
     ) as exc:
       raise HTTPException(
         409, "This app does not have a usable Git update source.",
       ) from exc
-  previous_source = _recorded_update_source(previous_tree, candidate.runtime_tree)
   upstream_diff = await asyncio.to_thread(
     _diff_preview_trees, previous_source, candidate.runtime_tree,
   )

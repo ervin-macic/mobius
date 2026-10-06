@@ -25,7 +25,7 @@ HISTORY = [
 
 
 def _bound(messages, run="run"):
-  return apply_checkpoint(None, name="test", summary="Preserve old files; draft only.",
+  return apply_checkpoint(None, name="test", digest="Preserve old files; draft only.",
                           coverage=checkpoint_coverage(messages, run))
 
 
@@ -61,15 +61,15 @@ def test_current_turn_and_all_steers_remain_uncovered():
     {"role": "assistant", "id": "run:assistant:1", "content": "partial 2"},
   ]
   note = _bound(messages)
-  summary, tail = recovery_source(note, messages)
-  assert "old files" in summary
+  digest, tail = recovery_source(note, messages)
+  assert "old files" in digest
   assert tail == messages[2:]
 
 
-def test_digest_and_title_changes_do_not_advance_coverage():
+def test_summary_and_title_changes_do_not_advance_coverage():
   messages = HISTORY + [{"role": "user", "content": "new task"}]
   note = _bound(messages)
-  updated = apply_checkpoint(note, name="renamed", digest="new blurb",
+  updated = apply_checkpoint(note, name="renamed", summary="new blurb",
                              coverage={"message_count": 999})
   assert recovery_source(updated, messages) == recovery_source(note, messages)
 
@@ -83,7 +83,7 @@ def test_uncertain_coverage_never_discards_history(change):
   elif change == "prefix":
     messages[0]["content"] = "Owner corrected this"
   elif change == "missing":
-    note = apply_checkpoint(None, name="old note", summary="Legacy summary")
+    note = apply_checkpoint(None, name="old note", digest="Legacy digest")
   else:
     note = note.replace('"message_count": 2', '"message_count": true')
   with pytest.raises(ValueError, match="coverage"):
@@ -92,7 +92,7 @@ def test_uncertain_coverage_never_discards_history(change):
 
 def test_new_messages_remain_in_tail_and_first_turn_covers_nothing():
   messages = [{"role": "user", "content": "初めて"}]
-  summary, tail = recovery_source(_bound(messages), messages)
+  _digest, tail = recovery_source(_bound(messages), messages)
   assert tail == messages
   later = messages + [{"role": "user", "content": "correction"}]
   assert recovery_source(_bound(messages), later)[1] == later
@@ -175,7 +175,7 @@ async def test_synthesizer_receives_full_note_and_only_uncovered_tail(monkeypatc
   source = NoteRecoverySource(messages, _bound(messages), "codex", "old", {})
   assert await source.summarize(data_dir="unused") == "safe briefing"
   assert seen[0][0] == messages[2:]
-  assert "old files" in seen[0][1]["source_summary"]
+  assert "old files" in seen[0][1]["source_digest"]
 
 
 class Broadcast:
@@ -448,16 +448,16 @@ def test_checkpoint_route_binds_detailed_note_without_renaming_or_changing_save_
   token = auth.create_agent_token(chat.id, "test", 0, run_id="run")
   headers = {"Authorization": f"Bearer {token}"}
   response = client.post("/api/chat/continuity/checkpoints", headers=headers,
-                         json={"summary": "Owner also forbids publication.", "digest": "Drafting."})
+                         json={"digest_entry": "Owner also forbids publication.", "chat_summary": "Drafting."})
   assert response.status_code == 204
   path = note_path(get_settings().data_dir, chat.id)
-  summary, tail = recovery_source(path.read_text(), list(row.messages))
-  assert "Preserve old files" in summary and "forbids publication" in summary
+  digest, tail = recovery_source(path.read_text(), list(row.messages))
+  assert "Preserve old files" in digest and "forbids publication" in digest
   assert tail == list(row.messages)[2:]
   response = client.post("/api/chat/continuity/checkpoints", headers=headers,
-                         json={"digest": "Shorter."})
+                         json={"chat_summary": "Shorter."})
   assert response.status_code == 204
-  assert recovery_source(path.read_text(), list(row.messages)) == (summary, tail)
+  assert recovery_source(path.read_text(), list(row.messages)) == (digest, tail)
 
 
 @pytest.mark.parametrize("when", ["before_synthesis", "before_commit"])
