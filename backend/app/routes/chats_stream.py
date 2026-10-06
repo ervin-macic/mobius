@@ -317,7 +317,10 @@ def _canonical_question_attachments(
     name = attachment.get("name") if isinstance(attachment, dict) else None
     entry = uploads.get(name) if isinstance(name, str) and name else None
     if not entry or not _safe_upload_path(entry.get("path"), get_settings().data_dir):
-      raise HTTPException(status_code=409, detail="An attached file is no longer available.")
+      raise HTTPException(
+        status_code=409,
+        detail=f"{name if isinstance(name, str) and name else 'An attached file'} is no longer available. Remove it and attach it again.",
+      )
     # Same shape as composer attachments: the file is addressed by name.
     canonical.setdefault(name, {
       "name": name,
@@ -793,6 +796,8 @@ async def _send_message_impl(
   from app.platform_restart import restart_action_block
   restart_block = restart_action_block(chat, body.question_id)
   if restart_block is not None:
+    if body.attachments:
+      raise HTTPException(409, detail="A Restart card can't take files. Remove the attachment to continue.")
     selections = body.selected_options
     if not selections:
       feedback = list((body.answers or {}).values())

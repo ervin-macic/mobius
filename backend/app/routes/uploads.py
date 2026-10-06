@@ -128,13 +128,19 @@ async def upload_files(
         "uploaded_at": datetime.now(UTC).isoformat(),
         "claimed": False,
       })
-    async with chat_queue.get_lock(chat_id):
-      expired = await run_in_threadpool(_record_uploads, db, chat, saved)
   except BaseException:
-    # A later file over the cap, or a commit failure, must not leave this
-    # request's files on disk with no metadata row.
+    # A later file over the cap must not leave this request's files on disk
+    # with no metadata row.
     await run_in_threadpool(remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
     raise
+  async with chat_queue.get_lock(chat_id):
+    try:
+      expired = await run_in_threadpool(_record_uploads, db, chat, saved)
+    except Exception:
+      # The commit failed and rolled back. A cancelled request is left alone:
+      # its commit may already have landed, and its files must then stay.
+      await run_in_threadpool(remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
+      raise
   await run_in_threadpool(remove_upload_files, upload_dir, expired)
   return saved
 

@@ -628,3 +628,35 @@ def test_failed_upload_write_leaves_no_file_behind(tmp_path, monkeypatch):
   with pytest.raises(OSError):
     uploads._create_upload_file(tmp_path, "report.pdf", b"data")
   assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", ["commit", "cancelled"])
+def test_upload_cleanup_only_when_the_record_did_not_land(db, chat, monkeypatch, failure):
+  """A failed commit removes the new files; a cancel after commit keeps them."""
+  import asyncio
+  from pathlib import Path
+  from fastapi import UploadFile
+  from app.deps import Principal
+  from app.routes import uploads
+  from app.upload_lifecycle import upload_dir
+
+  real_record = uploads._record_uploads
+
+  def record(db_, chat_, saved):
+    if failure == "commit":
+      raise RuntimeError("commit failed")
+    real_record(db_, chat_, saved)
+    raise asyncio.CancelledError()
+
+  monkeypatch.setattr(uploads, "_record_uploads", record)
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+  file = UploadFile(file=io.BytesIO(b"data"), filename="kept.txt")
+  with pytest.raises((RuntimeError, asyncio.CancelledError)):
+    asyncio.run(uploads.upload_files(chat.id, [file], principal, db))
+
+  db.refresh(chat)
+  on_disk = sorted(p.name for p in upload_dir(chat.id).iterdir())
+  if failure == "commit":
+    assert on_disk == [] and not chat.uploads
+  else:
+    assert on_disk == ["kept.txt"] and [u["name"] for u in chat.uploads] == ["kept.txt"]

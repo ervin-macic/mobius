@@ -41,6 +41,7 @@ def test_live_question_attachment_context_rejects_unuploaded_file(tmp_path, monk
       chat, [{"name": "forged.png"}],
     )
   assert exc.value.status_code == 409
+  assert "forged.png" in exc.value.detail
 
 
 def test_agent_card_answer_still_cannot_attach_arbitrary_upload():
@@ -201,3 +202,16 @@ def test_quiet_close_answer_refuses_files(client, auth, chat, monkeypatch, tmp_p
     card = next(b for m in row.messages for b in m.get("blocks", []) if b.get("question_id") == "quiet-files")
     assert "answers" not in card
     assert row.uploads[0]["claimed"] is False
+
+
+def test_restart_card_reply_refuses_files(client, auth, chat, monkeypatch):
+  """A written Restart reply never carries files, even from a direct API call."""
+  import app.platform_restart as platform_restart
+
+  monkeypatch.setattr(platform_restart, "restart_action_block", lambda *_: {"type": "question"})
+  res = client.post(f"/api/chats/{chat.id}/messages", headers=auth, json={
+    "content": "- Restart?: later", "hidden": True, "question_id": "restart-card",
+    "answers": {"Restart?": "later"}, "attachments": [{"name": "photo.png"}],
+  })
+  assert res.status_code == 409, res.text
+  assert "Restart card can't take files" in res.json()["detail"]
