@@ -155,8 +155,10 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   // already claimed, so callers need not work out which ones were sent.
   const discardFiles = useCallback(() => {
     for (const file of filesRef.current) {
+      // A failed chip never got a server name; its local name could belong
+      // to someone else's draft, so only finished uploads are discarded.
       if (file.status === 'uploading') discardedIds.current.add(file.id)
-      else discardUpload(file)
+      else if (file.status === 'done') discardUpload(file)
     }
     clearFiles()
   }, [clearFiles, discardUpload])

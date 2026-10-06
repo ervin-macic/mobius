@@ -7,7 +7,9 @@ claimed). Cancelling a queued message releases its files back to drafts unless
 another message still names them. Only drafts can be deleted, and drafts older
 than `UNCLAIMED_UPLOAD_TTL` are swept when the chat next receives an upload or
 a message. Entries without the key predate this lifecycle and are always kept,
-because nothing records whether a sent message uses them.
+because nothing records whether a sent message uses them; deleting one is a
+silent no-op. A draft a browser keeps unsent for longer than the TTL loses
+its file the same way an abandoned one does.
 """
 
 from __future__ import annotations
@@ -47,13 +49,17 @@ def claim_uploads(chat, attachments: list[dict] | None) -> None:
 def release_uploads(chat, removed_rows: list[dict]) -> None:
   """Return a cancelled message's files to drafts unless anything else names them.
 
-  Still in use means named by a transcript or queued row, or saved on an
-  answered question card.
+  Still in use means named by a transcript, in-progress or queued row, or
+  saved on an answered question card (cards answered mid-turn live in the
+  in-progress assistant row).
   """
   names = set()
   for row in removed_rows:
     names |= attachment_names(row.get("attachments"))
-  for row in [*(chat.messages or []), *(chat.pending_messages or [])]:
+  live = chat.live_assistant
+  rows = [*(chat.messages or []), *([live] if isinstance(live, dict) else []),
+          *(chat.pending_messages or [])]
+  for row in rows:
     names -= attachment_names(row.get("attachments"))
     for block in row.get("blocks") or []:
       if isinstance(block, dict):

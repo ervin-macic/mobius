@@ -1,6 +1,8 @@
 # backend/tests/test_uploads.py
 import io
 
+import pytest
+
 from PIL import Image
 
 from app import models
@@ -589,14 +591,20 @@ def test_expired_drafts_are_swept_when_a_message_arrives_but_not_its_own(client,
   assert Path(restored["path"]).exists()
 
 
-def test_cancel_keeps_files_an_answered_card_still_shows(client, db, auth, chat):
+@pytest.mark.parametrize("where", ["transcript", "live"])
+def test_cancel_keeps_files_an_answered_card_still_shows(client, db, auth, chat, where):
+  """Covers cards in the transcript and cards answered mid-turn (live row)."""
   from app.chat_writer import get_writer, AppendPending, CancelPending
 
   shown = _upload(client, auth, chat, "shown.txt")
-  chat.messages = [{"role": "assistant", "content": "", "ts": 1, "blocks": [{
+  card = {"role": "assistant", "content": "", "ts": 1, "blocks": [{
     "type": "question", "question_id": "q", "answers": {"Q?": "Attached 1 file"},
     "attachments": [{"name": shown["name"]}],
-  }]}]
+  }]}
+  if where == "live":
+    chat.live_assistant = card
+  else:
+    chat.messages = [card]
   db.commit()
   get_writer().submit(AppendPending(chat_id=chat.id, user_msg={
     "role": "user", "content": "answer", "cid": "c-answer",

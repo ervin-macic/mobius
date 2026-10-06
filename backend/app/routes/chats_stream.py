@@ -1904,10 +1904,12 @@ async def cancel_pending_message(
   # concurrent POST/promote can't lost-update. Returns the remaining
   # queue so the client can reconcile drift (e.g. the backend promoted a
   # message into the active turn between the click and the DELETE).
-  ack = get_writer().submit(
-    CancelPending(chat_id=chat_id, run_token="", cid=cid)
-  )
-  result = await await_ack(ack)
+  # Cancelling can release the row's uploads, so it holds the same per-chat
+  # lock as admission, upload and discard while the writer commits.
+  async with chat_queue.get_lock(chat_id):
+    result = await await_ack(get_writer().submit(
+      CancelPending(chat_id=chat_id, run_token="", cid=cid)
+    ))
   return {"pending_messages": result["pending"]}
 
 

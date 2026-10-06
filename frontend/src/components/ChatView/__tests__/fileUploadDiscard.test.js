@@ -93,3 +93,14 @@ test('removing an attachment restored from a saved draft still discards it on th
     remounted.unmount()
   }
 })
+
+
+test('discard never deletes by the local name of a failed upload', t => {
+  const { hook, calls } = setup(t, [
+    record('done.txt'),
+    { name: 'image.png', status: 'error', error: 'Upload failed' },
+  ])
+  hook.result.current.discardFiles()
+  assert.deepEqual(calls.map(call => call.url.split('/').pop()), ['done.txt'])
+  hook.unmount()
+})
