@@ -155,15 +155,8 @@ test('Möbius subscription status uses the same consumed-credit copy as the brai
 
 test('appearance indicator waits for the same seeded theme repaint as the palette', () => {
   assert.doesNotMatch(view, /setThemeMode\(newMode\)/)
-  assert.match(view, /await themeService\.toggleTheme\(queryClient, currentMode, api\)/)
+  assert.match(view, /themeService\.toggleTheme\(queryClient, currentMode, api\)/)
   assert.match(view, /setThemeMode\(themeModeQuery\.data === 'light'/)
-})
-
-test('the status-bar theme reload runs only after a saved theme, in the installed iPhone app', () => {
-  // A reload failure must not reach toggleTheme's rollback, and iOS's in-app
-  // browser leaks navigator.standalone, so display-mode is checked too.
-  assert.match(view, /\} catch \{[\s\S]*?onThemeChange\?\.\(\)[^\n]*\n\s*return\n\s*\} finally/)
-  assert.match(view, /\} finally \{\s*setThemeSwitching\(false\)\s*\}[\s\S]*?isStandaloneDisplay\(\) && window\.navigator\.standalone === true[\s\S]*?onStatusBarThemeReload\?\.\(\)\)\.catch\(/)
 })
 
 

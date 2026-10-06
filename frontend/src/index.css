@@ -181,8 +181,8 @@ html, body, #root {
   width: 100%;
 }
 
-/* iOS Home Screen apps combine viewport-fit=cover with a launch-time
-   status-bar policy. In that display mode WebKit can leave
+/* iOS Home Screen apps combine viewport-fit=cover with the launch-time
+   black-translucent status-bar policy. In that display mode WebKit can leave
    a bottom strip outside a percentage-height fixed root; sizing the two
    document owners from the large layout viewport closes that strip while the
    React root continues to inherit the document height. Keep browser tabs on
@@ -198,22 +198,6 @@ html, body, #root {
 
   #root {
     height: 100%;
-  }
-}
-
-/* Let the viewport hook measure installed WebKit's drawable bottom rather
-   than adding a device's safe area to a dynamic viewport unit.
-   The reserve is the share of that bottom safe area the chat composer keeps
-   clear. iOS's Home-indicator area is deliberately generous and the indicator
-   occupies only its lowest few points, so reserving a quarter of it places the
-   composer where Android's smaller gesture inset puts it. */
-@supports (-webkit-touch-callout: none) {
-  @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
-    .shell {
-      --shell-fit-visual-viewport: 1;
-      --shell-device-bottom-inset: env(safe-area-inset-bottom, 0px);
-      --shell-bottom-inset-reserve: 0.25;
-    }
   }
 }
 

@@ -13,15 +13,15 @@ function clearShellFrame(root) {
   root.style.removeProperty('top')
   root.style.removeProperty('bottom')
   root.style.removeProperty('height')
-  root.style.removeProperty('--shell-safe-bottom-inset')
+  root.style.removeProperty('--chat-foot-bottom-inset')
 }
 
 /**
- * Fit the shell above a keyboard, or to installed WebKit's drawable viewport.
- * Removing the previous inline frame first makes the shell's CSS layout the
- * baseline, so the next opening cannot reuse a stale window-height reading.
+ * Fit the shell to a keyboard-shrunken visual viewport. Removing the previous
+ * inline frame first makes the shell's own CSS layout the only baseline, so a
+ * browser cannot poison the next opening with a stale window-height reading.
  */
-export function fitShellToVisualViewport(root, viewport, { fitViewport = false, safeBottomInset = 0 } = {}) {
+export function fitShellToVisualViewport(root, viewport) {
   if (!root) return false
   clearShellFrame(root)
 
@@ -31,9 +31,7 @@ export function fitShellToVisualViewport(root, viewport, { fitViewport = false, 
   const visibleHeight = clientLengthToLayout(visibleClientHeight, space)
   const layoutHeight = space.height
   const coveredHeight = layoutHeight - visibleHeight
-  const keyboardOpen = coveredHeight >= clientLengthToLayout(MIN_KEYBOARD_INSET, space)
-  if (!keyboardOpen && !fitViewport) return false
-  if (coveredHeight < 0) return false
+  if (coveredHeight < clientLengthToLayout(MIN_KEYBOARD_INSET, space)) return false
 
   const visibleTop = Math.min(
     coveredHeight,
@@ -42,30 +40,12 @@ export function fitShellToVisualViewport(root, viewport, { fitViewport = false, 
   root.style.setProperty('top', `${visibleTop}px`)
   root.style.setProperty('bottom', 'auto')
   root.style.setProperty('height', `${visibleHeight}px`)
-  // The visual viewport ends above the keyboard. iOS can still report its
-  // Home-indicator safe area, but that area is now covered by the keyboard.
-  // A closed-keyboard viewport may already exclude part or all of the unsafe
-  // bottom band. Reserve only the part still inside the fitted shell.
-  const clippedBottom = Math.max(0, coveredHeight - visibleTop)
-  const remainingInset = keyboardOpen ? 0 : Math.max(0, safeBottomInset - clippedBottom)
-  root.style.setProperty('--shell-safe-bottom-inset', `${remainingInset}px`)
+  // The keyboard covers the Home indicator, so the chat composer rests directly
+  // on it (UIKit's keyboardLayoutGuide behaves the same). Only this fitted,
+  // keyboard-open frame zeroes the inset; otherwise the chat falls back to the
+  // device's bottom safe area.
+  root.style.setProperty('--chat-foot-bottom-inset', '0px')
   return true
-}
-
-/**
- * Read the installed-display contract the stylesheet publishes on the shell.
- * `--shell-bottom-inset-reserve` is the share of the device's bottom safe area
- * the composer keeps clear (1 when the platform does not set one).
- */
-export function installedViewportOptions(style) {
-  const read = name => style.getPropertyValue(name).trim()
-  const inset = Number.parseFloat(read('--shell-device-bottom-inset')) || 0
-  const reserve = Number.parseFloat(read('--shell-bottom-inset-reserve'))
-  const share = Number.isFinite(reserve) ? Math.min(1, Math.max(0, reserve)) : 1
-  return {
-    fitViewport: read('--shell-fit-visual-viewport') === '1',
-    safeBottomInset: inset * share,
-  }
 }
 
 export default function useShellVisualViewport(rootRef) {
@@ -77,7 +57,7 @@ export default function useShellVisualViewport(rootRef) {
     let frameRequest = 0
     const apply = () => {
       frameRequest = 0
-      fitShellToVisualViewport(root, viewport, installedViewportOptions(getComputedStyle(root)))
+      fitShellToVisualViewport(root, viewport)
     }
     const applySoon = () => {
       if (!frameRequest) frameRequest = requestAnimationFrame(apply)

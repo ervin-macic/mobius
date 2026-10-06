@@ -16,11 +16,19 @@
     <meta name="description" content="AI-powered personal app platform." />
     <!-- iOS PWA: hides Safari UI chrome when launched from home screen -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <!-- Installed iOS launches use the opaque `default` status bar, tinted from
-         theme-color to the active theme, including standalone /apps/<slug>/
-         installs and fullscreen games (which reuse this document). Immersive
-         apps cannot paint under the notch. iOS may pin this policy at Home
-         Screen installation, so re-add the icon to adopt a changed policy. -->
+    <!-- `default` (opaque) bar on purpose. Under `black-translucent`, installed
+         WebKit sizes the web view 47 pt short of the screen bottom (iPhone
+         390x844: innerHeight = visualViewport = 797) and the page can neither
+         measure nor paint that band (cf. WebKit bug 301994). Correcting for it
+         in the viewport hook still left the composer ~10 pt high. With
+         `default`, env(safe-area-inset-bottom) is accurate and the composer
+         rests on the safe area. The bar is tinted from theme-color to the
+         active theme; iOS re-reads its colour only on load/foreground, hence
+         the reload after a Settings theme switch. This also applies to
+         standalone /apps/<slug>/ installs and fullscreen games (which reuse
+         this document), and immersive apps cannot paint under the notch.
+         Icons added before this change keep the old policy until re-added.
+         See PR #1632. -->
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Möbius" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
