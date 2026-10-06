@@ -99,6 +99,61 @@ def test_previous_release_database_upgrades_to_current_orm(tmp_path):
   ]
 
 
+@pytest.mark.parametrize("start", ["fresh", "schema_0013"])
+def test_transcript_rows_run_after_the_chat_note_migrations(tmp_path, monkeypatch, start):
+  """The previous release ledgers 0083_swap_chat_note_sections and
+  0086_drop_chat_note_backup; 0087_transcript_rows then runs alone, after
+  them, and converts what that release wrote."""
+  from app import transcript_rows
+
+  monkeypatch.setenv("DATA_DIR", str(tmp_path))
+  note = tmp_path / "shared" / "memory" / "chats" / "kept" / "index.md"
+  note.parent.mkdir(parents=True)
+  note.write_text("# Kept\n\n## Digest\nshort\n\n## Summary\nfull\n", encoding="utf-8")
+  db_path = tmp_path / "upgrade.db"
+  if start == "schema_0013":
+    with sqlite3.connect(db_path) as connection:
+      connection.executescript(PREVIOUS_RELEASE_SCHEMA.read_text(encoding="utf-8"))
+  eng = create_engine(f"sqlite:///{db_path}")
+  models.Base.metadata.create_all(bind=eng)
+  versions = [version for version, _migration in migrations._SCHEMA_MIGRATIONS]
+  assert versions[-3:] == [
+    "0083_swap_chat_note_sections", "0086_drop_chat_note_backup", "0087_transcript_rows",
+  ]
+  monkeypatch.setattr(migrations, "_SCHEMA_MIGRATIONS", migrations._SCHEMA_MIGRATIONS[:-1])
+  run_migrations(eng)  # The previous release's ledger.
+  monkeypatch.undo()
+  monkeypatch.setenv("DATA_DIR", str(tmp_path))
+  assert "## Summary\nshort" in note.read_text(encoding="utf-8")
+  assert not (tmp_path / "backups" / "chat-notes-before-0083").exists()
+  with Session(eng) as db:
+    db.add(create_chat(id="kept", title="Kept", messages=[{"role": "user", "content": "old"}]))
+    db.commit()
+  with eng.begin() as conn:  # The previous release writes only the legacy value.
+    conn.execute(text("UPDATE chats SET messages = :m WHERE id = 'kept'"),
+                 {"m": json.dumps([{"role": "user", "content": "previous"}])})
+  transcript_tables = [models.ChatMessage.__table__, models.ChatTranscriptState.__table__,
+                       models.ChatTranscriptDamage.__table__]
+  models.Base.metadata.drop_all(bind=eng, tables=transcript_tables)  # Unknown to that release.
+
+  models.Base.metadata.create_all(bind=eng)  # This release's boot order.
+  run_migrations(eng)
+
+  history = [row["version"] for row in schema_migration_history(eng)]
+  assert history == versions
+  assert migrations.mapped_schema_gaps(eng) == []
+  with eng.connect() as conn:
+    triggers = {name for (name,) in conn.execute(text(
+      "SELECT name FROM sqlite_master WHERE type = 'trigger'"))}
+  assert set(migrations.TRANSCRIPT_TRIGGERS) <= triggers
+  with Session(eng) as db:
+    assert transcript_rows.unconverted_count(db) == 1
+    assert transcript_rows.convert(db, "kept")
+    db.commit()
+    assert transcript_rows.read_all(db, "kept") == [{"role": "user", "content": "previous"}]
+  eng.dispose()
+
+
 def test_git_app_source_migration_captures_files_and_attaches_catalog_origin(
   tmp_path, monkeypatch,
 ):
