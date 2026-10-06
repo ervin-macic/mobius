@@ -1071,6 +1071,24 @@ test.describe('AppCanvas location lifecycle', () => {
     expect(await frame.locator('#root').textContent()).toBe('list')
   })
 
+  test('a same-version document reload restores one Back target, not a ghost from the old document', async ({ page }) => {
+    await setupLocationRoutes(page)
+    let frame = await locationFrame(page, 81, 'live', '1000')
+    const entryBeforeDetail = await page.evaluate(() => history.state?.entryId)
+    expect(typeof entryBeforeDetail).toBe('string')
+    await frame.evaluate(() => window.openDetail())
+    await expectDetail(frame)
+    const documentId = await frame.evaluate(() => window.documentId)
+    await frame.goto(frame.url(), { waitUntil: 'load' })
+    frame = await locationFrame(page, 81, 'live', '1000')
+    expect(await frame.evaluate(() => window.documentId)).not.toBe(documentId)
+    await expectDetail(frame)
+    await page.evaluate(() => history.back())
+    await frame.waitForFunction(() => !window.detail)
+    // Retired physical entries are skipped during that same Back traversal.
+    await expect.poll(() => page.evaluate(() => history.state?.entryId)).toBe(entryBeforeDetail)
+  })
+
   test('bookmark survives actual warm-cache eviction and remount', async ({ page }) => {
     await setupLocationRoutes(page)
     let frame = await locationFrame(page)

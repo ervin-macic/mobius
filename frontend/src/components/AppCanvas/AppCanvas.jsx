@@ -1247,6 +1247,7 @@ const AppCanvas = forwardRef(function AppCanvas({
 
   // Clear this app's pending nav-sentinels when the VISIBLE frame stops
   // representing the same browsing context. That happens on:
+  //   - document reload (retired in handleFrameLoad before re-init)
   //   - AppCanvas unmount (LRU eviction, logout)
   //   - a SWAP (swap.liveVersion advances → the old frame, with its internal
   //     nav stack, unmounts and a fresh frame starting at 0 takes over)
@@ -1658,6 +1659,7 @@ const AppCanvas = forwardRef(function AppCanvas({
     // re-init below then runs the fresh document's handshake (this is exactly
     // why the parent never dedups frame-init).
     if (loadedDocsRef.current.has(v)) {
+      if (v === liveVersionRef.current) onNavReset?.(appId)
       retireFrameMediaSession(v)
       if (accountLinkRef.current?.source === framesRef.current.get(v)?.contentWindow) {
         clearAccountLinkRegistration()
