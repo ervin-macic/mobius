@@ -1704,8 +1704,17 @@ test.describe('Workspace view-mode toggle', () => {
       const { at: _at, ...saved } =
         JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]
       const wrapper = scroll.closest('[data-chat-world="builder"]')
+      // The reading position is the saved row's place in the viewport. Raw
+      // scrollTop is not: re-entry may legitimately mount a different loaded
+      // window (here the shared cache's anchored window without the older
+      // rows paged in above), which shifts scrollTop by those rows' height.
+      const row = saved.kind === 'ANCHOR_AT'
+        ? scroll.querySelector(`.chat__msg[data-key="${CSS.escape(saved.key)}"]`)
+        : null
       return {
-        top: scroll.scrollTop,
+        anchorTop: row
+          ? row.getBoundingClientRect().top - scroll.getBoundingClientRect().top
+          : null,
         saved,
         width: wrapper.getBoundingClientRect().width,
       }
@@ -1730,8 +1739,10 @@ test.describe('Workspace view-mode toggle', () => {
     await expect(builderScroll).toHaveAttribute('data-scroll-mode', 'ANCHOR_AT', {
       timeout: 15000,
     })
-    expect(Math.abs((await builderScroll.evaluate(scroll => scroll.scrollTop)) - before.top))
-      .toBeLessThanOrEqual(8)
+    const afterReturn = await readBuilderState()
+    expect(afterReturn.saved).toEqual(before.saved)
+    expect(before.anchorTop).not.toBeNull()
+    expect(Math.abs(afterReturn.anchorTop - before.anchorTop)).toBeLessThanOrEqual(8)
   })
 
   // Regression (item 0): a genuine MULTI-PANE exit via the real POINTER-HOLD
