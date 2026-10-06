@@ -355,11 +355,12 @@ export default function Drawer({
         setListWindow(current => (
           sameDrawerRowWindow(current, next) ? current : next
         ))
-        // The floor from a tab switch only ever shrinks as the owner scrolls.
+        // The floor from a tab switch only ever shrinks as content moves below
+        // the viewport. Ordinary scrolling has no floor and skips the reads.
         // Measure the section itself: this frame may predate the render that
         // applies the floor.
         const section = listSectionRef.current
-        if (section) {
+        if (section?.style.minHeight) {
           const floor = drawerListMinHeight(
             section.offsetHeight,
             scrollBelowViewport(root),

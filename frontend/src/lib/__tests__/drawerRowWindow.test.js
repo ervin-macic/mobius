@@ -120,7 +120,7 @@ test('a list switch floors the section at the height that keeps the viewport bot
   assert.equal(drawerListMinHeight(1800.2, 500), 1301)
 })
 
-test('the list floor shrinks as the owner scrolls down and releases at zero', () => {
+test('the list floor shrinks as content moves below the viewport and releases at zero', () => {
   assert.equal(drawerListMinHeight(1500, 400), 1100)
   assert.equal(drawerListMinHeight(1100, 1100), 0)
   assert.equal(drawerListMinHeight(1100, 1500), 0)
