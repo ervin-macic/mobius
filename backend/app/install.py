@@ -2664,9 +2664,8 @@ def _git_source_error(
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
-  A stalled or overlong transfer is reported as a timeout: retrying on a
-  better connection can fix it, whereas a missing or unverifiable source
-  needs the source itself to change.
+  A transfer exceeding its wall-clock ceiling is reported as a timeout,
+  distinct from a missing or unverifiable source.
   """
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"

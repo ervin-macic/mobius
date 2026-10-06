@@ -1083,7 +1083,7 @@ def test_git_clone_timeout_reads_as_a_timeout_not_a_missing_source(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ), patch(
     "app.install.app_git.clone_upstream",
-    side_effect=app_git.GitTransferTimeout("the remote stopped sending data"),
+    side_effect=app_git.GitTransferTimeout("it ran longer than 30 seconds"),
   ):
     failed = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
@@ -1091,7 +1091,7 @@ def test_git_clone_timeout_reads_as_a_timeout_not_a_missing_source(
   assert failed.status_code == 409, failed.text
   detail = failed.json()["detail"]
   assert detail["code"] == "git_transfer_timeout"
-  assert "timed out: the remote stopped sending data" in detail["message"]
+  assert "timed out: it ran longer than 30 seconds" in detail["message"]
   assert "Nothing was installed." in detail["message"]
   assert db.query(models.App).filter_by(slug="slow-git").first() is None
 
@@ -4235,7 +4235,7 @@ def test_update_candidate_preview_classifies_git_transfer_timeout_without_mutati
     "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
   ), patch(
     "app.app_git._run_network_command",
-    side_effect=app_git.GitTransferTimeout("the remote stopped sending data"),
+    side_effect=app_git.GitTransferTimeout("it ran longer than 30 seconds"),
   ) as network:
     response = client.get(
       f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
@@ -4246,7 +4246,7 @@ def test_update_candidate_preview_classifies_git_transfer_timeout_without_mutati
   assert response.status_code == 409, response.text
   detail = response.json()["detail"]
   assert detail["code"] == "git_transfer_timeout"
-  assert "timed out: the remote stopped sending data" in detail["message"]
+  assert "timed out: it ran longer than 30 seconds" in detail["message"]
   assert "installed version was left unchanged" in detail["message"]
   assert (repo / "index.jsx").read_bytes() == before
   assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == upstream
