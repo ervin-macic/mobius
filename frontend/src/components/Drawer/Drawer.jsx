@@ -61,6 +61,7 @@ import { isDrawerAppShareEligible } from './appShareState.js'
 import { recentsProjectChip } from '../../lib/recentsProjectChip.js'
 import {
   clampDrawerRowWindow,
+  drawerListMinHeight,
   drawerRowSpacerHeights,
   drawerRowWindow,
   drawerRowWindowForIndex,
@@ -98,6 +99,11 @@ function writeListTab(tab) {
 const EMPTY_SET = new Set()
 const EMPTY_LIST = []
 const TOUCH_CONTEXT_MENU_PROVENANCE_MS = 1500
+
+// Content still below the viewport bottom, in the scroller's own units.
+function scrollBelowViewport(root) {
+  return root.scrollHeight - root.scrollTop - root.clientHeight
+}
 
 export default function Drawer({
   open,
@@ -219,7 +225,16 @@ export default function Drawer({
   // machinery below; each device remembers which one it shows.
   const [listTab, setListTab] = useState(readListTab)
   const showingArchived = listTab === 'archived'
+  const [listMinHeight, setListMinHeight] = useState(0)
   const selectListTab = useCallback((tab) => {
+    // A shorter list would shrink the scroll extent and the browser would clamp
+    // scrollTop, so floor the lists section at the height that keeps the
+    // current viewport bottom reachable.
+    const root = navigationScrollRef.current
+    const section = listSectionRef.current
+    setListMinHeight(root && section
+      ? drawerListMinHeight(section.offsetHeight, scrollBelowViewport(root))
+      : 0)
     setListTab(tab)
     writeListTab(tab)
   }, [])
@@ -340,6 +355,18 @@ export default function Drawer({
         setListWindow(current => (
           sameDrawerRowWindow(current, next) ? current : next
         ))
+        // The floor from a tab switch only ever shrinks as content moves below
+        // the viewport. Ordinary scrolling has no floor and skips the reads.
+        // Measure the section itself: this frame may predate the render that
+        // applies the floor.
+        const section = listSectionRef.current
+        if (section?.style.minHeight) {
+          const floor = drawerListMinHeight(
+            section.offsetHeight,
+            scrollBelowViewport(root),
+          )
+          setListMinHeight(current => Math.min(current, floor))
+        }
       })
     }
     root.addEventListener('scroll', onScroll, { passive: true })
@@ -349,6 +376,10 @@ export default function Drawer({
       listWindowRafRef.current = 0
     }
   }, [listItems.length, open])
+  // A floor left from a tab switch must not outlive the drawer being open.
+  useEffect(() => {
+    if (!open) setListMinHeight(0)
+  }, [open])
 
   // The always-visible desktop sidebar follows chat selections made elsewhere.
   // The phone drawer instead preserves its last manual scroll position: opening
@@ -1345,6 +1376,7 @@ export default function Drawer({
               <section
                 ref={listSectionRef}
                 className="drawer__section drawer__section--lists"
+                style={listMinHeight ? { minHeight: listMinHeight } : undefined}
                 aria-label="Chats"
               >
                 <div
@@ -1397,15 +1429,6 @@ export default function Drawer({
                   role="tabpanel"
                   aria-labelledby={`drawer-tab-${listTab}`}
                 >
-                  {showingArchived && archivedItems.length > 0 && (
-                    // The count lives inside the open list so the switch stays
-                    // quiet; the needs-you marker is its only signal.
-                    <p className="drawer__list-caption">
-                      {archivedItems.length === 1
-                        ? '1 archived chat'
-                        : `${archivedItems.length} archived chats`}
-                    </p>
-                  )}
                   <div ref={listRowsStartRef} aria-hidden="true" />
                   {listSpacers.before > 0 && (
                     <div

@@ -25,8 +25,9 @@ function shellShortcut(item) {
  * document, so this document captures the chords its parent advertises
  * (`moebius:frame-shortcuts`), limited to real shell commands on Cmd/Ctrl
  * chords, and forwards the named action
- * (`moebius:shell-shortcut`). The app frame relays it to the shell, which
- * accepts only actions it advertised. An app that opted out advertises none.
+ * (`moebius:shell-shortcut`). The app frame relays it to the shell only while
+ * this document's iframe has keyboard focus in a focused app document, and
+ * the shell accepts only actions it advertised. An app that opted out advertises none.
  */
 export function installFrameShellShortcuts(win = window) {
   const parent = win.parent

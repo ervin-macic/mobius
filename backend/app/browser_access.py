@@ -28,7 +28,6 @@ from app.database import Base
 from app.timeutil import now_naive_utc
 
 
-INVITATION_TTL = timedelta(days=1)
 SESSION_IDLE_TTL = timedelta(days=30)
 
 
@@ -45,7 +44,7 @@ class BrowserAccessGrant(Base):
   epoch = Column(Integer, nullable=False, default=0)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
   revoked_at = Column(DateTime, nullable=True, default=None)
-  kind = Column(String(16), nullable=False, default="invitation")
+  kind = Column(String(16), nullable=False)
   issuer = Column(String(255), nullable=True)
   subject = Column(String(128), nullable=True)
   recipient_handle = Column(String(128), nullable=True)
@@ -336,71 +335,12 @@ def open_session(db: Session, grant: BrowserAccessGrant, owner, previous_session
   return secret, session
 
 
-def create_invitation(db: Session, owner, label: str) -> tuple[BrowserAccessGrant, str]:
-  """Create one recipient grant and return its invitation secret exactly once.
-
-  ``owner`` must already be authenticated and authorized by the caller.
-  """
-  if not isinstance(label, str) or not 1 <= len(label.strip()) <= 128:
-    raise ValueError("Recipient label must contain 1–128 characters.")
-  if owner is None or type(owner.id) is not int:
-    raise ValueError("An authenticated owner is required.")
-  now = now_naive_utc()
-  current_owner = _owner(db, owner.id)
-  secret = secrets.token_urlsafe(32)
-  grant = BrowserAccessGrant(
-    id=secrets.token_urlsafe(24), owner_id=owner.id,
-    label=label.strip(), created_at=now,
-  )
-  db.add(grant)
-  db.add(BrowserAccessInvite(
-    id=secrets.token_urlsafe(24), grant_id=grant.id,
-    secret_hash=_hash_secret(secret), owner_token_epoch=current_owner.token_epoch,
-    created_at=now,
-    expires_at=now + INVITATION_TTL,
-  ))
-  db.commit()
-  return grant, secret
-
-
-def reissue_invitation(db: Session, owner, grant_id: str) -> str:
-  """Issue a new one-day invite for an existing active recipient grant.
-
-  Prior unused invites for that grant expire atomically. Existing sessions and
-  the lasting grant remain unchanged. Caller must authorize ``owner`` first.
-  """
-  if owner is None or type(owner.id) is not int or not isinstance(grant_id, str):
-    raise _unauthorized()
-  try:
-    now = now_naive_utc()
-    grant = db.query(BrowserAccessGrant).filter_by(id=grant_id).first()
-    if grant is None or grant.owner_id != owner.id or grant.revoked_at is not None or grant.kind != "invitation":
-      raise _unauthorized()
-    # Match redemption's lock order: unused invite rows before the grant.
-    # If revocation wins meanwhile, rollback restores all old invitations.
-    db.execute(update(BrowserAccessInvite).where(
-      BrowserAccessInvite.grant_id == grant_id,
-      BrowserAccessInvite.consumed_at.is_(None),
-      BrowserAccessInvite.expires_at > now,
-    ).values(expires_at=now))
-    grant = _lock_active_grant(db, grant_id)
-    current_owner = _owner(db, grant.owner_id)
-    secret = secrets.token_urlsafe(32)
-    db.add(BrowserAccessInvite(
-      id=secrets.token_urlsafe(24), grant_id=grant_id,
-      secret_hash=_hash_secret(secret),
-      owner_token_epoch=current_owner.token_epoch,
-      created_at=now, expires_at=now + INVITATION_TTL,
-    ))
-    db.commit()
-    return secret
-  except Exception:
-    db.rollback()
-    raise
-
-
 def redeem_invitation(db: Session, secret: str, *, previous_session_secret: str | None = None):
-  """Atomically consume an invite; return (session_secret, session, grant, owner)."""
+  """Atomically consume an invite; return (session_secret, session, grant, owner).
+
+  Only links issued before link invitations were retired exist; each expires
+  one day after it was issued.
+  """
   try:
     now = now_naive_utc()
     invite = db.query(BrowserAccessInvite).filter_by(secret_hash=_hash_secret(secret)).first()

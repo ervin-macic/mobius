@@ -82,7 +82,7 @@ def test_attachments_saved_in_message(client, db, auth, chat):
 
 
 def test_augmentation_with_uploads(client, db, auth, chat):
-  """When files are uploaded, the file list must be appended."""
+  """A message carrying an uploaded file gets the session file list appended."""
   client.post(
     f"/api/chats/{chat.id}/uploads",
     files=[("files", ("report.pdf", io.BytesIO(b"data"), "application/pdf"))],
@@ -98,7 +98,7 @@ def test_augmentation_with_uploads(client, db, auth, chat):
   with patch("app.routes.chats_stream.run_chat", new=fake_run_chat):
     client.post(
       f"/api/chats/{chat.id}/messages",
-      json={"content": "analyze this"},
+      json={"content": "analyze this", "attachments": [{"name": "report.pdf"}]},
       headers=auth,
     )
 
@@ -966,7 +966,8 @@ def test_update_pending_message_rederives_upload_manifest(client, db, auth, chat
   the browser only sends the visible text. (`chat` uses a UUID4 id the uploads
   route accepts.)"""
   chat.pending_messages = [
-    {"role": "user", "content": "before", "ts": 100, "cid": "c-up"},
+    {"role": "user", "content": "before", "ts": 100, "cid": "c-up",
+     "attachments": [{"name": "report.pdf"}]},
   ]
   db.commit()
 
