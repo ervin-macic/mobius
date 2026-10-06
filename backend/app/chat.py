@@ -5342,7 +5342,7 @@ async def _run_chat_impl_with_db(
     # This turn reads its own transcript and, for helper results and
     # resumed-turn context, its helpers' transcripts.
     from app.delegations import ensure_parent_helpers_converted
-    await ensure_parent_helpers_converted(chat_id)
+    await ensure_parent_helpers_converted(chat_id, db)
   log = _get_logger()
   settings = get_settings()
   raw_user_message = messages[-1].content

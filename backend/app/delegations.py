@@ -614,7 +614,7 @@ def _assistant_result(chat: models.Chat) -> str:
   return ""
 
 
-async def ensure_parent_helpers_converted(parent_chat_id: str) -> None:
+async def ensure_parent_helpers_converted(parent_chat_id: str, db: Session | None = None) -> None:
   """Convert a parent chat and its helpers' chats before event-loop code reads them.
 
   Helper results (``derived_status``), resumed-turn context
@@ -623,14 +623,16 @@ async def ensure_parent_helpers_converted(parent_chat_id: str) -> None:
   until something converts it, and the event loop never waits inside a read
   (transcript_rows.require_rows), so these async callers await first.
   """
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    children = [row[0] for row in db.query(models.Delegation.child_chat_id).filter(
-      models.Delegation.parent_chat_id == parent_chat_id,
-    )]
+  if db is None:
+    from app.database import SessionLocal
+    with SessionLocal() as own:
+      await ensure_parent_helpers_converted(parent_chat_id, own)
+    return
+  children = [row[0] for row in db.query(models.Delegation.child_chat_id).filter(
+    models.Delegation.parent_chat_id == parent_chat_id,
+  )]
   for chat_id in (parent_chat_id, *children):
-    await transcript_rows.ensure_converted_async(chat_id)
+    await transcript_rows.ensure_converted_async(chat_id, db)
 
 
 def derived_status(
