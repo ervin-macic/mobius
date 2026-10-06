@@ -3296,9 +3296,10 @@ function makeSplit() {
 		};
 	};
 }
-function makeNav({ location = null } = {}) {
+function makeNav({ location = null, waitForNavigationReady = false, getFrameVisibility = () => null } = {}) {
 	let locationText = validNavLocationText(location);
-	let navigationReady = false;
+	const visibility = getFrameVisibility();
+	let navigationReady = !waitForNavigationReady || visibility?.visible === true && visibility.navigationReady !== false;
 	const stack = [];
 	const entries = /* @__PURE__ */ new Set();
 	const entriesByRequestId = /* @__PURE__ */ new Map();
@@ -3315,7 +3316,7 @@ function makeNav({ location = null } = {}) {
 		if (event.source !== window.parent) return;
 		const msg = event.data;
 		if (msg?.type === "moebius:frame-visibility") {
-			navigationReady = msg.visible === true && msg.navigationReady !== false;
+			navigationReady = !waitForNavigationReady || msg.visible === true && msg.navigationReady !== false;
 			if (navigationReady) for (const entry of entries) entry.send?.();
 			return;
 		}
@@ -4532,7 +4533,7 @@ const runtimeFeatures = Object.freeze({
 	navLocation: true,
 	projects: true
 });
-function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null }) {
+function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null, waitForNavigationReady = false, getFrameVisibility }) {
 	const identityKey = `${String(appId)}:${appInstanceId || "legacy"}`;
 	if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
 		_runtimeContext.tokenRef.current = getToken;
@@ -4590,7 +4591,11 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		signal,
 		capabilities,
 		chat,
-		nav: makeNav({ location: navLocation }),
+		nav: makeNav({
+			location: navLocation,
+			waitForNavigationReady,
+			getFrameVisibility
+		}),
 		split: makeSplit(),
 		immersive: makeImmersive({ appId }),
 		clipboard: makeClipboard(),

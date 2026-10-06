@@ -1,3 +1,5 @@
+import { isRetiredAppEntry } from './navHistory.js'
+
 const MAX_STANDALONE_HISTORY_ENTRIES = 40
 
 function normalizeEntry(value) {
@@ -63,7 +65,7 @@ export function standaloneHistoryState(state, entries) {
 export function reconcileStandaloneHistory(
   currentEntries,
   destinationState,
-  { localPopPending = false } = {},
+  { localPopPending = false, registry = null } = {},
 ) {
   const current = normalizedEntries(currentEntries) || []
   const entries = readStandaloneHistoryEntries(destinationState, current)
@@ -77,15 +79,22 @@ export function reconcileStandaloneHistory(
         consumedLocalPop = true
         continue
       }
-      commands.push({ direction: 'back', requestId: entry?.requestId ?? null })
+      if (!registry || !isRetiredAppEntry(registry.get(entry?.requestId))) {
+        commands.push({ direction: 'back', requestId: entry?.requestId ?? null })
+      }
     }
   } else if (entries.length > current.length) {
     for (const entry of entries.slice(current.length)) {
-      commands.push({ direction: 'forward', requestId: entry?.requestId ?? null })
+      if (!registry || !isRetiredAppEntry(registry.get(entry?.requestId))) {
+        commands.push({ direction: 'forward', requestId: entry?.requestId ?? null })
+      }
     }
   }
 
-  return { entries, commands, consumedLocalPop }
+  const direction = entries.length > current.length ? 'forward' : 'back'
+  const skipRetired = registry !== null && entries.length > 0
+    && isRetiredAppEntry(registry.get(entries.at(-1)?.requestId))
+  return { entries, commands, consumedLocalPop, direction, skipRetired }
 }
 
 export { MAX_STANDALONE_HISTORY_ENTRIES }

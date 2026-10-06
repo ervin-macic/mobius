@@ -299,11 +299,15 @@ export function makeSplit() {
 // `location` is the JSON text the shell kept from this app's previous frame
 // (see lib/appNavLocation.js). The app reads it as `nav.location` to restore
 // its place and reports each new place with `nav.setLocation(value)`.
-export function makeNav({ location = null } = {}) {
+export function makeNav({
+  location = null, waitForNavigationReady = false, getFrameVisibility = () => null,
+} = {}) {
   let locationText = validNavLocationText(location)
-  // Only the host can declare this document promoted and visible. An incoming
-  // frame can prepare restoration now, but must not own history until then.
-  let navigationReady = false
+  // Opted-in hosts declare when this document is promoted and visible. Older
+  // shells and published hosts keep immediate sends with the ownership timeout.
+  const visibility = getFrameVisibility()
+  let navigationReady = !waitForNavigationReady
+    || (visibility?.visible === true && visibility.navigationReady !== false)
   const stack = []
   const entries = new Set()
   const entriesByRequestId = new Map()
@@ -322,9 +326,9 @@ export function makeNav({ location = null } = {}) {
     if (event.source !== window.parent) return
     const msg = event.data
     if (msg?.type === 'moebius:frame-visibility') {
-      // Older hosts expose only visible; current hosts also distinguish a
-      // painted handoff cover from a frame allowed to own navigation.
-      navigationReady = msg.visible === true && msg.navigationReady !== false
+      // Only opted-in hosts promise to resend readiness after promotion.
+      navigationReady = !waitForNavigationReady
+        || (msg.visible === true && msg.navigationReady !== false)
       if (navigationReady) {
         for (const entry of entries) entry.send?.()
       }

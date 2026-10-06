@@ -241,7 +241,7 @@ test('Forward shortcut refuses an iframe-owned physical cursor', async () => {
 })
 
 async function mountNavigation(engine, {
-  tab = { kind: 'chat', id: 'c1' }, frames = null, dragActiveRef = { current: false },
+  tab = { kind: 'chat', id: 'c1' }, workspace = null, frames = null, dragActiveRef = { current: false },
 } = {}) {
   globalThis.window = engine.win
   globalThis.location = engine.win.location
@@ -261,14 +261,14 @@ async function mountNavigation(engine, {
     import('../../components/Shell/paneModel.js'),
   ])
 
-  const ws = { ...paneModel.seedFromFlatTabs([tab]), singleScreen: tab }
+  const ws = workspace || { ...paneModel.seedFromFlatTabs([tab]), singleScreen: tab }
   const workspaceStateRef = { current: { ws, undo: null } }
   // The wedged engine reports every failed mirror write through the shared
   // client-error logger; keep that console noise out of the test output.
   const consoleError = console.error
   console.error = () => {}
   try {
-    return renderHook(useNavigation, {
+    const mounted = renderHook(useNavigation, {
       workspace: ws,
       workspaceStateRef,
       dispatchWorkspace: () => {},
@@ -277,6 +277,7 @@ async function mountNavigation(engine, {
       replaceImplicitBootTab: false,
       dragActiveRef,
     })
+    return { ...mounted, workspace: ws }
   } finally {
     console.error = consoleError
   }
@@ -668,4 +669,60 @@ test('explicit file close remains synchronous and can be reversed once', async (
   assert.deepEqual(calls, ['close'])
   engine.userForward()
   assert.deepEqual(calls, ['close', 'restore'])
+})
+
+for (const [path, options] of [
+  ['Navigation API', {}],
+  ['popstate fallback', { navigationApi: false }],
+]) {
+  for (const reset of ['document reset', 'shell reload']) {
+    test(`${path} ${reset} reuses the current app entry and Back reaches its base`, async () => {
+      const engine = sessionHistory(options)
+      globalThis.document = { querySelector: () => ({ contentWindow: { postMessage() {} } }) }
+      let mounted = await mountNavigation(engine, { tab: { kind: 'app', id: '119' } })
+      const base = engine.currentState.entryId
+      const depth = engine.depth
+      assert.equal(mounted.result.current.appNavPush(119, { requestId: 'old' }), true)
+      const detail = engine.currentState.entryId
+      if (reset === 'shell reload') {
+        const workspace = mounted.workspace
+        mounted.unmount()
+        mounted = await mountNavigation(engine, { workspace })
+      } else {
+        mounted.result.current.appNavReset(119)
+      }
+      assert.equal(mounted.result.current.appNavPush(119, { requestId: 'restored' }), true)
+      assert.equal(engine.depth, depth + 1, 'restoration must not add a ghost level')
+      assert.equal(engine.currentState.entryId, detail)
+      assert.equal(engine.currentState.appNav.requestId, 'restored')
+      engine.userBack()
+      assert.equal(engine.currentState.entryId, base)
+      mounted.unmount()
+    })
+  }
+}
+
+test("a reload never reuses another app's retired history slot", async () => {
+  const engine = sessionHistory({ navigationApi: false })
+  let mounted = await mountNavigation(engine, { tab: { kind: 'app', id: '119' } })
+  mounted.result.current.appNavPush(119, { requestId: 'old' })
+  const oldId = engine.currentState.entryId
+  mounted.unmount()
+  mounted = await mountNavigation(engine, { tab: { kind: 'app', id: '120' } })
+  assert.equal(mounted.result.current.appNavPush(120, { requestId: 'new' }), true)
+  assert.notEqual(engine.currentState.entryId, oldId)
+  mounted.unmount()
+})
+
+
+test('restoration does not overwrite an iframe-created physical entry above a retired app slot', async () => {
+  const engine = sessionHistory({ navigationApi: false })
+  const mounted = await mountNavigation(engine, { tab: { kind: 'app', id: '119' } })
+  mounted.result.current.appNavPush(119, { requestId: 'old' })
+  mounted.result.current.appNavReset(119)
+  const depth = engine.depth
+  engine.pushIframeEntry()
+  assert.equal(mounted.result.current.appNavPush(119, { requestId: 'restored' }), true)
+  assert.equal(engine.depth, depth + 2, 'the actual physical cursor, not a remembered tag, determines reuse')
+  mounted.unmount()
 })

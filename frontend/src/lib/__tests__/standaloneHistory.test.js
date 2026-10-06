@@ -1,3 +1,4 @@
+import { isRetiredAppEntry, retireAppEntries } from '../navHistory.js'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
@@ -68,4 +69,27 @@ test('legacy depth entries are reconciled from the known stack and bounded', () 
   })
   assert.equal(malformed.length, MAX_STANDALONE_HISTORY_ENTRIES)
   assert.deepEqual(malformed.at(-1), { requestId: null, reversible: false })
+})
+
+test('standalone uses shell retirement and skips dead document levels without replaying them', () => {
+  const registry = new Map([
+    ['old', { appId: '81', status: 'live' }],
+    ['other', { appId: '82', status: 'live' }],
+  ])
+  assert.deepEqual(retireAppEntries(registry, 81), ['old'])
+  assert.deepEqual(retireAppEntries(registry, 81), [])
+  assert.equal(isRetiredAppEntry(registry.get('old')), true)
+  assert.equal(isRetiredAppEntry(registry.get('unknown')), true)
+  assert.equal(isRetiredAppEntry(registry.get('other')), false)
+  registry.set('restored', { appId: '81', status: 'live' })
+  const result = reconcileStandaloneHistory(
+    [entry('old'), entry('restored')],
+    standaloneHistoryState({}, [entry('old')]),
+    { registry },
+  )
+  assert.deepEqual(result.commands, [{ direction: 'back', requestId: 'restored' }])
+  assert.equal(result.skipRetired, true)
+  const skipped = reconcileStandaloneHistory(result.entries, standaloneHistoryState({}, []), { registry })
+  assert.deepEqual(skipped.commands, [])
+  assert.equal(skipped.skipRetired, false)
 })

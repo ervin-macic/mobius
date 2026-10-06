@@ -14,7 +14,7 @@ import {
 } from '../../lib/appToken.js'
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
 import { validNavLocationText } from '../../lib/appNavLocation.js'
-import { readAppNavLocation, writeAppNavLocation } from '../../lib/appNavLocationStore.js'
+import { readAppNavLocation, writeValidatedAppNavLocation } from '../../lib/appNavLocationStore.js'
 import {
   cacheAppToken, readAppFrameStorage, readCachedAppToken,
   isSharedVirtualStorageKey,
@@ -724,6 +724,7 @@ const AppCanvas = forwardRef(function AppCanvas({
     win.postMessage(
       {
         type: 'moebius:frame-init',
+        waitForNavigationReady: true,
         token,
         themeCss: eff?.css ?? theme?.css,
         bg: eff?.bg ?? theme?.bg,
@@ -847,6 +848,8 @@ const AppCanvas = forwardRef(function AppCanvas({
       // frame-mounted: the reducer routes it — promotion if it's the incoming
       // frame, first-load settle if it's the live frame, ignored if stale.
       if (msg.type === 'moebius:frame-mounted' && String(msg.appId) === String(appId)) {
+        const nav = frameNavRef.current.get(srcVersion)
+        if (nav) nav.mounted = true
         dispatchSwap({ type: 'frame-mounted', version: srcVersion })
         return
       }
@@ -916,14 +919,14 @@ const AppCanvas = forwardRef(function AppCanvas({
         return
       }
 
-      // Incoming reports become authoritative only on promotion. Bind writes to
-      // this document's init, never a token rotated while it is still running.
+      // Reports become authoritative only after mounting and promotion. Bind
+      // writes to this document's init, never a token rotated while it runs.
       if (msg.type === 'moebius:nav-location') {
         const nav = frameNavRef.current.get(srcVersion)
         if (!nav) return
         const location = validNavLocationText(msg.location)
-        if (srcVersion === liveVersionRef.current) {
-          writeAppNavLocation(appId, nav.instanceId, location)
+        if (srcVersion === liveVersionRef.current && nav.mounted) {
+          writeValidatedAppNavLocation(appId, nav.instanceId, location)
           // A live report can arrive before the promotion effect flushes.
           delete nav.location
         } else {
@@ -1440,8 +1443,8 @@ const AppCanvas = forwardRef(function AppCanvas({
   useEffect(() => {
     if (loadedDocsRef.current.has(swap.liveVersion)) {
       const nav = frameNavRef.current.get(swap.liveVersion)
-      if (nav && 'location' in nav) {
-        writeAppNavLocation(appId, nav.instanceId, nav.location)
+      if (swap.liveLoaded && nav?.mounted && 'location' in nav) {
+        writeValidatedAppNavLocation(appId, nav.instanceId, nav.location)
         delete nav.location
       }
       sendVisibility(swap.liveVersion, frameVisible)

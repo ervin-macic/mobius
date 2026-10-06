@@ -612,7 +612,7 @@
     //      registered before iframe.onLoad fires in the parent).
     //   2. parent (AppCanvas.jsx) posts
     //      {type:'moebius:frame-init', token, themeCss, bg,
-    //       capabilityContract, navLocation} on
+    //       capabilityContract, navLocation, waitForNavigationReady} on
     //      its iframe.onLoad handler. navLocation is the JSON text this app's
     //      previous frame reported through window.mobius.nav.setLocation, or
     //      null; the runtime validates it and exposes it as nav.location.
@@ -652,6 +652,8 @@
     let currentToken = null;
     let currentCapabilityContract = null;
     let currentNavLocation = null;
+    let waitForNavigationReady = false;
+    let currentFrameVisibility = null;
     let tokenRefreshPromise = null;
     let tokenRefreshResolve = null;
     let mountedRoot = null;
@@ -1388,6 +1390,10 @@
           getToken: runtimeToken,
           capabilityContract: currentCapabilityContract,
           navLocation: currentNavLocation,
+          waitForNavigationReady,
+          // Module transfer/evaluation is async. Read the latest trusted state
+          // at runtime init, not the state when the transfer began.
+          getFrameVisibility: () => currentFrameVisibility,
         };
         // Opaque sandboxed frames are intentionally NOT controlled by the
         // shell's service worker. Loading /module directly from here therefore
@@ -1545,11 +1551,19 @@
         });
         return;
       }
+      if (msg.type === 'moebius:frame-visibility') {
+        currentFrameVisibility = {
+          visible: msg.visible === true,
+          navigationReady: msg.navigationReady !== false,
+        };
+        return;
+      }
       if (msg.type === 'moebius:frame-init') {
         currentCapabilityContract = msg.capabilityContract || null;
         acceptToken(msg.token);
         if (initialized) return;
         initialized = true;
+        waitForNavigationReady = msg.waitForNavigationReady === true;
         currentNavLocation = typeof msg.navLocation === 'string' ? msg.navLocation : null;
         if (typeof window.__mobiusHydrateLocalStorage === 'function') {
           window.__mobiusHydrateLocalStorage(msg.storage);

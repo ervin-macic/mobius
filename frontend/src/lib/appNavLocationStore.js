@@ -26,7 +26,11 @@ export function readAppNavLocation(appId, instanceId, store = sessionStore()) {
 
 /** Store validated location text; anything else clears the entry. */
 export function writeAppNavLocation(appId, instanceId, text, store = sessionStore()) {
-  const location = validNavLocationText(text)
+  writeValidatedAppNavLocation(appId, instanceId, validNavLocationText(text), store)
+}
+
+/** Persist a report already validated at the frame-message boundary. */
+export function writeValidatedAppNavLocation(appId, instanceId, location, store = sessionStore()) {
   try {
     if (location === null) {
       store?.removeItem(keyFor(appId))

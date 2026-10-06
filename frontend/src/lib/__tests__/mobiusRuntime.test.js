@@ -421,7 +421,7 @@ test('nav restoration waits for trusted visibility and starts its timeout at sen
   globalThis.clearTimeout = () => {}
   try {
     await withFakeWindow(async ({ window, parent }) => {
-      const nav = makeNav({ location: '{"detail":"notes"}' })
+      const nav = makeNav({ location: '{"detail":"notes"}', waitForNavigationReady: true })
       const first = nav.open('collection')
       const second = nav.open('detail')
       window.emit({ type: 'moebius:frame-visibility', visible: false })
@@ -451,7 +451,7 @@ test('nav restoration waits for trusted visibility and starts its timeout at sen
 
 test('closing a deferred nav request cancels it before visibility can send it', async () => {
   await withFakeWindow(async ({ window, parent }) => {
-    const nav = makeNav()
+    const nav = makeNav({ waitForNavigationReady: true })
     const handle = nav.open('detail')
     handle.close()
     assert.deepEqual(await handle.outcome, { status: 'cancelled' })
@@ -1178,5 +1178,42 @@ test('Projects source import stays parent-mediated and bounds the source identit
     window.emit({ type: 'moebius:projects-result', requestId: request.requestId, ok: true, result: { id: 'linked-project' } })
     assert.deepEqual(await pending, { id: 'linked-project' })
     projects._destroy()
+  })
+})
+
+test('hosts without readiness opt-in still send and time out without visibility messages', async () => {
+  const previousSetTimeout = globalThis.setTimeout
+  const previousClearTimeout = globalThis.clearTimeout
+  const timers = []
+  globalThis.setTimeout = (cb, ms) => { timers.push({ cb, ms }); return timers.length }
+  globalThis.clearTimeout = () => {}
+  try {
+    await withFakeWindow(async ({ parent }) => {
+      const handle = makeNav().open('detail')
+      assert.equal(parent.messages.length, 1)
+      assert.equal(timers[0].ms, 5000)
+      timers[0].cb()
+      assert.deepEqual(await handle.outcome, { status: 'timeout' })
+      assert.equal(await handle.ready, false)
+      timers[1].cb()
+    })
+  } finally {
+    globalThis.setTimeout = previousSetTimeout
+    globalThis.clearTimeout = previousClearTimeout
+  }
+})
+
+test('delayed runtime init reads visibility retained by the wrapper before it listened', async () => {
+  await withFakeWindow(async ({ window, parent }) => {
+    let latest = { visible: false, navigationReady: false }
+    const config = { waitForNavigationReady: true, getFrameVisibility: () => latest }
+    // The config was seeded before async module transfer; the trusted wrapper
+    // receives visibility while no runtime listener exists yet.
+    latest = { visible: true, navigationReady: true }
+    const handle = makeNav(config).open('detail')
+    assert.equal(parent.messages.length, 1)
+    window.emit({ type: 'moebius:nav-push-ack', requestId: parent.messages[0].data.requestId })
+    assert.equal(await handle.ready, true)
+    handle.close()
   })
 })

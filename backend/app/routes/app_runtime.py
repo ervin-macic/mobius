@@ -316,7 +316,7 @@ def get_frame(
   changed. The service worker revalidates frame/module routes against
   the same ETag via `appCodeHandler` in `sw.js`; that cache is ungated
   and applies to every installed app.
-  SEPARATELY, `AppCanvas` appends `?v=<app.updated_at>` to the frame
+  SEPARATELY, `AppCanvas` appends `?v=<app.frame_version>` to the frame
   URL, which the SW keeps as its offline cache key (it strips only
   token/_/install, not `v`), so an app edit changes the SW key and
   forces a fresh load. `v` is purely a client/SW cache-buster — this

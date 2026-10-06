@@ -953,7 +953,7 @@ function locationFrameHTML(appId, { manualMount = false, fallback = false } = {}
     window.initCalls++;
     window.lastToken = msg.token;
     if (window.nav) return;
-    window.nav = makeNav({ location: msg.navLocation });
+    window.nav = makeNav({ location: msg.navLocation, waitForNavigationReady: msg.waitForNavigationReady });
     window.initialLocation = window.nav.location;
     window.report = () => window.nav.setLocation({ ...window.nav.location, detail: window.detail ? 'notes' : null });
     window.openDetail = async () => {
@@ -1053,6 +1053,7 @@ test.describe('AppCanvas location lifecycle', () => {
   test('bookmark restoration owns Back through version swap and shell refresh', async ({ page }) => {
     const state = await setupLocationRoutes(page)
     let frame = await locationFrame(page)
+    const entryBeforeDetail = await page.evaluate(() => history.state?.entryId)
     await frame.evaluate(() => window.openDetail())
     await expectDetail(frame)
     state.version = '2000'
@@ -1061,6 +1062,7 @@ test.describe('AppCanvas location lifecycle', () => {
     await expectDetail(frame)
     await page.evaluate(() => history.back())
     await frame.waitForFunction(() => !window.detail)
+    await expect.poll(() => page.evaluate(() => history.state?.entryId)).toBe(entryBeforeDetail)
     await frame.evaluate(() => window.openDetail())
     await expectDetail(frame)
     await page.reload({ waitUntil: 'domcontentloaded' })
@@ -1068,6 +1070,7 @@ test.describe('AppCanvas location lifecycle', () => {
     await expectDetail(frame)
     await page.evaluate(() => history.back())
     await frame.waitForFunction(() => !window.detail)
+    await expect.poll(() => page.evaluate(() => history.state?.entryId)).toBe(entryBeforeDetail)
     expect(await frame.locator('#root').textContent()).toBe('list')
   })
 
@@ -1085,7 +1088,7 @@ test.describe('AppCanvas location lifecycle', () => {
     await expectDetail(frame)
     await page.evaluate(() => history.back())
     await frame.waitForFunction(() => !window.detail)
-    // Retired physical entries are skipped during that same Back traversal.
+    // Restoration reused the physical detail slot, so one Back reaches its base.
     await expect.poll(() => page.evaluate(() => history.state?.entryId)).toBe(entryBeforeDetail)
   })
 
@@ -1163,6 +1166,21 @@ test.describe('AppCanvas location lifecycle', () => {
     await page.reload({ waitUntil: 'domcontentloaded' })
     const restored = await locationFrame(page, 81, 'live', '3000')
     expect(await restored.evaluate(() => window.initialLocation)).toEqual({ detail: null })
+  })
+
+  test('a live document fallback cannot overwrite the bookmark before mounting', async ({ page }) => {
+    const state = await setupLocationRoutes(page)
+    let frame = await locationFrame(page)
+    await frame.evaluate(() => window.openDetail())
+    await expectDetail(frame)
+    state.manualVersions.add('1000')
+    state.fallbackVersions.add('1000')
+    await frame.goto(frame.url(), { waitUntil: 'load' })
+    frame = await locationFrame(page)
+    await frame.waitForFunction(() => window.nav.location?.detail === null)
+    expect((await storedLocation(page)).location).toBe('{"detail":"notes"}')
+    await frame.evaluate(() => window.mount())
+    await expect.poll(async () => (await storedLocation(page))?.location).toBe('{"detail":null}')
   })
 
   test('a newer live report supersedes a fallback staged before promotion', async ({ page }) => {

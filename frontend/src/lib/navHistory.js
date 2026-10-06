@@ -90,6 +90,23 @@ export function ownerKeyOf(paneId, appId) {
   return JSON.stringify([String(paneId), String(appId)])
 }
 
+// Document-local ownership is never recovered from history payloads. Unknown
+// entries after a host reload, like explicitly retired entries, have no owner.
+export function isRetiredAppEntry(record) {
+  return !record || record.status === 'retired'
+}
+
+export function retireAppEntries(registry, appId, reason = 'reset') {
+  const retired = []
+  for (const [entryId, record] of registry) {
+    if (record.appId !== String(appId) || record.status === 'retired') continue
+    record.status = 'retired'
+    record.retiredReason = reason
+    retired.push(entryId)
+  }
+  return retired
+}
+
 // Pure "my tagged entry is topmost" predicate for the single-FIFO local-pop
 // pump (design §5, contract §3.3.2). All seven conditions must hold at the
 // instant before `history.back()`: (a) the caller passes the global queue head

@@ -3,6 +3,8 @@ import {
   dropPopsForEntry,
   isMobiusNavState,
   isTopmostAppEntry,
+  isRetiredAppEntry,
+  retireAppEntries,
   navEntryId,
   navEntryIndex,
   navTraversalDirection,
@@ -485,12 +487,8 @@ export default function useNavigation({
   // unmount cleanup can call it as a backstop.
   const retireAppHistory = useCallback((appId, reason = 'evict') => {
     const target = String(appId)
-    for (const [entryId, rec] of appEntryOwnersRef.current) {
-      if (rec.appId === target && rec.status !== 'retired') {
-        consumedAppEntryIdsRef.current.add(entryId)
-        rec.status = 'retired'
-        rec.retiredReason = reason
-      }
+    for (const entryId of retireAppEntries(appEntryOwnersRef.current, target, reason)) {
+      consumedAppEntryIdsRef.current.add(entryId)
     }
     for (const [key, pending] of pendingAppForwardsRef.current) {
       if (pending.appId !== target) continue
@@ -835,11 +833,23 @@ export default function useNavigation({
     }
     let state
     try {
-      state = pushShellEntry(
-        'app',
-        navRoute('canvas', null, Number(appId), ownerPaneId),
-        appNav,
-      )
+      const current = currentNavStateRef.current
+      const entryId = navEntryId(current)
+      const record = appEntryOwnersRef.current.get(entryId)
+      const route = navRoute('canvas', null, Number(appId), ownerPaneId)
+      // Restoration replaces the dead document's current slot, not another
+      // level on top of it. A different app/pane must keep its own history.
+      if (entryId && navEntryId(history.state) === entryId && current.kind === 'app'
+          && String(current.appNav?.appId) === String(appId)
+          && String(current.route?.paneId) === String(ownerPaneId)
+          && isRetiredAppEntry(record)
+          && (!record || ownerKeyOf(record.paneId, record.appId) === ownerKey)) {
+        state = updateCurrentNavEntry(route, { kind: 'app', appNav })
+        currentNavStateRef.current = state
+        consumedAppEntryIdsRef.current.delete(entryId)
+      } else {
+        state = pushShellEntry('app', route, appNav)
+      }
     } catch { return false }
     addAppEntry(navEntryId(state), ownerPaneId, appId, appNav)
     return true
@@ -1487,13 +1497,20 @@ export default function useNavigation({
       // still retains the surrounding entries. Explicit launch destinations
       // instead start a new shell-relative history model as before.
       const existing = history.state
+      // App sentinels use the visible owner (the synthetic slot in single
+      // mode), not the hidden builder pane carried by ordinary route hints.
+      const resumeRoute = existing?.kind === 'app' && initialRoute.view === 'canvas'
+        ? navRoute('canvas', null, initialRoute.appId,
+          appOwnerPaneId(workspaceStateRef.current.ws, initialRoute.appId))
+        : initialRoute
       const resumeEntry = !deepLink?.view && !returnView
         && !claimedReloadDestination
         // A base entry showing a non-chat surface still needs the HOME seed
         // behind it, so only a chat base entry is resumed as-is.
-        && (existing?.kind === 'nav' || (existing?.kind === 'base' && !seedHome))
+        && (existing?.kind === 'nav' || existing?.kind === 'app'
+          || (existing?.kind === 'base' && !seedHome))
         && isMobiusNavState(existing)
-        && sameRoute(existing.route, initialRoute)
+        && sameRoute(existing.route, resumeRoute)
       currentNavStateRef.current = resumeEntry
         ? existing
         : replaceNavEntry('base', routePath, baseRoute)
@@ -2266,8 +2283,14 @@ export default function useNavigation({
     const kind = history.state.kind === 'drawer' && !drawerPushedRef.current
       ? 'nav'
       : history.state.kind
-    currentNavStateRef.current = updateCurrentNavEntry(snapshotRoute(), { kind })
-  }, [activeView, activeChatId, activeAppId, activeProjectId, contentRoute.paneId, snapshotRoute])
+    const route = snapshotRoute()
+    if (kind === 'app' && route.view === 'canvas'
+        && String(history.state.appNav?.appId) === String(route.appId)) {
+      route.paneId = appOwnerPaneId(workspaceStateRef.current.ws, route.appId) ?? route.paneId
+    }
+    currentNavStateRef.current = updateCurrentNavEntry(route, { kind })
+  }, [activeView, activeChatId, activeAppId, activeProjectId, contentRoute.paneId,
+    snapshotRoute, appOwnerPaneId, workspaceStateRef])
 
   // A queued close from a hidden cached app becomes safe once shell Back restores
   // that app and its sentinel to the current tagged entry — or once a split/focus
