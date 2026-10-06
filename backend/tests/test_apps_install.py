@@ -4418,6 +4418,115 @@ def test_unchecked_runtime_dependencies_keep_the_resolver_fallback(runtime):
   assert not install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
 
 
+@pytest.mark.parametrize("declared", [False, True])
+def test_undeclared_package_version_conflict_uses_existing_auto_merge(
+  client, auth, tmp_path, bypass_url_validation, declared,
+):
+  manifest = {
+    "id": "package-version", "name": "Package version", "version": "1.0.0",
+    "description": "Version merge", "entry": "index.jsx",
+    **({"source_files": ["cards.js"]} if declared else {}),
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  # Establish a shared base for the version conflict, then edit both sides.
+  package = {"name": "package-version", "version": "1.0.0"}
+  (source_dir / "package.json").write_text(json.dumps(package))
+  app_git.commit_local(source_dir, "package base")
+  _publish_clone_files(work, bare, {"package.json": json.dumps(package)})
+  first = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
+  assert first.status_code == 201, first.text
+  (source_dir / "package.json").write_text(json.dumps({**package, "version": "1.0.1"}))
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "package.json": json.dumps({**package, "version": "2.0.0"}),
+  })
+
+  updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert json.loads((source_dir / "package.json").read_text())["version"] == "2.0.0"
+  assert not install.pending_conflict_update_receipt_present(source_dir)
+
+
+def test_directory_file_conflict_goes_to_resolver_on_retries(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  manifest = {
+    "id": "directory-conflict", "name": "Directory conflict", "version": "1.0.0",
+    "description": "Owner file against upstream directory", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  (source_dir / "notes").write_text("owner notes\n")
+  (work / "notes").mkdir()
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "notes/a.md": "upstream notes\n",
+  })
+
+  for _ in range(2):
+    updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
+    assert updated.status_code == 201, updated.text
+    assert updated.json()["mode"] == "conflict"
+    assert install.pending_conflict_update_receipt_present(source_dir)
+    assert (source_dir / "notes").read_text() == "owner notes\n"
+    assert not (source_dir / "notes~main").exists()
+
+
+@pytest.mark.parametrize("sources", [
+  None, [], 1, "templates/starter.md", ["templates/starter.md"],
+])
+def test_template_starter_sources_must_be_installed_and_protected(sources):
+  from app.manifest_contract import ManifestContractError, validate_manifest_contract
+
+  manifest = {
+    "id": "starter", "name": "Starter", "version": "1.0.0",
+    "description": "Project starter", "entry": "index.jsx",
+    "source_files": sources,
+    "project_templates": [{
+      "id": "doc", "name": "Document",
+      "files": {"README.md": "templates/starter.md"},
+    }],
+  }
+  if sources != ["templates/starter.md"]:
+    with pytest.raises(ManifestContractError, match="source_files"):
+      validate_manifest_contract(manifest)
+    return
+  validate_manifest_contract(manifest)
+  with patch("app.install.app_git.read_blob", return_value=json.dumps(manifest).encode()):
+    protected = install._update_package_paths("unused", manifest)
+  assert "templates/starter.md" in protected
+  assert "README.md" not in protected
+
+
+@pytest.mark.parametrize("css", [
+  b"@import './undeclared.css';",
+  b"body { background: url('./undeclared.png'); }",
+])
+@pytest.mark.parametrize("static", [False, True])
+def test_css_dependencies_keep_ancillary_conflicts_in_the_resolver(css, static):
+  manifest = {"entry": "index.jsx", "source_files": ["style.css"]}
+  tree = {"index.jsx": b"import './style.css'; export default () => null"}
+  assets = {}
+  if static:
+    manifest = {"entry": "index.jsx", "static_assets": {"style.css": "raw.css"}}
+    tree["index.jsx"] = b"import './static/style.css'; export default () => null"
+    assets["style.css"] = css
+  else:
+    tree["style.css"] = css
+  assert not install._benign_source_complete(tree, manifest, assets)
+
+
+def test_unknown_runtime_field_keeps_ancillary_conflicts_in_the_resolver():
+  manifest = {"entry": "index.jsx", "future_runtime": {"entry": "worker.py"}}
+  assert not install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
+
+
 def test_conflict_outside_the_package_keeps_local_and_updates(
   client, auth, tmp_path, bypass_url_validation,
 ):

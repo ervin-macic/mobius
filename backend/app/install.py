@@ -1342,24 +1342,24 @@ def _update_package_paths(
 def _benign_source_complete(
   tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
 ) -> bool:
-  """Only keep ancillary conflicts when the installed source is complete.
+  """Only keep ancillary conflicts for fully checked JavaScript packages.
 
-  The source checker follows JavaScript imports, not dependencies of Python
-  services, setup scripts, scheduled jobs, activities or artifact builders. Those
-  packages keep the resolver fallback rather than guessing their dependencies.
+  Extra manifest fields may introduce runtime dependencies the JS checker does
+  not understand. New features therefore need explicit admission here before
+  their ancillary conflicts can auto-resolve.
   """
-  schedule = manifest.get("schedule") or {}
-  job = schedule.get("job")
-  if (
-    manifest.get("service")
-    or manifest.get("setup", {}).get("steps")
-    or manifest.get("agent_activities")
-    or any(
-      template.get("artifact_types")
-      for template in manifest.get("project_templates") or []
-    )
-    or job
-  ):
+  understood_fields = {
+    "id", "name", "version", "description", "entry", "icon", "source_files",
+    "static_assets", "storage_seeds", "package_id", "previous_id",
+    "previous_manifest_url", "moved_to", "requires", "permissions",
+    "offline", "offline_capable", "theme_color", "background_color", "display",
+    "embeds_agent", "shell_shortcuts",
+  }
+  if not manifest.keys() <= understood_fields:
+    return False
+  # The bundler follows CSS @import and url() references; the JS checker does
+  # not. Keep packages containing CSS on the conservative resolver path.
+  if any(Path(rel).suffix.lower() == ".css" for rel in (*tree, *static_assets)):
     return False
   files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
   # These are the actual bytes activation writes, not placeholders: static JS
@@ -4829,9 +4829,8 @@ async def _install_candidate(
             # same owner-gated resolver instead of overwriting local work.
             # JSON manifests can reconcile serialization drift and disjoint
             # edits structurally. Other files retain the APP_VERSION-only
-            # rule. Any remaining overlap leaves the whole update untouched
-            # for the owner to resolve. A path outside the package keeps the
-            # owner's version.
+            # rule. Remaining overlaps need the owner unless a path outside
+            # a complete package can safely keep the owner's version.
             package_paths = await asyncio.to_thread(
               _update_package_paths, git_source_dir, manifest,
             )

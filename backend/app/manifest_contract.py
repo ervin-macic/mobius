@@ -756,6 +756,12 @@ def validate_manifest_contract(manifest) -> None:
       for destination, source in files.items():
         validate_repo_relative_path(destination, f"{field}.files.{destination}")
         validate_repo_relative_path(source, f"{field}.files.{destination}")
+        declared_sources = manifest.get("source_files")
+        if not isinstance(declared_sources, list) or source not in declared_sources:
+          _fail(
+            f"Manifest `{field}.files.{destination}` must also be listed in "
+            "`source_files` so it is installed in the app's source tree."
+          )
 
       artifact_types = template.get("artifact_types", [])
       if (

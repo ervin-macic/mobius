@@ -4003,9 +4003,11 @@ def resolve_benign_conflict(
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
 
-  A conflicting path outside ``package_paths`` keeps the local version,
-  including a local deletion. None protects every path. The caller must check
-  dependency completeness before accepting these ancillary resolutions.
+  If the per-file merge fails, a path outside ``package_paths`` can keep its
+  local version, including a local deletion of a base file. Synthetic conflict
+  paths absent from both local and base trees need the resolver. None protects
+  every path. The caller must check dependency completeness before accepting
+  these ancillary resolutions.
   """
   repo = Path(source_dir)
   if not conflict_paths:
@@ -4048,20 +4050,22 @@ def resolve_benign_conflict(
   kept_local: list[str] = []
   for rel in merge_conflicts:
     ours = read_blob(repo, LOCAL_BRANCH, rel)
-    if package_paths is not None and rel not in package_paths:
+    theirs = read_blob(repo, UPSTREAM_BRANCH, rel)
+    base = read_blob(repo, base_ref, rel)
+    merged = (
+      _resolve_benign_conflict_file(rel, base, ours, theirs)
+      if ours is not None and theirs is not None else None
+    )
+    if merged is not None:
+      resolved[rel] = merged
+    elif (
+      package_paths is not None and rel not in package_paths
+      and (ours is not None or base is not None)
+    ):
       resolved[rel] = ours
       kept_local.append(rel)
-      continue
-    theirs = read_blob(repo, UPSTREAM_BRANCH, rel)
-    # A deletion on either side is not a benign shape; leave it to the owner.
-    if ours is None or theirs is None:
+    else:
       return None
-    merged = _resolve_benign_conflict_file(
-      rel, read_blob(repo, base_ref, rel), ours, theirs,
-    )
-    if merged is None:
-      return None
-    resolved[rel] = merged
   full = read_merged_tree(repo, tree_oid)
   for rel, data in resolved.items():
     if data is None:

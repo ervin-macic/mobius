@@ -165,13 +165,13 @@ def test_project_templates_validate_ids_lists_and_confined_file_paths(tmp_path):
       "output": "{source}",
     }],
   }]
-  manifest["source_files"] = ["project-builder.sh"]
+  manifest["source_files"] = ["project-builder.sh", "templates/index.html"]
   validate_manifest_contract(manifest)
 
-  manifest["source_files"] = []
+  manifest["source_files"] = ["templates/index.html"]
   with pytest.raises(ManifestContractError, match="reviewed builder"):
     validate_manifest_contract(manifest)
-  manifest["source_files"] = ["project-builder.sh"]
+  manifest["source_files"] = ["project-builder.sh", "templates/index.html"]
 
   manifest["project_templates"][0]["artifact_types"][0]["output"] = "../site.html"
   with pytest.raises(ManifestContractError, match="must not contain"):
