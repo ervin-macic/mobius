@@ -1796,27 +1796,3 @@ def test_local_apply_refuses_the_protected_broker_model_transport(
   assert refused.status_code == 422, refused.text
   assert refused.json()["detail"]["code"] == "local_model_broker"
   assert db.query(models.App).count() == 0
-
-
-def test_installed_template_app_apply_warns_instead_of_rejecting_legacy_sources(
-  client, auth, caplog,
-):
-  source = _source("legacy-template")
-  created = _apply(client, auth, source)
-  assert created.status_code == 200, created.text
-  manifest = json.loads((source / "mobius.json").read_text())
-  manifest["project_templates"] = [{
-    "id": "doc", "name": "Document", "files": {"README.md": "starter.md"},
-  }]
-  (source / "starter.md").write_text("# Starter\n")
-  (source / "mobius.json").write_text(json.dumps(manifest))
-  (source / "index.jsx").write_text("export default () => <div>updated</div>")
-
-  updated = _apply(client, auth, source)
-
-  assert updated.status_code == 200, updated.text
-  assert "starter.md" in caplog.text
-  assert "source_files" in caplog.text
-  # A new author package must declare the same starter before it can install.
-  with pytest.raises(app_apply.AppApplyError, match="source_files"):
-    app_apply._read_manifest(source)

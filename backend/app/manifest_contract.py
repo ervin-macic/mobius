@@ -2,7 +2,6 @@
 
 from collections.abc import Callable, Iterator, Mapping
 import json
-import logging
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 import posixpath
@@ -513,10 +512,8 @@ def validate_agent_tools(tools, *, has_service: bool) -> None:
       )
 
 
-def validate_manifest_contract(
-  manifest, *, allow_legacy_template_sources: bool = False,
-) -> None:
-  """Validate package shape/path rules; installed legacy starters warn only."""
+def validate_manifest_contract(manifest) -> None:
+  """Validate every manifest shape/path rule enforced before installation."""
   if not isinstance(manifest, Mapping):
     _fail("Manifest must be a JSON object.")
   invalid_required = [
@@ -783,17 +780,6 @@ def validate_manifest_contract(
       for destination, source in files.items():
         validate_repo_relative_path(destination, f"{field}.files.{destination}")
         validate_repo_relative_path(source, f"{field}.files.{destination}")
-        declared_sources = manifest.get("source_files")
-        if not isinstance(declared_sources, list) or source not in declared_sources:
-          message = (
-            f"Manifest `{field}.files.{destination}` ({source!r}) must also be listed in "
-            "`source_files` so it is installed in the app's source tree."
-          )
-          if not allow_legacy_template_sources:
-            _fail(message)
-          # Installed third-party apps predate this packaging rule. Keep their
-          # runtime and Apply working while authors repair the declaration.
-          logging.getLogger(__name__).warning(message)
 
       artifact_types = template.get("artifact_types", [])
       if (

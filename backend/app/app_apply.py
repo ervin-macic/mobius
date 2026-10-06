@@ -345,7 +345,7 @@ async def _git_operation(label: str, fn, *args):
     ) from exc
 
 
-def _read_manifest(snapshot_dir: Path, *, installed: bool = False) -> dict:
+def _read_manifest(snapshot_dir: Path) -> dict:
   path = snapshot_dir / "mobius.json"
   try:
     raw = path.read_bytes()
@@ -370,7 +370,7 @@ def _read_manifest(snapshot_dir: Path, *, installed: bool = False) -> dict:
       "manifest_invalid", f"Invalid mobius.json: {exc}",
     ) from exc
   try:
-    validate_manifest_contract(manifest, allow_legacy_template_sources=installed)
+    validate_manifest_contract(manifest)
   except ManifestContractError as exc:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
   size = package_bytes_on_disk(snapshot_dir, manifest)
@@ -725,7 +725,7 @@ async def apply_source_revision(
       )
       store_managed = app is not None and app.manifest_url is not None
       manifest = (
-        _read_manifest(snapshot_dir, installed=app is not None)
+        _read_manifest(snapshot_dir)
         if not store_managed or accept_local_package
         else None
       )

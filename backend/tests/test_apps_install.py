@@ -4514,32 +4514,6 @@ def test_directory_file_conflict_goes_to_resolver_on_retries(
     assert not (source_dir / "notes~main").exists()
 
 
-@pytest.mark.parametrize("sources", [
-  None, [], 1, "templates/starter.md", ["templates/starter.md"],
-])
-def test_template_starter_sources_must_be_installed_and_protected(sources):
-  from app.manifest_contract import ManifestContractError, validate_manifest_contract
-
-  manifest = {
-    "id": "starter", "name": "Starter", "version": "1.0.0",
-    "description": "Project starter", "entry": "index.jsx",
-    "source_files": sources,
-    "project_templates": [{
-      "id": "doc", "name": "Document",
-      "files": {"README.md": "templates/starter.md"},
-    }],
-  }
-  if sources != ["templates/starter.md"]:
-    with pytest.raises(ManifestContractError, match="source_files"):
-      validate_manifest_contract(manifest)
-    return
-  validate_manifest_contract(manifest)
-  with patch("app.install.app_git.read_blob", return_value=json.dumps(manifest).encode()):
-    protected = install._update_package_paths("unused", manifest)
-  assert "templates/starter.md" in protected
-  assert "README.md" not in protected
-
-
 def test_unknown_runtime_field_keeps_ancillary_conflicts_in_the_resolver():
   manifest = {"entry": "index.jsx", "future_runtime": {"entry": "worker.py"}}
   assert not install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})

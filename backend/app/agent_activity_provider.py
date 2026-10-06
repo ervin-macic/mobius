@@ -41,7 +41,7 @@ def resolve_agent_activity_binding(db: Session) -> AgentActivityBinding:
         manifest = json.loads(
           (runtime_root(app) / "mobius.json").read_text("utf-8"),
         )
-        validate_manifest_contract(manifest, allow_legacy_template_sources=True)
+        validate_manifest_contract(manifest)
       except (AppliedRuntimeUnavailable, OSError, UnicodeError, ValueError):
         continue
       declarations = manifest.get("agent_activities")

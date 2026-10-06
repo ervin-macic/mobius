@@ -263,7 +263,7 @@ def migrate_accepted_service_contracts(db) -> tuple[int, list[str]]:
       manifest = json.loads(raw)
       if not isinstance(manifest, dict) or manifest.get("service") is None:
         continue
-      validate_manifest_contract(manifest, allow_legacy_template_sources=True)
+      validate_manifest_contract(manifest)
       service = contract_from_manifest(manifest).get("service")
       if not isinstance(service, dict):
         raise ManifestContractError("Manifest service declaration is invalid.")
