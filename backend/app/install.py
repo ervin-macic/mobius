@@ -43,6 +43,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import httpx
 from fastapi import HTTPException
 from sqlalchemy import case
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app import (
@@ -1746,7 +1747,7 @@ def _verify_git_install_candidate(
 
 
 async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
-  """Remove the pending receipt and its resolver binding together."""
+  """Remove the receipt and resolver binding; caller holds the source lock."""
   source_dir = app.source_dir
   # The receipt is the durable "not installed yet" marker, so it goes first. A
   # crash afterwards leaves only a stray checkout, which the next conflict or
@@ -5077,8 +5078,10 @@ async def _install_candidate(
   # Only now is the update fully converged. Until the receipt goes, a retry
   # reruns this whole install, post-commit effects included.
   try:
-    await clear_pending_conflict_update(db, app)
-  except (OSError, subprocess.SubprocessError):
+    async with fs_locks.source_dir_lock(app.source_dir):
+      await clear_pending_conflict_update(db, app)
+  except (OSError, subprocess.SubprocessError, SQLAlchemyError):
+    db.rollback()
     log.warning("install: could not clear the finished pending update", exc_info=True)
 
   return InstallResult(

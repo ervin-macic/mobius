@@ -3850,8 +3850,9 @@ def test_conflict_resolver_start_is_serialized_with_overlapping_request(
 
 
 def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
-  client, auth, bypass_url_validation,
+  client, auth, bypass_url_validation, monkeypatch,
 ):
+  from app import fs_locks
   from app.database import SessionLocal
 
   apps = _prepare_conflict_resolver_apps(client, auth, ("one",))
@@ -3859,6 +3860,15 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
   opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert opened.status_code == 200, opened.text
   assert install.pending_update_receipt_file(app_dir).exists()
+  drop_worktree = install._drop_pending_update_worktree
+
+  def cleanup_under_source_lock(source_dir):
+    # This callback runs in the cleanup worker, after install released its
+    # materialization lock. Publication must still be excluded here.
+    assert fs_locks.source_dir_lock(str(source_dir)).locked()
+    drop_worktree(source_dir)
+
+  monkeypatch.setattr(install, "_drop_pending_update_worktree", cleanup_under_source_lock)
   # A later Store release agrees with the owner's local title, so a normal
   # install supersedes the blocked update without using resolve-update.
   updated = _update_v2(
@@ -3875,6 +3885,45 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
     app = db.get(models.App, app_id)
     assert app.conflict_resolver_chat_id is None
     assert app.conflict_resolver_upstream_commit is None
+
+
+@pytest.mark.parametrize("failure", ["commit", "worktree"])
+def test_successful_install_is_not_failed_by_pending_cleanup(
+  client, auth, bypass_url_validation, monkeypatch, failure,
+):
+  from app.database import SessionLocal
+  from sqlalchemy.exc import SQLAlchemyError
+
+  apps = _prepare_conflict_resolver_apps(client, auth, ("one",))
+  app_id, app_dir, name = apps[0]
+  opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
+  assert opened.status_code == 200, opened.text
+  clear_pending = install.clear_pending_conflict_update
+
+  async def fail_cleanup(db, app):
+    if failure == "commit":
+      with patch.object(db, "commit", side_effect=SQLAlchemyError("cleanup commit failed")):
+        await clear_pending(db, app)
+    else:
+      with patch.object(install, "_drop_pending_update_worktree", side_effect=OSError("cleanup failed")):
+        await clear_pending(db, app)
+
+  monkeypatch.setattr(install, "clear_pending_conflict_update", fail_cleanup)
+  updated = _update_v2(
+    client, auth, "https://batch-conflict-one.test/repo/",
+    {**MANIFEST_NEWS, "id": "batch-conflict-one", "name": name, "version": "3.0.0"},
+    JSX_MULTI.replace("ORIGINAL TITLE", "LOCAL ONE"),
+  )
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert updated.json()["version"] == "3.0.0"
+  assert install.pending_update_worktree(app_dir).exists()
+  with SessionLocal() as db:
+    app = db.get(models.App, app_id)
+    assert app.version == "3.0.0"
+    # The install was committed before this best-effort effect. A failed
+    # cleanup commit rolls back only the attempted resolver unbinding.
+    assert app.conflict_resolver_chat_id == (opened.json()["chat_id"] if failure == "commit" else None)
 
 
 @pytest.mark.parametrize("selection", ["subset", "single", "overlap"])
