@@ -300,15 +300,13 @@ export function makeSplit() {
 // (see lib/appNavLocation.js). The app reads it as `nav.location` to restore
 // its place and reports each new place with `nav.setLocation(value)`.
 export function makeNav({
-  location = null, waitForNavigationReady = false, getFrameVisibility = () => null,
+  location = null, waitForNavigationReady = false,
 } = {}) {
   let locationText = validNavLocationText(location)
   let locationReported = false
   // Opted-in hosts declare when this document is promoted and visible. Older
   // shells and published hosts keep immediate sends with the ownership timeout.
-  const visibility = getFrameVisibility()
   let navigationReady = !waitForNavigationReady
-    || (visibility?.visible === true && visibility.navigationReady !== false)
   const stack = []
   const entries = new Set()
   const entriesByRequestId = new Map()

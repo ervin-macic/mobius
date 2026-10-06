@@ -3296,11 +3296,10 @@ function makeSplit() {
 		};
 	};
 }
-function makeNav({ location = null, waitForNavigationReady = false, getFrameVisibility = () => null } = {}) {
+function makeNav({ location = null, waitForNavigationReady = false } = {}) {
 	let locationText = validNavLocationText(location);
 	let locationReported = false;
-	const visibility = getFrameVisibility();
-	let navigationReady = !waitForNavigationReady || visibility?.visible === true && visibility.navigationReady !== false;
+	let navigationReady = !waitForNavigationReady;
 	const stack = [];
 	const entries = /* @__PURE__ */ new Set();
 	const entriesByRequestId = /* @__PURE__ */ new Map();
@@ -4535,7 +4534,7 @@ const runtimeFeatures = Object.freeze({
 	navLocation: true,
 	projects: true
 });
-function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null, waitForNavigationReady = false, getFrameVisibility }) {
+function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null, waitForNavigationReady = false }) {
 	const identityKey = `${String(appId)}:${appInstanceId || "legacy"}`;
 	if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
 		_runtimeContext.tokenRef.current = getToken;
@@ -4595,8 +4594,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		chat,
 		nav: makeNav({
 			location: navLocation,
-			waitForNavigationReady,
-			getFrameVisibility
+			waitForNavigationReady
 		}),
 		split: makeSplit(),
 		immersive: makeImmersive({ appId }),

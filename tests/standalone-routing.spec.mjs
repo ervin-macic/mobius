@@ -157,37 +157,4 @@ test.describe('standalone navigation document ownership', () => {
     await expect(frame.getByTestId('nav-place')).toHaveText('list v2')
     await expect.poll(() => page.evaluate(() => history.state.mobiusStandaloneDepth)).toBe(0)
   })
-
-  test('the wrapper retains trusted visibility while the real compiled module is delayed', async ({ page, request }) => {
-    const token = await ownerToken(page)
-    const app = await createLocationApp(request, token)
-    let releaseModule
-    const moduleGate = new Promise(resolve => { releaseModule = resolve })
-    await page.route(new RegExp(`/api/apps/${app.id}/module`), async route => {
-      await moduleGate
-      await route.continue()
-    })
-    try {
-      await page.goto(`${BASE}/apps/${app.slug}/`, { waitUntil: 'domcontentloaded' })
-      const iframe = page.locator(`iframe.canvas--live[data-app-id="${app.id}"]`)
-      await expect(iframe).toBeAttached()
-      const frame = await (await iframe.elementHandle()).contentFrame()
-      await frame.waitForFunction(() => Boolean(globalThis.__mobiusRuntimeConfig))
-      // Simulate the trusted older shell's one initial visibility message during
-      // async transfer. The wrapper must retain it before runtime init exists.
-      await frame.evaluate(() => window.dispatchEvent(new MessageEvent('message', {
-        source: window.parent, origin: window.location.origin,
-        data: { type: 'moebius:frame-visibility', visible: true },
-      })))
-      expect(await frame.evaluate(() => globalThis.__mobiusRuntimeConfig.getFrameVisibility()))
-        .toEqual({ visible: true, navigationReady: true })
-      releaseModule()
-      await frame.waitForFunction(() => Boolean(window.openDetail))
-      expect(await frame.evaluate(() => window.hasNavLocation)).toBe(true)
-      await frame.evaluate(() => window.openDetail())
-      await expect(frame.getByTestId('nav-place')).toHaveText('detail: notes v1')
-    } finally {
-      releaseModule()
-    }
-  })
 })

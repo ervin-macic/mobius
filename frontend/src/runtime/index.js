@@ -187,7 +187,7 @@ export const runtimeFeatures = Object.freeze({
 
 export function init({
   appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null,
-  waitForNavigationReady = false, getFrameVisibility,
+  waitForNavigationReady = false,
 }) {
   const identityKey = `${String(appId)}:${appInstanceId || 'legacy'}`
   if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
@@ -250,7 +250,7 @@ export function init({
     signal,
     capabilities,
     chat,
-    nav: makeNav({ location: navLocation, waitForNavigationReady, getFrameVisibility }),
+    nav: makeNav({ location: navLocation, waitForNavigationReady }),
     split: makeSplit(),
     immersive: makeImmersive({ appId }),
     clipboard: makeClipboard(),

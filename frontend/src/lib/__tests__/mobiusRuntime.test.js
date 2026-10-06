@@ -1220,18 +1220,3 @@ test('hosts without readiness opt-in still send and time out without visibility 
     globalThis.clearTimeout = previousClearTimeout
   }
 })
-
-test('delayed runtime init reads visibility retained by the wrapper before it listened', async () => {
-  await withFakeWindow(async ({ window, parent }) => {
-    let latest = { visible: false, navigationReady: false }
-    const config = { waitForNavigationReady: true, getFrameVisibility: () => latest }
-    // The config was seeded before async module transfer; the trusted wrapper
-    // receives visibility while no runtime listener exists yet.
-    latest = { visible: true, navigationReady: true }
-    const handle = makeNav(config).open('detail')
-    assert.equal(parent.messages.length, 1)
-    window.emit({ type: 'moebius:nav-push-ack', requestId: parent.messages[0].data.requestId })
-    assert.equal(await handle.ready, true)
-    handle.close()
-  })
-})

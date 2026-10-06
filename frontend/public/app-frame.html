@@ -653,7 +653,6 @@
     let currentCapabilityContract = null;
     let currentNavLocation = null;
     let waitForNavigationReady = false;
-    let currentFrameVisibility = null;
     let tokenRefreshPromise = null;
     let tokenRefreshResolve = null;
     let mountedRoot = null;
@@ -1391,9 +1390,6 @@
           capabilityContract: currentCapabilityContract,
           navLocation: currentNavLocation,
           waitForNavigationReady,
-          // Module transfer/evaluation is async. Read the latest trusted state
-          // at runtime init, not the state when the transfer began.
-          getFrameVisibility: () => currentFrameVisibility,
         };
         // Opaque sandboxed frames are intentionally NOT controlled by the
         // shell's service worker. Loading /module directly from here therefore
@@ -1549,13 +1545,6 @@
             ok: false, error: String(error && error.message || error).slice(0, 1000)
           }, window.location.origin);
         });
-        return;
-      }
-      if (msg.type === 'moebius:frame-visibility') {
-        currentFrameVisibility = {
-          visible: msg.visible === true,
-          navigationReady: msg.navigationReady !== false,
-        };
         return;
       }
       if (msg.type === 'moebius:frame-init') {
