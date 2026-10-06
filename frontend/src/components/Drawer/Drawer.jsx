@@ -1479,15 +1479,6 @@ export default function Drawer({
                   role="tabpanel"
                   aria-labelledby={`drawer-tab-${listTab}`}
                 >
-                  {showingArchived && archivedItems.length > 0 && (
-                    // The count lives inside the open list so the switch stays
-                    // quiet; the needs-you marker is its only signal.
-                    <p className="drawer__list-caption">
-                      {archivedItems.length === 1
-                        ? '1 archived chat'
-                        : `${archivedItems.length} archived chats`}
-                    </p>
-                  )}
                   <div ref={listRowsStartRef} aria-hidden="true" />
                   {listSpacers.before > 0 && (
                     <div
