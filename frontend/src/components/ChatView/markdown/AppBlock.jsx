@@ -83,10 +83,11 @@ export default function AppBlock({ block, onInternalNav }) {
   }
   const open = openHref(block.href)
   const show = intent => { setViewIntent(intent); setDelivered(false) }
-  const action = canExpand && app && block.action
-    ? <button type="button" className="md-app-block__action" aria-pressed={viewIntent === block.action.intent}
-      onClick={() => show(viewIntent === block.action.intent ? null : block.action.intent)}>{block.action.label}</button>
+  const actionButton = target => canExpand && app && target
+    ? <button type="button" className="md-app-block__action" aria-pressed={viewIntent === target.intent}
+      onClick={() => show(viewIntent === target.intent ? null : target.intent)}>{target.label}</button>
     : null
+  const action = actionButton(block.action)
   const toggle = canExpand && app
     ? <button type="button" className="md-app-block__toggle" aria-expanded={viewIntent !== null}
       onClick={() => show(viewIntent === null ? block.intent : null)}>
@@ -107,7 +108,7 @@ export default function AppBlock({ block, onInternalNav }) {
       <ul className="md-app-batch__list">
         {block.items.map(item => <li key={item.intent}>
           {item.pull
-            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={null} />
+            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} />
             : <a className="md-app-batch__title" href={sharedBrowserShellHref(item.href)} onClick={openHref(item.href)}>{item.title}</a>}
         </li>)}
       </ul>

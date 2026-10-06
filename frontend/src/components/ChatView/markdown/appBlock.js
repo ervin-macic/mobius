@@ -55,17 +55,19 @@ export function appBlockFromToken(token) {
         return { label: fact.label.slice(0, 80), value: fact.value.slice(0, 240), ...(href ? { href } : {}) }
       })
     const inline = value.inline !== false
-    // An app may offer one primary action. It only opens the app's own view
-    // with a second intent; whatever that view then does is the app's to check.
-    const action = inline && shortText(value.action?.label, 40) && INTENT.test(value.action?.intent || '')
-      ? { label: shortText(value.action.label, 40), intent: value.action.intent } : null
+    // An app may offer one primary action (and one per batch item). It only
+    // opens the app's own view with a second intent; whatever that view then
+    // does is the app's to check.
+    const actionOf = raw => inline && shortText(raw?.label, 40) && INTENT.test(raw?.intent || '')
+      ? { label: shortText(raw.label, 40), intent: raw.intent } : null
+    const action = actionOf(value.action)
     // A batch block lists up to 12 items, each its own destination, under one
     // shared action (for example "Contribute all").
     const href = intent => `/shell/?${new URLSearchParams({ app: value.app, intent })}`
     const items = (Array.isArray(value.items) ? value.items : [])
       .filter(item => shortText(item?.title, 240) && INTENT.test(item?.intent || ''))
       .slice(0, 12)
-      .map(item => ({ title: item.title.trim().slice(0, 240), intent: item.intent, pull: pullSnapshot(item.pull), href: href(item.intent) }))
+      .map(item => ({ title: item.title.trim().slice(0, 240), intent: item.intent, pull: pullSnapshot(item.pull), href: href(item.intent), action: actionOf(item.action) }))
     return { app: value.app, intent: value.intent, title: value.title, facts, pull: pullSnapshot(value.pull),
       inline, action, items,
       expandLabel: shortText(value.expand_label, 40),

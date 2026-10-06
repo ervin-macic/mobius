@@ -73,13 +73,15 @@ test('a batch renders every item as its own linked row with one shared action', 
   const html = render({ app: 'contribute', intent: 'review:batch', title: 'Ready to contribute',
     action: { label: 'Contribute all', intent: 'chat-send-batch:a,b' },
     items: [
-      { title: 'First change', intent: 'review:a', pull: { repo: 'owner/repo', state: 'proposed', badges: [{ label: 'All clear', tone: 'success' }] } },
+      { title: 'First change', intent: 'review:a', action: { label: 'Contribute', intent: 'chat-send:a' }, pull: { repo: 'owner/repo', state: 'proposed', badges: [{ label: 'All clear', tone: 'success' }] } },
       { title: 'Second change', intent: 'review:b', pull: { repo: 'owner/app', state: 'proposed' } },
     ] }, [{ id: 80, slug: 'contribute', name: 'Contribute' }])
   assert.match(html, /md-app-block--batch/)
   assert.match(html, /intent=review%3Aa"[^>]*>First change</)
   assert.match(html, /intent=review%3Ab"[^>]*>Second change</)
-  assert.equal((html.match(/md-app-block__action/g) || []).length, 1)
+  // One shared action plus each item's own action where it has one.
+  assert.equal((html.match(/class="md-app-block__action"/g) || []).length, 2)
   assert.match(html, />Contribute all<\/button>/)
+  assert.match(html, />Contribute<\/button>/)
   assert.doesNotMatch(html, /md-app-block__view/)
 })
