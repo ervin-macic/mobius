@@ -365,17 +365,14 @@ def package_input_paths(manifest: Mapping) -> Iterator[str]:
   """Yield every repo-relative file declared by a validated manifest.
 
   Order is entry, icon, schedule job, source_files, static-asset sources, then
-  file seeds; collections keep declaration order and repeated paths are kept.
+  file seeds. Collections keep declaration order; separate destinations using
+  the same source each count. List-form static assets count each path once.
   Static destinations and inline JSON seeds are not source files. mobius.json
   itself is excluded: its bytes have a separate manifest cap. Other file-backed
   features (services, setup, prompts, skills) must appear in source_files.
   """
   schedule = manifest.get("schedule")
-  static_assets = manifest.get("static_assets") or {}
-  static_sources = (
-    static_assets if isinstance(static_assets, list)
-    else static_asset_entries(static_assets).values()
-  )
+  static_sources = static_asset_entries(manifest.get("static_assets") or {}).values()
   declared = (
     manifest.get("entry"),
     manifest.get("icon"),
@@ -390,7 +387,7 @@ def package_input_paths(manifest: Mapping) -> Iterator[str]:
 
 
 def package_bytes(manifest: Mapping, size_of: Callable[[str], int]) -> int:
-  """Sum declared inputs per declaration, including repeated paths.
+  """Sum declared inputs per written destination, including source aliases.
 
   Each alias consumes the budget again because each destination is written
   separately. Install, local apply, validation and publication use this same

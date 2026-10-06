@@ -1602,6 +1602,46 @@ def package_content_digest_from_git(
     return package_content_digest_from_tree(tree)
 
 
+def read_recorded_update_source(
+  source_dir: str | Path, candidate_tree: Mapping[str, bytes],
+) -> dict[str, bytes]:
+  """Read installed runtime source without applying incoming-package rules.
+
+  Historical manifests may predate validation and size limits. If one cannot
+  be read safely, use the candidate's runtime paths plus the entry. Otherwise
+  include prior declared sources too, so previews preserve deletions. Only
+  this old/new runtime-path union is materialized, never old assets or other
+  repository files. Callers hold the source lock.
+  """
+  with app_git.open_ref_tree(source_dir, app_git.UPSTREAM_BRANCH) as tree:
+    paths = set(candidate_tree) | {"index.jsx"}
+    if "mobius.json" not in tree:
+      # Pre-manifest imports recorded runtime source directly, not a clone.
+      # Keep that source set so a dropped legacy module remains an update.
+      paths.update(set(tree) - _MERGED_NON_SOURCE)
+    raw_manifest = tree.get("mobius.json")
+    manifest = None
+    if (
+      raw_manifest is not None
+      and _package_input_size(raw_manifest) <= _MANIFEST_MAX_BYTES
+    ):
+      try:
+        manifest = json.loads(_package_input_bytes(raw_manifest))
+      except (OSError, RuntimeError, ValueError):
+        pass
+    if isinstance(manifest, dict):
+      sources = manifest.get("source_files")
+      if isinstance(sources, list):
+        paths.update(rel for rel in sources if isinstance(rel, str))
+      schedule = manifest.get("schedule")
+      if isinstance(schedule, dict) and isinstance(schedule.get("job"), str):
+        paths.add(schedule["job"])
+    return {
+      rel: _package_input_bytes(data)
+      for rel, data in tree.items() if rel in paths and data is not None
+    }
+
+
 def _git_runtime_source_tree(
   source_dir: str | Path,
   commit: str,
@@ -2415,14 +2455,12 @@ class GitInstallCandidate:
 
 
 def _reviewed_commit_has_manifest(source_dir: str | Path, commit: str) -> bool:
-  """Whether a reviewed commit carries a package manifest, without reading it.
-
-  Raises when the commit itself is gone, so a vanished review stays an
-  ordinary "update changed" refusal rather than a legacy replay.
-  """
-  if not app_git.ref_exists(source_dir, f"{commit}^{{commit}}"):
-    raise ValueError("reviewed Git commit is no longer available")
-  return app_git.ref_exists(source_dir, f"{commit}:mobius.json")
+  """Check manifest presence without confusing a Git failure with absence."""
+  proc = app_git._run(
+    Path(source_dir), "ls-tree", "--name-only", f"{commit}^{{commit}}",
+    "--", "mobius.json", read_only=True,
+  )
+  return "mobius.json" in proc.stdout.splitlines()
 
 
 def _reviewed_git_package_commit(source_dir: str | Path, commit: str) -> str:
