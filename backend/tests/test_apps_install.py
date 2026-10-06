@@ -1919,39 +1919,34 @@ def test_install_accepts_valid_cron_shapes(client, auth, bypass_url_validation):
 
 
 def test_install_rejects_decompression_bomb_icon(client, auth, bypass_url_validation):
-  """Fix 2: a tiny PNG that decodes to a giant image must be rejected
-  before PIL's `load()` allocates gigabytes. We patch `Image.open` to
-  return a mock whose `.size` reports 50000x50000 — the dimension gate
-  fires before `load()`, so the install endpoint treats it as a 415
-  icon error and surfaces it as a non-fatal warning (icons are
-  optional). The app installs without the icon."""
-  from unittest.mock import patch as _patch, MagicMock
+  """Pillow refuses a real oversized header before allocating its pixels.
+
+  Icon rejection remains nonfatal for imports; no pixel decode may run.
+  """
+  from PIL import Image
+
+  icon = io.BytesIO()
+  Image.new("1", (6000, 6000)).save(icon, format="PNG")
   base = "https://x.test/bomb/"
   responses = {
     base + "mobius.json": (200, json.dumps({
       **MANIFEST_NEWS, "id": "bomb-icon",
     }).encode()),
     base + "index.jsx": (200, JSX.encode()),
-    base + "icon.png": (200, b"\x89PNG\r\n\x1a\n" + b"bogus"),  # any bytes
+    base + "icon.png": (200, icon.getvalue()),
     base + "prompt.md": (200, PROMPT.encode()),
     base + "fetch.sh": (200, b""),
   }
-  fake_img = MagicMock()
-  fake_img.size = (50000, 50000)
-  fake_img.mode = "RGB"
-  with _patch(
+  with patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses),
-  ), _patch("PIL.Image.open", return_value=fake_img):
+  ), patch("PIL.PngImagePlugin.PngImageFile.load") as load:
     r = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
     })
-  # Icon rejection is non-fatal — the install succeeds, the icon path
-  # surfaces as a warning. The important assertion is that PIL.load()
-  # was NEVER called (i.e. no gigabyte allocation).
-  fake_img.load.assert_not_called()
+  load.assert_not_called()
   assert r.status_code == 201, r.text
-  assert any("icon" in w.lower() for w in r.json()["warnings"])
+  assert any("32 million pixels" in warning for warning in r.json()["warnings"])
 
 
 # --- Stream byte counter aborts mid-download (fix 3) ----------------

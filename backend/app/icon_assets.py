@@ -65,12 +65,7 @@ def _normalize_uncached(raw: bytes) -> bytes:
     with warnings.catch_warnings():
       warnings.simplefilter("error", Image.DecompressionBombWarning)
       image = Image.open(io.BytesIO(raw))
-      width, height = image.size
-      if width * height > MAX_ICON_PIXELS:
-        raise InvalidIcon(f"{too_large} This one is {width}x{height}.")
       image.load()
-  except InvalidIcon:
-    raise
   except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
     raise InvalidIcon(too_large) from exc
   except Exception as exc:

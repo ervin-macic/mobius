@@ -40,7 +40,6 @@ from app.app_compile_contract import (  # noqa: E402
   rolldown_report_contract_error,
 )
 from app.build_admission import build_lease  # noqa: E402
-from app.icon_assets import InvalidIcon, normalize_icon  # noqa: E402
 from app.manifest_contract import (  # noqa: E402
   MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES,
@@ -168,12 +167,22 @@ def _referenced_file_findings(
       )
     else:
       try:
-        normalize_icon(icon_path.read_bytes())
-      except InvalidIcon as exc:
+        from app.icon_assets import InvalidIcon, normalize_icon
+      except ModuleNotFoundError as exc:
+        if exc.name is None or not exc.name.startswith("PIL"):
+          raise
         errors.append(
-          f"manifest icon {icon!r}: {exc} Local apply and Store publication "
-          "reject it, and installs skip it."
+          "icon validation requires Pillow; install backend requirements "
+          "before validating an app with an icon"
         )
+      else:
+        try:
+          normalize_icon(icon_path.read_bytes())
+        except InvalidIcon as exc:
+          errors.append(
+            f"manifest icon {icon!r}: {exc} Local apply and Store publication "
+            "reject it, and installs skip it."
+          )
   for source in static_assets.values():
     if _symlink_component(root, source) is None and not (root / source).is_file():
       errors.append(f"static asset source {source!r} is missing")
@@ -196,13 +205,6 @@ def _package_size_errors(root: Path, manifest_path: Path, manifest: dict) -> lis
 
   if manifest_path.stat().st_size > MANIFEST_MAX_BYTES:
     errors.append(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
-
-  package_total = package_bytes_on_disk(root, manifest)
-  if package_total > PACKAGE_MAX_BYTES:
-    errors.append(
-      f"app package is {package_total} bytes; installs and the Store accept "
-      f"at most {PACKAGE_MAX_BYTES}"
-    )
 
   for skill in manifest.get("skills") or []:
     if isinstance(skill, str) and size(skill) > SKILL_MAX_BYTES:
@@ -271,6 +273,15 @@ def main() -> int:
     validate_manifest_contract(manifest)
   except ManifestContractError as exc:
     print(f"[ERROR] mobius.json: {exc}", file=sys.stderr)
+    return 1
+
+  package_total = package_bytes_on_disk(root, manifest)
+  if package_total > PACKAGE_MAX_BYTES:
+    print(
+      f"[ERROR] mobius.json: app package is {package_total} bytes; installs "
+      f"and the Store accept at most {PACKAGE_MAX_BYTES}",
+      file=sys.stderr,
+    )
     return 1
 
   tree = _load_tree(root)
