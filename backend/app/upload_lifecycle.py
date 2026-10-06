@@ -45,12 +45,19 @@ def claim_uploads(chat, attachments: list[dict] | None) -> None:
 
 
 def release_uploads(chat, removed_rows: list[dict]) -> None:
-  """Return a cancelled message's files to drafts unless another row names them."""
+  """Return a cancelled message's files to drafts unless anything else names them.
+
+  Still in use means named by a transcript or queued row, or saved on an
+  answered question card.
+  """
   names = set()
   for row in removed_rows:
     names |= attachment_names(row.get("attachments"))
   for row in [*(chat.messages or []), *(chat.pending_messages or [])]:
     names -= attachment_names(row.get("attachments"))
+    for block in row.get("blocks") or []:
+      if isinstance(block, dict):
+        names -= attachment_names(block.get("attachments"))
   _set_claimed(chat, names, False)
 
 

@@ -5,7 +5,6 @@ import { useHistoryDismiss } from '../../hooks/useHistoryDismiss.jsx'
 import { BASE } from '../../api/client.js'
 import { mediaTokenParam } from '../../api/mediaToken.js'
 
-/** File-upload chips (rendered above the input row when files exist). */
 /** Classifies a file by extension into a colored badge variant.
  *  Returns {kind, label} where kind = 'pdf' | 'doc' | 'code' and
  *  label is the short tag shown inside the badge. */

@@ -587,3 +587,22 @@ def test_expired_drafts_are_swept_when_a_message_arrives_but_not_its_own(client,
   assert [(u["name"], u["claimed"]) for u in chat.uploads] == [("restored.txt", True)]
   assert not Path(stale["path"]).exists()
   assert Path(restored["path"]).exists()
+
+
+def test_cancel_keeps_files_an_answered_card_still_shows(client, db, auth, chat):
+  from app.chat_writer import get_writer, AppendPending, CancelPending
+
+  shown = _upload(client, auth, chat, "shown.txt")
+  chat.messages = [{"role": "assistant", "content": "", "ts": 1, "blocks": [{
+    "type": "question", "question_id": "q", "answers": {"Q?": "Attached 1 file"},
+    "attachments": [{"name": shown["name"]}],
+  }]}]
+  db.commit()
+  get_writer().submit(AppendPending(chat_id=chat.id, user_msg={
+    "role": "user", "content": "answer", "cid": "c-answer",
+    "attachments": [{"name": shown["name"]}],
+  })).result(timeout=5)
+  get_writer().submit(CancelPending(chat_id=chat.id, cid="c-answer")).result(timeout=5)
+
+  db.refresh(chat)
+  assert chat.uploads[0]["claimed"] is True
