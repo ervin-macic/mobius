@@ -13,6 +13,7 @@ the release that keeps ``chats.messages`` as a mirror of those rows.
   write-new     candidate: writer-command edits, a new chat, a rename, a purge
   write-old     previous: an append, a new chat, a rename, a purge
   unconverted   any image, server stopped: ids without a conversion marker
+  stores-rows   any image, server stopped: whether this release keeps message rows
   mirror-exact  candidate: converted chats whose legacy bytes are not exactly
                 '[' + ', '.join(row bodies) + ']' (must be none)
 
@@ -179,7 +180,8 @@ def mirror_exact():
 
 
 COMMANDS = {"mirror-exact": mirror_exact, "seed": seed, "dump": dump, "pending": pending, "write-new": write_new,
-            "write-old": write_old, "unconverted": unconverted}
+            "write-old": write_old, "unconverted": unconverted,
+            "stores-rows": lambda: {"rows": candidate()}}
 
 if __name__ == "__main__":
   print(json.dumps(COMMANDS[sys.argv[1]](), sort_keys=True))
