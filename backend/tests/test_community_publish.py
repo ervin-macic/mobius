@@ -511,6 +511,9 @@ def test_snapshot_applies_the_same_icon_rule_as_apply(tmp_path):
 
 
 @pytest.mark.parametrize("credential", [
+  "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+  "-----BEGIN DSA PRIVATE KEY-----",
+  "-----BEGIN PGP PRIVATE KEY BLOCK-----",
   "AIza" + "A" * 35,
   "sk-ant-" + "A" * 20,
   "sk-proj-" + "A" * 20,

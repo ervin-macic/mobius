@@ -58,7 +58,8 @@ _SENSITIVE_FILES = {
 # Heuristics catch recognizable credentials, not every possible secret.
 # Authors still need to review the accepted source before publication.
 _SECRET_PATTERNS = (
-  re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+  re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED |DSA )?PRIVATE KEY-----"),
+  re.compile(r"-----BEGIN PGP PRIVATE KEY BLOCK-----"),
   re.compile(r"\bgh[pousr]_[A-Za-z0-9]{24,}\b"),
   re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b"),
   re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
