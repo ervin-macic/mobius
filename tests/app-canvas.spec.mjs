@@ -955,7 +955,7 @@ function locationFrameHTML(appId, { manualMount = false, fallback = false } = {}
     if (window.nav) return;
     window.nav = makeNav({ location: msg.navLocation });
     window.initialLocation = window.nav.location;
-    window.report = () => window.nav.setLocation({ detail: window.detail ? 'notes' : null });
+    window.report = () => window.nav.setLocation({ ...window.nav.location, detail: window.detail ? 'notes' : null });
     window.openDetail = async () => {
       window.restoring = true;
       const handle = window.nav.open('notes', () => { window.detail = false; render(); window.report(); });
@@ -1020,7 +1020,8 @@ async function setupLocationRoutes(page) {
     })
   })
   await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
-  await locationFrame(page, appId)
+  const frame = await locationFrame(page, appId, 'live', '1000')
+  await frame.waitForFunction(() => window.visible)
   return state
 }
 
@@ -1142,7 +1143,7 @@ test.describe('AppCanvas location lifecycle', () => {
     await locationFrame(page, 81, 'live', '3000')
     await expect.poll(async () => (await storedLocation(page))?.location).toBe('{"detail":null}')
     await page.reload({ waitUntil: 'domcontentloaded' })
-    const restored = await locationFrame(page)
+    const restored = await locationFrame(page, 81, 'live', '3000')
     expect(await restored.evaluate(() => window.initialLocation)).toEqual({ detail: null })
   })
 
@@ -1175,7 +1176,7 @@ test.describe('AppCanvas location lifecycle', () => {
     await locationFrame(page, 81, 'live', '2000')
     await expect.poll(async () => (await storedLocation(page))?.location).toBe('{"detail":null,"filter":"latest"}')
     await page.reload({ waitUntil: 'domcontentloaded' })
-    const restored = await locationFrame(page)
+    const restored = await locationFrame(page, 81, 'live', '2000')
     expect(await restored.evaluate(() => window.initialLocation)).toEqual({ detail: null, filter: 'latest' })
   })
 
