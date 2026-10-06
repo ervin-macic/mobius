@@ -450,7 +450,7 @@ def test_snapshot_refuses_names_that_collide_on_other_checkouts(tmp_path):
 def test_content_scan_still_catches_credentials_in_any_directory(tmp_path):
   repo, app, _ = _app_repo(tmp_path)
   _commit_files(repo, app, {
-    "secrets/config.js": b"export const key = 'AIza" + b"A" * 35 + b"';",
+    "secrets/config.js": b"export const key = 'ghp_" + b"A" * 36 + b"';",
   })
 
   with pytest.raises(CommunityPublicationError) as raised:
