@@ -14,7 +14,9 @@ from PIL import Image
 # Pillow's default (~89M pixels) still permits a tiny hostile file to request
 # a very large allocation. App icons never need that headroom. This pixel
 # ceiling is the only size rule: any image within it is accepted and scaled
-# down, so install, apply, update checks and publication agree on every icon.
+# down. Author-facing apply and publication reject invalid icons; imported
+# packages instead warn and omit/preserve them for historical compatibility.
+# Install and update-check digests both omit refused icons.
 MAX_ICON_PIXELS = 32_000_000
 Image.MAX_IMAGE_PIXELS = MAX_ICON_PIXELS
 

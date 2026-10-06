@@ -4731,8 +4731,8 @@ def _bare_origin(tmp_path: Path) -> Path:
   return bare
 
 
-def test_network_git_is_bounded_by_progress_not_a_wall_clock(tmp_path, monkeypatch):
-  """A large or slow repository must not fail a 30-second local-op timeout."""
+def test_file_transport_clone_and_fetch_wire_network_options(tmp_path, monkeypatch):
+  """file:// exercises option wiring, not HTTP progress or stall detection."""
   bare = _bare_origin(tmp_path)
   real_run = subprocess.run
   seen: list[tuple[list[str], object]] = []
