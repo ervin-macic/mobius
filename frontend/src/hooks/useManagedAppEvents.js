@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 // The shell's latest app lifecycle event, sequenced so a repeated update of
 // the same app still changes state. `observe` takes every system event.
@@ -23,12 +23,15 @@ export function useManagedAppEvent() {
 export function useManagedAppFrameForwarding(
   framesRef, event, capabilityContract,
 ) {
+  const delivered = useRef(new WeakMap())
   useEffect(() => {
     if (event?.type !== 'app_updated'
       || capabilityContract?.data?.manage_apps !== true) return
     const message = { type: 'moebius:managed-app-event', event }
     for (const frame of framesRef.current.values()) {
-      frame?.contentWindow?.postMessage(message, '*')
+      if (!frame?.contentWindow || delivered.current.get(frame) === event.sequence) continue
+      frame.contentWindow.postMessage(message, '*')
+      delivered.current.set(frame, event.sequence)
     }
   }, [capabilityContract, event, framesRef])
 }

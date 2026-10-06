@@ -71,3 +71,23 @@ test('a completion without an app id remains an authoritative refresh signal', (
   })
   hook.unmount()
 })
+
+test('capability rerenders do not redeliver an event to the same frame', () => {
+  const { framesRef, posted } = fakeFrames()
+  const hook = renderShellAndFrame(framesRef, { data: { manage_apps: true } })
+  hook.result.current({ type: 'app_updated', appId: 7 })
+  hook.rerender({ data: { manage_apps: true } })
+  hook.rerender({ data: { manage_apps: true } })
+  assert.deepEqual(posted.map(item => item.message.event.sequence), [1])
+
+  // A newly mounted frame still gets the latest signal once.
+  const replacement = fakeFrames()
+  framesRef.current = replacement.framesRef.current
+  hook.rerender({ data: { manage_apps: true } })
+  assert.equal(replacement.posted.length, 1)
+  hook.rerender({ data: { manage_apps: true } })
+  assert.equal(replacement.posted.length, 1)
+  hook.result.current({ type: 'app_updated', appId: 7 })
+  assert.deepEqual(replacement.posted.map(item => item.message.event.sequence), [1, 2])
+  hook.unmount()
+})
