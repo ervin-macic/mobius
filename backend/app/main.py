@@ -73,7 +73,6 @@ from app.response_policy import (
 from app.storage_io import ParentIsFile, atomic_write
 from app.account_browser_access import SharedAccessError
 from app import activity, models
-from app.transcript_rows import TranscriptUnavailable
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
 # uvicorn boot. See the
@@ -394,19 +393,6 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-
-@app.exception_handler(TranscriptUnavailable)
-async def _transcript_unavailable_handler(_request: Request, exc: TranscriptUnavailable):
-  # One answer for every route, sync or async, whose chat could not be
-  # converted while serving it. The chat's legacy value stays authoritative.
-  logging.getLogger(__name__).warning("%s", exc)
-  detail = (
-    "This chat is being prepared; please try again."
-    if exc.in_progress else
-    "This chat couldn't be prepared; the error is recorded in diagnostics."
-  )
-  return JSONResponse(status_code=503, content={"detail": detail})
 
 
 @app.exception_handler(IntegerOutOfRange)

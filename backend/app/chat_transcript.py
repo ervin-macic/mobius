@@ -156,7 +156,7 @@ class MaterializedHistory:
   def __reversed__(self):
     if self.live is not None and self.live_index < 0:
       yield self.live
-    for index, message in transcript_rows.reverse_iter(self.history.db, self.chat):
+    for index, message in self.history.items_reversed():
       yield self.live if index == self.live_index else message
 
 

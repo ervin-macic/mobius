@@ -206,53 +206,77 @@ def _assert_legacy_mirrors_rows(connection) -> None:
     )
 
 
-def _install_unconverted_request_audit():
-  """Audit mode (MOBIUS_TEST_UNCONVERT_ON_REQUEST=1): before every HTTP
-  request, every boot plan and every supervisor tick, the database looks as if
-  the previous release had just written every chat.
+_ALL_UNCONVERTED_PAUSED = [False]
 
-  That is the state a first boot after an update serves (and, for a chat
-  whose conversion failed or was deferred, any later moment). A run in this
-  mode finds event-loop code that reads some chat's rows without awaiting
-  ``transcript_rows.ensure_converted_async``. Off by default.
+
+def pytest_configure(config):
+  config.addinivalue_line(
+    "markers", "converted_chats: keep chats converted in all-unconverted mode",
+  )
+
+
+@pytest.fixture(autouse=True)
+def _converted_chats_marker(request):
+  _ALL_UNCONVERTED_PAUSED[0] = request.node.get_closest_marker("converted_chats") is not None
+  yield
+  _ALL_UNCONVERTED_PAUSED[0] = False
+
+
+def _install_all_unconverted_mode():
+  """All-unconverted mode (MOBIUS_TEST_ALL_UNCONVERTED=1).
+
+  At every commit every chat loses its conversion marker, as if the previous
+  release had just written all of them: the state a first boot after an
+  update serves, at every moment of every test. Readers must then serve each
+  chat exactly from its legacy value, and each write converts its chat
+  inline again. Two guards hold throughout: no conversion runs on the event
+  loop's thread, and the event loop never blocks waiting for the writer.
+  Off by default. A test marked ``converted_chats`` pins the converted state
+  itself (conversion mechanics, converted-only search prose, row-path query
+  shapes) and runs with conversion left as it is.
   """
-  if os.environ.get("MOBIUS_TEST_UNCONVERT_ON_REQUEST") != "1":
+  if os.environ.get("MOBIUS_TEST_ALL_UNCONVERTED") != "1":
     return
+  import asyncio
   import functools
 
-  from app import chat as chat_module, chat_waits, delegations, startup
+  from sqlalchemy import event as sa_event
+  from sqlalchemy import text as sa_text
+  from sqlalchemy.orm import Session as SASession
 
-  def unconvert_every_chat():
-    with engine.begin() as connection:
-      connection.exec_driver_sql("DELETE FROM chat_transcript_state")
-    # The process-level "all converted" fact would otherwise hide these chats.
-    from app import transcript_rows as audit_transcript_rows
-    audit_transcript_rows.reset_conversion_facts()
+  from app import chat_writer as mode_chat_writer
+  from app import transcript_rows as mode_transcript_rows
 
-  @app.middleware("http")
-  async def unconvert_before_request(request, call_next):
-    unconvert_every_chat()
-    return await call_next(request)
+  def on_event_loop() -> bool:
+    try:
+      asyncio.get_running_loop()
+    except RuntimeError:
+      return False
+    return True
 
-  def unconverting(function):
+  # Registered after transcript_rows' mirror listener, so it runs after it.
+  @sa_event.listens_for(SASession, "before_commit")
+  def unconvert_every_chat(session):
+    if _ALL_UNCONVERTED_PAUSED[0] or session.in_nested_transaction():
+      return
+    if session.execute(sa_text("SELECT 1 FROM chat_transcript_state LIMIT 1")).first():
+      session.execute(sa_text("DELETE FROM chat_transcript_state"))
+
+  # The process fact would otherwise end every per-read marker check.
+  mode_transcript_rows.mark_all_converted = lambda _db: None
+
+  def off_the_loop(function):
     @functools.wraps(function)
-    async def wrapper(*args, **kwargs):
-      unconvert_every_chat()
-      return await function(*args, **kwargs)
+    def wrapper(*args, **kwargs):
+      assert not on_event_loop(), f"{function.__name__} ran on the event loop"
+      return function(*args, **kwargs)
     return wrapper
 
-  for module, name in (
-    (startup, "run_startup_plan"),
-    (chat_module, "sweep_wedged_runs"),
-    (chat_module, "sweep_idle_pending_chats"),
-    (chat_module, "sweep_reset_parks"),
-    (chat_waits, "sweep_due_waits"),
-    (delegations, "wake_parents_for_completed_delegations"),
-  ):
-    setattr(module, name, unconverting(getattr(module, name)))
+  mode_transcript_rows.convert = off_the_loop(mode_transcript_rows.convert)
+  mode_chat_writer.wait_ack = off_the_loop(mode_chat_writer.wait_ack)
 
 
-_install_unconverted_request_audit()
+_install_all_unconverted_mode()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -343,6 +367,7 @@ def fresh_db():
   # suite reuses one engine across tests that rebuild its state.
   from app import transcript_rows as transcript_rows_mod
   transcript_rows_mod.reset_conversion_facts()
+  chat_writer_mod.transcript_conversion_status.update(state="idle", error=None, failed={})
   from app.database import SessionLocal as _WriterSession
   chat_writer_mod.start_writer(_WriterSession)
   # start_writer intentionally publishes before its worker opens and probes

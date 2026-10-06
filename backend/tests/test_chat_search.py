@@ -9,6 +9,10 @@ from app import chat_search, chat_writer, models, transcript_rows
 from sqlalchemy import text as sql
 from app.chat_visibility import visible_in_owner_drawer
 from app.timeutil import now_naive_utc
+import pytest
+
+# Search reads message text of converted chats only, by contract.
+pytestmark = pytest.mark.converted_chats
 
 
 import pytest

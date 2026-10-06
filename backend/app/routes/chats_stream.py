@@ -74,11 +74,7 @@ from app.resource_access import (
   require_active_chat_access,
 )
 
-from app.routes.chats import converted_path_chat
-
-router = APIRouter(
-  prefix="/api/chats", tags=["chats"], dependencies=[Depends(converted_path_chat)],
-)
+router = APIRouter(prefix="/api/chats", tags=["chats"])
 
 log = logging.getLogger(__name__)
 

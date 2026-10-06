@@ -593,19 +593,9 @@ def _assistant_result(chat: models.Chat) -> str:
 
   The outcome is the message's last text block (the report; earlier text
   blocks are progress narration split off by tools or provider items) plus
-  its latest error, so a failed or stopped helper stays actionable. A helper
-  whose transcript could not be converted reports that, with the recorded
-  error, instead of failing the parent's read.
+  its latest error, so a failed or stopped helper stays actionable.
   """
-  try:
-    history = transcript_rows.history(chat)
-  except (transcript_rows.TranscriptNotConverted, transcript_rows.TranscriptUnavailable):
-    from app.chat_writer import transcript_conversion_status
-    error = transcript_conversion_status["failed"].get(chat.id)
-    if error is None:
-      raise  # Not a recorded failure: a reader that skipped its conversion.
-    return f"Result unavailable: this helper's transcript could not be prepared ({error})."
-  for message in reversed(history):
+  for message in reversed(transcript_rows.history(chat)):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
     blocks = message.get("blocks")
@@ -622,33 +612,6 @@ def _assistant_result(chat: models.Chat) -> str:
     if isinstance(content, str) and content.strip():
       return content.strip()
   return ""
-
-
-async def ensure_parent_helpers_converted(parent_chat_id: str, db: Session | None = None) -> None:
-  """Convert a parent chat and its helpers' chats before event-loop code reads them.
-
-  Helper results (``derived_status``), resumed-turn context
-  (``active_parent_context``) and wake or steer notices read the children's
-  transcripts. A child the previous release wrote last stays unconverted
-  until something converts it, and the event loop never waits inside a read
-  (transcript_rows.require_rows), so these async callers await first.
-  """
-  if db is None:
-    from app.database import SessionLocal
-    with SessionLocal() as own:
-      await ensure_parent_helpers_converted(parent_chat_id, own)
-    return
-  await transcript_rows.ensure_converted_async(parent_chat_id, db)
-  children = [row[0] for row in db.query(models.Delegation.child_chat_id).filter(
-    models.Delegation.parent_chat_id == parent_chat_id,
-  )]
-  for chat_id in children:
-    try:
-      await transcript_rows.ensure_converted_async(chat_id, db)
-    except transcript_rows.TranscriptUnavailable as exc:
-      # One helper that cannot convert must never break its parent: readers
-      # report that helper's result as unavailable (_assistant_result).
-      _LOG.warning("helper transcript unavailable for parent %s: %s", parent_chat_id, exc)
 
 
 def derived_status(
@@ -2723,7 +2686,6 @@ async def steer_results_into_running_parent(
   from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
   from app.database import SessionLocal
 
-  await ensure_parent_helpers_converted(parent_chat_id)
   async with chat_queue.get_lock(parent_chat_id):
     with SessionLocal() as db:
       chat = db.query(models.Chat).filter(
@@ -2839,7 +2801,6 @@ async def _deliver_parent_wake_once(
   )
   from app.database import SessionLocal
 
-  await ensure_parent_helpers_converted(parent_chat_id)
   async with chat_queue.get_transition_lock(parent_chat_id):
     with SessionLocal() as db:
       parent_chat = (

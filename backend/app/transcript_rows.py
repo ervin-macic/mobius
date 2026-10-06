@@ -10,15 +10,18 @@ Two-release storage change (TRANSCRIPT_STORAGE_DESIGN.md). While the previous
 release's ``chats.messages`` column exists (``legacy_present``):
 
 * A chat's rows are authoritative only once a ``chat_transcript_state`` row
-  exists for it. Until then ``chats.messages`` is, and ``require_rows``
-  converts the chat (through the writer) before any read or write of rows.
+  exists for it. Until then ``chats.messages`` is, and every reader below
+  reads that value, decoded once per call or ``History`` handle: exactly what
+  the previous release reads. Reads never convert and never wait.
+* Only a mutation converts, inline in its own transaction (the writer's), so
+  the change and the conversion commit or roll back together.
 * The ``before_commit`` hook below rewrites ``chats.messages`` from the rows
   of every chat changed in the transaction, so the previous image can be
   rolled back to at any committed state and sees every transcript.
 * The schema trigger ``chats_messages_written`` deletes the state row whenever
   ``chats.messages`` is updated. The hook re-inserts it right after its own
   update; the previous image never does, so exactly the chats it changed (or
-  created) are converted again when this release returns.
+  created) are read from their legacy value again, until converted again.
 
 Search entries and purge cleanup are maintained by schema triggers (see
 ``schema_migrations._add_transcript_rows``) and need no code here.
@@ -26,14 +29,14 @@ Search entries and purge cleanup are maintained by schema triggers (see
 
 from __future__ import annotations
 
-import asyncio
 import json
+import math
 import weakref
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 
 from sqlalchemy import (
-  DateTime, Text, bindparam, delete, event, func, insert, inspect, select, text, update,
+  DateTime, bindparam, delete, event, func, insert, inspect, select, text, update,
 )
 from sqlalchemy.orm import Session, object_session
 
@@ -47,35 +50,12 @@ DERIVED_CID = 64
 ATTACHMENTS = 128
 
 _PROSE_ROLES = ("user", "assistant")
-# Set by chat_writer on the actor's own Session: conversion there runs inline,
-# inside the command's transaction.
+# Set by chat_writer on the actor's own Session.
 WRITER_SESSION = "transcript_writer"
 _DIRTY = "transcript_dirty"
 # New chats whose initial rows this transaction wrote; settled at commit.
 _NEW_TRANSCRIPTS = "transcript_new_chats"
 _M = models.ChatMessage
-
-
-class TranscriptUnavailable(RuntimeError):
-  """A chat's conversion, needed to serve a request, did not complete.
-
-  ``in_progress`` distinguishes a conversion that has not finished in time
-  from one that failed (its error is recorded in the conversion
-  diagnostics). The app maps both to 503 with an honest message.
-  """
-
-  def __init__(self, chat_id: str, cause: BaseException):
-    self.chat_id = chat_id
-    self.in_progress = isinstance(cause, TimeoutError)
-    super().__init__(f"chat {chat_id} transcript unavailable: {type(cause).__name__}: {cause}")
-
-
-class TranscriptNotConverted(RuntimeError):
-  """A caller that may not wait asked for an unconverted chat's rows.
-
-  On the event-loop thread, await ``ensure_converted_async`` before opening
-  the transcript.
-  """
 
 
 # -- Projections -------------------------------------------------------------
@@ -184,7 +164,7 @@ def conversion_settled(bind) -> bool:
 
   Recorded by ``mark_all_converted`` after background conversion leaves no
   chat behind. Nothing in this process can unconvert a chat afterwards (its
-  own mirror re-marks), so per-request checks stop querying.
+  own mirror re-marks), so readers stop consulting the marker.
   """
   engine = bind.engine
   return bool(_ALL_CONVERTED.get(engine))
@@ -201,19 +181,61 @@ def reset_conversion_facts() -> None:
   _LEGACY_BY_ENGINE.clear()
 
 
+def rows_are_authority(db) -> bool:
+  """Whether every chat's rows are authoritative, with no per-chat check."""
+  return not legacy_present(db) or conversion_settled(db.get_bind())
+
+
 def is_converted(db, chat_id: str) -> bool:
-  if not legacy_present(db) or conversion_settled(db.get_bind()):
+  if rows_are_authority(db):
     return True
   return db.execute(text(
     "SELECT 1 FROM chat_transcript_state WHERE chat_id = :id"
   ), {"id": chat_id}).first() is not None
 
 
-def needs_conversion(db, chat_id: str) -> bool:
-  """Whether this chat exists and its rows are not yet authoritative."""
-  return not is_converted(db, chat_id) and db.execute(
-    text("SELECT 1 FROM chats WHERE id = :id"), {"id": chat_id},
-  ).first() is not None
+_NULL = "The stored transcript is JSON null"
+
+
+def _parse_legacy(raw: bytes) -> tuple[list, str | None]:
+  """Decode a legacy value as the previous release reads it.
+
+  Returns the messages and why the stored bytes are not exactly a message
+  list: damage (with the visible placeholder as the messages), or ``_NULL``,
+  the empty chat the previous release displayed for a JSON null.
+  """
+  try:
+    messages = json.loads(raw)
+  except (ValueError, UnicodeError) as exc:
+    return damaged_messages(), f"The stored transcript is not valid JSON: {exc}"
+  if messages is None:
+    return [], _NULL
+  if not isinstance(messages, list):
+    return damaged_messages(), "The stored transcript is not a message list"
+  return messages, None
+
+
+def _legacy_raw(db, chat_id: str) -> bytes | None:
+  row = db.execute(text(
+    "SELECT CAST(c.messages AS BLOB) FROM chats c WHERE c.id = :id AND NOT EXISTS "
+    "(SELECT 1 FROM chat_transcript_state s WHERE s.chat_id = c.id)"
+  ), {"id": chat_id}).first()
+  return None if row is None else bytes(row[0] or b"")
+
+
+def legacy_messages(db, chat) -> list | None:
+  """An unconverted chat's authoritative legacy value, decoded; else None.
+
+  None means the rows are authoritative (or the chat does not exist, whose
+  rows are then simply empty). Reads nothing for a converted chat beyond the
+  marker, and writes nothing.
+  """
+  if not isinstance(chat, str) and inspect(chat).pending:
+    db.flush()  # A chat created in this session is converted from birth.
+  if rows_are_authority(db):
+    return None
+  raw = _legacy_raw(db, _id(chat))
+  return None if raw is None else _parse_legacy(raw)[0]
 
 
 def convert(db, chat_id: str) -> bool:
@@ -222,64 +244,25 @@ def convert(db, chat_id: str) -> bool:
 
   Valid JSON is not rewritten: its rows decode to the same values. Damaged
   bytes are preserved before the legacy value is replaced by the visible
-  placeholder that the rows then hold.
+  placeholder that the rows then hold. Rows left from an earlier conversion
+  (the previous release has written since) are rewritten by position, so
+  only positions it changed are touched.
   """
   if is_converted(db, chat_id):
     return False
-  raw = db.execute(text(
-    "SELECT CAST(messages AS BLOB) FROM chats WHERE id = :id"
-  ), {"id": chat_id}).first()
+  raw = _legacy_raw(db, chat_id)
   if raw is None:
     return False
-  raw = bytes(raw[0] or b"")
-  db.execute(delete(_M).where(_M.chat_id == chat_id))
-  error = None
-  try:
-    messages = json.loads(raw)
-    if messages is None:
-      # The previous release displayed a JSON null as an empty chat; the
-      # mirror rewrites it as the empty list the rows now hold.
-      messages = []
-      _changed(db, chat_id)
-    elif not isinstance(messages, list):
-      error = "The stored transcript is not a message list"
-  except (ValueError, UnicodeError) as exc:
-    error = f"The stored transcript is not valid JSON: {exc}"
-  if error is None:
-    _insert(db, chat_id, 0, messages)
-    db.execute(text("INSERT INTO chat_transcript_state(chat_id) VALUES (:id)"),
-               {"id": chat_id})
-    return True
-  db.add(models.ChatTranscriptDamage(chat_id=chat_id, raw=raw, error=error))
-  _insert(db, chat_id, 0, damaged_messages())
-  _changed(db, chat_id)
+  messages, error = _parse_legacy(raw)
+  _rewrite(db, chat_id, messages)
+  if error is not None:
+    if error != _NULL:
+      db.add(models.ChatTranscriptDamage(chat_id=chat_id, raw=raw, error=error))
+    # The mirror replaces the stored bytes with the list the rows now hold.
+    _changed(db, chat_id)
+  db.execute(text("INSERT OR IGNORE INTO chat_transcript_state(chat_id) VALUES (:id)"),
+             {"id": chat_id})
   return True
-
-
-def live_working_set(db) -> list[str]:
-  """Unconverted chats that boot recovery and the startup sweeps read.
-
-  Unconverted chats only come into existence while older code runs, so they
-  all exist at boot. This set is the work actually in flight: chats with a
-  non-terminal run, chats with queued messages, and both ends of every
-  delegation whose parent or child has a non-terminal run. Its size is
-  bounded by in-flight work, not by history (an idle open Goal is not in
-  flight: its next turn, wake or steer converts what it reads first).
-  Everything else is converted by its first reader or in the background.
-  """
-  if not legacy_present(db) or conversion_settled(db.get_bind()):
-    return []
-  m = models
-  running = set(db.execute(select(m.ChatRun.chat_id).where(
-    m.ChatRun.status.in_(m.NONTERMINAL_RUN_STATUSES),
-  )).scalars())
-  live = running | set(db.execute(select(m.Chat.id).where(
-    m.Chat.pending_messages.cast(Text).not_in(("[]", "null")),
-  )).scalars())
-  for parent, child in db.execute(select(m.Delegation.parent_chat_id, m.Delegation.child_chat_id)).all():
-    if parent in running or child in running:
-      live.update(chat for chat in (parent, child) if chat)
-  return sorted(chat_id for chat_id in live if needs_conversion(db, chat_id))
 
 
 def next_unconverted(db, after: str | None) -> str | None:
@@ -292,7 +275,7 @@ def next_unconverted(db, after: str | None) -> str | None:
 
 
 def unconverted_count(db) -> int:
-  if not legacy_present(db) or conversion_settled(db.get_bind()):
+  if rows_are_authority(db):
     return 0
   return db.execute(text(
     "SELECT COUNT(*) FROM chats c WHERE NOT EXISTS "
@@ -300,64 +283,13 @@ def unconverted_count(db) -> int:
   )).scalar()
 
 
-def _on_event_loop() -> bool:
-  try:
-    asyncio.get_running_loop()
-  except RuntimeError:
-    return False
-  return True
-
-
-def require_rows(db, chat) -> None:
-  """The one seam that makes a chat's rows authoritative before use.
-
-  The writer converts inline. A worker thread waits for the writer to
-  convert. The event-loop thread must never wait: it raises, and async
-  callers await ``ensure_converted_async`` first.
-  """
+def _rows_for_write(db, chat) -> str:
+  """Make the chat's rows authoritative before a mutation, in its transaction."""
   chat_id = _id(chat)
   if not isinstance(chat, str) and inspect(chat).pending:
     db.flush()  # A chat created in this session is converted from birth.
-  if db.info.get(WRITER_SESSION):
-    convert(db, chat_id)
-    return
-  if not needs_conversion(db, chat_id):
-    return  # Converted, or absent (the caller's own lookup reports that).
-  if _on_event_loop():
-    raise TranscriptNotConverted(
-      f"chat {chat_id} is not converted; await ensure_converted_async first",
-    )
-  raw = db.connection().connection.driver_connection
-  if raw.in_transaction:
-    # Waiting would deadlock on this session's own lock or keep reading the
-    # snapshot that predates the conversion.
-    raise RuntimeError(
-      "require_rows needs the chat converted before this session's transaction",
-    )
-  from app.chat_writer import ConvertTranscript, get_writer, wait_ack
-  try:
-    wait_ack(get_writer().submit(ConvertTranscript(chat_id=chat_id)))
-  except Exception as exc:
-    raise TranscriptUnavailable(chat_id, exc) from exc
-
-
-async def ensure_converted_async(chat_id: str, db=None) -> None:
-  """Await the writer's conversion of one chat; for event-loop callers."""
-  from app.chat_writer import ConvertTranscript, await_ack, get_writer
-  from app.database import engine
-  if conversion_settled(engine if db is None else db.get_bind()):
-    return
-  if db is None:
-    from app.database import SessionLocal
-    with SessionLocal() as session:
-      needed = needs_conversion(session, chat_id)
-  else:
-    needed = needs_conversion(db, chat_id)
-  if needed:
-    try:
-      await await_ack(get_writer().submit(ConvertTranscript(chat_id=chat_id)))
-    except Exception as exc:
-      raise TranscriptUnavailable(chat_id, exc) from exc
+  convert(db, chat_id)
+  return chat_id
 
 
 # -- The legacy mirror: one write path ---------------------------------------
@@ -366,10 +298,11 @@ def _changed(db, chat) -> None:
   db.info.setdefault(_DIRTY, set()).add(_id(chat))
 
 
+# Bodies in position order through the primary key, so no sort is needed;
+# joined in Python (SQLite's ordered group_concat builds a temporary B-tree).
+_BODIES = text("SELECT body FROM chat_messages WHERE chat_id = :id ORDER BY seq")
 _MIRROR = text(
-  "UPDATE chats SET messages = '[' || coalesce((SELECT group_concat(body, ', ' ORDER BY seq) "
-  "FROM chat_messages WHERE chat_id = :id), '') || ']', "
-  "has_messages = EXISTS (SELECT 1 FROM chat_messages WHERE chat_id = :id), "
+  "UPDATE chats SET messages = :messages, has_messages = :has_messages, "
   "updated_at = :now WHERE id = :id"
 ).bindparams(bindparam("now", type_=DateTime))
 _SCALARS = text(
@@ -385,9 +318,10 @@ _MARK_CONVERTED = text(
 def _mirror_changed_transcripts(session) -> None:
   """Derive each changed chat's legacy value and scalars from its rows.
 
-  Each body holds default ``json.dumps`` text, so ``'[' + ', '.join(bodies)
-  + ']'`` is exactly ``json.dumps(list)``: the bytes the previous release
-  writes and decodes itself. One statement per changed chat per root commit.
+  Each body holds default (ASCII) ``json.dumps`` text, so ``'[' + ',
+  '.join(bodies) + ']'`` is exactly ``json.dumps(list)``: the bytes the
+  previous release writes and decodes itself. One update per changed chat
+  per root commit.
 
   The changed set belongs to the root transaction (cleared only when it
   ends, below), so a rolled-back savepoint or a failed and retried commit
@@ -406,7 +340,9 @@ def _mirror_changed_transcripts(session) -> None:
   for chat_id in sorted(dirty):
     params = {"id": chat_id, "now": now}
     if legacy:
-      session.execute(_MIRROR, params)
+      bodies = session.execute(_BODIES, {"id": chat_id}).scalars().all()
+      session.execute(_MIRROR, {**params, "messages": "[" + ", ".join(bodies) + "]",
+                                "has_messages": bool(bodies)})
       # chats_messages_written just deleted the state row; this release's own
       # mirror leaves the chat converted.
       session.execute(_MARK_CONVERTED, {"id": chat_id})
@@ -449,8 +385,6 @@ def initialize_new(chat, messages) -> None:
   chat._initial_transcript = list(messages)
 
 
-
-
 @event.listens_for(Session, "before_flush")
 def _write_new_chat_transcripts(session, _context, _instances) -> None:
   new = [obj for obj in session.new
@@ -475,8 +409,7 @@ def _write_new_chat_transcripts(session, _context, _instances) -> None:
 
 
 def append(db, chat, message) -> int:
-  require_rows(db, chat)
-  chat_id = _id(chat)
+  chat_id = _rows_for_write(db, chat)
   seq = _size(db, chat_id)
   _insert(db, chat_id, seq, [message])
   _changed(db, chat_id)
@@ -484,21 +417,19 @@ def append(db, chat, message) -> int:
 
 
 def append_many(db, chat, messages) -> None:
-  require_rows(db, chat)
-  chat_id = _id(chat)
+  chat_id = _rows_for_write(db, chat)
   _insert(db, chat_id, _size(db, chat_id), list(messages))
   _changed(db, chat_id)
 
 
 def _stored_text(db, chat_id: str, seq: int):
-  return db.execute(select(_M.body.cast(Text)).where(
-    _M.chat_id == chat_id, _M.seq == seq,
-  )).scalar()
+  return db.execute(text(
+    "SELECT body FROM chat_messages WHERE chat_id = :id AND seq = :seq"
+  ), {"id": chat_id, "seq": seq}).scalar()
 
 
 def update_at(db, chat, index: int, body) -> None:
-  require_rows(db, chat)
-  chat_id = _id(chat)
+  chat_id = _rows_for_write(db, chat)
   stored = _stored_text(db, chat_id, index)
   if stored is None:
     raise IndexError(index)
@@ -510,19 +441,14 @@ def update_at(db, chat, index: int, body) -> None:
   _changed(db, chat_id)
 
 
-def replace_all(db, chat, messages) -> None:
-  """Explicit whole-history operations rewrite only positions that changed."""
-  require_rows(db, chat)
-  chat_id = _id(chat)
-  messages = list(messages)
-  stored = dict(db.execute(select(_M.seq, _M.body.cast(Text)).where(
-    _M.chat_id == chat_id,
-  )).all())
+def _rewrite(db, chat_id: str, messages: list) -> bool:
+  """Make the rows equal ``messages``, writing only positions that differ."""
+  stored = dict(db.execute(text(
+    "SELECT seq, body FROM chat_messages WHERE chat_id = :id"
+  ), {"id": chat_id}).tuples().all())
   changed = False
   for index, body in enumerate(messages):
-    if index not in stored:
-      continue
-    if stored[index] != json.dumps(body):
+    if index in stored and stored[index] != json.dumps(body):
       db.execute(update(_M).where(_M.chat_id == chat_id, _M.seq == index).values(
         body=body, **attributes(body),
       ))
@@ -533,22 +459,28 @@ def replace_all(db, chat, messages) -> None:
   elif len(messages) < len(stored):
     db.execute(delete(_M).where(_M.chat_id == chat_id, _M.seq >= len(messages)))
     changed = True
-  if changed:
+  return changed
+
+
+def replace_all(db, chat, messages) -> None:
+  """Explicit whole-history operations rewrite only positions that changed."""
+  chat_id = _rows_for_write(db, chat)
+  if _rewrite(db, chat_id, list(messages)):
     _changed(db, chat_id)
 
 
 # -- Reads -------------------------------------------------------------------
+# Each reader takes one decision: an unconverted chat (``legacy_messages``)
+# is read from its legacy value, every other chat from its rows.
 
-def pin_read_snapshot(db, *chats) -> None:
+def pin_read_snapshot(db) -> None:
   """Keep one read owner's metadata and body windows on one SQLite snapshot.
 
   Python's legacy sqlite3 transaction mode issues no BEGIN for SELECT, so a
   concurrently settled reply could otherwise move a page's coordinates
-  between its reads. The chats read under it are converted first: a snapshot
-  taken before a conversion would never see that chat's rows.
+  between its reads. Taken before the first read, so the conversion marker
+  and whichever value it selects are read from the same snapshot.
   """
-  for chat in chats:
-    require_rows(db, chat)
   connection = db.connection()
   if connection.dialect.name == "sqlite":
     raw = connection.connection.driver_connection
@@ -557,13 +489,15 @@ def pin_read_snapshot(db, *chats) -> None:
 
 
 def count(db, chat) -> int:
-  require_rows(db, chat)
-  return _size(db, _id(chat))
+  legacy = legacy_messages(db, chat)
+  return len(legacy) if legacy is not None else _size(db, _id(chat))
 
 
 def at(db, chat, index: int):
   """The body at ``index`` (negative from the end); None outside the range."""
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return legacy[index] if -len(legacy) <= index < len(legacy) else None
   chat_id = _id(chat)
   if index < 0:
     index += _size(db, chat_id)
@@ -590,25 +524,43 @@ def _stream(db, chat_id: str, *, descending: bool = False,
 
 
 def iterate(db, chat) -> Iterator:
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return iter(legacy)
   return (body for _seq, body in _stream(db, _id(chat)))
 
 
 def reverse_iter(db, chat) -> Iterator[tuple[int, object]]:
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return ((index, legacy[index]) for index in range(len(legacy) - 1, -1, -1))
   return _stream(db, _id(chat), descending=True)
 
 
 def read_all(db, chat) -> list:
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return legacy
   return [body for _seq, body in _stream(db, _id(chat))]
 
 
 def assistant_index(db, chat, message) -> int:
   """Position of the assistant row this message updates, or -1 to append."""
-  require_rows(db, chat)
-  chat_id = _id(chat)
   key = message.get("id") if isinstance(message, dict) else None
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    projected = [attributes(body) for body in legacy]
+    if key is not None:
+      for seq, row in enumerate(projected):
+        if row["role"] == "assistant" and row["message_key"] == _key(key):
+          return seq
+    if not projected:
+      return -1
+    last = projected[-1]
+    if last["role"] == "assistant" and (key is None or last["message_id"] is None):
+      return len(projected) - 1
+    return -1
+  chat_id = _id(chat)
   if key is not None:
     found = db.execute(select(_M.seq).where(
       _M.chat_id == chat_id, _M.role == "assistant", _M.message_key == _key(key),
@@ -628,7 +580,11 @@ def assistant_index(db, chat, message) -> int:
 
 def client_message_seq(db, chat, client_id: str, *, role: str = "user") -> int | None:
   """Position of the first ``role`` row whose cid (``cid_of``) matches."""
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return next((seq for seq, body in enumerate(legacy)
+                 if (row := attributes(body))["role"] == role
+                 and row["client_id"] == client_id), None)
   return db.execute(select(_M.seq).where(
     _M.chat_id == _id(chat), _M.role == role, _M.client_id == client_id,
   ).order_by(_M.seq).limit(1)).scalar()
@@ -638,17 +594,27 @@ def attachment_bodies(db, chat) -> list:
   """Bodies of the rows that name attachments (on the message or a block).
 
   Upload release asks whether anything still names a file; only these rows
-  can, so it never decodes the rest of the history.
+  can, so a converted chat never decodes the rest of its history.
   """
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return [body for body in legacy if attributes(body)["flags"] & ATTACHMENTS]
   return list(db.execute(select(_M.body).where(
     _M.chat_id == _id(chat), _M.flags.op("&")(ATTACHMENTS) != 0,
   ).order_by(_M.seq)).scalars())
 
 
+def _numeric_ts(value) -> bool:
+  return (isinstance(value, (int, float)) and not isinstance(value, bool)
+          and not (isinstance(value, float) and not math.isfinite(value)))
+
+
 def max_timestamp(db, chat):
-  """Largest numeric ``ts`` (never bool), exact as stored; 0 when none."""
-  require_rows(db, chat)
+  """Largest finite numeric ``ts`` (never bool), exact as stored; 0 when none."""
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    stamps = [body.get("ts") for body in legacy if isinstance(body, dict)]
+    return max((ts for ts in stamps if _numeric_ts(ts)), key=float, default=0)
   value = db.execute(text(
     "SELECT ts FROM chat_messages WHERE chat_id = :id "
     "AND json_type(ts) IN ('integer', 'real') "
@@ -657,22 +623,36 @@ def max_timestamp(db, chat):
   return 0 if value is None else json.loads(value)
 
 
+def _coordinates(message_id, client_id, role, ts, flags) -> dict:
+  message = {"role": role, "ts": ts, "hidden": bool(flags & HIDDEN)}
+  if message_id is not None:
+    message["id"] = message_id
+  if client_id is not None and not flags & DERIVED_CID:
+    message["cid"] = client_id
+  return message
+
+
 def metadata(db, chat) -> list[dict]:
   """Identity and lifecycle coordinates without hydrating ordinary bodies."""
-  require_rows(db, chat)
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    result = []
+    for body in legacy:
+      row = attributes(body)
+      message = _coordinates(row["message_id"], row["client_id"], row["role"],
+                             row["ts"], row["flags"])
+      if row["flags"] & GOAL_COMPLETION:
+        message["blocks"] = body.get("blocks", [])
+      result.append(message)
+    return result
   chat_id = _id(chat)
   result, goal_rows = [], []
   for seq, message_id, client_id, role, ts, flags in db.execute(select(
     _M.seq, _M.message_id, _M.client_id, _M.role, _M.ts, _M.flags,
   ).where(_M.chat_id == chat_id).order_by(_M.seq)).tuples():
-    message = {"role": role, "ts": ts, "hidden": bool(flags & HIDDEN)}
-    if message_id is not None:
-      message["id"] = message_id
-    if client_id is not None and not flags & DERIVED_CID:
-      message["cid"] = client_id
     if flags & GOAL_COMPLETION:
       goal_rows.append(seq)
-    result.append(message)
+    result.append(_coordinates(message_id, client_id, role, ts, flags))
   if goal_rows:
     # Goal placement needs those rows' blocks; only they are decoded.
     for seq, body in db.execute(select(_M.seq, _M.body).where(
@@ -682,10 +662,30 @@ def metadata(db, chat) -> list[dict]:
   return result
 
 
-class History(Sequence):
-  """A position-addressed view of one chat's rows, sized when opened.
+def chats_with_flag(db, flag: int, legacy_marker: str):
+  """Chat ids whose transcript may hold a row with ``flag``, as a subquery.
 
-  Iteration streams the current rows; indexing a position that has since
+  Converted chats answer from their rows' flags; while the legacy column
+  exists, an unconverted chat qualifies when its legacy text contains
+  ``legacy_marker`` (a superset the caller's exact body check then narrows).
+  """
+  flagged = select(_M.chat_id).where(_M.flags.op("&")(flag) != 0)
+  if rows_are_authority(db):
+    return flagged
+  unconverted = select(models.Chat.id).where(
+    ~select(models.ChatTranscriptState.chat_id).where(
+      models.ChatTranscriptState.chat_id == models.Chat.id,
+    ).exists(),
+    func.instr(text("CAST(chats.messages AS TEXT)"), legacy_marker) > 0,
+  )
+  return flagged.union(unconverted)
+
+
+class History(Sequence):
+  """A position-addressed view of one chat's transcript, sized when opened.
+
+  An unconverted chat's legacy value is decoded once, when opened. For rows,
+  iteration streams the current rows; indexing a position that has since
   vanished raises IndexError instead of returning a placeholder.
   """
 
@@ -694,8 +694,8 @@ class History(Sequence):
     self.db = object_session(chat)
     if self.db is None:
       raise RuntimeError("Transcript reads require the chat's database session")
-    require_rows(self.db, chat)
-    self.size = _size(self.db, chat.id)
+    self.legacy = legacy_messages(self.db, chat)
+    self.size = len(self.legacy) if self.legacy is not None else _size(self.db, chat.id)
 
   def __len__(self):
     return self.size
@@ -703,12 +703,16 @@ class History(Sequence):
   def __getitem__(self, key):
     if isinstance(key, slice):
       start, stop, step = key.indices(self.size)
+      if self.legacy is not None:
+        return self.legacy[start:stop:step]
       if step == 1:
         return _window(self.db, self.chat.id, start, stop)
       return [self[index] for index in range(start, stop, step)]
     index = key + self.size if key < 0 else key
     if index < 0 or index >= self.size:
       raise IndexError(key)
+    if self.legacy is not None:
+      return self.legacy[index]
     row = self.db.execute(select(_M.body).where(
       _M.chat_id == self.chat.id, _M.seq == index,
     )).first()
@@ -719,15 +723,22 @@ class History(Sequence):
   def __iter__(self):
     # Bounded by the size taken at opening, so iteration never yields more
     # items than len(); positions removed since then are simply absent.
+    if self.legacy is not None:
+      return iter(self.legacy)
     if not self.size:
       return iter(())  # An empty transcript is known from opening; read nothing.
     return (body for _seq, body in _stream(self.db, self.chat.id, below=self.size))
 
-  def __reversed__(self):
+  def items_reversed(self) -> Iterator[tuple[int, object]]:
+    """(position, body) from the last position, bounded like iteration."""
+    if self.legacy is not None:
+      return ((index, self.legacy[index]) for index in range(self.size - 1, -1, -1))
     if not self.size:
       return iter(())
-    return (body for _seq, body in _stream(
-      self.db, self.chat.id, descending=True, below=self.size))
+    return _stream(self.db, self.chat.id, descending=True, below=self.size)
+
+  def __reversed__(self):
+    return (body for _seq, body in self.items_reversed())
 
 
 def history(chat) -> History:

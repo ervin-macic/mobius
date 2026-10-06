@@ -108,22 +108,7 @@ from app.usage_metrics import CHAT_TOKEN_FIELDS, summarize_chat_run_tokens
 
 log = logging.getLogger(__name__)
 
-async def converted_path_chat(request: Request) -> None:
-  """Convert the path's chat before an event-loop handler reads its rows.
-
-  Handlers run on the event loop, which must never wait for a conversion
-  (transcript_rows.require_rows). This awaits the writer instead, once per
-  request, and is free for a chat that is already converted.
-  """
-  chat_id = request.path_params.get("chat_id")
-  if chat_id:
-    # A failure raises TranscriptUnavailable, which the app maps to 503.
-    await transcript_rows.ensure_converted_async(chat_id)
-
-
-router = APIRouter(
-  prefix="/api/chats", tags=["chats"], dependencies=[Depends(converted_path_chat)],
-)
+router = APIRouter(prefix="/api/chats", tags=["chats"])
 _OWNER_CHAT_CREATE_LOCK = threading.Lock()
 
 
@@ -186,10 +171,7 @@ def _active_assistant_message_id(
 # lives under its own /api/app-chats prefix so the owner-only /api/chats
 # surface stays unambiguously owner-only — the app path is additive and
 # greppable, not a flag threaded through the owner routes.
-app_chat_router = APIRouter(
-  prefix="/api/app-chats", tags=["app-chats"],
-  dependencies=[Depends(converted_path_chat)],
-)
+app_chat_router = APIRouter(prefix="/api/app-chats", tags=["app-chats"])
 
 # SOFT_DELETE_TTL is imported from app.timeutil — one shared window for chat +
 # app soft-delete so the two recovery periods can't drift.
@@ -626,7 +608,7 @@ def _chat_detail_response(
   # This read owner pins the scalar/live snapshot and every body window.
   # General History views must not hold an old read transaction across an
   # external writer acknowledgement (startup repair and send planning use it).
-  transcript_rows.pin_read_snapshot(db, chat.id)
+  transcript_rows.pin_read_snapshot(db)
   db.refresh(chat)
   all_msgs = materialized_messages(chat)
   running = is_chat_running(chat.id) or has_running_run(db, chat.id)
@@ -1918,7 +1900,7 @@ def get_chat_message_sources(
   if principal.scope == "app":
     raise HTTPException(status_code=403, detail="App token is not valid here.")
   require_chat_embed_operation(principal, "chat:read")
-  transcript_rows.pin_read_snapshot(db, chat_id)
+  transcript_rows.pin_read_snapshot(db)
   chat = get_active_chat_for_principal(db, chat_id, principal)
   messages = materialized_messages(chat)
   if message_index >= len(messages):
@@ -1997,7 +1979,7 @@ def get_chat_activity_detail(
   if end <= start or end - start > MAX_ACTIVITY_DETAIL_BLOCKS:
     raise HTTPException(status_code=422, detail="Invalid activity range.")
 
-  transcript_rows.pin_read_snapshot(db, chat_id)
+  transcript_rows.pin_read_snapshot(db)
   chat = get_active_chat_for_principal(db, chat_id, principal)
   messages = materialized_messages(chat)
   if message_index >= len(messages):
@@ -2136,7 +2118,7 @@ def get_chat_edit_diffs(
   # is read once below, after rollback has retired the pre-fence snapshot.
   get_active_chat_or_404(db, chat_id, load_fields=(models.Chat.id,))
   _drain_writer_before_sidecar_read(db, chat_id, "chat changes")
-  transcript_rows.pin_read_snapshot(db, chat_id)
+  transcript_rows.pin_read_snapshot(db)
   chat = get_active_chat_or_404(db, chat_id)
   messages = materialized_messages(chat)
 

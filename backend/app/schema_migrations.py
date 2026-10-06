@@ -6300,7 +6300,32 @@ def ensure_transcript_triggers(eng) -> list[str]:
       if detection_lost else "",
     )
     _add_transcript_rows(eng, reconvert_all=detection_lost)
+    _repair_transcript_derived_rows(eng)
   return missing
+
+
+def _repair_transcript_derived_rows(eng) -> None:
+  """Bring derived rows back in line after triggers were missing.
+
+  Chats hard-deleted while ``chats_deleted`` was missing left their rows,
+  search entries, damage records and markers behind, and titles changed
+  while a title trigger was missing left stale entries. Both are derived
+  data, so they are removed and the title entries rebuilt from ``chats``;
+  prose entries follow their rows, which conversion maintains.
+  """
+  whitespace = "char(32, 9, 10, 11, 12, 13)"
+  with eng.begin() as conn:
+    for table in ("chat_messages", "chat_search_entries", "chat_transcript_damage",
+                  "chat_transcript_state"):
+      conn.exec_driver_sql(
+        f"DELETE FROM {table} WHERE chat_id NOT IN (SELECT id FROM chats)"
+      )
+    conn.exec_driver_sql("DELETE FROM chat_search_entries WHERE seq = -1")
+    conn.exec_driver_sql(
+      "INSERT INTO chat_search_entries (chat_id, seq, text) "
+      f"SELECT id, -1, trim(title, {whitespace}) FROM chats "
+      f"WHERE coalesce(trim(title, {whitespace}), '') <> ''"
+    )
 
 
 _SCHEMA_MIGRATIONS = (

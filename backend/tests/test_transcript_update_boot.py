@@ -1,9 +1,12 @@
-"""The update's first boot: recovery, sweeps and resumed turns on chats the
-previous release wrote last (so they are unconverted), and the disk tier the
-background conversion stops at.
+"""The update's first boot: recovery, sweeps, resumed turns, wake and steer
+on chats the previous release wrote last (so they are unconverted), and the
+disk tier the background conversion stops at.
 
-These began as reproductions in the update-path audit. Every chat a test
-"unconverts" stands for one the previous release wrote just before the boot.
+These began as reproductions in the update-path audit (F1) and the helper
+isolation review (R-A), when event-loop readers had to convert first. Reads
+now serve an unconverted chat from its legacy value, so each scenario simply
+works. Every chat a test "unconverts" stands for one the previous release
+wrote just before the boot.
 """
 
 import hashlib
@@ -67,29 +70,6 @@ def _boot_context():
   )
 
 
-def test_the_live_working_set_is_only_work_in_flight():
-  _seed("live-running")
-  _seed_helper("live-parent", "live-child")
-  with SessionLocal() as db:
-    db.add(create_chat(id="live-queued", title="q", pending_messages=[{"role": "user", "content": "x"}]))
-    db.add(create_chat(id="live-idle", title="i", messages=[{"role": "user", "content": "x"}]))
-    # An idle open Goal with an old helper is not in flight: its next turn,
-    # wake or steer converts what it reads.
-    db.add(create_chat(id="idle-goal", title="g", messages=[{"role": "user", "content": "x"}]))
-    db.add(models.ChatGoal(id="idle-goal-1", chat_id="idle-goal", objective="later", status="open"))
-    db.add(create_chat(id="idle-goal-helper", title="h", messages=[]))
-    db.add(models.Delegation(
-      id="idle-deleg", parent_chat_id="idle-goal", parent_root_run_id="idle-root",
-      task_key="t", child_chat_id="idle-goal-helper", provider="codex", scope="write", cwd="/data",
-      startup_prompt="task", prompt_sha256=hashlib.sha256(b"task").hexdigest()))
-    db.commit()
-  _unconvert()
-  with SessionLocal() as db:
-    assert transcript_rows.live_working_set(db) == [
-      "live-child", "live-parent", "live-queued", "live-running",
-    ]
-
-
 @pytest.mark.asyncio
 async def test_first_boot_recovers_a_running_turn_an_orphan_and_a_helper(caplog, monkeypatch):
   """A turn running across the update, an auto-resume orphan and an attached
@@ -124,21 +104,19 @@ async def test_first_boot_recovers_a_running_turn_an_orphan_and_a_helper(caplog,
     if task.name != "verify app identity cutover"))
   context = _boot_context()
   with caplog.at_level(logging.WARNING):
-    await startup.run_startup_plan(context)
-    # The audit mode unconverts again before each later sweep, so these
-    # direct (test-side) reads only hold in an ordinary run.
-    if os.environ.get("MOBIUS_TEST_UNCONVERT_ON_REQUEST") != "1":
-      for chat_id in (cid, "boot-orphan", "boot-parent", "boot-child"):
-        assert _converted(chat_id)
-      # A resumed coordinator reads its helper without tripping the loop guard.
-      from app.delegations import active_parent_context
-      with SessionLocal() as db:
-        assert "boot-child-deleg" in active_parent_context(db, "boot-parent", "boot-parent-run")
+    result = await startup.run_startup_plan(context)
+    assert result.serviceable
+    assert not context.failed_tasks
+    # A resumed coordinator reads its unconverted helper on the event loop.
+    from app.delegations import active_parent_context
+    with SessionLocal() as db:
+      assert "boot-child-deleg" in active_parent_context(db, "boot-parent", "boot-parent-run")
     task = chat_writer._transcript_conversion_task
     if task is not None:
       await task
-  assert "TranscriptNotConverted" not in caplog.text
   assert _run(cid)["status"] == "parked"
+  if os.environ.get("MOBIUS_TEST_ALL_UNCONVERTED") != "1":
+    assert all(_converted(chat_id) for chat_id in (cid, "boot-orphan", "boot-parent", "boot-child"))
 
 
 @pytest.mark.asyncio
@@ -208,16 +186,13 @@ async def test_a_failing_orphan_candidate_is_isolated(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_resumed_parent_turn_converts_its_helpers_before_reading_them():
-  from app.delegations import active_parent_context, ensure_parent_helpers_converted
+async def test_a_resumed_parent_turn_reads_its_unconverted_helpers():
+  from app.delegations import active_parent_context
   _seed_helper()
-  _unconvert("up-child")
-  with SessionLocal() as db:
-    with pytest.raises(transcript_rows.TranscriptNotConverted):
-      active_parent_context(db, "up-parent", "up-parent-run")
-  await ensure_parent_helpers_converted("up-parent")
+  _unconvert("up-parent", "up-child")
   with SessionLocal() as db:
     assert "up-child-deleg" in active_parent_context(db, "up-parent", "up-parent-run")
+  assert not _converted("up-child")
 
 
 @pytest.mark.asyncio
@@ -281,33 +256,35 @@ def test_a_legacy_null_converts_to_an_empty_transcript():
     db.commit()
   with engine.begin() as conn:
     conn.exec_driver_sql("UPDATE chats SET messages = 'null' WHERE id = 'null-chat'")
-  chat_writer.wait_ack(chat_writer.get_writer().submit(chat_writer.ConvertTranscript(chat_id="null-chat")))
+  with SessionLocal() as db:
+    assert transcript_rows.read_all(db, "null-chat") == []
+    transcript_rows.convert(db, "null-chat")
+    db.commit()
   with engine.connect() as conn:
     assert conn.exec_driver_sql(
       "SELECT messages FROM chats WHERE id = 'null-chat'").scalar() == "[]"
     assert conn.exec_driver_sql(
       "SELECT COUNT(*) FROM chat_transcript_damage WHERE chat_id = 'null-chat'").scalar() == 0
-  assert _converted("null-chat")
+  if os.environ.get("MOBIUS_TEST_ALL_UNCONVERTED") != "1":
+    assert _converted("null-chat")
 
 
-def _fail_conversion_of(monkeypatch, content):
-  real = transcript_rows.attributes
+def _fail_conversion_of(monkeypatch, chat_id):
+  real = transcript_rows._rewrite
 
-  def failing(body):
-    if isinstance(body, dict) and body.get("content") == content:
+  def failing(db, failing_id, messages):
+    if failing_id == chat_id:
       raise RuntimeError("simulated conversion bug")
-    return real(body)
+    return real(db, failing_id, messages)
 
-  monkeypatch.setattr(transcript_rows, "attributes", failing)
+  monkeypatch.setattr(transcript_rows, "_rewrite", failing)
 
 
 @pytest.mark.asyncio
 async def test_one_unconvertible_helper_never_breaks_its_parent(monkeypatch):
-  """A parent whose old helper cannot convert still starts turns, and its
-  wake and steer notices report that helper's result as unavailable."""
-  from app.delegations import (
-    _compose_wake_notice, active_parent_context, derived_status, ensure_parent_helpers_converted,
-  )
+  """A parent whose old helper cannot convert still reads it everywhere:
+  turn context, results, and wake and steer notices show its real result."""
+  from app.delegations import _compose_wake_notice, active_parent_context, derived_status
   _seed_helper()
   with SessionLocal() as db:
     db.add(create_chat(id="old-helper", title="Old", provider="codex",
@@ -318,36 +295,32 @@ async def test_one_unconvertible_helper_never_breaks_its_parent(monkeypatch):
       startup_prompt="task", prompt_sha256=hashlib.sha256(b"task").hexdigest()))
     db.commit()
   _unconvert("old-helper", "up-child")
-  _fail_conversion_of(monkeypatch, "unconvertible")
-  # Turn start: never raises for one helper.
-  await ensure_parent_helpers_converted("up-parent")
-  assert _converted("up-child") and not _converted("old-helper")
+  _fail_conversion_of(monkeypatch, "old-helper")
+  await chat_writer.convert_remaining_transcripts()
   assert "old-helper" in chat_writer.transcript_conversion_status["failed"]
   with SessionLocal() as db:
-    context = active_parent_context(db, "up-parent", "up-parent-run")
-    assert "old-deleg" in context
+    assert "old-deleg" in active_parent_context(db, "up-parent", "up-parent-run")
     old = db.get(models.Delegation, "old-deleg")
     _status, _run, result = derived_status(db, old)
-    assert result.startswith("Result unavailable") and "simulated conversion bug" in result
-    # Wake and steer compose the same notice.
+    assert result == "unconvertible"
     notice = _compose_wake_notice(db, [old], {old.id: None})
-    assert "Result unavailable" in notice
+    assert "unconvertible" in notice
 
 
-def test_a_reader_that_skipped_conversion_still_fails_loudly():
-  """Only a recorded conversion failure becomes "result unavailable"; a chat
-  nobody tried to convert still trips the event-loop guard."""
+def test_an_event_loop_reader_of_an_unconverted_helper_just_works():
+  """R-A's regression: no reader has to remember to convert first."""
+  import asyncio
+
   from app.delegations import derived_status
   _seed_helper()
   _unconvert("up-child")
 
   async def on_loop():
     with SessionLocal() as db:
-      with pytest.raises(transcript_rows.TranscriptNotConverted):
-        derived_status(db, db.get(models.Delegation, "up-child-deleg"))
+      return derived_status(db, db.get(models.Delegation, "up-child-deleg"))[2]
 
-  import asyncio
-  asyncio.run(on_loop())
+  assert asyncio.run(on_loop()) == "report"
+  assert not _converted("up-child")
 
 
 def test_search_reports_how_many_chats_are_searchable_by_title_only(client, auth):
@@ -356,7 +329,6 @@ def test_search_reports_how_many_chats_are_searchable_by_title_only(client, auth
   response = client.get("/api/chats/search?q=helper", headers=auth)
   assert response.status_code == 200
   assert isinstance(response.json(), list)
-  # The count the request saw (audit mode unconverts every chat before it).
   with SessionLocal() as db:
     count = transcript_rows.unconverted_count(db)
   assert count >= 1

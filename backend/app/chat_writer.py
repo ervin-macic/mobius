@@ -177,10 +177,25 @@ async def await_ack(ack: Future, *, timeout: float | None = None):
 def wait_ack(ack: Future, *, timeout: float | None = None):
   """Synchronously await a writer ack from a thread that is not the event loop.
 
-  Used by boot work and by worker-thread readers waiting for a transcript
-  conversion (transcript_rows.require_rows); bounded by ACK_TIMEOUT_SECS.
+  Used by boot work; bounded by ACK_TIMEOUT_SECS.
   """
   return ack.result(timeout=ACK_TIMEOUT_SECS if timeout is None else timeout)
+
+
+def _end_uncommitted_writes(db) -> None:
+  """Roll back writes a command left uncommitted, releasing the write lock.
+
+  A command that returns without committing (a duplicate, a no-op) must not
+  hold SQLite's write transaction until the next command. Only an open
+  database write transaction is ended, so the identity map of a command
+  that committed is left alone.
+  """
+  get_transaction = getattr(db, "get_transaction", None)  # Test stubs have none.
+  if get_transaction is None or get_transaction() is None:
+    return
+  driver = db.connection().connection.driver_connection
+  if getattr(driver, "in_transaction", False):
+    db.rollback()
 
 
 # -- Commands (domain-level; a later milestone swaps their dispatch) -----
@@ -1132,17 +1147,6 @@ class ReplaceTranscript(_Command):
 
 
 @dataclass
-class ConvertTranscript(_Command):
-  """Make one chat's rows authoritative from its legacy value.
-
-  Submitted by a reader that may not convert itself (transcript_rows
-  `require_rows` / `ensure_converted_async`). A no-op once converted.
-  """
-
-  chat_id: str = ""
-
-
-@dataclass
 class ConvertNextTranscript(_Command):
   """One background conversion step, in chat-id order after `after`.
 
@@ -1864,6 +1868,7 @@ class ChatWriterActor:
           # clobber that write.
           self._db.expire_all()
           result = self._dispatch(self._db, cmd)
+          _end_uncommitted_writes(self._db)
           _safe_set_result(cmd.ack, result)
         except SQLAlchemyError:
           # A DB-level failure (broken session / commit error the helpers
@@ -2169,8 +2174,6 @@ class ChatWriterActor:
       return self._clear_pending(db, cmd)
     if isinstance(cmd, ReplaceTranscript):
       return self._replace_transcript(db, cmd)
-    if isinstance(cmd, ConvertTranscript):
-      return self._convert_transcript(db, cmd.chat_id)
     if isinstance(cmd, ConvertNextTranscript):
       return self._convert_next_transcript(db, cmd.after)
     if isinstance(cmd, FinishRun):
@@ -2419,8 +2422,7 @@ class ChatWriterActor:
       )
       # Check the actual write target inside the actor: an unkeyed legacy
       # request must not bypass a card published after the route's read.
-      from itertools import chain
-      candidates = chain(
+      candidates = itertools.chain(
         [chat.live_assistant] if isinstance(chat.live_assistant, dict) else [],
         (message for _seq, message in transcript_rows.reverse_iter(db, chat)),
       )
@@ -5349,20 +5351,12 @@ class ChatWriterActor:
     return {"cleared": cleared, "cleared_cids": cleared_cids}
 
   def _convert_transcript(self, db, chat_id: str) -> bool:
-    """Convert one chat for a request (reader or writer command).
-
-    Serving a request needs this one chat, and its growth is bounded by that
-    chat, so it does not consult the disk floor; SQLite's own SQLITE_FULL is
-    the bound. A failure leaves the legacy value authoritative and is
-    recorded per chat for diagnostics.
-    """
-    if not transcript_rows.needs_conversion(db, chat_id):
-      db.rollback()  # Nothing to write; release the read transaction.
-      return False
+    """Convert one chat for the background run; a failure leaves the legacy
+    value authoritative and is recorded per chat for diagnostics."""
     try:
       transcript_rows.convert(db, chat_id)
       if not _commit_or_rollback(db):
-        raise _PersistFailed("ConvertTranscript did not persist")
+        raise _PersistFailed("Transcript conversion did not persist")
     except Exception as exc:
       db.rollback()
       transcript_conversion_status["failed"][chat_id] = f"{type(exc).__name__}: {exc}"
@@ -7359,12 +7353,13 @@ async def convert_remaining_transcripts() -> None:
   writer command converting one chat in one transaction, so live commands
   interleave at chat granularity and an interruption resumes from the state
   table on the next boot. A chat that fails is recorded and skipped, never
-  retried here. The constrained-disk tier stops the run; the capacity
-  monitor re-arms it when disk pressure is normal again, and readers convert
-  the chats they open meanwhile.
+  retried in this run (a re-armed run retries it; the record stays until it
+  converts). The constrained-disk tier stops the run; the capacity monitor
+  re-arms it when disk pressure is normal again. Meanwhile readers read each
+  unconverted chat's legacy value, and its first write converts it.
   """
   status = transcript_conversion_status
-  status.update(state="running", error=None, failed={})
+  status.update(state="running", error=None)
   after = None
   try:
     while True:

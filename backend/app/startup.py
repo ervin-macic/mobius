@@ -498,34 +498,11 @@ def _start_chat_writer(_context: StartupContext) -> None:
   start_writer()
 
 
-async def _convert_live_transcripts(context: StartupContext) -> None:
-  """Convert the chats recovery and resumption are about to read.
-
-  Boot reconcile, the continuation and wedged sweeps, and resumed turns read
-  these chats (and their helpers') on the event loop, which never waits for
-  a conversion. Request-serving conversion: no disk floor, no dependence on
-  background progress. A chat that cannot convert keeps its legacy value and
-  is reported in diagnostics; the readers then fail for that chat alone.
-  """
-  from app import transcript_rows
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    chat_ids = transcript_rows.live_working_set(db)
-  for chat_id in chat_ids:
-    try:
-      await transcript_rows.ensure_converted_async(chat_id)
-    except transcript_rows.TranscriptUnavailable as exc:
-      context.logger.warning("%s", exc)
-  if chat_ids:
-    context.logger.info("converted %d live chat transcript(s) before recovery", len(chat_ids))
-
-
 def _start_transcript_conversion(_context: StartupContext) -> None:
   """Convert chats the previous release wrote, in the background.
 
-  Readiness never waits for it: a chat read or written first is converted on
-  demand through the writer (transcript_rows.require_rows).
+  Readiness never waits for it: until a chat converts, its readers read its
+  legacy value, and its first write converts it inline (transcript_rows).
   """
   from app.chat_writer import start_transcript_conversion
 
@@ -710,7 +687,6 @@ DATABASE_STARTUP_TASKS = (
   # failures still fail open exactly as they did when the writer started near
   # the end of the plan.
   StartupTask("start chat writer", _start_chat_writer),
-  StartupTask("convert live transcripts", _convert_live_transcripts),
   StartupTask("start transcript conversion", _start_transcript_conversion),
   StartupTask(
     "backfill active assistant identities",

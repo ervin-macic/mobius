@@ -23,6 +23,10 @@ from app.chat_writer import create_chat
 from app.database import SessionLocal, engine
 
 
+# Conversion mechanics pin the converted state themselves.
+pytestmark = pytest.mark.converted_chats
+
+
 TYPED = [
   {"role": "user", "content": "héllo ☃", "ts": 1, "cid": "c-1"},
   {"role": "assistant", "id": "a-1", "content": "floats", "ts": 2,
@@ -97,9 +101,11 @@ def count_body_decodes(monkeypatch):
   return decoded
 
 
-def convert_through_writer(chat_id):
-  chat_writer.wait_ack(chat_writer.get_writer().submit(
-    chat_writer.ConvertTranscript(chat_id=chat_id)))
+def convert_now(chat_id):
+  """Convert one chat inline, as a write's own transaction does."""
+  with SessionLocal() as db:
+    rows.convert(db, chat_id)
+    db.commit()
 
 
 # -- One write path ----------------------------------------------------------
@@ -194,7 +200,7 @@ def test_previous_release_update_insert_and_delete_are_detected_exactly():
   assert unconverted == {changed, "inserted"}
   assert leftovers == [0, 0, 0, 0]
   for chat_id in (changed, "inserted"):
-    convert_through_writer(chat_id)
+    convert_now(chat_id)
     assert converted(chat_id)
     assert stored_rows(chat_id) == json.loads(legacy_text(chat_id))
   assert stored_rows(changed)[-1]["content"] == "from previous"
@@ -225,7 +231,7 @@ def test_conversion_keeps_legacy_bytes_and_types_exactly():
   previous_release_writes(chat_id, [])
   with engine.begin() as conn:
     conn.execute(text("UPDATE chats SET messages = :m WHERE id = :id"), {"m": odd_bytes, "id": chat_id})
-  convert_through_writer(chat_id)
+  convert_now(chat_id)
   assert legacy_text(chat_id) == odd_bytes
   assert canonical(stored_rows(chat_id)) == canonical(json.loads(odd_bytes))
   assert isinstance(stored_rows(chat_id)[0]["ts"], float)
@@ -236,7 +242,7 @@ def test_damaged_legacy_bytes_are_preserved_before_the_placeholder_replaces_them
   chat_id = seed(messages=[{"role": "user", "content": "x"}])
   with engine.begin() as conn:
     conn.execute(text("UPDATE chats SET messages = :m WHERE id = :id"), {"m": raw, "id": chat_id})
-  convert_through_writer(chat_id)
+  convert_now(chat_id)
   with engine.connect() as conn:
     saved = conn.execute(text(
       "SELECT raw FROM chat_transcript_damage WHERE chat_id = :id"), {"id": chat_id}).scalar()
@@ -246,48 +252,98 @@ def test_damaged_legacy_bytes_are_preserved_before_the_placeholder_replaces_them
   assert converted(chat_id)
 
 
-def test_worker_thread_reader_converts_through_the_writer():
+READERS = {
+  "history": lambda db, chat: list(rows.history(chat)),
+  "reversed": lambda db, chat: list(reversed(rows.history(chat))),
+  "slice": lambda db, chat: rows.history(chat)[1:],
+  "count": lambda db, chat: rows.count(db, chat),
+  "at": lambda db, chat: [rows.at(db, chat, i) for i in (-3, -1, 0, 1, 5)],
+  "read_all": lambda db, chat: rows.read_all(db, chat),
+  "iterate": lambda db, chat: list(rows.iterate(db, chat)),
+  "reverse_iter": lambda db, chat: list(rows.reverse_iter(db, chat)),
+  "metadata": lambda db, chat: rows.metadata(db, chat),
+  "assistant_index": lambda db, chat: [
+    rows.assistant_index(db, chat, m) for m in ({"id": "a1"}, {"id": 7}, {}, {"id": "zz"})],
+  "client_message_seq": lambda db, chat: [
+    rows.client_message_seq(db, chat, c) for c in ("c1", "legacy-3", "none")],
+  "attachment_bodies": lambda db, chat: rows.attachment_bodies(db, chat),
+  "max_timestamp": lambda db, chat: rows.max_timestamp(db, chat),
+}
+LEGACY_TRANSCRIPT = [
+  {"role": "user", "content": "first", "ts": 1, "cid": "c1"},
+  {"role": "assistant", "id": "a1", "ts": 2.5, "blocks": [
+    {"type": "tool", "tool": "update_goal", "edit_preview": {"diff": "d"}}]},
+  {"role": "user", "content": "no cid", "ts": 3, "attachments": [{"name": "f.txt"}]},
+  {"role": "assistant", "id": 7, "ts": True, "hidden": True, "content": "x"},
+  "not a dict",
+]
+
+
+@pytest.mark.parametrize("reader", sorted(READERS))
+def test_every_reader_serves_an_unconverted_chat_exactly_without_converting(reader):
+  """An unconverted chat reads its legacy value, exactly as its rows will."""
   chat_id = seed(messages=[])
-  previous_release_writes(chat_id, [{"role": "user", "content": "written by previous"}])
+  previous_release_writes(chat_id, LEGACY_TRANSCRIPT)
+  statements = []
+  from sqlalchemy import event
+  listener = lambda *a: statements.append(a[2])
+  with SessionLocal() as db:
+    event.listen(engine, "before_cursor_execute", listener)
+    try:
+      unconverted = READERS[reader](db, db.get(models.Chat, chat_id))
+    finally:
+      event.remove(engine, "before_cursor_execute", listener)
+  assert not converted(chat_id)
+  assert not any(sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+                 for sql in statements)
+  convert_now(chat_id)
+  with SessionLocal() as db:
+    assert READERS[reader](db, db.get(models.Chat, chat_id)) == unconverted
+
+
+def test_an_undecodable_legacy_value_reads_as_the_placeholder_without_writing():
+  chat_id = seed(messages=[])
+  previous_release_writes(chat_id, [])
+  with engine.begin() as conn:
+    conn.execute(text("UPDATE chats SET messages = :raw WHERE id = :id"),
+                 {"raw": b"[{broken", "id": chat_id})
+  with SessionLocal() as db:
+    assert list(rows.history(db.get(models.Chat, chat_id))) == rows.damaged_messages()
+  assert not converted(chat_id)
+  with engine.connect() as conn:
+    assert conn.execute(text("SELECT COUNT(*) FROM chat_transcript_damage")).scalar() == 0
+
+
+def test_readers_on_any_thread_never_wait_for_the_writer(monkeypatch):
+  """Worker threads, the event loop and a session inside its own write
+  transaction all read an unconverted chat directly."""
+  chat_id = seed(messages=[])
+  previous_release_writes(chat_id, [{"role": "user", "content": "previous"}])
+  monkeypatch.setattr(chat_writer, "get_writer", lambda: pytest.fail("a reader used the writer"))
   result = {}
 
   def read():
     with SessionLocal() as db:
-      chat = db.get(models.Chat, chat_id)
-      result["messages"] = list(rows.history(chat))
+      result["worker"] = list(rows.history(db.get(models.Chat, chat_id)))
 
   worker = threading.Thread(target=read)
   worker.start()
   worker.join()
-  assert result["messages"] == [{"role": "user", "content": "written by previous"}]
-  assert converted(chat_id)
-
-
-def test_event_loop_never_waits_for_a_conversion():
-  chat_id = seed(messages=[])
-  previous_release_writes(chat_id, [{"role": "user", "content": "previous"}])
 
   async def on_loop():
     with SessionLocal() as db:
-      chat = db.get(models.Chat, chat_id)
-      with pytest.raises(rows.TranscriptNotConverted):
-        rows.history(chat)
-      await rows.ensure_converted_async(chat_id)
-      return list(rows.history(chat))
+      return list(rows.history(db.get(models.Chat, chat_id)))
 
-  assert asyncio.run(on_loop()) == [{"role": "user", "content": "previous"}]
-
-
-def test_reader_inside_its_own_transaction_refuses_to_wait():
-  chat_id = seed(messages=[])
+  result["loop"] = asyncio.run(on_loop())
   other = seed("other", messages=[])
-  previous_release_writes(chat_id, [{"role": "user", "content": "previous"}])
   with SessionLocal() as db:
     db.get(models.Chat, other).title = "holds a write lock"
     db.flush()
-    with pytest.raises(RuntimeError, match="before this session's transaction"):
-      rows.count(db, chat_id)
+    result["in_transaction"] = rows.read_all(db, chat_id)
     db.rollback()
+  expected = [{"role": "user", "content": "previous"}]
+  assert result == {"worker": expected, "loop": expected, "in_transaction": expected}
+  assert not converted(chat_id)
 
 
 def test_writer_commands_convert_inline_before_mutating():
@@ -305,7 +361,7 @@ def test_background_conversion_resumes_from_durable_state_and_finishes():
   ids = [seed(f"bg-{i}", messages=[]) for i in range(5)]
   for chat_id in ids:
     previous_release_writes(chat_id, [{"role": "user", "content": f"from {chat_id}"}])
-  convert_through_writer(ids[2])  # A reader got there first.
+  convert_now(ids[2])  # A reader got there first.
   asyncio.run(chat_writer.convert_remaining_transcripts())
   assert chat_writer.transcript_conversion_status["state"] == "done"
   assert all(converted(chat_id) for chat_id in ids)
@@ -324,25 +380,45 @@ def test_background_conversion_pauses_at_the_critical_disk_floor(monkeypatch):
   assert not converted(chat_id)
 
 
-@pytest.mark.parametrize("fault", ["after_rows_deleted", "after_rows_inserted"])
+@pytest.mark.parametrize("fault", ["before_rows_rewritten", "after_rows_rewritten"])
 def test_a_crash_inside_conversion_leaves_the_legacy_value_authoritative(monkeypatch, fault):
   chat_id = seed(messages=[{"role": "user", "content": "row"}])
   previous_release_writes(chat_id, [{"role": "user", "content": "legacy"}])
-  real_insert = rows._insert
+  real_rewrite = rows._rewrite
 
-  def failing_insert(db, cid, start, messages):
-    if fault == "after_rows_inserted":
-      real_insert(db, cid, start, messages)
+  def failing_rewrite(db, cid, messages):
+    if fault == "after_rows_rewritten":
+      real_rewrite(db, cid, messages)
     raise RuntimeError("simulated crash")
 
-  monkeypatch.setattr(rows, "_insert", failing_insert)
+  monkeypatch.setattr(rows, "_rewrite", failing_rewrite)
   with pytest.raises(RuntimeError):
-    convert_through_writer(chat_id)
+    convert_now(chat_id)
   assert not converted(chat_id)
   assert json.loads(legacy_text(chat_id)) == [{"role": "user", "content": "legacy"}]
-  monkeypatch.setattr(rows, "_insert", real_insert)
-  convert_through_writer(chat_id)
+  monkeypatch.setattr(rows, "_rewrite", real_rewrite)
+  convert_now(chat_id)
   assert stored_rows(chat_id) == [{"role": "user", "content": "legacy"}]
+
+
+def test_reconversion_rewrites_only_the_positions_the_previous_release_changed():
+  history = [{"role": "user", "content": f"m{i}", "ts": i} for i in range(20)]
+  chat_id = seed(messages=history)
+  changed = [*history[:19], {"role": "user", "content": "edited", "ts": 19},
+             {"role": "assistant", "content": "added", "ts": 20}]
+  previous_release_writes(chat_id, changed)
+  statements = []
+  from sqlalchemy import event
+  listener = lambda *a: statements.append(a[2])
+  event.listen(engine, "before_cursor_execute", listener)
+  try:
+    convert_now(chat_id)
+  finally:
+    event.remove(engine, "before_cursor_execute", listener)
+  writes = [sql for sql in statements if sql.lstrip().upper().startswith(("INSERT INTO CHAT_MESSAGES",
+            "UPDATE CHAT_MESSAGES", "DELETE FROM CHAT_MESSAGES"))]
+  assert len(writes) == 2  # One update (position 19) and one insert (position 20).
+  assert stored_rows(chat_id) == changed
 
 
 def test_a_crash_inside_the_mirror_hook_commits_nothing(monkeypatch):
@@ -391,7 +467,7 @@ def test_search_reaches_previous_release_prose_after_conversion(db):
   chat_id = seed(messages=[])
   previous_release_writes(chat_id, [{"role": "user", "content": "converted prose"}])
   assert chat_search.search(db, "converted") == []
-  convert_through_writer(chat_id)
+  convert_now(chat_id)
   assert [hit["id"] for hit in chat_search.search(db, "converted")] == [chat_id]
 
 
@@ -533,10 +609,9 @@ async def test_boot_on_a_previous_release_database_converts_in_the_background(ca
     task = chat_writer._transcript_conversion_task
     assert task is not None
     await task
-  assert "TranscriptNotConverted" not in caplog.text
   assert "start transcript conversion" not in context.failed_tasks
-  if os.environ.get("MOBIUS_TEST_UNCONVERT_ON_REQUEST") == "1":
-    return  # The audit mode unconverts again before each later sweep.
+  if os.environ.get("MOBIUS_TEST_ALL_UNCONVERTED") == "1":
+    return  # That mode unconverts every chat again at each commit.
   assert all(converted(chat_id) for chat_id in ids)
   assert stored_rows(ids[0]) == [{"role": "user", "content": f"boot {ids[0]}"}]
 
@@ -611,47 +686,53 @@ def test_a_chat_that_fails_to_convert_never_stops_later_chats(monkeypatch):
     assert not rows.conversion_settled(db.get_bind())
 
 
-def test_a_reader_is_never_refused_by_the_background_disk_floor(monkeypatch):
-  """The floor defers bulk background work only; serving a request converts
-  that one chat, bounded by SQLite's own SQLITE_FULL."""
+def test_a_writes_conversion_is_never_refused_by_the_background_disk_floor(monkeypatch):
+  """The floor defers bulk background work only; a write converts its one
+  chat, bounded by SQLite's own SQLITE_FULL."""
   import app.resource_pressure as pressure
   chat_id = seed(messages=[])
   previous_release_writes(chat_id, [{"role": "user", "content": "x"}])
   monkeypatch.setattr(pressure, "resource_status",
                       lambda _dir: {"pressure": {"disk": {"state": "critical"}}})
-  convert_through_writer(chat_id)
+  convert_now(chat_id)
   assert converted(chat_id)
 
 
-def test_a_failed_conversion_answers_an_honest_503(client, auth, monkeypatch):
+def test_a_chat_that_cannot_convert_never_blocks_a_route(client, auth, monkeypatch):
+  """Reads serve its legacy value, DELETE works; only a write reports the error."""
   chat_id = seed(messages=[])
-  previous_release_writes(chat_id, [{"role": "user", "content": "x"}])
+  previous_release_writes(chat_id, [{"role": "user", "content": "kept"}])
+  real = rows._rewrite
 
-  def failing(body):
-    raise RuntimeError("projection bug")
+  def failing(db, failing_id, messages):
+    if failing_id == chat_id:
+      raise RuntimeError("projection bug")
+    return real(db, failing_id, messages)
 
-  monkeypatch.setattr(rows, "attributes", failing)
-  response = client.get(f"/api/chats/{chat_id}", headers=auth)
-  assert response.status_code == 503
-  assert "couldn't be prepared" in response.json()["detail"]
+  monkeypatch.setattr(rows, "_rewrite", failing)
+  asyncio.run(chat_writer.convert_remaining_transcripts())
   assert "projection bug" in chat_writer.transcript_conversion_status["failed"][chat_id]
-  # Worker-thread readers (sync routes anywhere) raise the same mapped error.
-  result = {}
-
-  def read():
-    with SessionLocal() as db:
-      try:
-        rows.history(db.get(models.Chat, chat_id))
-      except rows.TranscriptUnavailable as exc:
-        result["error"] = exc
-
-  worker = threading.Thread(target=read)
-  worker.start()
-  worker.join()
-  assert result["error"].in_progress is False
+  response = client.get(f"/api/chats/{chat_id}", headers=auth)
+  assert response.status_code == 200, response.text
+  assert [m["content"] for m in response.json()["messages"]] == ["kept"]
+  assert client.get(f"/api/chats/{chat_id}/edit-diffs", headers=auth).status_code == 200
+  assert client.delete(f"/api/chats/{chat_id}", headers=auth).status_code in (200, 204)
 
 
-def test_finished_background_conversion_stops_per_request_checks():
+def test_rearming_keeps_each_chats_failure_record(monkeypatch):
+  chat_writer.transcript_conversion_status.update(
+    state="blocked", error="disk", failed={"earlier": "RuntimeError: kept"})
+  started = []
+  monkeypatch.setattr(chat_writer, "start_transcript_conversion", lambda: started.append(1))
+  assert chat_writer.rearm_transcript_conversion("normal")
+  assert started
+  asyncio.run(chat_writer.convert_remaining_transcripts())
+  assert chat_writer.transcript_conversion_status["failed"] == {"earlier": "RuntimeError: kept"}
+
+
+@pytest.mark.skipif(os.environ.get("MOBIUS_TEST_ALL_UNCONVERTED") == "1",
+                    reason="that mode never records the all-converted fact")
+def test_finished_background_conversion_stops_per_read_marker_checks():
   chat_id = seed(messages=[])
   previous_release_writes(chat_id, [{"role": "user", "content": "x"}])
   with SessionLocal() as db:
@@ -660,12 +741,23 @@ def test_finished_background_conversion_stops_per_request_checks():
   statements = []
   from sqlalchemy import event
   listener = lambda *a: statements.append(a[2])
-  event.listen(engine, "before_cursor_execute", listener)
-  try:
-    asyncio.run(rows.ensure_converted_async(chat_id))
-  finally:
-    event.remove(engine, "before_cursor_execute", listener)
+  with SessionLocal() as db:
+    event.listen(engine, "before_cursor_execute", listener)
+    try:
+      assert rows.legacy_messages(db, chat_id) is None
+    finally:
+      event.remove(engine, "before_cursor_execute", listener)
   assert statements == []
+
+
+def test_search_drops_prose_the_previous_release_replaced(db):
+  chat_id = seed(messages=[{"role": "user", "content": "zebracorn sighting"}], title="Zoo")
+  assert [hit["id"] for hit in chat_search.search(db, "zebracorn")] == [chat_id]
+  previous_release_writes(chat_id, [{"role": "user", "content": "nothing here"}])
+  assert chat_search.search(db, "zebracorn") == []
+  assert [hit["id"] for hit in chat_search.search(db, "zoo")] == [chat_id]  # Titles stay.
+  convert_now(chat_id)
+  assert chat_search.search(db, "zebracorn") == []
 
 
 def test_search_survives_prose_with_a_lone_surrogate(db):
@@ -706,12 +798,32 @@ def test_boot_reinstalls_a_lost_transcript_trigger_and_recovers_missed_writes():
   assert ensure_transcript_triggers(engine) == []
   # Every chat re-converts from its exact legacy value; nothing is lost.
   assert not converted(missed)
-  convert_through_writer(missed)
+  convert_now(missed)
   assert [m["content"] for m in stored_rows(missed)] == ["f1", "appended by previous"]
   # Detection works again.
   chat_id = seed(messages=[{"role": "user", "content": "x"}])
   previous_release_writes(chat_id, [])
   assert not converted(chat_id)
+
+
+def test_trigger_repair_removes_what_deleted_chats_left_and_refreshes_titles():
+  from app.schema_migrations import ensure_transcript_triggers
+  kept = seed("kept", messages=[{"role": "user", "content": "kept prose"}], title="Old")
+  gone = seed("gone", messages=[{"role": "user", "content": "gone prose"}], title="Gone")
+  with engine.begin() as conn:
+    conn.exec_driver_sql("DROP TRIGGER chats_deleted")
+    conn.exec_driver_sql("DROP TRIGGER chats_title_au")
+    conn.exec_driver_sql("DELETE FROM chats WHERE id = 'gone'")
+    conn.exec_driver_sql("UPDATE chats SET title = 'New' WHERE id = 'kept'")
+  assert sorted(ensure_transcript_triggers(engine)) == ["chats_deleted", "chats_title_au"]
+  with engine.connect() as conn:
+    for table in ("chat_messages", "chat_search_entries", "chat_transcript_state"):
+      assert conn.execute(text(f"SELECT COUNT(*) FROM {table} WHERE chat_id = :id"),
+                          {"id": gone}).scalar() == 0, table
+    assert conn.execute(text(
+      "SELECT text FROM chat_search_entries WHERE chat_id = :id AND seq = -1"), {"id": kept},
+    ).scalar() == "New"
+  assert stored_rows(kept) == [{"role": "user", "content": "kept prose"}]
 
 
 def test_a_failed_commit_never_loses_a_new_chats_initial_transcript(monkeypatch):

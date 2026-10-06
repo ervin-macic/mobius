@@ -19,15 +19,17 @@ sees every chat completely. No updater, deployment controller or database
 - Every row mutation goes through a `chat_writer` domain command calling
   `transcript_rows`; `chat_writer.create_chat` is the only way to create a chat.
   Mutations mark the chat dirty in its Session. One `before_commit` listener
-  (`transcript_rows._mirror_changed_transcripts`) then runs, per changed chat,
-  one SQL statement that rewrites `chats.messages` as
-  `'[' || group_concat(body, ', ' ORDER BY seq) || ']'`, recomputes
-  `has_messages` and moves `updated_at`. Bodies are default `json.dumps` text,
-  so this is byte-for-byte `json.dumps(list)`: exactly what the previous
-  release writes and decodes itself. No caller can skip it.
+  (`transcript_rows._mirror_changed_transcripts`) then, per changed chat,
+  reads the bodies in primary-key order and rewrites `chats.messages` as
+  `'[' + ', '.join(bodies) + ']'`, with `has_messages` and `updated_at`.
+  Bodies are default (ASCII) `json.dumps` text, so this is byte-for-byte
+  `json.dumps(list)`: exactly what the previous release writes and decodes
+  itself. No caller can skip it. (SQLite's ordered `group_concat` builds a
+  temporary B-tree per commit, about 3x slower on a 20 MB chat; the primary
+  key already yields position order.)
 - Cost: each committing transaction rewrites a changed chat's whole legacy
-  value, the previous release's own write cost, in SQLite rather than Python.
-  `SQLITE_MAX_LENGTH` bounds one chat's value, as it always did.
+  value, the previous release's own write cost. `SQLITE_MAX_LENGTH` bounds
+  one chat's value, as it always did.
 
 ### Detecting the previous release's writes without scanning
 
@@ -38,8 +40,8 @@ this release's own update. So:
 
 | Previous release does | Effect |
 |---|---|
-| updates `messages` (its ORM) | marker deleted, chat reconverted |
-| inserts a chat | no marker, chat converted |
+| updates `messages` (its ORM) | marker deleted; the chat reads from `messages` until converted again |
+| inserts a chat | no marker; the chat reads from `messages` until converted |
 | deletes or purges a chat | `chats_deleted` removes rows, search entries, damage copies, marker and its own search documents |
 | renames a chat | title trigger updates the search entry |
 
@@ -49,97 +51,88 @@ the migration ledger, `mapped_schema_gaps`, the readiness table probe) ignore
 the additions. Its own search tables are left to it; it reconciles them from
 `updated_at` after a rollback.
 
-### Conversion never delays readiness
+### Reads never convert
 
-- `transcript_rows.convert` makes one chat authoritative in one transaction:
-  delete stale rows, parse the legacy bytes, insert rows, insert the marker.
-  Valid legacy values are not rewritten (they decode equal).
+- While `chats.messages` exists, an unconverted chat's authority is its
+  legacy value, so every `transcript_rows` reader (`history`/`History`, `at`,
+  `count`, `iterate`, `reverse_iter`, `read_all`, `metadata`,
+  `assistant_index`, `client_message_seq`, `attachment_bodies`,
+  `max_timestamp`) reads it for such a chat, decoding it once per call or
+  `History` handle, exactly as the previous release reads it. A value that
+  is not a JSON list reads as the damage placeholder (a JSON `null` as an
+  empty transcript), writing nothing. A converted chat reads its rows.
+- So no reader converts, waits for the writer or depends on its thread,
+  route or startup order: an event-loop reader that "forgot to convert" is
+  not a possible bug. The marker and the value it selects come from one
+  statement, or from one snapshot under `pin_read_snapshot`.
+- Only a mutation converts (`transcript_rows.convert`), inline in its own
+  transaction, which is the writer's: the change and the conversion commit
+  or roll back together. Conversion rewrites rows by position against the
+  legacy value (as `replace_all` does), so re-converting a chat the previous
+  release touched writes only the positions it changed. Valid legacy values
+  are not rewritten (they decode equal). A legacy value that is not a JSON
+  list keeps its exact bytes in `chat_transcript_damage`, written in the
+  same transaction that replaces the chat's rows (and so its mirror) with a
+  visible recovery placeholder.
+- After every command the writer rolls back writes the command left
+  uncommitted, so a no-op command never holds SQLite's write lock.
+
+### Background conversion
+
 - A background task (`chat_writer.convert_remaining_transcripts`) submits one
-  `ConvertNextTranscript` writer command per chat in id order. A chat whose
-  conversion fails is recorded (`/api/debug/status` → `transcript_conversion`,
-  per chat) and skipped, never retried by the loop and never hidden behind a
-  placeholder: its legacy value stays authoritative and later chats still
-  convert. Projections are total over arbitrary JSON, so such a failure means
-  a bug, which stays visible.
-- The disk rule is split by cause, not by path. The background loop is
-  deferrable bulk work. It must never itself push the volume into the
-  critical tier, where agent admission defers every turn, so it stops one
-  tier earlier, at the existing "constrained" verdict, checked before each
-  chat. A per-chat byte bound against the critical floor would be the
-  tighter rule, but it is not provable: an FTS5 insert can trigger an
-  incremental merge whose output is proportional to the whole search index,
-  not to the chat, and those pages sit in the WAL until a checkpoint. The
-  stop is recorded; the existing capacity-monitor tick re-arms the loop when
-  it observes disk pressure back to normal (no timer of its own), and the
-  next boot resumes it in any case (the marker table is its durable
-  progress). The residual risk is a single chat whose conversion, including
-  any merge it triggers, needs more than the gap between the constrained and
-  critical tiers (at least 32 MiB; 5% of the volume, up to 1 GiB). A
-  conversion that serves a request (a reader's, or inline in a writer
-  command) needs that one chat and is bounded by it, so it never consults
-  the tiers; SQLite's own `SQLITE_FULL` is its bound, and a failure leaves
-  the legacy value authoritative. No reader is refused because of disk tiers.
+  `ConvertNextTranscript` writer command per chat in id order. It gives
+  search its coverage and later writes their speed; nothing waits for it. A
+  chat whose conversion fails is recorded (`/api/debug/status` →
+  `transcript_conversion`, per chat) and skipped in that run. Its legacy
+  value stays authoritative and readable, later chats still convert, and no
+  route is blocked: only a write to that chat fails, with the error.
+  Projections are total over arbitrary JSON, and bytes that are not a
+  message list take the damage path, so such a failure (for example a
+  `RecursionError` on deeply nested JSON) means a bug, which stays visible.
+  Release 2's contraction requires the failed set to be empty (below).
+- The disk rule. The background loop is deferrable bulk work. It must never
+  itself push the volume into the critical tier, where agent admission
+  defers every turn, so it stops one tier earlier, at the existing
+  "constrained" verdict, checked before each chat. A per-chat byte bound
+  against the critical floor would be the tighter rule, but it is not
+  provable: an FTS5 insert can trigger an incremental merge whose output is
+  proportional to the whole search index, not to the chat, and those pages
+  sit in the WAL until a checkpoint. The stop is recorded; the existing
+  capacity-monitor tick re-arms the loop when it observes disk pressure back
+  to normal (no timer of its own), keeping each chat's failure record until
+  it converts, and the next boot resumes it in any case (the marker table is
+  its durable progress). Conversion inline in a write needs that one chat
+  and is bounded by it, so it never consults the tiers; SQLite's own
+  `SQLITE_FULL` is its bound. No reader is affected by disk tiers.
 - Disk cost: conversion adds about 1x the converted chats' legacy transcript
   bytes (measured 1.09x: rows, search entries and indexes; the legacy column
   is kept). A rollback does not return it, and neither does release 2's
   column drop without a VACUUM. `/api/debug/status` states this beside the
   pending count.
-- Unconverted chats only come into existence while older code runs, so all
-  of them exist at boot; afterwards the only unconverted chats are those
-  whose conversion failed or was deferred. Before boot recovery, sweeps or
-  any resume, a startup step (`convert live transcripts`) converts the live
-  working set (`transcript_rows.live_working_set`): only work actually in
-  flight, namely chats with a non-terminal run, chats with queued messages,
-  and both ends of every delegation whose parent or child has a non-terminal
-  run. Startup tasks run before the server answers, so this set is bounded by
-  in-flight work, never by history: on this instance 31 chats and 10.8 MB
-  (under a second), where including idle open Goals would pull in 539 chats
-  and 340 MB (25–30 s before the server answers). An idle open Goal is not
-  in flight; its next turn, wake or steer converts what it reads first. It
-  is request-serving conversion: no disk tier, no dependence on background
-  progress. Later event-loop readers of other chats await them first
-  (`delegations.ensure_parent_helpers_converted`: resumed turns, wake and
-  steer paths, the continuation and wedged sweeps), and each
-  continuation-sweep candidate is isolated, so one chat never stops every
-  resume. One helper whose conversion fails never breaks its parent: the
-  parent's own conversion is required, each helper's is not, and a helper
-  with a recorded conversion failure reads as "Result unavailable" with that
-  error in results, wake and steer notices.
-- Search reads only converted chats' message text (titles are indexed for
-  every chat). The search response carries `X-Search-Unindexed-Chats`, the
-  number of chats not yet converted, and the shell shows a quiet note when it
-  is above zero; there is no fallback read of the previous release's index.
-- A legacy JSON `null` converts to an empty transcript, as the previous
-  release displayed it.
-- Any conversion that fails while serving a request raises
-  `transcript_rows.TranscriptUnavailable`, which one app-level handler maps
-  to 503 for every route, sync or async: "being prepared" only when the
-  conversion simply did not finish in time, otherwise "couldn't be prepared;
-  the error is recorded in diagnostics".
 - Once the loop leaves no chat unconverted, a per-process fact
-  (`transcript_rows.conversion_settled`) ends per-request checks: nothing in
-  this process can unconvert a chat, because its own mirror re-marks.
-- A chat read or written before then is converted on demand through one seam,
-  `transcript_rows.require_rows`: the writer converts inline; a worker thread
-  waits for the writer's `ConvertTranscript`; the event-loop thread never
-  waits and raises `TranscriptNotConverted`. Event-loop callers await
-  `transcript_rows.ensure_converted_async` first: the chat routers do so for
-  their path's `chat_id` (`routes.chats.converted_path_chat`), and the few
-  background coroutines that read transcripts call it explicitly.
+  (`transcript_rows.conversion_settled`) ends the per-read marker check:
+  nothing in this process can unconvert a chat, because its own mirror
+  re-marks.
 - The commit mirror's changed-chat set belongs to the root transaction: it
   survives a rolled-back savepoint and a failed, retried commit, and is
   cleared only when the root transaction ends (commit, rollback or close).
-- A legacy value that is not a JSON list keeps its exact bytes in
-  `chat_transcript_damage`, written in the same transaction that replaces the
-  chat's rows (and so its mirror) with a visible recovery placeholder.
 
 ### Reads and search
 
 - `transcript_rows.history(chat)` is a position-addressed view sized when
-  opened; iteration streams one statement (one snapshot); an index that has
-  since vanished raises `IndexError`. Targeted reads (`at`, `client_message_seq`,
-  `assistant_index`, `max_timestamp`, `metadata`) never decode ordinary bodies.
-  Detail and log read owners pin one SQLite snapshot with `pin_read_snapshot`.
+  opened; for rows, iteration streams one statement (one snapshot) and an
+  index that has since vanished raises `IndexError`. For a converted chat,
+  targeted reads (`at`, `client_message_seq`, `assistant_index`,
+  `max_timestamp`, `metadata`, `attachment_bodies`) never decode ordinary
+  bodies. Detail and log read owners pin one SQLite snapshot with
+  `pin_read_snapshot`.
+- Search reads only converted chats' message text: while `chats.messages`
+  exists, a prose entry counts only for a chat with a marker, because the
+  previous release may have replaced that transcript since the entry was
+  derived. Titles are indexed and found for every chat. The search response
+  carries `X-Search-Unindexed-Chats`, the number of chats not yet converted,
+  and the shell shows a quiet note when it is above zero; there is no
+  fallback read of the previous release's index.
 - `chat_search_entries` (stripped title at seq -1, one row per prose item,
   FTS5) is maintained by triggers on `chat_messages` and `chats.title` for
   every writer. Search reads entry text as bytes and decodes with
@@ -148,10 +141,13 @@ the additions. Its own search tables are left to it; it reconciles them from
   one `sqlite_master` read) while `chats.messages` exists and reinstalls any
   that are missing from 0087's frozen DDL, logging it. When the detection
   trigger itself was missing, the same transaction clears every conversion
-  marker, so each chat re-converts from `chats.messages`, which is exact in
-  every case (this release's mirror or the previous release's newer write): a later table rebuild
-  would otherwise silently stop detecting the previous release's writes. A
-  test applies every migration and asserts they remain.
+  marker, so each chat reads from and re-converts from `chats.messages`,
+  which is exact in every case (this release's mirror or the previous
+  release's newer write): a later table rebuild would otherwise silently
+  stop detecting the previous release's writes. The repair also removes the
+  rows, entries, damage copies and markers of chats deleted while
+  `chats_deleted` was missing, and rebuilds every title entry. A test
+  applies every migration and asserts the triggers remain.
   Search only reads, applying drawer visibility at query time.
 
 ### The next release's database
@@ -168,15 +164,17 @@ supported database; migration `0087_transcript_rows` refuses others.
 
 - Refuse before any write when `chats.messages` exists and any chat lacks a
   marker (`transcript_conversion_incomplete`); the updater rolls back and
-  release 1 finishes converting.
+  release 1 finishes converting. So the contraction requires release 1's
+  failed-conversion set to be empty: a chat that cannot convert must be
+  fixed (or its failure understood) first.
 - One migration: drop `chats_messages_written`, recreate `chats_deleted`
   without the marker and old-search lines, drop `chat_transcript_state` and
   the previous release's search tables, clear and drop `chats.messages`.
 - Remove `chats_messages_written` from `TRANSCRIPT_TRIGGERS` (boot's guard then
   checks the permanent triggers always), and delete `legacy_present` and its
   branches, the mirror clause of the commit
-  hook, `require_rows`, `convert`, the conversion commands and task, the
-  placeholder supply, the `legacy_messages` mapping and its gap-check skip.
+  hook, the legacy branch of every reader (`legacy_messages`), `convert`, the
+  conversion command and task, the placeholder supply, the `legacy_messages` mapping and its gap-check skip.
   `chat_transcript_damage` rows stay. Change `reflection-evidence.py` to count
   rows.
 - The previous release refuses a release-2 database by its own schema check

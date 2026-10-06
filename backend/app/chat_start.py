@@ -174,8 +174,6 @@ async def start_programmatic_chat_continuation(
   existing observation claim across this start. They still enter the queue
   lock here, preserving the canonical transition -> queue lock order.
   """
-  # Event-loop code never waits on a conversion inside a transcript read.
-  await transcript_rows.ensure_converted_async(chat_id)
   from app import chat_queue, models, schemas
   from app.chat import (
     _schedule_continuation,
@@ -371,8 +369,6 @@ async def start_programmatic_activity_continuation(
   then supplies ``run_chat`` a small ephemeral provider protocol prompt; it is
   never appended to ``messages`` or ``pending_messages``.
   """
-  # Event-loop code never waits on a conversion inside a transcript read.
-  await transcript_rows.ensure_converted_async(chat_id)
   from app import chat_queue, schemas
   from app.chat import (
     _schedule_continuation,

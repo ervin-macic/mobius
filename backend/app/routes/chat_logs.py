@@ -137,7 +137,7 @@ def list_chat_logs(
   rows = base.limit(limit + 1).all()
   has_more = len(rows) > limit
   rows = rows[:limit]
-  transcript_rows.pin_read_snapshot(db, *rows)
+  transcript_rows.pin_read_snapshot(db)
 
   items = []
   for c in rows:
@@ -208,7 +208,7 @@ def get_chat_log(
   readable only during their recovery window.
   """
   _gate_summary(principal, db, include_deleted=include_deleted)
-  transcript_rows.pin_read_snapshot(db, chat_id)
+  transcript_rows.pin_read_snapshot(db)
 
   if include_deleted:
     cutoff = now_naive_utc() - SOFT_DELETE_TTL

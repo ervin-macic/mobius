@@ -94,7 +94,14 @@ def _snippet(
 
 
 def _candidate_rows(db: Session, tokens: list[str]):
-  """Stream FTS candidates of live chats, grouped by chat and position."""
+  """Stream FTS candidates of live chats, grouped by chat and position.
+
+  While the previous release's column exists, a chat's prose entries count
+  only once it is converted: the previous release may have replaced its
+  transcript since they were derived. Titles always count.
+  """
+  from app import transcript_rows
+
   return db.execute(
     sql(
       # Raw bytes: json_extract renders an escaped lone surrogate as bytes
@@ -106,9 +113,12 @@ def _candidate_rows(db: Session, tokens: list[str]):
       "JOIN chat_search_entries e ON e.id = chat_search_entries_fts.rowid "
       "JOIN chats chat ON chat.id = e.chat_id "
       "WHERE chat.deleted_at IS NULL AND chat_search_entries_fts MATCH :query "
+      "AND (e.seq < 0 OR :rows_authoritative OR EXISTS "
+      "(SELECT 1 FROM chat_transcript_state s WHERE s.chat_id = e.chat_id)) "
       "ORDER BY e.chat_id, e.seq"
     ).execution_options(stream_results=True, max_row_buffer=256),
-    {"query": _fts_query(tokens)},
+    {"query": _fts_query(tokens),
+     "rows_authoritative": transcript_rows.rows_are_authority(db)},
   )
 
 

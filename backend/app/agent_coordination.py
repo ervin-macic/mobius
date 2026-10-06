@@ -1734,7 +1734,6 @@ def _interrupt_peer_carrier(
 
 async def _steer_running_recipient(chat_id: str) -> str:
   """Steer one live recipient, or report the durable fallback to use."""
-  await transcript_rows.ensure_converted_async(chat_id)
   import app.chat_queue as chat_queue
   from app import questions
   from app.chat import is_chat_running, is_draining

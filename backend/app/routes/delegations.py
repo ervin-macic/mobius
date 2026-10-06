@@ -296,7 +296,6 @@ async def submit_or_attach(
     from app.goal_plans import publish_plan_for_delegation
     publish_plan_for_delegation(db, row)
     publish_parent_waiting_changed(row.parent_chat_id)
-  await transcript_rows.ensure_converted_async(row.child_chat_id, db)
   payload = serialize_delegation(db, row)
   payload["attached"] = attached
   return payload
@@ -477,7 +476,6 @@ async def retry_delegation(
   started = await retry_limit_park(db, row, run_token=body.run_token)
   db.rollback()
   row = _row_for_principal(db, delegation_id, principal)
-  await transcript_rows.ensure_converted_async(row.child_chat_id, db)
   payload = serialize_delegation(db, row)
   payload["retry_started"] = started
   publish_parent_waiting_changed(row.parent_chat_id)
@@ -503,7 +501,6 @@ async def cancel_delegation(
       )
     db.rollback()
     row = _row_for_principal(db, delegation_id, principal)
-  await transcript_rows.ensure_converted_async(row.child_chat_id, db)
   payload = serialize_delegation(db, row)
   from app.goal_plans import publish_plan_for_delegation
   publish_plan_for_delegation(db, row)

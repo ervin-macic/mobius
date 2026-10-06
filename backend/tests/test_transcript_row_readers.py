@@ -1,5 +1,7 @@
 """Materialized row reads retain legacy coordinates without loading full bodies."""
 
+import pytest
+
 from app import chat_writer, transcript_rows
 from app.chat_transcript import materialized_messages
 from app.routes.chats import _chat_detail_window
@@ -77,6 +79,7 @@ def test_search_applies_legacy_string_visibility_at_query_time(db):
   assert [r["id"] for r in chat_search.search(db, "secretquokka")] == ["hidden-legacy"]
 
 
+@pytest.mark.converted_chats  # A converted chat's row-path query shape.
 def test_whole_materialized_iteration_streams_one_statement_not_per_row_queries(db):
   from sqlalchemy import event
   chat = chat_writer.create_chat(id="reader-streaming", messages=[

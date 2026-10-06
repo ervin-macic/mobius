@@ -88,6 +88,7 @@ def test_metadata_preserves_both_anchor_identities_and_timestamp_type(db):
   assert projected["ts"] == 4.5
 
 
+@pytest.mark.converted_chats  # A converted chat's row-path query shape.
 def test_bounded_window_does_not_hydrate_earlier_bodies(db):
   chat = seed(db, messages=[{"role": "user", "content": "x" * 50_000, "ts": i} for i in range(100)])
   statements = []
@@ -129,7 +130,7 @@ def test_metadata_does_not_decode_normal_message_bodies(db):
 
 def test_page_metadata_and_bodies_share_a_snapshot_during_concurrent_append(db):
   chat = seed(db, messages=[{"role": "user", "ts": 1}])
-  rows.pin_read_snapshot(db, chat.id)
+  rows.pin_read_snapshot(db)
   view = rows.history(chat)
   assert len(view) == 1
   with SessionLocal() as other:
