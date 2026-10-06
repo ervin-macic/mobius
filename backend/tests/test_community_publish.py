@@ -459,6 +459,41 @@ def test_content_scan_still_catches_credentials_in_any_directory(tmp_path):
   assert raised.value.code == "secret_detected"
 
 
+@pytest.mark.parametrize("folder", ["secrets", "credentials"])
+def test_content_scan_catches_ascii_credentials_in_invalid_utf8(tmp_path, folder):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {
+    f"{folder}/config.txt": b"\xff\nTOKEN=ghp_" + b"A" * 36,
+  })
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "secret_detected"
+
+
+@pytest.mark.parametrize("character", [
+  "\u2028", "\u2029", "\u200e", "\u200f", "\u061c", "\u200b", "\u200c",
+  "\u200d", "\u2060", "\u180e", "\u2062", "\ufeff",
+])
+def test_snapshot_refuses_invisible_filename_characters(tmp_path, character):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {f"look{character}alike.js": b"export {}"})
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "invalid_path"
+
+
+def test_snapshot_allows_slack_placeholder(tmp_path):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {"README.md": b"Set xoxb-your-token-here in the example."})
+
+  _, files = build_public_snapshot(app)
+  assert "README.md" in {item["path"] for item in files}
+
+
 def test_snapshot_applies_the_same_icon_rule_as_apply(tmp_path):
   repo, app, _ = _app_repo(tmp_path)
   manifest = json.loads((repo / "mobius.json").read_text())
@@ -481,7 +516,7 @@ def test_snapshot_applies_the_same_icon_rule_as_apply(tmp_path):
   "sk-proj-" + "A" * 20,
   "rk_live_" + "A" * 20,
   "sk_live_" + "A" * 20,
-  "xoxb-" + "A" * 10,
+  "xoxb-1234567890-1234567890-" + "A" * 24,
 ])
 def test_snapshot_refuses_additional_recognizable_credential_patterns(
   tmp_path, credential,

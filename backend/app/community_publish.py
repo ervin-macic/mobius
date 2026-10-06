@@ -30,9 +30,9 @@ MAX_STORE_SCREENSHOTS = 5
 _OID = re.compile(r"^[0-9a-f]{40,64}$")
 # Git, GitHub and install accept any other file name, including spaces,
 # brackets, tildes and non-ASCII letters. Refuse only names that cannot be
-# shown or handled faithfully: control characters (NUL, newlines, terminal
-# escapes) and bidirectional overrides that display a name as something else.
-_UNSAFE_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+# shown or handled faithfully: control, format, and line/paragraph separators
+# include invisible and bidirectional characters that disguise a name.
+_UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Zl", "Zp"}
 # Path segments refused anywhere in a published tree, each with the reason the
 # author sees. Credentials are found by file name and content below rather than
 # by guessing from a directory name.
@@ -64,7 +64,7 @@ _SECRET_PATTERNS = (
   re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
   re.compile(r"\bsk-(?:ant-|proj-)[A-Za-z0-9_-]{20,}"),
   re.compile(r"\b[rs]k_live_[A-Za-z0-9]{20,}\b"),
-  re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+  re.compile(r"\bxox[abprs]-[0-9]{8,}-[0-9]{8,}-[A-Za-z0-9]{10,}\b"),
 )
 _JOURNAL_STATES = {"listing_pending", "failed", "live"}
 _LOCAL_APP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
@@ -311,7 +311,7 @@ def _validate_path(path: str) -> None:
     or len(path.encode("utf-8")) > MAX_PATH_BYTES
     or str(pure) != path
     or any(part in {"", ".", ".."} for part in parts)
-    or _UNSAFE_PATH_CHARS.search(path)
+    or any(unicodedata.category(char) in _UNSAFE_PATH_CATEGORIES for char in path)
   ):
     raise CommunityPublicationError(
       f"The path {path!r} cannot be published. Use a relative path of at most "
@@ -334,10 +334,8 @@ def _validate_path(path: str) -> None:
 
 
 def _scan_content(path: str, content: bytes) -> None:
-  try:
-    text = content.decode("utf-8")
-  except UnicodeDecodeError:
-    return
+  # Replacement preserves ASCII token runs even in otherwise binary files.
+  text = content.decode("utf-8", errors="replace")
   if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
     raise CommunityPublicationError(
       f"A likely credential was found in {path}. Remove it before publishing.",
