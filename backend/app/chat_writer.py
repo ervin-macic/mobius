@@ -65,6 +65,7 @@ from app.goals import admit_goal
 from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
 from app.json_safety import json_safe
+from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
   TOOL_OUTPUT_INLINE_THRESHOLD,
   build_assistant_message,
@@ -3514,6 +3515,7 @@ class ChatWriterActor:
       existing.append(cmd.user_msg)
     if not resuming:
       transcript_rows.append(db, chat, cmd.user_msg)
+      claim_uploads(chat, cmd.user_msg.get("attachments"))
     # Allocate the current assistant's stable display id while history and the
     # queue are already in memory. Streaming snapshots can then update only the
     # small live value without rereading the historical JSON blob.
@@ -4366,10 +4368,11 @@ class ChatWriterActor:
       )
       applied = True
     else:
-      metadata = (
-        {"selected_options": cmd.selected_options}
-        if cmd.selected_options is not None else None
-      )
+      metadata = {}
+      if cmd.selected_options is not None:
+        metadata["selected_options"] = cmd.selected_options
+      if cmd.answers and new_msg.get("attachments"):
+        metadata["attachments"] = new_msg["attachments"]
       applied = apply_answers_to_last_question(
         chat, cmd.answers, cmd.question_id, metadata=metadata,
       )
@@ -4407,6 +4410,7 @@ class ChatWriterActor:
     else:
       pending.append(new_msg)
     chat.pending_messages = pending
+    claim_uploads(chat, new_msg.get("attachments"))
     if applied:
       # Both a recovered answer and an early continuation-card answer use the
       # queue. Retire the question, but leave a still-running turn's browser
@@ -5239,6 +5243,7 @@ class ChatWriterActor:
     remaining = [m for m in pending if cid_of(m) != cmd.cid]
     if len(remaining) != len(pending):
       chat.pending_messages = remaining
+      release_uploads(chat, [m for m in pending if cid_of(m) == cmd.cid])
       chat.updated_at = datetime.now(UTC)
       if not _commit_or_rollback(db):
         raise _PersistFailed("CancelPending did not persist")
@@ -7204,7 +7209,7 @@ def _question_answer_fields(block: dict) -> dict:
   """Persisted settlement wins over stale streaming snapshots, even without Yes."""
   return {
     key: copy.deepcopy(block[key])
-    for key in ("answers", "answer_turn", "selected_options", "platform_action")
+    for key in ("answers", "answer_turn", "selected_options", "platform_action", "attachments")
     if key in block
   }
 
