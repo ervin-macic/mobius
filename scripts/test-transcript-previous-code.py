@@ -16,8 +16,9 @@ disposable SQLite file:
    every chat exactly as this release's rows hold it, then write: an append,
    a new chat, a rename and a purge;
 3. this release must find exactly the chats the previous one changed or
-   created unconverted, nothing left of the purged chat, and after
-   converting, every transcript equal to the previous release's view.
+   created unconverted, nothing left of the purged chat, every transcript
+   read (before converting) equal to the previous release's view, and the
+   same again after converting.
 
 Prints one JSON report and exits non-zero on the first broken contract.
 """
@@ -104,12 +105,16 @@ with SessionLocal() as db:
     unconverted.append(after)
   leftovers = {t: db.execute(text(f"SELECT COUNT(*) FROM {t} WHERE chat_id = 'purge-me'")).scalar()
                for t in ("chat_messages", "chat_search_entries", "chat_transcript_state", "chat_transcript_damage")}
+  # Before converting, readers serve each unconverted chat from its legacy value.
+  before = {c.id: {"title": c.title, "messages": rows.read_all(db, c)} for c in db.query(models.Chat)}
+  db.rollback()
   db.info[rows.WRITER_SESSION] = True
   for chat_id in list(unconverted):
     rows.convert(db, chat_id)
     db.commit()
   view = {c.id: {"title": c.title, "messages": rows.read_all(db, c)} for c in db.query(models.Chat)}
-print(json.dumps({"unconverted": unconverted, "leftovers": leftovers, "view": view}))
+print(json.dumps({"unconverted": unconverted, "leftovers": leftovers, "view": view,
+                  "before": before}))
 '''
 
 THIS_MIRROR = r'''
@@ -184,11 +189,14 @@ def _run_rounds(previous_ref: str, work: Path) -> dict:
   report["unconverted_after_previous"] = returned["unconverted"]
   report["purge_leftovers"] = returned["leftovers"]
   report["nothing_lost"] = canonical(returned["view"]) == canonical(previous_round["after"])
+  report["reads_exact_before_converting"] = (
+    canonical(returned["before"]) == canonical(previous_round["after"]))
   report["mirror_not_byte_exact_after_return"] = run(this_backend, env, THIS_MIRROR)["differ"]
   ok = (not mismatched and report["previous_sees_unconverted_legacy"]
         and not report["mirror_not_byte_exact"] and not report["mirror_not_byte_exact_after_return"]
         and returned["unconverted"] == ["bulk-00", "bulk-01", "from-previous"]
-        and set(returned["leftovers"].values()) == {0} and report["nothing_lost"])
+        and set(returned["leftovers"].values()) == {0} and report["nothing_lost"]
+        and report["reads_exact_before_converting"])
   report["ok"] = ok
   if mismatched:
     report["mismatched"] = mismatched[:5]

@@ -401,11 +401,13 @@ def test_hot_terminal_write_updates_only_owned_message(actor, command, provider)
     "role": "assistant", "id": "owned-run", "ts": 500,
     "blocks": [{"type": "text", "content": "partial"}],
   }])
-  statements = []
+  statements, mirrors = [], []
 
   def record(_conn, _cursor, statement, _parameters, _context, _many):
     if "chat_messages" in statement.lower():
       statements.append(statement.lower())
+    if statement.lower().lstrip().startswith("update chats set messages"):
+      mirrors.append(statement)
 
   event.listen(engine, "before_cursor_execute", record)
   try:
@@ -431,11 +433,14 @@ def test_hot_terminal_write_updates_only_owned_message(actor, command, provider)
 
   writes = [sql for sql in statements if sql.lstrip().startswith(
     ("update", "insert", "delete"))]
-  # One owned row, plus release 1's single legacy-mirror statement for the
-  # chat (transcript_rows; rebuilt inside SQLite, never decoded here).
-  assert [sql.split()[1] for sql in writes] == ["chat_messages", "chats"], statements
-  assert "group_concat" in writes[1], statements
+  # One owned row, plus release 1's single legacy-mirror update for the chat
+  # (transcript_rows joins the stored body text in position order and never
+  # decodes it).
+  assert [sql.split()[1] for sql in writes] == ["chat_messages"], statements
+  assert len(mirrors) == 1, mirrors
+  mirror_read = "select body from chat_messages where chat_id = ? order by seq"
   assert all("message_key" in sql or "seq =" in sql or "ts" in sql or "max(" in sql
+             or sql.strip() == mirror_read
              for sql in statements if sql.lstrip().startswith("select")), statements
   assert len(_load_chat()["messages"]) == 201
 

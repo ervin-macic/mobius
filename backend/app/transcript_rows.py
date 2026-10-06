@@ -36,7 +36,7 @@ from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 
 from sqlalchemy import (
-  DateTime, bindparam, delete, event, func, insert, inspect, select, text, update,
+  DateTime, Text, bindparam, delete, event, func, insert, inspect, select, text, update,
 )
 from sqlalchemy.orm import Session, object_session
 
@@ -423,9 +423,9 @@ def append_many(db, chat, messages) -> None:
 
 
 def _stored_text(db, chat_id: str, seq: int):
-  return db.execute(text(
-    "SELECT body FROM chat_messages WHERE chat_id = :id AND seq = :seq"
-  ), {"id": chat_id, "seq": seq}).scalar()
+  return db.execute(select(_M.body.cast(Text)).where(
+    _M.chat_id == chat_id, _M.seq == seq,
+  )).scalar()
 
 
 def update_at(db, chat, index: int, body) -> None:
