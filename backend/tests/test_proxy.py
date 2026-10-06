@@ -363,7 +363,9 @@ def test_proxy_forwards_rate_limit_headers():
     async def send(self, req, stream=True):
       return _RateLimitedResponse()
 
-  response = asyncio.run(_capped_response(_Client(), object()))
+  response = asyncio.run(_capped_response(
+    _Client(), httpx.Request("POST", "https://example.com/"),
+  ))
   assert response.status_code == 429
   assert response.headers["retry-after"] == "60"
   assert response.headers["x-ratelimit-remaining"] == "0"
@@ -523,7 +525,7 @@ def test_proxy_get_stops_after_the_install_redirect_limit(
   assert len(sent) == 6
 
 
-def test_proxy_get_refuses_an_oversized_response_instead_of_truncating(
+def test_proxy_get_truncates_an_oversized_response(
   client, owner_token, monkeypatch,
 ):
   from app.routes.proxy import _MAX_BYTES
@@ -538,19 +540,56 @@ def test_proxy_get_refuses_an_oversized_response_instead_of_truncating(
     headers={"Authorization": f"Bearer {owner_token}"},
   )
 
-  assert r.status_code == 413
+  assert r.status_code == 200
+  assert r.content == b"x" * _MAX_BYTES
 
 
-def test_proxy_post_refuses_an_oversized_response_instead_of_truncating():
+@pytest.mark.parametrize("public_transport", [False, True])
+def test_proxy_post_and_public_transport_truncate_oversized_response(public_transport):
   from app.routes.proxy import _MAX_BYTES
 
   class _Client:
     async def send(self, req, stream=True):
       return _HopUpstream(200, b"x" * (_MAX_BYTES + 1))
 
+  response = asyncio.run(_capped_response(
+    _Client(), httpx.Request(
+      "GET" if public_transport else "POST", "https://example.com/",
+    ),
+    forward_cache_headers=public_transport,
+  ))
+  assert response.status_code == 200
+  assert response.body == b"x" * _MAX_BYTES
+
+
+@pytest.mark.parametrize("public_transport", [False, True])
+@pytest.mark.parametrize("error, status", [
+  (httpx.ReadTimeout("body stalled"), 504),
+  (httpx.ReadError("connection lost"), 502),
+])
+def test_proxy_post_and_public_transport_classify_midstream_failure_and_close(
+  public_transport, error, status,
+):
+  class _FailingUpstream(_HopUpstream):
+    async def aiter_bytes(self):
+      yield b"partial body"
+      raise error
+
+  upstream = _FailingUpstream(200)
+
+  class _Client:
+    async def send(self, req, stream=True):
+      return upstream
+
   with pytest.raises(HTTPException) as raised:
-    asyncio.run(_capped_response(_Client(), object()))
-  assert raised.value.status_code == 413
+    asyncio.run(_capped_response(
+      _Client(), httpx.Request(
+        "GET" if public_transport else "POST", "https://example.com/",
+      ),
+      forward_cache_headers=public_transport,
+    ))
+  assert raised.value.status_code == status
+  assert upstream.closed
 
 
 def test_declared_favicon_urls_accepts_unquoted_and_relative_icon_links():

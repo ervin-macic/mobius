@@ -18,7 +18,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.deps import authorize_current_owner_or_app_detached, reject_cross_site
-from app.net_utils import validate_url_safe
+from app.net_utils import MAX_REDIRECTS as _MAX_REDIRECTS, validate_url_safe
 
 router = APIRouter(prefix="/api/proxy", tags=["proxy"])
 
@@ -30,14 +30,9 @@ router = APIRouter(prefix="/api/proxy", tags=["proxy"])
 # convention as _FAVICON_USER_AGENT below.
 _PROXY_USER_AGENT = "Mobius/1.0 (app proxy; +https://github.com/mobius-os/mobius)"
 
-# Hard limit on response size to avoid pulling in huge payloads. A larger
-# response is refused with 413, never truncated: a cut-off manifest or JSON
-# document would otherwise reach the caller as a valid-looking 200.
+# Hard limit on response size to avoid pulling in huge payloads. The general
+# proxy preserves its original behavior of returning the first 2 MiB.
 _MAX_BYTES = 2 * 1024 * 1024  # 2 MB
-# Same hop cap as app install, so a manifest URL the Store can preview is one
-# install can fetch.
-_MAX_REDIRECTS = 5
-
 # 512 KB — generous for API payloads, prevents memory exhaustion from abuse.
 _MAX_BODY = 512 * 1024
 _FORWARDED_RESPONSE_HEADERS = (
@@ -153,6 +148,26 @@ def _canonical_root_icon_urls(page_url: str) -> list[str]:
   ]
 
 
+async def _read_bounded_body(
+  upstream: httpx.Response, max_bytes: int, url: str,
+) -> tuple[bytes, bool]:
+  """Read at most one byte past the limit, classifying mid-stream failures."""
+  body = bytearray()
+  try:
+    async for chunk in upstream.aiter_bytes():
+      room = max_bytes + 1 - len(body)
+      if room <= 0:
+        break
+      body.extend(chunk[:room])
+      if len(body) > max_bytes:
+        break
+  except httpx.TimeoutException as exc:
+    raise HTTPException(504, f"Timeout fetching {url}") from exc
+  except httpx.RequestError as exc:
+    raise HTTPException(502, f"Failed to fetch {url}: {exc}") from exc
+  return bytes(body[:max_bytes]), len(body) > max_bytes
+
+
 async def _read_external_get(
   client: httpx.AsyncClient,
   url: str,
@@ -203,32 +218,23 @@ async def _read_external_get(
         current_url = urljoin(current_url, location)
         continue
 
-      body = bytearray()
-      async for chunk in upstream.aiter_bytes():
-        room = max_bytes + 1 - len(body)
-        if room <= 0:
-          break
-        body.extend(chunk[:room])
-        if len(body) > max_bytes:
-          break
+      body, truncated = await _read_bounded_body(
+        upstream, max_bytes, current_url,
+      )
       return _ExternalRead(
-        body=bytes(body[:max_bytes]),
+        body=body,
         status_code=upstream.status_code,
         content_type=upstream.headers.get(
           "content-type", "application/octet-stream",
         ),
         final_url=current_url,
-        truncated=len(body) > max_bytes,
+        truncated=truncated,
         forwarded_headers={
           name: upstream.headers[name]
           for name in _FORWARDED_RESPONSE_HEADERS
           if name in upstream.headers
         },
       )
-    except httpx.TimeoutException as exc:
-      raise HTTPException(504, f"Timeout fetching {current_url}") from exc
-    except httpx.RequestError as exc:
-      raise HTTPException(502, f"Failed to fetch {current_url}: {exc}") from exc
     finally:
       await upstream.aclose()
   raise HTTPException(502, "Redirect resolution failed.")
@@ -265,21 +271,17 @@ async def _capped_response(
   """Sends `req` streaming and reads at most `_MAX_BYTES` into memory.
 
   Reading the full body (`r.content`) before checking would let a huge or
-  malicious upstream exhaust process memory before the cap applied, so the
-  read stops one byte past the cap and refuses the response with 413."""
+  malicious upstream exhaust process memory before the cap applied."""
   try:
     r = await client.send(req, stream=True)
+  except httpx.TimeoutException as exc:
+    raise HTTPException(504, f"Timeout fetching {req.url}") from exc
+  except httpx.RequestError as exc:
+    raise HTTPException(502, f"Failed to fetch {req.url}: {exc}") from exc
   except Exception as exc:
     raise HTTPException(status_code=502, detail=str(exc))
   try:
-    buf = bytearray()
-    async for chunk in r.aiter_bytes():
-      # Append only up to one byte past the cap so the buffer stays strictly
-      # bounded (extending the whole chunk could overshoot by a chunk's worth).
-      room = _MAX_BYTES + 1 - len(buf)
-      buf.extend(chunk[:room])
-      if len(buf) > _MAX_BYTES:
-        raise _too_large()
+    body, _ = await _read_bounded_body(r, _MAX_BYTES, str(req.url))
     headers = {
       name: r.headers[name]
       for name in _FORWARDED_RESPONSE_HEADERS
@@ -290,19 +292,13 @@ async def _capped_response(
         if name in r.headers:
           headers[name] = r.headers[name]
     return Response(
-      content=bytes(buf),
+      content=body,
       status_code=r.status_code,
       headers=headers,
       media_type=r.headers.get("content-type", "application/octet-stream"),
     )
   finally:
     await r.aclose()
-
-
-def _too_large() -> HTTPException:
-  return HTTPException(
-    413, f"The response is larger than the proxy's {_MAX_BYTES // (1024 * 1024)} MiB limit.",
-  )
 
 
 @router.get("/favicon")
@@ -376,8 +372,6 @@ async def proxy_get(
     read = await _read_external_get(
       client, url, _MAX_BYTES, headers={"User-Agent": _PROXY_USER_AGENT},
     )
-  if read.truncated:
-    raise _too_large()
   return Response(
     content=read.body,
     status_code=read.status_code,
