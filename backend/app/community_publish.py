@@ -31,9 +31,10 @@ MAX_STORE_SCREENSHOTS = 5
 _OID = re.compile(r"^[0-9a-f]{40,64}$")
 # Git, GitHub and install accept any other file name, including spaces,
 # brackets, tildes and non-ASCII letters. Refuse only names that cannot be
-# shown or handled faithfully: control, format, and line/paragraph separators
-# include invisible and bidirectional characters that disguise a name.
-_UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Zl", "Zp"}
+# shown or handled faithfully: control, format, and separator characters
+# plus blank-lookalike fillers disguise a name. ASCII spaces remain allowed.
+_UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Zl", "Zp", "Zs"}
+_BLANK_PATH_CHARACTERS = {"\u115f", "\u1160", "\u3164", "\uffa0", "\u2800"}
 # Path segments refused anywhere in a published tree, each with the reason the
 # author sees. Private folder names remain a guard beyond the content scan.
 _UNPUBLISHED_SEGMENTS = {
@@ -314,12 +315,17 @@ def _validate_path(path: str) -> None:
     or len(path.encode("utf-8")) > MAX_PATH_BYTES
     or str(pure) != path
     or any(part in {"", ".", ".."} for part in parts)
-    or any(unicodedata.category(char) in _UNSAFE_PATH_CATEGORIES for char in path)
+    or any(
+      char != " " and (
+        unicodedata.category(char) in _UNSAFE_PATH_CATEGORIES
+        or char in _BLANK_PATH_CHARACTERS
+      ) for char in path
+    )
   ):
     raise CommunityPublicationError(
       f"The path {path!r} cannot be published. Use a relative path of at most "
       f"{MAX_PATH_BYTES} bytes with '/' separators (no backslashes), no '.' "
-      "or '..' segments, and no control or text-direction characters.",
+      "or '..' segments, and no control, text-direction or blank-lookalike characters.",
       "invalid_path",
     )
   folded = [part.casefold() for part in parts]

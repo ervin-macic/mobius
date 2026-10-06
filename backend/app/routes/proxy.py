@@ -148,6 +148,12 @@ def _canonical_root_icon_urls(page_url: str) -> list[str]:
   ]
 
 
+def _fetch_error(url: str, exc: httpx.RequestError) -> HTTPException:
+  if isinstance(exc, httpx.TimeoutException):
+    return HTTPException(504, f"Timeout fetching {url}")
+  return HTTPException(502, f"Failed to fetch {url}: {exc}")
+
+
 async def _read_bounded_body(
   upstream: httpx.Response, max_bytes: int, url: str,
 ) -> tuple[bytes, bool]:
@@ -161,10 +167,8 @@ async def _read_bounded_body(
       body.extend(chunk[:room])
       if len(body) > max_bytes:
         break
-  except httpx.TimeoutException as exc:
-    raise HTTPException(504, f"Timeout fetching {url}") from exc
   except httpx.RequestError as exc:
-    raise HTTPException(502, f"Failed to fetch {url}: {exc}") from exc
+    raise _fetch_error(url, exc) from exc
   return bytes(body[:max_bytes]), len(body) > max_bytes
 
 
@@ -198,10 +202,8 @@ async def _read_external_get(
     req.extensions["sni_hostname"] = sni_host
     try:
       upstream = await client.send(req, stream=True)
-    except httpx.TimeoutException:
-      raise HTTPException(504, f"Timeout fetching {current_url}")
     except httpx.RequestError as exc:
-      raise HTTPException(502, f"Failed to fetch {current_url}: {exc}")
+      raise _fetch_error(current_url, exc) from exc
     try:
       if upstream.status_code in _REDIRECT_STATUSES:
         location = upstream.headers.get("location")
@@ -274,10 +276,8 @@ async def _capped_response(
   malicious upstream exhaust process memory before the cap applied."""
   try:
     r = await client.send(req, stream=True)
-  except httpx.TimeoutException as exc:
-    raise HTTPException(504, f"Timeout fetching {req.url}") from exc
   except httpx.RequestError as exc:
-    raise HTTPException(502, f"Failed to fetch {req.url}: {exc}") from exc
+    raise _fetch_error(str(req.url), exc) from exc
   except Exception as exc:
     raise HTTPException(status_code=502, detail=str(exc))
   try:

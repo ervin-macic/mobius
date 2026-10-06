@@ -2681,7 +2681,7 @@ def git_source_error(
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
-  return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}"})
+  return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}".strip()})
 
 
 def _fetch_git_package_commit(source_dir: str | Path, source_url: str) -> str:

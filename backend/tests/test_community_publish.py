@@ -485,6 +485,7 @@ def test_content_scan_catches_ascii_credentials_in_invalid_utf8(tmp_path, folder
 @pytest.mark.parametrize("character", [
   "\u2028", "\u2029", "\u200e", "\u200f", "\u061c", "\u200b", "\u200c",
   "\u200d", "\u2060", "\u180e", "\u2062", "\ufeff",
+  "\u00a0", "\u3000", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800",
 ])
 def test_snapshot_refuses_invisible_filename_characters(tmp_path, character):
   repo, app, _ = _app_repo(tmp_path)

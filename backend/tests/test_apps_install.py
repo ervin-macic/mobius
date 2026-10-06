@@ -7942,16 +7942,20 @@ def test_install_git_network_has_short_lifecycle_ceiling(
     base + "index.jsx": (200, JSX.encode()),
   }
   seen = []
-  real_run = app_git.subprocess.run
+  real_popen = app_git.subprocess.Popen
 
-  def unopened_connection(cmd, *args, **kwargs):
-    if "clone" in cmd or "fetch" in cmd:
-      seen.append(kwargs["timeout"])
-      assert 0 < kwargs["timeout"] <= 30
-      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-    return real_run(cmd, *args, **kwargs)
+  class SlowTransfer(real_popen):
+    timed_out = False
 
-  monkeypatch.setattr(app_git.subprocess, "run", unopened_connection)
+    def communicate(self, *args, **kwargs):
+      if not self.timed_out and ("clone" in self.args or "fetch" in self.args):
+        self.timed_out = True
+        seen.append(kwargs["timeout"])
+        assert 0 < kwargs["timeout"] <= 30
+        raise subprocess.TimeoutExpired(self.args, kwargs["timeout"])
+      return super().communicate(*args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "Popen", SlowTransfer)
   with patch(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ):
@@ -7977,17 +7981,21 @@ def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
     client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
   )
   assert installed.status_code == 201, installed.text
-  real_run = app_git.subprocess.run
   seen = []
+  real_popen = app_git.subprocess.Popen
 
-  def unopened_connection(cmd, *args, **kwargs):
-    if "fetch" in cmd:
-      seen.append(kwargs["timeout"])
-      assert 0 < kwargs["timeout"] <= 30
-      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-    return real_run(cmd, *args, **kwargs)
+  class SlowTransfer(real_popen):
+    timed_out = False
 
-  monkeypatch.setattr(app_git.subprocess, "run", unopened_connection)
+    def communicate(self, *args, **kwargs):
+      if not self.timed_out and ("fetch" in self.args):
+        self.timed_out = True
+        seen.append(kwargs["timeout"])
+        assert 0 < kwargs["timeout"] <= 30
+        raise subprocess.TimeoutExpired(self.args, kwargs["timeout"])
+      return super().communicate(*args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "Popen", SlowTransfer)
   failed = _install_clone_fixture(
     client, auth, base, {**manifest, "version": "2.0.0"},
     CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
@@ -8040,16 +8048,21 @@ def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
     hide_merge_base(repo)
     upstream_before = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
 
-  real_run = app_git.subprocess.run
   seen = []
+  real_popen = app_git.subprocess.Popen
 
-  def slow_unshallow(cmd, *args, **kwargs):
-    if "--unshallow" in cmd:
-      seen.append(kwargs["timeout"])
-      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-    return real_run(cmd, *args, **kwargs)
+  class SlowTransfer(real_popen):
+    timed_out = False
 
-  monkeypatch.setattr(app_git.subprocess, "run", slow_unshallow)
+    def communicate(self, *args, **kwargs):
+      if not self.timed_out and ("--unshallow" in self.args):
+        self.timed_out = True
+        seen.append(kwargs["timeout"])
+        assert 0 < kwargs["timeout"] <= 30
+        raise subprocess.TimeoutExpired(self.args, kwargs["timeout"])
+      return super().communicate(*args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "Popen", SlowTransfer)
   if operation == "update":
     failed = _update_v2(
       client, auth, base, {**manifest, "version": "2.0.0"}, incoming,
@@ -8067,3 +8080,8 @@ def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
   assert not install.pending_update_worktree(repo).exists()
   db.expire_all()
   assert db.get(models.App, app_id).version == manifest["version"]
+
+
+def test_git_source_error_without_failure_has_no_leading_space():
+  error = install.git_source_error("The app was not changed.", RuntimeError("unavailable"))
+  assert error.detail["message"] == "The app was not changed."

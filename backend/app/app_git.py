@@ -62,6 +62,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -417,10 +418,24 @@ def _run(
     "-C", str(repo),
     *args,
   ]
-  return subprocess.run(
-    cmd, capture_output=True, text=True, timeout=timeout,
-    check=check, env=_git_env(repo, read_only=read_only),
-  )
+  with subprocess.Popen(
+    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    start_new_session=True, env=_git_env(repo, read_only=read_only),
+  ) as process:
+    try:
+      stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+      # Git removes its locks on SIGTERM; stop transport children with it.
+      os.killpg(process.pid, signal.SIGTERM)
+      try:
+        process.communicate(timeout=1)
+      except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+      raise
+    if check and process.returncode:
+      raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
 def _run_network(
@@ -2679,7 +2694,7 @@ def clone_upstream(
   Returns:
     The checked-out HEAD sha.
   """
-  repo = Path(source_dir)
+  repo = Path(source_dir).resolve()
   if repo.exists() and not repo.is_dir():
     raise RuntimeError(f"source_dir exists and is not a directory: {repo}")
   repo.parent.mkdir(parents=True, exist_ok=True)
