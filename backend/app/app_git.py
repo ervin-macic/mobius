@@ -423,45 +423,16 @@ def _run(
   )
 
 
-def _run_network_command(
-  cmd: list[str], env: dict[str, str], *, check: bool = True,
+def _run_network(
+  repo: Path, *args: str, check: bool = True,
 ) -> subprocess.CompletedProcess:
-  """Run one network Git command with a short wall-clock ceiling.
-
-  An overlong transfer raises ``GitTransferTimeout`` even with ``check=False``,
-  so callers can report a timeout rather than a missing source.
-  """
+  """Run a Git transfer, reporting an overlong command even with check=False."""
   try:
-    result = subprocess.run(
-      cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-      check=False, env=env,
-    )
+    return _run(repo, *args, check=check)
   except subprocess.TimeoutExpired as exc:
     raise GitTransferTimeout(
       f"it ran longer than {_GIT_TIMEOUT} seconds"
     ) from exc
-  if check and result.returncode != 0:
-    raise subprocess.CalledProcessError(
-      result.returncode, cmd, output=result.stdout, stderr=result.stderr,
-    )
-  return result
-
-
-def _run_network(
-  repo: Path, *args: str, check: bool = True,
-) -> subprocess.CompletedProcess:
-  """``_run`` for a git subcommand that transfers objects from a remote."""
-  return _run_network_command(
-    [
-      "git",
-      "-c", f"user.name={_GIT_NAME}",
-      "-c", f"user.email={_GIT_EMAIL}",
-      "-C", str(repo),
-      *args,
-    ],
-    _git_env(repo),
-    check=check,
-  )
 
 
 def _run_with_index(
@@ -2736,10 +2707,8 @@ def clone_upstream(
         clone_dir, immutable_ref, depth=depth,
       )
     else:
-      cmd = [
-        "git",
-        "-c", f"user.name={_GIT_NAME}",
-        "-c", f"user.email={_GIT_EMAIL}",
+      _run_network(
+        clone_parent,
         # core.symlinks=false: check out any tracked symlink as a PLAIN FILE
         # (the link text as content), never a real filesystem symlink. Catalog
         # repos are untrusted content; a materialized symlink (e.g. `static` ->
@@ -2748,13 +2717,9 @@ def clone_upstream(
         # _assert_within — that guard is skipped for the cloned tree, so the
         # non-symlink checkout is what keeps the clone inside its own dir.
         "-c", "core.symlinks=false",
-        "clone", "-q",
-        "--depth", str(depth),
-        "--branch", ref,
-        repo_url,
-        str(clone_dir),
-      ]
-      _run_network_command(cmd, _git_env(repo))
+        "clone", "-q", "--depth", str(depth), "--branch", ref,
+        repo_url, str(clone_dir),
+      )
       remote_ref = f"origin/{ref}"
       _run(clone_dir, "rev-parse", "--verify", remote_ref)
     # Keep later checkouts under the same safety policy as clone's first

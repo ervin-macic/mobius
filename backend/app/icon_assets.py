@@ -9,9 +9,10 @@ from collections import OrderedDict
 
 from PIL import Image
 
-from .image_limits import MAX_IMAGE_PIXELS, check_image_size
+MAX_IMAGE_PIXELS = 32_000_000
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
-# The shared pixel ceiling is the only size rule: images within it are scaled
+# The icon pixel ceiling is the only size rule: images within it are scaled
 # down. Author-facing apply and publication reject invalid icons; imported
 # packages instead warn and omit/preserve them for historical compatibility.
 # Install and update-check digests both omit refused icons.
@@ -58,7 +59,8 @@ def _normalize_uncached(raw: bytes) -> bytes:
     # Refuse from the header before load() allocates the pixel buffer. Do not
     # rely on Pillow's process-global warning filters in concurrent workers.
     image = Image.open(io.BytesIO(raw))
-    check_image_size(image)
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+      raise Image.DecompressionBombError(too_large)
     image.load()
   except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
     raise InvalidIcon(too_large) from exc

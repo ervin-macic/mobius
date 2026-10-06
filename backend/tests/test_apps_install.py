@@ -4234,7 +4234,7 @@ def test_update_candidate_preview_classifies_git_transfer_timeout_without_mutati
   with patch(
     "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
   ), patch(
-    "app.app_git._run_network_command",
+    "app.app_git._run_network",
     side_effect=app_git.GitTransferTimeout("it ran longer than 30 seconds"),
   ) as network:
     response = client.get(
@@ -4242,7 +4242,7 @@ def test_update_candidate_preview_classifies_git_transfer_timeout_without_mutati
     )
 
   network.assert_called_once()
-  assert "fetch" in network.call_args.args[0]
+  assert network.call_args.args[1] == "fetch"
   assert response.status_code == 409, response.text
   detail = response.json()["detail"]
   assert detail["code"] == "git_transfer_timeout"
@@ -6264,7 +6264,7 @@ def test_git_manifest_accepts_exact_size_boundary(tmp_path):
   assert summary.manifest["id"] == MANIFEST_MULTI["id"]
 
 
-def test_git_package_inputs_are_bounded_like_http_installs(monkeypatch):
+def test_git_candidate_inputs_are_bounded_like_http_installs(monkeypatch):
   from app import install
 
   manifest = {
@@ -6281,10 +6281,10 @@ def test_git_package_inputs_are_bounded_like_http_installs(monkeypatch):
   monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 399)
 
   with pytest.raises(install.PackageTooLarge, match="MiB app package limit"):
-    install._read_git_package_inputs(tree, strict=True)
+    install._read_git_candidate_inputs(tree, strict=True)
 
   monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", len(JSX) + 400)
-  assert install._read_git_package_inputs(tree, strict=True).static_assets
+  assert install._read_git_candidate_inputs(tree, strict=True).static_assets
 
 
 def _commit_package(root: Path, files: dict[str, bytes]) -> tuple[Path, str]:

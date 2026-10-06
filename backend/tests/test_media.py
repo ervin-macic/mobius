@@ -9,12 +9,9 @@ from app.config import agent_scratch_root, get_settings
 from app.image_previews import display_image_preview, preview_cache_path
 
 
-@pytest.mark.parametrize("size", [(9000, 9000), (6400, 6250)])
-def test_oversized_preview_is_refused_before_decode(tmp_path, monkeypatch, size):
+def test_decompression_bomb_preview_is_refused_before_decode(tmp_path, monkeypatch):
   source = tmp_path / "compressed.png"
-  Image.new("1", size).save(source)
-  # Preview safety must not depend on other workers' Pillow configuration.
-  monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", None)
+  Image.new("1", (9000, 9000)).save(source)
 
   def forbidden_load(self, *args, **kwargs):
     pytest.fail("An oversized preview must be refused before decoding")
@@ -22,6 +19,17 @@ def test_oversized_preview_is_refused_before_decode(tmp_path, monkeypatch, size)
   monkeypatch.setattr(PngImagePlugin.PngImageFile, "load", forbidden_load)
   assert display_image_preview(source, tmp_path) is None
   assert not preview_cache_path(source, tmp_path).exists()
+
+
+def test_phone_photo_above_icon_pixel_limit_still_gets_a_preview(tmp_path):
+  source = tmp_path / "phone.png"
+  Image.new("1", (7300, 5480)).save(source)
+  with pytest.warns(Image.DecompressionBombWarning):
+    preview = display_image_preview(source, tmp_path)
+  assert preview is not None
+  with Image.open(preview) as image:
+    assert image.format == "WEBP"
+    assert max(image.size) == 1024
 
 
 def _write_chat_image(chat_id: str, subdir: str, filename: str, data: bytes) -> None:

@@ -405,13 +405,23 @@ def test_snapshot_publishes_file_names_install_accepts(tmp_path):
   repo, app, _ = _app_repo(tmp_path)
   names = [
     "Screenshot (1).png", "café.mp3", "[id].jsx", "a~b.md",
-    "secrets/SecretsPanel.jsx", "credentials/README.md",
   ]
   _commit_files(repo, app, {name: b"ordinary source" for name in names})
 
   _, files = build_public_snapshot(app)
 
   assert set(names) <= {item["path"] for item in files}
+
+
+@pytest.mark.parametrize("folder", ["secrets", "credentials"])
+def test_snapshot_refuses_private_directory_names_without_known_secret_content(tmp_path, folder):
+  repo, app, _ = _app_repo(tmp_path)
+  path = f"{folder}/ordinary.txt"
+  _commit_files(repo, app, {path: b"unrecognized private material"})
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+  assert raised.value.code == "sensitive_path"
+  assert path in raised.value.detail
 
 
 def test_snapshot_names_the_path_it_refuses_and_why(tmp_path):
@@ -450,7 +460,7 @@ def test_snapshot_refuses_names_that_collide_on_other_checkouts(tmp_path):
 def test_content_scan_still_catches_credentials_in_any_directory(tmp_path):
   repo, app, _ = _app_repo(tmp_path)
   _commit_files(repo, app, {
-    "secrets/config.js": b"export const key = 'ghp_" + b"A" * 36 + b"';",
+    "config/config.js": b"export const key = 'ghp_" + b"A" * 36 + b"';",
   })
 
   with pytest.raises(CommunityPublicationError) as raised:
@@ -459,7 +469,7 @@ def test_content_scan_still_catches_credentials_in_any_directory(tmp_path):
   assert raised.value.code == "secret_detected"
 
 
-@pytest.mark.parametrize("folder", ["secrets", "credentials"])
+@pytest.mark.parametrize("folder", ["config", "settings"])
 def test_content_scan_catches_ascii_credentials_in_invalid_utf8(tmp_path, folder):
   repo, app, _ = _app_repo(tmp_path)
   _commit_files(repo, app, {

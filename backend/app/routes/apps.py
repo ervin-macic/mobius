@@ -1106,9 +1106,7 @@ def _park_pending_update(repo: Path, receipt: dict) -> list[str]:
     try:
       merge = app_git.merge_upstream(repo)
     except app_git.GitTransferTimeout as exc:
-      raise install._git_source_error(
-        "git_update_unavailable",
-        "The app's Git update could not be merged.",
+      raise install.git_source_error(
         "The installed version was left unchanged.",
         exc,
       ) from exc
@@ -1623,11 +1621,10 @@ async def update_candidate_preview(
     except (
       OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
     ) as exc:
-      raise install._git_source_error(
-        "git_update_unavailable",
-        "This app does not have a usable Git update source.",
+      raise install.git_source_error(
         "The installed version was left unchanged.",
         exc,
+        failure="This app does not have a usable Git update source.",
       ) from exc
   upstream_diff = await asyncio.to_thread(
     _diff_preview_trees, previous_source, candidate.runtime_tree,

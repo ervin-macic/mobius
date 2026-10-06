@@ -35,11 +35,12 @@ _OID = re.compile(r"^[0-9a-f]{40,64}$")
 # include invisible and bidirectional characters that disguise a name.
 _UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Zl", "Zp"}
 # Path segments refused anywhere in a published tree, each with the reason the
-# author sees. Credentials are found by file name and content below rather than
-# by guessing from a directory name.
+# author sees. Private folder names remain a guard beyond the content scan.
 _UNPUBLISHED_SEGMENTS = {
   ".git": "Git's own metadata is never app source.",
   ".env": "environment files usually hold credentials.",
+  "credentials": "private credential directories must not be published.",
+  "secrets": "private secret directories must not be published.",
   ".github": (
     "Möbius does not publish .github files, because creating GitHub workflow "
     "files needs a broader GitHub token scope than publishing uses."

@@ -4745,17 +4745,10 @@ def test_file_transport_clone_and_fetch_use_the_git_timeout(tmp_path, monkeypatc
   app_git.clone_upstream(source, bare.as_uri(), "main")
   app_git.fetch_upstream(source, "main")
 
-  network = [
-    (cmd, timeout) for cmd, timeout in seen
-    if "clone" in cmd or "fetch" in cmd
-  ]
   assert {"clone", "fetch"} <= {
-    word for cmd, _ in network for word in cmd if word in ("clone", "fetch")
+    word for cmd, _ in seen for word in cmd if word in ("clone", "fetch")
   }
-  for cmd, timeout in network:
-    assert timeout == 30
-  local = {timeout for cmd, timeout in seen if (cmd, timeout) not in network}
-  assert local == {app_git._GIT_TIMEOUT}
+  assert {timeout for _, timeout in seen} == {30}
 
 
 def test_overlong_network_git_surfaces_as_a_timeout(tmp_path, monkeypatch):

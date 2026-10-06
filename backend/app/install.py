@@ -1529,7 +1529,9 @@ def package_content_digest_from_tree(
   when the manifest contract grows.
   """
   try:
-    inputs = _read_git_package_inputs(tree, strict=True)
+    inputs = _read_git_package_inputs(
+      tree, _read_git_package_manifest(tree, strict=True),
+    )
   except HTTPException as exc:
     raise PackageContentError(str(exc.detail)) from exc
   except ValueError as exc:
@@ -2452,16 +2454,10 @@ class _GitPackageInputs:
 def _read_git_package_manifest(
   tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
 ) -> dict:
-  """Validate a Git manifest, checking its metadata before materialization."""
+  """Parse and validate a Git manifest independently of admission limits."""
   raw_manifest = tree.get("mobius.json")
   if raw_manifest is None:
     raise ValueError("candidate Git tree is missing manifest mobius.json")
-  size = _package_input_size(raw_manifest)
-  if size > _MANIFEST_MAX_BYTES:
-    raise PackageTooLarge(
-      f"This app's mobius.json is {size} bytes, more than the "
-      f"{_MANIFEST_MAX_BYTES} byte manifest limit.",
-    )
   try:
     manifest = json.loads(_package_input_bytes(raw_manifest))
   except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -2473,8 +2469,26 @@ def _read_git_package_manifest(
   return manifest
 
 
-def _read_git_package_inputs(
+def _read_git_candidate_inputs(
   tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
+) -> _GitPackageInputs:
+  """Apply admission limits before parsing or materializing candidate inputs."""
+  raw_manifest = tree.get("mobius.json")
+  size = _package_input_size(raw_manifest)
+  if size > _MANIFEST_MAX_BYTES:
+    raise PackageTooLarge(
+      f"This app's mobius.json is {size} bytes, more than the "
+      f"{_MANIFEST_MAX_BYTES} byte manifest limit.",
+    )
+  manifest = _read_git_package_manifest(tree, strict=strict)
+  size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
+  if size > _PACKAGE_MAX_BYTES:
+    raise PackageTooLarge(package_limit_message(size))
+  return _read_git_package_inputs(tree, manifest)
+
+
+def _read_git_package_inputs(
+  tree: Mapping[str, PackageContentBytes | None], manifest: dict,
 ) -> _GitPackageInputs:
   # Discovery intentionally differs from strict installation validation.
   # Both readers share missing-input, schedule and non-fatal icon semantics.
@@ -2486,11 +2500,6 @@ def _read_git_package_inputs(
       return value
     except KeyError as exc:
       raise ValueError(f"candidate Git tree is missing {field} {relative}") from exc
-
-  manifest = _read_git_package_manifest(tree, strict=strict)
-  size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
-  if size > _PACKAGE_MAX_BYTES:
-    raise PackageTooLarge(package_limit_message(size))
 
   entry_bytes = required(manifest["entry"], "entry")
   source_files = {
@@ -2561,7 +2570,7 @@ def read_git_install_candidate(
   # Spool the commit rather than reading every file into memory: the package
   # bound is checked first, then only declared inputs are materialized.
   with app_git.open_ref_tree(repo, resolved) as tree:
-    inputs = _read_git_package_inputs(tree, strict=strict)
+    inputs = _read_git_candidate_inputs(tree, strict=strict)
     entry_bytes = _package_input_bytes(inputs.entry_bytes)
     static_assets = {
       key: _package_input_bytes(value) for key, value in inputs.static_assets.items()
@@ -2650,7 +2659,7 @@ def read_git_package_summary(
   repo = Path(source_dir)
   resolved = _reviewed_git_package_commit(repo, commit)
   with app_git.open_ref_tree(repo, resolved) as tree:
-    inputs = _read_git_package_inputs(tree, strict=strict)
+    inputs = _read_git_candidate_inputs(tree, strict=strict)
     return GitPackageSummary(
       commit=resolved,
       manifest=inputs.manifest,
@@ -2659,8 +2668,9 @@ def read_git_package_summary(
     )
 
 
-def _git_source_error(
-  code: str, failure: str, outcome: str, exc: BaseException,
+def git_source_error(
+  outcome: str, exc: BaseException, *,
+  code: str = "git_update_unavailable", failure: str = "",
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
@@ -4472,11 +4482,10 @@ async def _install_candidate(
                 trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-            raise _git_source_error(
-              "git_update_unavailable",
-              "The reviewed Git update could not be applied.",
+            raise git_source_error(
               "The installed version was left unchanged.",
               exc,
+              failure="The reviewed Git update could not be applied.",
             ) from exc
           app.upstream_commit = promoted.sha
           allow_unrelated_histories = (
@@ -4508,11 +4517,10 @@ async def _install_candidate(
                 git_source_dir, fetched_sha, candidate,
               )
             except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise _git_source_error(
-                "git_update_unavailable",
-                "The app's Git update could not be fetched or verified.",
+              raise git_source_error(
                 "The installed version was left unchanged.",
                 exc,
+                failure="The app's Git update could not be fetched or verified.",
               ) from exc
             await asyncio.to_thread(
               app_git.replace_upstream_ref,
@@ -4535,11 +4543,10 @@ async def _install_candidate(
                 ),
               )
             except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise _git_source_error(
-                "git_update_unavailable",
-                "The app's Git update could not be fetched or verified.",
+              raise git_source_error(
                 "The installed version was left unchanged.",
                 exc,
+                failure="The app's Git update could not be fetched or verified.",
               ) from exc
             app.upstream_commit = fetched_upstream.sha
             allow_unrelated_histories = (
@@ -4773,12 +4780,12 @@ async def _install_candidate(
           except (
             OSError, subprocess.SubprocessError, RuntimeError, ValueError,
           ) as exc:
-            raise _git_source_error(
-              "git_install_unavailable",
-              "The app's Git repository could not be cloned or verified; "
-              "retry when its source is available.",
+            raise git_source_error(
               "Nothing was installed.",
               exc,
+              code="git_install_unavailable",
+              failure="The app's Git repository could not be cloned or verified; "
+              "retry when its source is available.",
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the
@@ -4992,9 +4999,7 @@ async def _install_candidate(
   except app_git.GitTransferTimeout as exc:
     db.rollback()
     journal.rollback_materialization()
-    raise _git_source_error(
-      "git_update_unavailable",
-      "The app's Git update could not be merged.",
+    raise git_source_error(
       "The installed version was left unchanged.",
       exc,
     ) from exc

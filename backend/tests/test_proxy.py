@@ -420,6 +420,19 @@ def _pin_every_hop(monkeypatch):
   return validated
 
 
+@pytest.mark.parametrize("headers", [None, {}])
+def test_external_reader_uses_favicon_defaults_only_when_headers_are_unspecified(
+  monkeypatch, headers,
+):
+  _pin_every_hop(monkeypatch)
+  fake_client, sent = _hop_client([_HopUpstream(200, b"ok")])
+  asyncio.run(_read_external_get(
+    fake_client(), "https://example.com/", 1024, headers=headers,
+  ))
+  assert ("accept" in sent[0].headers) == (headers is None)
+  assert ("user-agent" in sent[0].headers) == (headers is None)
+
+
 def test_proxy_get_follows_redirects_like_install(client, owner_token, monkeypatch):
   """A manifest URL that redirects must preview as it installs."""
   validated = _pin_every_hop(monkeypatch)

@@ -189,7 +189,7 @@ async def _read_external_get(
     req = client.build_request(
       "GET",
       pinned_url,
-      headers=headers or {
+      headers=headers if headers is not None else {
         "Accept": "image/*,text/html;q=0.8,*/*;q=0.1",
         "User-Agent": _FAVICON_USER_AGENT,
       },
