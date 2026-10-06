@@ -181,6 +181,7 @@ def test_edit_diffs_rechecks_authoritative_state_after_fence(
     assert "+new committed text" in response.text
 
 
+@pytest.mark.converted_chats  # A converted chat's row reads.
 def test_detail_history_with_many_goals_reads_transcript_only_once(
   client, auth, db, monkeypatch,
 ):

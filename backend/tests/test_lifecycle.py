@@ -5,6 +5,7 @@ from app.chat_writer import create_chat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import uuid
+import pytest
 
 from app import browser_profiles, chat_retention, chat_search, models
 from app.chat_retention import purge_expired_chat_tombstones
@@ -149,6 +150,7 @@ def test_hard_purge_removes_peer_mail_on_both_sides(db, chat):
   assert db.query(models.ChatActivityPosition).count() == 0
 
 
+@pytest.mark.converted_chats  # Search finds a converted chat's prose.
 def test_hard_purge_removes_derived_search_transcript_without_later_search(
   db, chat,
 ):
