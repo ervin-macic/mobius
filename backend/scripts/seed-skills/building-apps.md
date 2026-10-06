@@ -862,9 +862,10 @@ app's server-verified bearer.
 ### Shell shortcuts
 
 Shell shortcuts (Cmd/Ctrl+K search, Cmd/Ctrl+N new chat, Cmd/Ctrl+, back, and
-the rest of the shortcut reference) work inside every app by default, including
-while a text field has focus. The app frame captures exactly those chords and
-nothing else, so every other key reaches the app. Apps need no code for this.
+the rest of the shortcut reference) work in your app document by default,
+including while a text field has focus. The app frame captures exactly those
+chords and nothing else, so every other key reaches the app. Your app document
+needs no code for this; documents you nest in an iframe do (below).
 
 An app that needs those chords for its own UI, such as a code editor or a
 terminal, turns this off for the whole app in `mobius.json`:
@@ -876,8 +877,11 @@ terminal, turns this off for the whole app in `mobius.json`:
 Embedded agent chat (`window.mobius.chat(...)`) is covered automatically.
 Other documents you nest in an iframe are separate documents, and keys typed
 there never reach the app frame. If you author that document (for example an
-interactive HTML preview), add this script to it to give it the same shell
-shortcuts. It applies only to a direct child frame of your app document:
+interactive HTML preview, or a packaged build a wrapper app mounts from
+`/app-embeds/by-id/<appId>/…`), add this script to it to give it the same shell
+shortcuts. It applies only to a direct child frame of your app document, and the
+app frame relays a child's shell action only while that child's iframe has
+keyboard focus, so a background embed cannot trigger one:
 
 ```html
 <script>

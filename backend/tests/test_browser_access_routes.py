@@ -1,10 +1,9 @@
 """Shared browser identity stays revocable across request and token boundaries."""
-from urllib.parse import urlsplit, parse_qs
-
 import pytest
 from app import auth as tokens, models
-from app.browser_access import BrowserAccessGrant
 from app.config import get_settings
+from app.database import SessionLocal
+from tests.browser_access_fixtures import link_grant
 
 ROOT = "/api/connect/browser-access"
 
@@ -19,23 +18,23 @@ def https(client, monkeypatch):
   return client
 
 
-def invite(client, owner_headers, label="Alice"):
-  response = client.post(ROOT, json={"label": label}, headers=owner_headers)
-  assert response.status_code == 200, response.text
-  result = response.json()
-  assert "?" not in result["join_url"]
-  secret = parse_qs(urlsplit(result["join_url"]).fragment)["invite"][0]
+def invite(client, label="Alice"):
+  """Redeem a link issued before link invitations were retired."""
+  with SessionLocal() as db:
+    grant, secret = link_grant(db, db.query(models.Owner).one(), label)
+    grant_id = grant.id
   response = client.post(ROOT + "/session/redeem", json={"invite": secret})
   assert response.status_code == 200, response.text
   # Only signing in writes the refresh cookie; its lifetime is fixed and long.
   cookie = response.headers["set-cookie"].lower()
   assert "httponly" in cookie and "secure" in cookie and "samesite=strict" in cookie
   assert "max-age=34560000" in cookie
-  return result["grant"]["id"], response.json()["access_token"], secret
+  assert response.json()["grant"]["id"] == grant_id
+  return grant_id, response.json()["access_token"], secret
 
 
 def test_invite_session_and_descendant_app_credentials_revoke_together(https, auth, db, monkeypatch):
-  grant_id, token, invitation = invite(https, auth)
+  grant_id, token, invitation = invite(https)
   guest = {"Authorization": "Bearer " + token}
   assert https.get("/api/chats", headers=guest).status_code == 200
   renewed = https.post(ROOT + "/session")
@@ -61,9 +60,9 @@ def test_invite_session_and_descendant_app_credentials_revoke_together(https, au
 
 
 def test_guest_cannot_create_grants_or_launder_install_or_job_credentials(https, auth):
-  _, token, _ = invite(https, auth)
+  _, token, _ = invite(https)
   guest = {"Authorization": "Bearer " + token}
-  assert https.post(ROOT, json={"label": "Another"}, headers=guest).status_code == 403
+  assert https.post(ROOT + "/accounts", json={"recipient_handle": "another-person"}, headers=guest).status_code == 403
   assert https.get(ROOT + "/shared", headers=guest).status_code == 403
   assert https.post(ROOT + "/shared/respond", headers=guest, json={
     "origin": "https://other.example", "grant_id": "g" * 32, "action": "accept",
@@ -74,26 +73,27 @@ def test_guest_cannot_create_grants_or_launder_install_or_job_credentials(https,
 
 
 def test_logout_ends_only_that_browser_not_other_recipient_or_owner(https, auth):
-  grant_a, token_a, _ = invite(https, auth, "Alice")
+  grant_a, token_a, _ = invite(https, "Alice")
   assert https.post(ROOT + "/session/logout", json={"grant_id": grant_a}).status_code == 204
   assert https.get("/api/chats", headers={"Authorization": "Bearer " + token_a}).status_code == 401
-  grant_b, token_b, _ = invite(https, auth, "Bob")
+  grant_b, token_b, _ = invite(https, "Bob")
   assert grant_a != grant_b
   assert https.get("/api/chats", headers={"Authorization": "Bearer " + token_b}).status_code == 200
   assert https.get("/api/chats", headers=auth).status_code == 200
 
 
 def test_session_cookie_cannot_be_used_from_sibling_origin(https, auth):
-  invite(https, auth)
+  invite(https)
   for origin in ["https://evil.example", "https://sub.shared.example", "null"]:
     assert https.post(ROOT + "/session", headers={"Origin": origin}).status_code == 403
 
 
-def test_invite_replay_fails_and_plain_http_cannot_create_invitation(https, auth, monkeypatch):
-  _, _, secret = invite(https, auth)
+def test_invite_replay_fails_and_plain_http_cannot_share(https, auth, monkeypatch):
+  _, _, secret = invite(https)
   assert https.post(ROOT + "/session/redeem", json={"invite": secret}).status_code == 401
   monkeypatch.setattr(get_settings(), "frontend_origin", "http://shared.example")
-  assert https.post(ROOT, json={"label": "Unsafe"}, headers=auth).status_code == 409
+  refused = https.post(ROOT + "/accounts", json={"recipient_handle": "sam-person"}, headers=auth)
+  assert refused.status_code == 409 and "HTTPS" in refused.json()["detail"]
 
 
 def test_claim_pair_must_be_valid_and_cannot_omit_grant(https, auth, db):
@@ -104,7 +104,7 @@ def test_claim_pair_must_be_valid_and_cannot_omit_grant(https, auth, db):
 
 
 def test_logout_revokes_minted_frame_and_media_tokens(https, auth, db):
-  _, token, _ = invite(https, auth)
+  _, token, _ = invite(https)
   principal = __import__('app.deps', fromlist=['get_principal']).get_principal(token, db)
   app = models.App(name="Example", slug="example", source_dir=get_settings().data_dir + "/example")
   db.add(app); db.commit()
@@ -123,12 +123,11 @@ def test_logout_revokes_minted_frame_and_media_tokens(https, auth, db):
 
 @pytest.mark.asyncio
 async def test_open_browser_event_stream_stops_before_next_revoked_event(db):
-  from app.browser_access import BrowserLineage, create_invitation, redeem_invitation, revoke_grant
-  from app.database import SessionLocal
+  from app.browser_access import BrowserLineage, redeem_invitation, revoke_grant
   from app.deps import Principal, revocable_browser_stream
   owner = models.Owner(username="stream-owner", hashed_password="unused")
   db.add(owner); db.commit()
-  grant, secret = create_invitation(db, owner, "Guest")
+  grant, secret = link_grant(db, owner, "Guest")
   _, session, _, _ = redeem_invitation(db, secret)
   # The request's ORM session commits and closes before the stream runs.
   request_db = SessionLocal()
@@ -152,11 +151,11 @@ async def test_open_browser_event_stream_stops_before_next_revoked_event(db):
 
 
 def _guest_stream_fixture(db, name):
-  from app.browser_access import BrowserLineage, create_invitation, redeem_invitation
+  from app.browser_access import BrowserLineage, redeem_invitation
   from app.deps import Principal
   owner = models.Owner(username=name, hashed_password="unused")
   db.add(owner); db.commit()
-  grant, invitation = create_invitation(db, owner, "Guest")
+  grant, invitation = link_grant(db, owner, "Guest")
   secret, session, _, _ = redeem_invitation(db, invitation)
   principal = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id, session.id))
   return owner, grant, secret, principal
@@ -216,7 +215,7 @@ def test_private_service_bearer_retains_browser_attribution(https, auth, db):
   from app.deps import _resolve_owner
   from app.browser_access import BrowserLineage, revoke_grant
   from fastapi import HTTPException
-  grant, token, _ = invite(https, auth)
+  grant, token, _ = invite(https)
   claims = tokens.decode_access_token(token)
   assert "browser_grant_epoch" not in claims
   owner = db.query(models.Owner).one()
@@ -233,8 +232,8 @@ def test_private_service_bearer_retains_browser_attribution(https, auth, db):
 
 
 def test_switching_person_retires_only_previous_cookie_session(https, auth):
-  grant_a, token_a, _ = invite(https, auth, "Alice")
-  grant_b, token_b, _ = invite(https, auth, "Bob")
+  grant_a, token_a, _ = invite(https, "Alice")
+  grant_b, token_b, _ = invite(https, "Bob")
   assert https.get("/api/chats", headers={"Authorization": "Bearer " + token_a}).status_code == 401
   assert https.get("/api/chats", headers={"Authorization": "Bearer " + token_b}).status_code == 200
   # An old tab must not sign the new recipient out or delete their cookie.
@@ -245,20 +244,19 @@ def test_switching_person_retires_only_previous_cookie_session(https, auth):
   assert https.get("/api/chats", headers=auth).status_code == 200
 
 
-def test_reissue_keeps_existing_session_and_replaces_unused_invitation(https, auth):
-  grant, token, _ = invite(https, auth)
-  first = https.post(ROOT + f"/{grant}/invitation", headers=auth)
-  second = https.post(ROOT + f"/{grant}/invitation", headers=auth)
-  assert first.status_code == second.status_code == 200
-  old = parse_qs(urlsplit(first.json()["join_url"]).fragment)["invite"][0]
-  fresh = parse_qs(urlsplit(second.json()["join_url"]).fragment)["invite"][0]
-  assert https.post(ROOT + "/session/redeem", json={"invite": old}).status_code == 401
+def test_retired_link_routes_refuse_cleanly_and_existing_link_grants_stay_listed(https, auth):
+  grant, token, _ = invite(https)
+  # An older Connect app may still call these; they answer, never crash.
+  for path in [ROOT, ROOT + f"/{grant}/invitation"]:
+    refused = https.post(path, json={"label": "Bob"}, headers=auth)
+    assert refused.status_code == 404 and refused.headers["content-type"] == "application/json"
+  listed = https.get(ROOT, headers=auth).json()["grants"]
+  assert [(row["id"], row["kind"], row["status"]) for row in listed] == [(grant, "invitation", "active")]
   assert https.get("/api/chats", headers={"Authorization": "Bearer " + token}).status_code == 200
-  assert https.post(ROOT + "/session/redeem", json={"invite": fresh}).status_code == 200
 
 
 def test_guest_cannot_start_installation_setup_or_read_owner_screen(https, auth):
-  _, token, _ = invite(https, auth)
+  _, token, _ = invite(https)
   guest = {"Authorization": "Bearer " + token}
   assert https.post("/api/setup/rerun", headers=guest).status_code == 403
   assert https.get("/api/screen-control/sessions/fake/events", headers=guest).status_code == 403
@@ -268,7 +266,7 @@ def test_embedded_chat_session_inherits_guest_revocation(https, auth, db):
   from test_app_fixtures import create_local_app
   from app.browser_access import revoke_grant
   app = create_local_app(https, auth, name="Guest embed", description="test")
-  grant, token, _ = invite(https, auth)
+  grant, token, _ = invite(https)
   child = https.post("/api/auth/app-token", json={"app_id": app["id"]},
                      headers={"Authorization": "Bearer " + token}).json()["token"]
   child_headers = {"Authorization": "Bearer " + child, "Origin": "null"}
@@ -291,10 +289,10 @@ async def test_revocation_cancels_only_attributed_service_queue(db, monkeypatch)
   import asyncio
   from types import SimpleNamespace
   from app import app_services
-  from app.browser_access import create_invitation, revoke_grant
+  from app.browser_access import revoke_grant
   owner = models.Owner(username="service-owner", hashed_password="unused")
   db.add(owner); db.commit()
-  grant, _ = create_invitation(db, owner, "Alice")
+  grant, _ = link_grant(db, owner, "Alice")
   queued = asyncio.Event()
   class Gate(asyncio.Semaphore):
     async def acquire(self):
@@ -324,7 +322,7 @@ def test_revoke_reports_unconfirmed_work_without_claiming_stop(https, auth, monk
   import app.chat
   from app.routes import connect
   from fastapi import HTTPException
-  grant, token, _ = invite(https, auth)
+  grant, token, _ = invite(https)
   pending = [{"host_id": "demo", "request_id": "work", "remote_confirmed": False}]
   monkeypatch.setattr(connect, "cancel_browser_grant_commands", lambda value: pending if value == grant else [])
   async def incomplete(*args, **kwargs):
@@ -337,7 +335,7 @@ def test_revoke_reports_unconfirmed_work_without_claiming_stop(https, auth, monk
 
 
 def test_browser_guest_cannot_create_independent_shared_membership(https, auth):
-  _, token, _ = invite(https, auth)
+  _, token, _ = invite(https)
   guest = {"Authorization": "Bearer " + token}
   base = "/api/shared-apps/missing"
   assert https.post(base + "/invites", json={"invitee_name": "Other", "role": "editor"}, headers=guest).status_code == 403
@@ -358,7 +356,7 @@ def test_existing_shared_app_owner_keeps_resource_confined_administration(db):
 async def test_revoked_list_derives_pending_stop_after_reload_without_cancelling(https, auth, db):
   from app.browser_access import revoke_grant
   from app.routes import connect
-  grant_id, _, _ = invite(https, auth)
+  grant_id, _, _ = invite(https)
   owner = db.query(models.Owner).one()
   host_id = connect._new_id()
   connect._save_host({"id": host_id, "name": "Fixture", "active_commands": []})
@@ -384,7 +382,7 @@ async def test_revoked_list_derives_pending_stop_after_reload_without_cancelling
 
 
 def test_guest_cannot_launch_clean_owner_conflict_resolver(https, auth):
-  _, token, _ = invite(https, auth)
+  _, token, _ = invite(https)
   response = https.post("/api/apps/999/conflict-resolver-chat", json={},
                         headers={"Authorization": "Bearer " + token})
   assert response.status_code == 403
