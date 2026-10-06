@@ -157,17 +157,17 @@ PY
   start "$PREVIOUS"
   probe dump > "$work/previous-view.json"
   same "previous release sees the candidate's transcripts" "$work/candidate.json" "$work/previous-view.json"
-  probe write-old >/dev/null
+  wrote=$(probe write-old)
   probe dump > "$work/seeded.json"
   docker stop "$name" >/dev/null
 
   echo "4.$round only the previous release's changes are marked"
   marks=$(offline_probe "$CANDIDATE" unconverted)
-  python3 - "$marks" "$round" <<'PY' || fail "the previous release's changes were not detected exactly: $marks"
+  python3 - "$marks" "$wrote" <<'PY' || fail "the previous release's changes were not detected exactly: $marks (expected per $wrote)"
 import json, sys
 state = json.loads(sys.argv[1])
-r = int(sys.argv[2])
-assert state["unconverted"] == [f"bulk-{r * 10 + 3:04d}", f"from-previous-{r}"], state["unconverted"]
+expected = json.loads(sys.argv[2])["expect_unconverted"]
+assert state["unconverted"] == expected, state["unconverted"]
 assert set(state["purged_leftovers"].values()) == {0}, state["purged_leftovers"]
 PY
 done
