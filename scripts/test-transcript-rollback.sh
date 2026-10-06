@@ -115,6 +115,17 @@ PY
 
 docker volume create "$db_volume" >/dev/null
 
+# "previous" is a release without message rows: the one an owner rolls back to
+# across the conversion. Once the newest published ancestor stores rows itself,
+# use the conversion's parent, which the candidate must still be able to run on.
+if [ "$(offline_probe "$PREVIOUS" stores-rows)" = '{"rows": true}' ]; then
+  conversion=$(git -C "$ROOT" log --first-parent --diff-filter=A --format=%H -- backend/app/transcript_rows.py | tail -1)
+  [ -n "$conversion" ] || fail "cannot find the release that introduced message rows"
+  PREVIOUS="${PREVIOUS%%:*}:sha-$(git -C "$ROOT" rev-parse "$conversion^")"
+  echo "previous release already stores message rows; rolling back to $PREVIOUS"
+  docker pull -q "$PREVIOUS" >/dev/null || fail "cannot pull $PREVIOUS"
+fi
+
 echo "1. previous release seeds history"
 start "$PREVIOUS"
 probe seed >/dev/null
