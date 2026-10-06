@@ -303,6 +303,7 @@ export function makeNav({
   location = null, waitForNavigationReady = false, getFrameVisibility = () => null,
 } = {}) {
   let locationText = validNavLocationText(location)
+  let locationReported = false
   // Opted-in hosts declare when this document is promoted and visible. Older
   // shells and published hosts keep immediate sends with the ownership timeout.
   const visibility = getFrameVisibility()
@@ -565,7 +566,9 @@ export function makeNav({
 
   function setLocation(value) {
     const text = encodeNavLocation(value)
-    if (text === locationText) return
+    // The first report belongs to this document, even if it restored the same
+    // place: the outgoing frame may have reported a newer place during the swap.
+    if (text === locationText && locationReported) return
     locationText = text
     if (window.parent === window) return
     try {
@@ -573,6 +576,7 @@ export function makeNav({
         { type: 'moebius:nav-location', location: text },
         window.location.origin,
       )
+      locationReported = true
     } catch (e) {}
   }
 

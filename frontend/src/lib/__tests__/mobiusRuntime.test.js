@@ -936,7 +936,9 @@ test('nav location reports bounded JSON to the parent and exposes the restored p
     assert.deepEqual(nav.location, { tab: 'browse', item: 'notes' })
 
     nav.setLocation({ tab: 'browse', item: 'notes' })
-    assert.equal(parent.messages.length, 0, 'an unchanged place is not re-sent')
+    assert.equal(parent.messages.length, 1, 'the replacement document must report its own place')
+    nav.setLocation({ tab: 'browse', item: 'notes' })
+    assert.equal(parent.messages.length, 1, 'later unchanged reports are deduplicated')
 
     nav.setLocation({ tab: 'library' })
     assert.deepEqual(parent.messages.at(-1), {
@@ -950,6 +952,22 @@ test('nav location reports bounded JSON to the parent and exposes the restored p
     nav.setLocation(null)
     assert.equal(parent.messages.at(-1).data.location, null)
     assert.equal(nav.location, null)
+  })
+})
+
+test('the first report after promotion reconciles a restored place changed by the outgoing frame', async () => {
+  await withFakeWindow(async ({ window, parent }) => {
+    let saved = '{"detail":"A"}'
+    const nav = makeNav({ location: saved, waitForNavigationReady: true })
+    // The outgoing frame stays interactive while this document mounts.
+    saved = '{"detail":"B"}'
+    window.emit({ type: 'moebius:frame-visibility', visible: true, navigationReady: true })
+    assert.equal(parent.messages.length, 0, 'inherited location is not an app report')
+    nav.setLocation({ detail: 'A' })
+    saved = parent.messages.at(-1)?.data.location
+    assert.equal(saved, '{"detail":"A"}', 'the saved place must match the promoted screen')
+    nav.setLocation({ detail: 'A' })
+    assert.equal(parent.messages.length, 1)
   })
 })
 

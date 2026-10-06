@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app import icon_cache, models
-from app.app_compile_contract import app_frame_version
+from app.app_compile_contract import app_frame_version, app_storage_generation
 from app.config import get_settings
 from app.database import get_db
 from app.frontend_assets import resolve_frontend_dir
@@ -569,6 +569,7 @@ def _standalone_boot_payload(app: models.App) -> dict:
     "frame_version": app_frame_version(
       app.compiled_path, app.capability_contract, app.token_nonce,
     ),
+    "storage_generation": app_storage_generation(app.token_nonce),
     "offline_capable": bool(app.offline_capable),
     "capability_contract": app.capability_contract or {},
     "theme_color": app.theme_color,

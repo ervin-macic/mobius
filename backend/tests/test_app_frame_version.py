@@ -62,6 +62,7 @@ def test_settings_writes_keep_frame_version(client, auth):
   after = renamed.json()
   assert after["updated_at"] != before["updated_at"]
   assert after["frame_version"] == before["frame_version"]
+  assert after["storage_generation"] == before["storage_generation"]
   assert "token_nonce" not in after
 
 
@@ -79,11 +80,13 @@ def test_code_change_and_data_wipe_rotate_frame_version(
   asyncio.run(compiler.recompile_app_bundle(db, row, row.jsx_source))
   rebuilt = client.get(f"/api/apps/{app['id']}", headers=auth).json()
   assert rebuilt["frame_version"] != initial["frame_version"]
+  assert rebuilt["storage_generation"] == initial["storage_generation"]
 
   wiped = client.delete(f"/api/apps/{app['id']}/data", headers=auth)
   assert wiped.status_code in (200, 204), wiped.text
   after_wipe = client.get(f"/api/apps/{app['id']}", headers=auth).json()
   assert after_wipe["frame_version"] != rebuilt["frame_version"]
+  assert after_wipe["storage_generation"] != rebuilt["storage_generation"]
 
 
 def test_standalone_boot_uses_the_same_frame_version(client, auth, db):
@@ -93,4 +96,7 @@ def test_standalone_boot_uses_the_same_frame_version(client, auth, db):
   listed = client.get(f"/api/apps/{app['id']}", headers=auth).json()
   row = db.query(models.App).filter(models.App.id == app["id"]).one()
 
-  assert _standalone_boot_payload(row)["frame_version"] == listed["frame_version"]
+  boot = _standalone_boot_payload(row)
+  assert boot["frame_version"] == listed["frame_version"]
+  assert boot["storage_generation"] == listed["storage_generation"]
+  assert row.token_nonce not in str(boot)

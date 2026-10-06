@@ -3298,6 +3298,7 @@ function makeSplit() {
 }
 function makeNav({ location = null, waitForNavigationReady = false, getFrameVisibility = () => null } = {}) {
 	let locationText = validNavLocationText(location);
+	let locationReported = false;
 	const visibility = getFrameVisibility();
 	let navigationReady = !waitForNavigationReady || visibility?.visible === true && visibility.navigationReady !== false;
 	const stack = [];
@@ -3514,7 +3515,7 @@ function makeNav({ location = null, waitForNavigationReady = false, getFrameVisi
 	}
 	function setLocation(value) {
 		const text = encodeNavLocation(value);
-		if (text === locationText) return;
+		if (text === locationText && locationReported) return;
 		locationText = text;
 		if (window.parent === window) return;
 		try {
@@ -3522,6 +3523,7 @@ function makeNav({ location = null, waitForNavigationReady = false, getFrameVisi
 				type: "moebius:nav-location",
 				location: text
 			}, window.location.origin);
+			locationReported = true;
 		} catch (e) {}
 	}
 	return {

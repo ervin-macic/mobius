@@ -4910,6 +4910,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               interactive={appRuntimeVisible
                 && !modalDrawerOpen && !modeBeatActive}
               version={versionForApp(id)}
+              storageGeneration={app?.storage_generation}
               appName={app?.name}
               appSlug={app?.slug}
               offlineCapable={!!app?.offline_capable}

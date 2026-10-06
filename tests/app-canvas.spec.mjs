@@ -980,7 +980,7 @@ async function setupLocationRoutes(page) {
     Object.defineProperty(navigator, 'deviceMemory', { configurable: true, value: 4 })
   })
   const state = {
-    version: '1000', instance: 'nonce-a', updatedAt: '1000', name: 'Location 0',
+    version: '1000', instance: 'nonce-a', storageGeneration: 'generation-a', updatedAt: '1000', name: 'Location 0',
     manualVersions: new Set(), fallbackVersions: new Set(), fetches: 0,
   }
   await page.route('**/test-nav-runtime.js', route => route.fulfill({
@@ -998,6 +998,7 @@ async function setupLocationRoutes(page) {
         compiled_path: `/data/compiled/app-${appId + index}.js`, chat_id: null,
         created_at: '1000', updated_at: index === 0 ? state.updatedAt : '1000',
         frame_version: index === 0 ? state.version : '1000',
+        storage_generation: index === 0 ? state.storageGeneration : `generation-${index}`,
       }))),
     })
   })
@@ -1216,6 +1217,25 @@ test.describe('AppCanvas location lifecycle', () => {
     expect(await restored.evaluate(() => window.initialLocation)).toEqual({ detail: null, filter: 'latest' })
   })
 
+  test('promotion saves the restored screen even when the outgoing frame reported a newer place', async ({ page }) => {
+    const state = await setupLocationRoutes(page)
+    const outgoing = await locationFrame(page)
+    await outgoing.evaluate(() => window.openDetail())
+    await expectDetail(outgoing)
+    state.manualVersions.add('2000')
+    state.version = '2000'
+    await refetchLocationApps(page, state, outgoing)
+    const incoming = await locationFrame(page, 81, 'incoming', '2000')
+    expect(await incoming.evaluate(() => window.initialLocation)).toEqual({ detail: 'notes' })
+    await outgoing.evaluate(() => window.nav.setLocation({ detail: 'notes', filter: 'changed-during-swap' }))
+    await expect.poll(async () => (await storedLocation(page))?.location)
+      .toBe('{"detail":"notes","filter":"changed-during-swap"}')
+    await incoming.evaluate(() => window.mount())
+    const promoted = await locationFrame(page, 81, 'live', '2000')
+    await expectDetail(promoted)
+    await expect.poll(async () => (await storedLocation(page))?.location).toBe('{"detail":"notes"}')
+  })
+
   test('token rotation before a wipe swap cannot adopt an outgoing document bookmark', async ({ page }) => {
     const state = await setupLocationRoutes(page)
     const outgoing = await locationFrame(page)
@@ -1232,12 +1252,43 @@ test.describe('AppCanvas location lifecycle', () => {
     }, before)
     await outgoing.evaluate(() => window.nav.setLocation({ detail: 'outgoing-old-data' }))
     await expect.poll(async () => (await storedLocation(page))?.location).toBe('{"detail":"outgoing-old-data"}')
-    expect((await storedLocation(page)).instance).toBe('nonce-a')
+    expect((await storedLocation(page)).instance).toBe('generation-a')
+    state.storageGeneration = 'generation-b'
     state.version = '2000'
     await refetchLocationApps(page, state, outgoing)
     const fresh = await locationFrame(page, 81, 'live', '2000')
     expect(await fresh.evaluate(() => window.initialLocation)).toBeNull()
     expect(await fresh.evaluate(() => window.detail)).toBe(false)
+  })
+
+  test('a wipe list refresh before token refresh binds the new frame to the new storage generation', async ({ page }) => {
+    const state = await setupLocationRoutes(page)
+    const outgoing = await locationFrame(page)
+    await outgoing.evaluate(() => window.openDetail())
+    await expectDetail(outgoing)
+    const staleToken = await outgoing.evaluate(() => window.lastToken)
+    // Refresh only the app list first. AppCanvas deliberately still holds the
+    // cached pre-wipe token while mounting the new version.
+    state.instance = 'nonce-b'
+    state.storageGeneration = 'generation-b'
+    state.version = '2000'
+    await refetchLocationApps(page, state, outgoing)
+    const fresh = await locationFrame(page, 81, 'live', '2000')
+    expect(await fresh.evaluate(() => window.lastToken)).toBe(staleToken)
+    expect(await fresh.evaluate(() => window.initialLocation)).toBeNull()
+    expect(await fresh.evaluate(() => window.detail)).toBe(false)
+    await expect.poll(async () => (await storedLocation(page))?.instance).toBe('generation-b')
+    // Token-expiry recovery re-initializes this document but must not change
+    // its app-row binding or resurrect the pre-wipe place.
+    const before = await fresh.evaluate(() => window.initCalls)
+    await fresh.evaluate(() => window.parent.postMessage({ type: 'moebius:token-expired', appId: '81' }, window.location.origin))
+    await fresh.waitForFunction(count => window.initCalls > count, before)
+    await fresh.evaluate(() => window.nav.setLocation({ detail: null, filter: 'fresh' }))
+    await expect.poll(async () => (await storedLocation(page))?.location).toBe('{"detail":null,"filter":"fresh"}')
+    expect((await storedLocation(page)).instance).toBe('generation-b')
+    await fresh.goto(fresh.url(), { waitUntil: 'load' })
+    const reloaded = await locationFrame(page, 81, 'live', '2000')
+    expect(await reloaded.evaluate(() => window.initialLocation)).toEqual({ detail: null, filter: 'fresh' })
   })
 
   test('settings-only changes retain the same frame document and open view', async ({ page }) => {

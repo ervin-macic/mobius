@@ -838,7 +838,9 @@ export default function useNavigation({
       const record = appEntryOwnersRef.current.get(entryId)
       const route = navRoute('canvas', null, Number(appId), ownerPaneId)
       // Restoration replaces the dead document's current slot, not another
-      // level on top of it. A different app/pane must keep its own history.
+      // level on top of it. Only the current slot is reusable: multi-level
+      // restoration can still leave retired slots below it. A different
+      // app/pane must keep its own history.
       if (entryId && navEntryId(history.state) === entryId && current.kind === 'app'
           && String(current.appNav?.appId) === String(appId)
           && String(current.route?.paneId) === String(ownerPaneId)

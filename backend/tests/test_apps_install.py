@@ -281,6 +281,7 @@ def test_install_fresh_app_writes_everything(client, auth, tmp_path, bypass_url_
   assert row["background_color"] == "#101820"
   assert row["display"] == "fullscreen"
   assert payload["frame_version"] == row["frame_version"]
+  assert payload["storage_generation"] == row["storage_generation"]
 
 
 def test_install_fresh_service_app_syncs_aliases_during_activation(
@@ -859,6 +860,7 @@ def test_install_update_path_in_place(client, auth, bypass_url_validation):
     })
   assert r1.status_code == 201
   v1_id = r1.json()["id"]
+  v1_generation = r1.json()["storage_generation"]
 
   # User edits the prompt seed before the update lands.
   data_dir = Path(get_settings().data_dir)
@@ -887,6 +889,7 @@ def test_install_update_path_in_place(client, auth, bypass_url_validation):
   assert payload["mode"] == "update"
   assert payload["version"] == "1.2.0"
   assert payload["id"] == v1_id  # same row, not a duplicate
+  assert payload["storage_generation"] == v1_generation
   # User's edit is preserved
   assert user_prompt_path.read_text() == "USER EDITED"
   # JSX got refreshed in source_dir

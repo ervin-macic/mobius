@@ -69,7 +69,9 @@ def app_frame_version(
   with the accepted runtime declarations and bound to one storage generation.
   Ordinary row writes such as a pin, rename, icon, or permission change touch
   none of these, so the shell keeps the running frame and the app keeps its
-  place. The nonce enters only through the digest, never on the wire.
+  place. Packaged /app-assets are excluded: changing only a static asset
+  does not reload an already-running frame. The raw nonce is not exposed by
+  this key (app-scoped JWTs separately carry it as app_nonce).
   """
   runtime = (
     capability_contract.get("runtime")
@@ -81,6 +83,11 @@ def app_frame_version(
     separators=(",", ":"),
   )
   return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def app_storage_generation(token_nonce: str | None) -> str:
+  """Non-secret installation identity for binding saved client-side state."""
+  return hashlib.sha256((token_nonce or "").encode("utf-8")).hexdigest()[:20]
 
 
 def runtime_inject_path() -> Path:

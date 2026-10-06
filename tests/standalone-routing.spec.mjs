@@ -102,6 +102,15 @@ async function standaloneLocationFrame(page, app) {
 test.describe('standalone navigation document ownership', () => {
   test.use({ serviceWorkers: 'block' })
 
+  test.beforeEach(async ({ page }) => {
+    // Navigation tests do not exercise the first-launch install sheet.
+    await page.addInitScript(() => {
+      if (window === window.top) {
+        sessionStorage.setItem('mobius:install-dismissed:standalone-nav-location', '1')
+      }
+    })
+  })
+
   test('real wrapper initializes nav.location and repeated host/frame reloads reuse one Back slot', async ({ page, request }) => {
     const token = await ownerToken(page)
     const app = await createLocationApp(request, token)

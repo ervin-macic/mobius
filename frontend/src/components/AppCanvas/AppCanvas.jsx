@@ -328,7 +328,7 @@ function CameraPreviewLayer({ preview }) {
 // well within the server-side validity window. The token is app-scoped (keyed
 // by appId server-side), so it is identical for both buffered versions.
 const AppCanvas = forwardRef(function AppCanvas({
-  appId, version = 0, appName, appSlug, offlineCapable = false,
+  appId, version = 0, storageGeneration = null, appName, appSlug, offlineCapable = false,
   capabilityContract = null,
   // The shell's applied presentation for this app: full-bleed immersive,
   // status-bar-preserving chrome collapse, or null. One value keeps safe-area
@@ -540,7 +540,8 @@ const AppCanvas = forwardRef(function AppCanvas({
   // listener is live and it can receive frame-init/theme/insets. Per frame,
   // because the two buffered frames finish loading independently.
   const loadedDocsRef = useRef(new Set())
-  // Each document keeps its init installation identity and any pre-promotion report.
+  // Bind each frame to the app row that supplied its version, not the independently
+  // refreshed token. Each document also keeps its pre-promotion report.
   const frameNavRef = useRef(new Map())
   // version -> last immersive request ({ value, mode }) that frame declared.
   // Recorded for every frame, including a hidden incoming one whose real-time post
@@ -558,9 +559,12 @@ const AppCanvas = forwardRef(function AppCanvas({
     const cache = refCbCacheRef.current
     let cb = cache.get(v)
     if (!cb) {
+      const instanceId = storageGeneration
       cb = (el) => {
-        if (el) framesRef.current.set(v, el)
-        else {
+        if (el) {
+          framesRef.current.set(v, el)
+          frameNavRef.current.set(v, { instanceId })
+        } else {
           // AppCanvas can temporarily render a service/loading surface without
           // unmounting itself. Ref removal is the exhaustive boundary for the
           // exact live document, including those non-component teardown paths.
@@ -700,9 +704,6 @@ const AppCanvas = forwardRef(function AppCanvas({
     if (!token) return
     const win = framesRef.current.get(v)?.contentWindow
     if (!win) return
-    if (!frameNavRef.current.has(v)) {
-      frameNavRef.current.set(v, { instanceId: appTokenIdentity(token)?.appInstanceId })
-    }
     // NOTE: do NOT gate on `theme`. Previously this returned early until the
     // theme query resolved, to avoid a one-frame flash from the iframe's
     // fallback theme repainting when `frame-theme` arrives. But offline (cold
@@ -1675,7 +1676,8 @@ const AppCanvas = forwardRef(function AppCanvas({
       )
       dispatchSwap({ type: 'live-reload', version: v })
     }
-    frameNavRef.current.delete(v)
+    const instanceId = frameNavRef.current.get(v)?.instanceId
+    frameNavRef.current.set(v, { instanceId })
     loadedDocsRef.current.add(v)
     sendInit(v)
     sendOnlineStatus(v)

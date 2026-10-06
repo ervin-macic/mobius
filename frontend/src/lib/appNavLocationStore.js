@@ -6,7 +6,7 @@ import { sessionStore } from './workspaceStorage.js'
 // reload in this tab). Tab-scoped workspace storage: it survives a reload but
 // not the tab, so two shell tabs never overwrite each other's place, and a
 // guest's grant storage keeps it out of the owner's. Each entry is bound to
-// the app's installation nonce, so a reused id or a data wipe starts fresh.
+// the app row's storage generation, so a reused id or a data wipe starts fresh.
 
 const KEY_PREFIX = 'mobius:app-nav-location:'
 
@@ -22,11 +22,6 @@ export function readAppNavLocation(appId, instanceId, store = sessionStore()) {
   } catch {
     return null
   }
-}
-
-/** Store validated location text; anything else clears the entry. */
-export function writeAppNavLocation(appId, instanceId, text, store = sessionStore()) {
-  writeValidatedAppNavLocation(appId, instanceId, validNavLocationText(text), store)
 }
 
 /** Persist a report already validated at the frame-message boundary. */

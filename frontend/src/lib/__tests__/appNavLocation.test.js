@@ -9,7 +9,7 @@ import {
 import {
   clearAppNavLocations,
   readAppNavLocation,
-  writeAppNavLocation,
+  writeValidatedAppNavLocation,
 } from '../appNavLocationStore.js'
 
 function memoryStore(initial = {}) {
@@ -26,8 +26,8 @@ function memoryStore(initial = {}) {
 
 test('locations stay per app and per installation', () => {
   const store = memoryStore()
-  writeAppNavLocation(1, 'nonce-a', '{"view":"one"}', store)
-  writeAppNavLocation(2, 'nonce-b', '{"view":"two"}', store)
+  writeValidatedAppNavLocation(1, 'nonce-a', '{"view":"one"}', store)
+  writeValidatedAppNavLocation(2, 'nonce-b', '{"view":"two"}', store)
 
   assert.equal(readAppNavLocation(1, 'nonce-a', store), '{"view":"one"}')
   assert.equal(readAppNavLocation(2, 'nonce-b', store), '{"view":"two"}')
@@ -35,19 +35,19 @@ test('locations stay per app and per installation', () => {
   assert.equal(readAppNavLocation(1, 'nonce-b', store), null, 'a reused id or wiped data starts fresh')
 })
 
-test('invalid or oversized reports clear the entry instead of being stored', () => {
+test('a cleared report removes the entry', () => {
   const store = memoryStore()
-  writeAppNavLocation(1, null, '{"view":"one"}', store)
-  writeAppNavLocation(1, null, 'alert(1)', store)
-  assert.equal(readAppNavLocation(1, null, store), null)
-
-  writeAppNavLocation(1, null, '{"view":"one"}', store)
-  writeAppNavLocation(1, null, JSON.stringify({ q: 'x'.repeat(APP_NAV_LOCATION_MAX_BYTES) }), store)
+  writeValidatedAppNavLocation(1, null, '{"view":"one"}', store)
+  writeValidatedAppNavLocation(1, null, null, store)
   assert.equal(store.items.size, 0)
+})
 
-  writeAppNavLocation(1, null, '{"view":"one"}', store)
-  writeAppNavLocation(1, null, { view: 'object' }, store)
-  assert.equal(readAppNavLocation(1, null, store), null)
+test('the shared wire validator rejects invalid reports before persistence', () => {
+  const invalid = ['alert(1)', '{broken', { view: 'object' },
+    JSON.stringify({ q: 'x'.repeat(APP_NAV_LOCATION_MAX_BYTES) })]
+  for (const value of invalid) {
+    assert.equal(validNavLocationText(value), null)
+  }
 })
 
 test('a tampered stored entry is never handed to a frame', () => {
@@ -70,8 +70,8 @@ test('the size bound counts UTF-8 bytes of the JSON text', () => {
 
 test('logout clears every app location and nothing else', () => {
   const store = memoryStore({ unrelated: 'keep' })
-  writeAppNavLocation(1, null, '{"view":"one"}', store)
-  writeAppNavLocation(2, null, '{"view":"two"}', store)
+  writeValidatedAppNavLocation(1, null, '{"view":"one"}', store)
+  writeValidatedAppNavLocation(2, null, '{"view":"two"}', store)
   clearAppNavLocations(store)
   assert.deepEqual([...store.items.keys()], ['unrelated'])
 })

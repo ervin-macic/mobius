@@ -149,6 +149,8 @@ export default function StandaloneApp({ initialApp }) {
   const onNavPush = useCallback((appId, meta = {}) => {
     const entries = navEntriesRef.current
     const current = entries.at(-1)
+    // Only the current browser slot is reusable; deeper retired slots remain
+    // during multi-level restoration. Single-level restoration adds no ghost Back.
     const reuse = entries.length > 0 && isRetiredAppEntry(navOwnersRef.current.get(current?.requestId))
     if (!reuse && entries.length >= MAX_STANDALONE_HISTORY_ENTRIES) return false
     const entry = {
@@ -260,6 +262,7 @@ export default function StandaloneApp({ initialApp }) {
         appName={app.name}
         appSlug={app.slug}
         version={appFrameVersion(app)}
+        storageGeneration={app.storage_generation}
         offlineCapable={app.offline_capable === true}
         capabilityContract={app.capability_contract || null}
         active
