@@ -8,10 +8,11 @@ from fastapi import HTTPException
 
 from app import connect_runner
 from app import auth
-from app.browser_access import BrowserLineage, create_invitation, revoke_grant
+from app.browser_access import BrowserLineage, revoke_grant
 from app.deps import Principal, get_principal, require_installation_owner_control
 from app.models import Owner
 from app.routes import connect
+from tests.browser_access_fixtures import link_grant
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +61,7 @@ async def _start(host_id, channel, request_id, principal):
 @pytest.mark.asyncio
 async def test_revoke_cancels_only_recipient_commands_not_owner_commands(db):
   owner = _owner(db)
-  grant, _ = create_invitation(db, owner, "laptop")
+  grant, _ = link_grant(db, owner, "laptop")
   guest = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id))
   own = Principal(owner=owner, app_id=None)
   host_id, channel = _host()
@@ -90,7 +91,7 @@ async def test_revoke_cancels_only_recipient_commands_not_owner_commands(db):
 @pytest.mark.asyncio
 async def test_revoke_during_dispatch_finishes_the_guest_command_at_once(db):
   owner = _owner(db)
-  grant, _ = create_invitation(db, owner, "laptop")
+  grant, _ = link_grant(db, owner, "laptop")
   guest = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id))
   host_id, channel = _host()
   request_id = "a" * 16
@@ -116,7 +117,7 @@ async def test_revoke_during_dispatch_finishes_the_guest_command_at_once(db):
 @pytest.mark.asyncio
 async def test_cancel_pending_survives_restart_and_reconnect_without_replay(db):
   owner = _owner(db)
-  grant, _ = create_invitation(db, owner, "laptop")
+  grant, _ = link_grant(db, owner, "laptop")
   host_id, _ = _host()
   # A record persisted before the grant epoch retired stays readable.
   command = connect._ActiveCommand.from_record({
@@ -148,7 +149,7 @@ async def test_cancel_pending_survives_restart_and_reconnect_without_replay(db):
 @pytest.mark.asyncio
 async def test_revocation_before_startup_reconciliation_blocks_guest_replay(db):
   owner = _owner(db)
-  grant, _ = create_invitation(db, owner, "laptop")
+  grant, _ = link_grant(db, owner, "laptop")
   host_id, _ = _host()
   guest_command = connect._ActiveCommand(
     "a" * 16, 60, cmd="printf guest", browser_grant_id=grant.id,
@@ -177,7 +178,7 @@ async def test_revocation_before_startup_reconciliation_blocks_guest_replay(db):
 
 def test_guest_cannot_mint_installation_connect_authority(db):
   owner = _owner(db)
-  grant, _ = create_invitation(db, owner, "laptop")
+  grant, _ = link_grant(db, owner, "laptop")
   guest = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id))
   with pytest.raises(HTTPException) as denied:
     require_installation_owner_control(guest)
@@ -187,8 +188,8 @@ def test_guest_cannot_mint_installation_connect_authority(db):
 @pytest.mark.asyncio
 async def test_shared_finished_retry_never_reexecutes_or_adopts_another_grant(db):
   owner = _owner(db)
-  first, _ = create_invitation(db, owner, "first")
-  second, _ = create_invitation(db, owner, "second")
+  first, _ = link_grant(db, owner, "first")
+  second, _ = link_grant(db, owner, "second")
   a = Principal(owner=owner, app_id=None, browser=BrowserLineage(first.id))
   b = Principal(owner=owner, app_id=None, browser=BrowserLineage(second.id))
   host_id, channel = _host()
@@ -212,7 +213,7 @@ async def test_shared_finished_retry_never_reexecutes_or_adopts_another_grant(db
 
 def test_one_failed_stop_record_does_not_abort_revocation_on_other_hosts(db, monkeypatch):
   owner = _owner(db)
-  grant, _ = create_invitation(db, owner, "laptop")
+  grant, _ = link_grant(db, owner, "laptop")
   failing_host, _ = _host()
   other_host, _ = _host()
   failing = connect._ActiveCommand("a" * 16, 60, cmd="printf one", browser_grant_id=grant.id)

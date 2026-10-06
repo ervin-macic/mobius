@@ -8,13 +8,13 @@ from fastapi import HTTPException
 
 from app.browser_access import (
   BrowserAccessGrant, BrowserAccessInvite, BrowserAccessSession,
-  INVITATION_TTL, SESSION_IDLE_TTL, create_invitation,
-  logout_session, redeem_invitation, reissue_invitation, renew_session,
+  SESSION_IDLE_TTL, logout_session, redeem_invitation, renew_session,
   BrowserLineage, is_live, revoke_grant,
 )
 from app.models import Owner
 from app.database import SessionLocal
 from app.timeutil import now_naive_utc
+from tests.browser_access_fixtures import link_grant
 
 
 def _owner(db, name):
@@ -34,30 +34,9 @@ def _denied(action):
   assert error.value.status_code == 401
 
 
-def test_new_grants_are_recipient_isolated_and_secrets_are_never_stored(db):
-  owner = _owner(db, "owner")
-  other = _owner(db, "other")
-  grant_a, invitation_a = create_invitation(db, owner, " laptop ")
-  grant_b, invitation_b = create_invitation(db, owner, "phone")
-  assert grant_a.id != grant_b.id
-  assert grant_a.label == "laptop"
-  assert grant_a.revoked_at is None
-  assert grant_a.created_at is not None
-  assert grant_a.id != invitation_a
-  assert invitation_a != invitation_b
-  invites = db.query(BrowserAccessInvite).all()
-  assert len(invites) == 2
-  assert all(invite.secret_hash not in (invitation_a, invitation_b) for invite in invites)
-  assert all(invite.expires_at - invite.created_at == INVITATION_TTL for invite in invites)
-  assert all(invite.owner_token_epoch == owner.token_epoch for invite in invites)
-  assert _live(db, grant_a.id, owner.id)
-  assert not _live(db, grant_a.id, other.id)
-  assert not _live(db, grant_b.id, other.id)
-
-
 def test_invitation_is_one_use_and_session_is_idle_expiring_not_grant_expiring(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   secret, session, received_grant, received_owner = redeem_invitation(db, invitation)
   assert received_grant.id == grant.id
   assert received_owner.id == owner.id
@@ -78,7 +57,7 @@ def test_invitation_is_one_use_and_session_is_idle_expiring_not_grant_expiring(d
 
 def test_expired_invitation_never_consumes_or_issues_session(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   invite = db.query(BrowserAccessInvite).filter_by(grant_id=grant.id).one()
   invite.expires_at = now_naive_utc() - timedelta(seconds=1)
   db.commit()
@@ -90,8 +69,8 @@ def test_expired_invitation_never_consumes_or_issues_session(db):
 
 def test_revocation_is_idempotent_and_cannot_affect_another_grant(db):
   owner = _owner(db, "owner")
-  grant_a, invite_a = create_invitation(db, owner, "a")
-  grant_b, invite_b = create_invitation(db, owner, "b")
+  grant_a, invite_a = link_grant(db, owner, "a")
+  grant_b, invite_b = link_grant(db, owner, "b")
   secret_a, _, _, _ = redeem_invitation(db, invite_a)
   secret_b, _, _, _ = redeem_invitation(db, invite_b)
   revoked_at = revoke_grant(db, grant_a.id, owner.id).revoked_at
@@ -105,7 +84,7 @@ def test_revocation_is_idempotent_and_cannot_affect_another_grant(db):
 
 def test_owner_epoch_change_invalidates_session_but_not_other_permission(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   secret, _, _, _ = redeem_invitation(db, invitation)
   owner.token_epoch += 1
   db.commit()
@@ -115,7 +94,7 @@ def test_owner_epoch_change_invalidates_session_but_not_other_permission(db):
 
 def test_owner_epoch_change_invalidates_unredeemed_invitation(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   owner.token_epoch += 1
   db.commit()
   _denied(lambda: redeem_invitation(db, invitation))
@@ -127,8 +106,8 @@ def test_owner_epoch_change_invalidates_unredeemed_invitation(db):
 def test_session_liveness_checks_lineage_expiry_epoch_and_logout(db):
   owner = _owner(db, "owner")
   other = _owner(db, "other")
-  grant, invitation = create_invitation(db, owner, "recipient")
-  other_grant, _ = create_invitation(db, owner, "other recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
+  other_grant, _ = link_grant(db, owner, "other recipient")
   secret, session, _, _ = redeem_invitation(db, invitation)
   assert _live(db, grant.id, owner.id, session.id)
   assert not _live(db, other_grant.id, owner.id, session.id)
@@ -145,7 +124,7 @@ def test_session_liveness_checks_lineage_expiry_epoch_and_logout(db):
 
 def test_session_liveness_denies_idle_expiry_and_owner_epoch_change(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   _, session, _, _ = redeem_invitation(db, invitation)
   session.idle_expires_at = now_naive_utc() - timedelta(seconds=1)
   db.commit()
@@ -156,24 +135,12 @@ def test_session_liveness_denies_idle_expiry_and_owner_epoch_change(db):
   assert not _live(db, grant.id, owner.id, session.id)
 
 
-def test_reissue_invitation_keeps_grant_and_session_but_expires_old_invite(db):
+def test_revoking_a_link_grant_voids_its_unredeemed_invite(db):
   owner = _owner(db, "owner")
-  other = _owner(db, "other")
-  grant, old_invitation = create_invitation(db, owner, "recipient")
-  _denied(lambda: reissue_invitation(db, other, grant.id))
-  new_invitation = reissue_invitation(db, owner, grant.id)
-  assert new_invitation != old_invitation
-  _denied(lambda: redeem_invitation(db, old_invitation))
-  secret, session, received_grant, _ = redeem_invitation(db, new_invitation)
-  assert received_grant.id == grant.id
-  assert _live(db, grant.id, owner.id, session.id)
-  again = reissue_invitation(db, owner, grant.id)
-  assert again != new_invitation
-  assert renew_session(db, secret)[0].id == grant.id
+  grant, invitation = link_grant(db, owner, "recipient")
   revoke_grant(db, grant.id, owner.id)
-  _denied(lambda: reissue_invitation(db, owner, grant.id))
-  _denied(lambda: redeem_invitation(db, again))
-  assert not _live(db, grant.id, owner.id, session.id)
+  _denied(lambda: redeem_invitation(db, invitation))
+  assert db.query(BrowserAccessSession).count() == 0
 
 
 @pytest.mark.parametrize("claim", [None, "", 123, [], {}, True, "x" * 65])
@@ -185,7 +152,7 @@ def test_malformed_grant_id_claim_fails_closed(claim):
 
 def test_retired_epoch_claim_is_ignored_but_never_stands_alone(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   _, session, _, _ = redeem_invitation(db, invitation)
   # Bearers minted before the epoch retired keep working until revoked.
   legacy = {"browser_grant": grant.id, "browser_grant_epoch": 0, "browser_session": session.id}
@@ -237,7 +204,7 @@ def test_revocation_is_terminal_nothing_clears_revoked_at():
 def test_wrong_owner_cannot_revoke_and_invite_remains_redeemable(db):
   owner = _owner(db, "owner")
   other = _owner(db, "other")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   _denied(lambda: revoke_grant(db, grant.id, other.id))
   assert db.get(BrowserAccessGrant, grant.id).revoked_at is None
   assert redeem_invitation(db, invitation)[2].id == grant.id
@@ -245,7 +212,7 @@ def test_wrong_owner_cannot_revoke_and_invite_remains_redeemable(db):
 
 def test_two_sessions_preloading_same_invite_still_only_redeem_once(db):
   owner = _owner(db, "owner")
-  grant, invitation = create_invitation(db, owner, "recipient")
+  grant, invitation = link_grant(db, owner, "recipient")
   first = SessionLocal()
   second = SessionLocal()
   try:
@@ -278,7 +245,7 @@ async def test_ending_a_grant_runs_every_stop_step_when_one_fails(db, monkeypatc
   from app import app_services, chat, browser_access
   from app.routes import connect
   owner = _owner(db, "owner")
-  grant, _ = create_invitation(db, owner, "recipient")
+  grant, _ = link_grant(db, owner, "recipient")
   grant = revoke_grant(db, grant.id, owner.id)
   calls = []
 

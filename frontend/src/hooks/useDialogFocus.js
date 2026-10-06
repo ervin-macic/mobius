@@ -43,6 +43,26 @@ export function dialogSiblingElements(container, boundary = null) {
   return siblings
 }
 
+// Nested dialogs can both make the same element inert. Each element is counted and gets its original
+// state back only when the last dialog holding it lets go, whichever closes first.
+const inertHolds = new WeakMap()
+
+export function holdInert(element) {
+  const hold = inertHolds.get(element) || { count: 0, original: element.inert }
+  hold.count += 1
+  inertHolds.set(element, hold)
+  element.inert = true
+}
+
+export function releaseInert(element) {
+  const hold = inertHolds.get(element)
+  if (!hold) return
+  hold.count -= 1
+  if (hold.count > 0) return
+  inertHolds.delete(element)
+  element.inert = hold.original
+}
+
 function lockBodyScroll() {
   if (bodyScrollLockCount === 0) {
     bodyOverflowBeforeLock = document.body.style.overflow
@@ -67,6 +87,8 @@ export default function useDialogFocus({
   shouldRestoreFocus,
   onClose,
   closeOnEscape = true,
+  // Optional: return false to let an Escape press through without closing (for example while typing).
+  shouldCloseOnEscape,
   modal = true,
   lockScroll = modal,
   // A local modal can block only its owning surface while leaving sibling
@@ -78,6 +100,8 @@ export default function useDialogFocus({
   onCloseRef.current = onClose
   const closeOnEscapeRef = useRef(closeOnEscape)
   closeOnEscapeRef.current = closeOnEscape
+  const shouldCloseOnEscapeRef = useRef(shouldCloseOnEscape)
+  shouldCloseOnEscapeRef.current = shouldCloseOnEscape
 
   useEffect(() => {
     if (!open) return undefined
@@ -98,13 +122,13 @@ export default function useDialogFocus({
     const siblings = []
     if (modal) {
       dialogSiblingElements(container).forEach(element => {
-        siblings.push({ element, inert: element.inert })
-        element.inert = true
+        siblings.push(element)
+        holdInert(element)
       })
     } else if (boundary) {
       dialogSiblingElements(container, boundary).forEach(element => {
-        siblings.push({ element, inert: element.inert })
-        element.inert = true
+        siblings.push(element)
+        holdInert(element)
       })
     }
 
@@ -127,7 +151,12 @@ export default function useDialogFocus({
       // keypress even though inerting correctly hides the lower surface.
       if (dialogStack.at(-1) !== stackEntry) return
       const eventIsInsideDialog = container.contains(event.target)
-      if (event.key === 'Escape' && closeOnEscapeRef.current && (modal || eventIsInsideDialog)) {
+      if (
+        event.key === 'Escape'
+        && closeOnEscapeRef.current
+        && (modal || eventIsInsideDialog)
+        && shouldCloseOnEscapeRef.current?.(event) !== false
+      ) {
         event.preventDefault()
         onCloseRef.current?.()
         return
@@ -156,7 +185,7 @@ export default function useDialogFocus({
       document.removeEventListener('keydown', onKeyDown, true)
       const stackIndex = dialogStack.lastIndexOf(stackEntry)
       if (stackIndex !== -1) dialogStack.splice(stackIndex, 1)
-      siblings.forEach(({ element, inert }) => { element.inert = inert })
+      siblings.forEach(releaseInert)
       if (lockScroll) unlockBodyScroll()
       if (shouldRestoreFocus?.() === false) return
       if (explicitRestoreTarget) {
