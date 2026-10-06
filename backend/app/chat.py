@@ -26,6 +26,7 @@ from sqlalchemy import Text, cast, literal_column, or_, text
 from sqlalchemy.orm import Session, load_only
 from starlette.concurrency import run_in_threadpool
 
+from app import transcript_rows
 from app import (
   activity,
   auth,
@@ -925,7 +926,7 @@ def reconcile_startup_chats(
         and not _has_unanswered_question(chat)
       )
       from app.chat_transcript import materialized_messages
-      msgs = materialized_messages(chat)
+      msgs = list(materialized_messages(chat))
       note = (
         "This legacy helper was interrupted during the single-mode cutover. "
         "Its transcript is preserved; start a new helper to rerun the task."
@@ -1975,8 +1976,7 @@ def _auto_resume_recovery(
   if not goal_allows_automatic_resume(db, physical):
     return None
   control = physical.continuation_json
-  messages = list(chat.messages or [])
-  source = messages[-1] if messages else None
+  source = transcript_rows.at(db, chat, -1)
   recorded_park = (
     control.get("supersedes_run_token")
     if isinstance(control, dict)
@@ -2429,11 +2429,19 @@ async def sweep_reset_parks(
   for physical in orphan_candidates:
     if is_chat_running(physical.chat_id):
       continue
-    chat = db.query(models.Chat).filter(
-      models.Chat.id == physical.chat_id,
-      models.Chat.deleted_at.is_(None),
-    ).first()
-    recovered = _auto_resume_recovery(db, chat, physical)
+    # One candidate's failure must never stop every other resume in this sweep.
+    try:
+      chat = db.query(models.Chat).filter(
+        models.Chat.id == physical.chat_id,
+        models.Chat.deleted_at.is_(None),
+      ).first()
+      recovered = _auto_resume_recovery(db, chat, physical)
+    except Exception:
+      log.warning(
+        "sweep_reset_parks: orphan recovery check failed chat_id=%s run_token=%s",
+        physical.chat_id, physical.id, exc_info=True,
+      )
+      continue
     if recovered is None:
       continue
     park, _payload = recovered
@@ -5528,7 +5536,7 @@ async def _run_chat_impl_with_db(
     )
     turn_message = next((
       message for message in reversed(
-        list(chat_row.messages or []) if chat_row is not None else []
+        transcript_rows.history(chat_row) if chat_row is not None else []
       )
       if isinstance(message, dict) and message.get("role") == "user"
     ), None)

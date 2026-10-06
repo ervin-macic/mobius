@@ -23,9 +23,13 @@ owns activation and restarts, and `contributing` owns public GitHub actions.
 
 ## Code invariants
 
-- **Chat persistence.** Every write to `Chat.messages` or `Chat.pending_messages`
-  goes through `chat_writer.py` domain commands; never assign either JSON column
-  directly. Read that module's docstring before changing chat persistence.
+- **Chat persistence.** Transcript-row and `Chat.pending_messages` mutations
+  go through `chat_writer.py` domain commands, using `transcript_rows.py` inside
+  that transaction; create chats only through `chat_writer.create_chat`. The
+  legacy `chats.messages` column is a mirror the commit hook derives from the
+  rows: never read or write it directly; `transcript_rows` readers serve an
+  unconverted chat from it themselves. Read `TRANSCRIPT_STORAGE_DESIGN.md`
+  before changing chat persistence.
 - **Owner-input cards.** Card access is deliberately uniform: any authenticated
   participant that can read a Q&A, Restart, or sealed-input card may answer it
   through that card's ordinary endpoint. The chat access check and exact card

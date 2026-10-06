@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
-from app import models, providers
+from app import models, providers, transcript_rows
 from app.chat_start import start_programmatic_chat_turn
 from app.database import get_db
 from app.config import get_settings
@@ -416,7 +416,7 @@ def get_delegation(
   payload = serialize_delegation(db, row)
   if include_history:
     child = db.query(models.Chat).filter(models.Chat.id == row.child_chat_id).first()
-    payload["history"] = list(child.messages or []) if child is not None else []
+    payload["history"] = transcript_rows.read_all(db, child) if child is not None else []
   return payload
 
 
@@ -492,7 +492,7 @@ async def cancel_delegation(
   db: Session = Depends(get_db),
 ):
   row = _row_for_principal(db, delegation_id, principal)
-  status, _, _ = derived_status(db, row)
+  status, _, _ = derived_status(db, row, load_result=False)
   if status in ACTIVE_DELEGATION_STATUSES:
     if not await cancel_delegation_execution(row.id):
       raise HTTPException(
@@ -595,7 +595,7 @@ async def cancel_active_for_parent(db: Session, parent_chat_id: str) -> list[str
   ).all()
   cancelled: list[str] = []
   for row in rows:
-    status, _, _ = derived_status(db, row)
+    status, _, _ = derived_status(db, row, load_result=False)
     if status not in ACTIVE_DELEGATION_STATUSES:
       continue
     if await cancel_delegation_execution(row.id):
