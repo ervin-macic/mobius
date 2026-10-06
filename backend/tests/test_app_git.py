@@ -4741,3 +4741,14 @@ def test_worktree_merges_all_go_through_the_index_refreshing_primitive():
         if {"read-tree", "-m", "-u"} <= words:
           offenders.append(f"{source.relative_to(app_dir)}:{call.lineno}")
   assert offenders == []
+
+
+def test_read_blob_rejects_directory_objects(tmp_path):
+  repo = tmp_path / "repo"
+  repo.mkdir()
+  app_git.ensure_repo(repo)
+  (repo / "notes").mkdir()
+  (repo / "notes" / "readme.md").write_bytes(b"notes\n")
+  app_git.commit_local(repo, "Add notes")
+  assert app_git.read_blob(repo, "main", "notes/readme.md") == b"notes\n"
+  assert app_git.read_blob(repo, "main", "notes") is None

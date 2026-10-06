@@ -4403,11 +4403,26 @@ def test_update_package_paths_uses_declarations_not_metadata():
 
 @pytest.mark.parametrize("local", [
   None, b"not json", b"[]", b'{"entry": "index.jsx"}',
+  json.dumps({**MANIFEST_NEWS, "tools": [{"name": ["x"]}]}).encode(),
+  json.dumps({**MANIFEST_NEWS, "agent_activities": {
+    "broken": {"tool": ["x"], "running_label": "Running"},
+  }}).encode(),
   b" " * (install._MANIFEST_MAX_BYTES + 1), b"[" * 2000 + b"]" * 2000,
 ])
 def test_invalid_local_manifest_protects_every_path(local):
   with patch("app.install.app_git.read_blob", return_value=local):
     assert install._update_package_paths("unused", MANIFEST_NEWS) is None
+
+
+@pytest.mark.parametrize("patch_fields", [
+  {"tools": [{"name": ["x"]}]},
+  {"agent_activities": {"broken": {"tool": ["x"], "running_label": "Running"}}},
+])
+def test_unhashable_tool_shapes_raise_manifest_contract_error(patch_fields):
+  from app.manifest_contract import ManifestContractError, validate_manifest_contract
+
+  with pytest.raises(ManifestContractError):
+    validate_manifest_contract({**MANIFEST_NEWS, **patch_fields})
 
 
 def test_unreadable_local_manifest_protects_every_path():
@@ -4510,9 +4525,62 @@ def test_directory_file_conflict_goes_to_resolver_on_retries(
     assert not (source_dir / "notes~main").exists()
 
 
-def test_unimplemented_manifest_field_cannot_introduce_runtime_dependencies():
-  manifest = {"entry": "index.jsx", "future_runtime": {"entry": "worker.py"}}
-  assert install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
+def test_platform_manifest_fields_have_explicit_dependency_classification():
+  import ast
+  import inspect
+  from app import app_capabilities, manifest_contract
+
+  # There is no top-level field registry: derive reads from the contract and
+  # its capability normalizers, including field loops. Unknown read syntax
+  # fails this test rather than silently omitting a new platform feature.
+  platform_fields = set()
+  for module in (manifest_contract, app_capabilities):
+    tree = ast.parse(inspect.getsource(module))
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for node in ast.walk(tree):
+      key = None
+      if (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "manifest"
+        and node.func.attr == "get"
+      ):
+        key = node.args[0]
+      elif (
+        isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+        and node.value.id == "manifest" and isinstance(node.ctx, ast.Load)
+      ):
+        key = node.slice
+      if key is None:
+        continue
+      if isinstance(key, ast.Constant):
+        platform_fields.add(key.value)
+        continue
+      assert isinstance(key, ast.Name), "Classify the new manifest field access"
+      ancestor = node
+      while ancestor in parents:
+        ancestor = parents[ancestor]
+        loops = ancestor.generators if isinstance(ancestor, ast.ListComp) else (
+          [ancestor] if isinstance(ancestor, ast.For) else []
+        )
+        loop = next((loop for loop in loops if isinstance(loop.target, ast.Name)
+                     and loop.target.id == key.id), None)
+        if loop is not None:
+          values = getattr(module, loop.iter.id) if isinstance(loop.iter, ast.Name) else ast.literal_eval(loop.iter)
+          platform_fields.update(values)
+          break
+      else:
+        pytest.fail("Classify the new dynamic manifest field access")
+
+  executable = manifest_contract.EXECUTABLE_MANIFEST_FIELDS
+  inert = {
+    "id", "name", "version", "description", "entry", "icon", "package_id",
+    "moved_to", "previous_id", "previous_manifest_url", "permissions", "requires",
+    "offline", "offline_capable", "embeds_agent", "shell_shortcuts", "skills",
+    "source_files", "static_assets", "storage_seeds", "system_prompt",
+    "public_access", "capabilities",
+  }
+  assert not executable & inert
+  assert platform_fields == executable | inert
 
 
 @pytest.mark.parametrize("store_shaped", [False, True])
@@ -4664,6 +4732,33 @@ def test_ancillary_conflict_preserves_local_executable_mode(
   assert readme.read_text() == "local mode and content\n"
   assert bool(readme.stat().st_mode & 0o111) is local_executable
   assert ("README.md" in app_git.read_tree_exec_paths(source_dir, "main")) is local_executable
+
+
+def test_ancillary_owner_edit_survives_upstream_deletion(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  manifest = {
+    "id": "upstream-delete", "name": "Upstream delete", "version": "1.0.0",
+    "description": "Edit preservation", "entry": "index.jsx", "source_files": ["cards.js"],
+  }
+  base, work, bare, app_id, source_dir = _install_readme_fixture(
+    client, auth, tmp_path, manifest["id"], manifest,
+  )
+  owner_bytes = b"owner edited readme\n"
+  (source_dir / "README.md").write_bytes(owner_bytes)
+  (work / "README.md").unlink()
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+  })
+
+  updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert updated.json()["reconciliation"]["kept_local_paths"] == ["README.md"]
+  assert "README.md" in " ".join(updated.json()["warnings"])
+  assert (source_dir / "README.md").read_bytes() == owner_bytes
+  assert app_git.read_blob(source_dir, "main", "README.md") == owner_bytes
 
 
 def test_ancillary_conflict_preserves_local_deletion(
@@ -8355,12 +8450,11 @@ def test_update_discovery_preserves_stored_address_binding(
 def test_stored_address_binding_accepts_only_the_package_or_its_predecessor(
   manifest_id, previous_id, allowed,
 ):
-  from fastapi import HTTPException
+  from app.manifest_identity import require_bound_manifest
 
   manifest = {"id": manifest_id, "previous_id": previous_id}
   if allowed:
-    install.require_bound_manifest(manifest, "current")
+    require_bound_manifest(manifest, "current")
   else:
-    with pytest.raises(HTTPException) as error:
-      install.require_bound_manifest(manifest, "current")
-    assert error.value.status_code == 409
+    with pytest.raises(ValueError, match="no longer"):
+      require_bound_manifest(manifest, "current")

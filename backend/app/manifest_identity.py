@@ -1,12 +1,9 @@
 """Stored app identities and their bound manifest fetch addresses."""
 
-from fastapi import HTTPException
+MANIFEST_ID_MARKER = "#manifest-id="
 
 
-_MANIFEST_ID_MARKER = "#manifest-id="
-
-
-def _canonical_base(url_or_base: str) -> str:
+def canonical_manifest_base(url_or_base: str) -> str:
   """Drop URL decoration so equivalent fetch locators identify one app."""
   base = url_or_base.split("#", 1)[0].split("?", 1)[0]
   if base.endswith("/mobius.json"):
@@ -14,14 +11,14 @@ def _canonical_base(url_or_base: str) -> str:
   return base.rstrip("/")
 
 
-def _canonical_identity_key(url_or_base: str, manifest_id: str) -> str:
+def canonical_manifest_identity_key(url_or_base: str, manifest_id: str) -> str:
   """Identity shared by inline and URL installs; the fragment is never fetched."""
-  return f"{_canonical_base(url_or_base)}{_MANIFEST_ID_MARKER}{manifest_id}"
+  return f"{canonical_manifest_base(url_or_base)}{MANIFEST_ID_MARKER}{manifest_id}"
 
 
 def stored_manifest_fetch_url(identity_key: str) -> str:
   """The raw manifest behind an `App.manifest_url` identity key."""
-  return _canonical_base(identity_key) + "/mobius.json"
+  return canonical_manifest_base(identity_key) + "/mobius.json"
 
 
 def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
@@ -31,7 +28,7 @@ def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
   The fetched package must still carry that id (or name it as `previous_id`),
   so the key keeps meaning one package. Any other URL passes through as is.
   """
-  base, marker, manifest_id = manifest_url.rpartition(_MANIFEST_ID_MARKER)
+  base, marker, manifest_id = manifest_url.rpartition(MANIFEST_ID_MARKER)
   if not marker or not base or not manifest_id:
     return manifest_url, None
   return stored_manifest_fetch_url(manifest_url), manifest_id
@@ -42,8 +39,6 @@ def require_bound_manifest(manifest: dict, bound_id: str | None) -> None:
   if bound_id is not None and bound_id not in (
     manifest.get("id"), manifest.get("previous_id"),
   ):
-    raise HTTPException(
-      409,
+    raise ValueError(
       f"The manifest at this address is no longer the {bound_id!r} app.",
     )
-

@@ -69,8 +69,12 @@ from app.compiler import (
 )
 from app.config import get_settings
 from app.manifest_identity import (
-  _MANIFEST_ID_MARKER, _canonical_base, _canonical_identity_key, requested_manifest_source,
-  stored_manifest_fetch_url, require_bound_manifest,
+  MANIFEST_ID_MARKER as _MANIFEST_ID_MARKER,
+  canonical_manifest_base as _canonical_base,
+  canonical_manifest_identity_key as _canonical_identity_key,
+  requested_manifest_source,
+  stored_manifest_fetch_url,
+  require_bound_manifest as _require_bound_manifest,
 )
 from app.manifest_contract import (
   EXECUTABLE_MANIFEST_FIELDS,
@@ -744,8 +748,6 @@ def pending_conflict_update_matches_app(
   return _trusted_origin_catalog_identity_matches(
     app, raw_base, manifest_id,
   )
-
-
 
 
 async def _http_get(
@@ -2418,7 +2420,10 @@ async def preview_manifest_capabilities(
       manifest=manifest,
       raw_base=raw_base,
     )
-  require_bound_manifest(loaded, bound_manifest_id)
+  try:
+    _require_bound_manifest(loaded, bound_manifest_id)
+  except ValueError as exc:
+    raise HTTPException(409, str(exc)) from exc
   contract, digest = contract_and_digest(loaded)
   return loaded, normalized_base, contract, digest
 
@@ -4204,7 +4209,10 @@ async def install_from_manifest(
       expected_candidate_digest=expected_candidate_digest,
     )
 
-  require_bound_manifest(candidate.manifest, bound_manifest_id)
+  try:
+    _require_bound_manifest(candidate.manifest, bound_manifest_id)
+  except ValueError as exc:
+    raise HTTPException(409, str(exc)) from exc
 
   # Phase 2: immutable identity/update decision. No writes occur here.
   target = _select_install_target(
@@ -4932,6 +4940,10 @@ async def _install_candidate(
         dropped_source_paths |= await asyncio.to_thread(
           _read_upstream_source_paths, git_source_dir, app_git.LOCAL_BRANCH,
         ) - set(source_tree)
+
+      # The served merge result owns deletions, not the new upstream alone:
+      # an upstream deletion may conflict with an owner edit we retained.
+      dropped_source_paths -= set(source_tree)
 
       # The disk-write phase runs INSIDE the same held lock for the Git path so
       # no source commit interleaves between the merge decision and the write; a

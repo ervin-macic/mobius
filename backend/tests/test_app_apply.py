@@ -1164,6 +1164,21 @@ def test_local_manifest_identity_is_immutable(client, auth, db):
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
 
 
+def test_local_manifest_identity_uses_stored_address_parser():
+  from types import SimpleNamespace
+
+  source = Path("/apps/local-name")
+  app = SimpleNamespace(manifest_url="https://example.test/app#manifest-id=stored-id")
+  app_apply._validate_local_identity(
+    source, {"id": "stored-id", "name": "Stored"}, app,
+  )
+  app.manifest_url += "&other=fragment"
+  with pytest.raises(app_apply.AppApplyError, match="source-directory name"):
+    app_apply._validate_local_identity(
+      source, {"id": "stored-id", "name": "Stored"}, app,
+    )
+
+
 def test_local_apply_updates_runtime_capabilities_with_source(
   client, auth, db,
 ):

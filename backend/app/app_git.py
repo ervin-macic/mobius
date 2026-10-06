@@ -3782,10 +3782,10 @@ _APP_VERSION_RE = re.compile(
 
 
 def read_blob(source_dir: str | Path, ref: str, rel: str) -> bytes | None:
-  """Raw bytes of `rel` at `ref`, or None if the path is absent there."""
+  """Raw blob bytes of `rel` at `ref`, or None for absent/non-file paths."""
   repo = Path(source_dir)
   proc = subprocess.run(
-    ["git", "-C", str(repo), "cat-file", "-p", f"{ref}:{rel}"],
+    ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{rel}"],
     capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
   )
   return proc.stdout if proc.returncode == 0 else None

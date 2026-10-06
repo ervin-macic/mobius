@@ -1315,12 +1315,10 @@ def _update_manifest_source(
   installed_manifest_url: str, manifest_url: str | None,
 ) -> tuple[str, str | None]:
   """Use explicit discovery URLs unchanged, or fetch the stored identity."""
-  fetch_url, bound_id = requested_manifest_source(
-    manifest_url if manifest_url is not None else installed_manifest_url,
-  )
-  if manifest_url is None and bound_id is None:
-    fetch_url = stored_manifest_fetch_url(installed_manifest_url)
-  return fetch_url, bound_id
+  if manifest_url is not None:
+    return requested_manifest_source(manifest_url)
+  _, bound_id = requested_manifest_source(installed_manifest_url)
+  return stored_manifest_fetch_url(installed_manifest_url), bound_id
 
 
 @router.get(
@@ -1611,7 +1609,10 @@ async def update_candidate_preview(
         fetch_manifest_url,
         strict=True,
       )
-      require_bound_manifest(candidate.manifest, bound_manifest_id)
+      try:
+        require_bound_manifest(candidate.manifest, bound_manifest_id)
+      except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
       if manifest_url is not None and not _update_candidate_matches_installed(
         installed_manifest_url, manifest_url, candidate.manifest,
       ):
