@@ -3759,8 +3759,8 @@ export default function ChatView({
           if (Array.isArray(result.message?._consumed_cids)) {
             pendingQueue.promoteManyByCid(result.message._consumed_cids)
           }
+          // The pin already landed at submit for this same cid; see below.
           const startedMessages = startedMessagesFromResponse(result)
-          landSentMessage(cid, { intent: freshPinIntent })
           if (startedMessages) {
             commitMessages(prev => appendMessageBatch(prev, startedMessages))
           }
@@ -3779,10 +3779,10 @@ export default function ChatView({
       }
       const startedMessages = startedMessagesFromResponse(result)
       if (startedMessages) {
-        // The started row carries the same cid the client minted, so the pin
-        // targets that cid directly — no retarget from optimistic to canonical
-        // ts, and no last-row fallback. The funnel owns arming + staleness.
-        landSentMessage(cid, { intent: freshPinIntent })
+        // The started row carries the same cid the client minted, and the pin
+        // already landed on that cid at submit. Do not commit the send again:
+        // by now a no-scroll tail swipe or the filled-reservation handoff may
+        // own the mode, and a second commit would resurrect the replaced pin.
         commitMessages(prev => {
           return replaceOptimisticWithBatch(prev, cid, startedMessages)
         })

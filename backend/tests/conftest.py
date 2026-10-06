@@ -306,6 +306,17 @@ def fresh_db():
   for _sub in ("apps", "app-secrets", "app-runtime", "app-envs", "shared", "compiled", "cli-auth"):
     _shutil.rmtree(_os.path.join(_data_dir, _sub), ignore_errors=True)
 
+  # Installed apps' model-provider declarations are projected into the
+  # process-global provider registry, and that projection is read-throttled
+  # for a second. The previous test's App rows are gone, so re-project from
+  # the empty tables now and reopen the throttle; otherwise a test that runs
+  # within a second of one that installed the identity app inherits its
+  # Möbius provider as available.
+  from app import providers as providers_mod
+  from app.config import get_settings as _get_settings
+  providers_mod.sync_app_model_providers(_get_settings().data_dir, force=True)
+  providers_mod._app_provider_sync_at = 0.0
+
   yield
   from app import chat_writer as _cw
   _cw.stop_writer(timeout=5)
