@@ -376,12 +376,13 @@ class _HopUpstream:
     self.status_code = status_code
     self._body = body
     self.headers = headers or {}
+    self.closed = False
 
   async def aiter_bytes(self):
     yield self._body
 
   async def aclose(self):
-    pass
+    self.closed = True
 
 
 def _hop_client(hops):
@@ -443,6 +444,64 @@ def test_proxy_get_follows_redirects_like_install(client, owner_token, monkeypat
   ]
   assert sent[1].headers["host"] == "cdn.example"
   assert sent[1].extensions["sni_hostname"] == "cdn.example"
+
+
+@pytest.mark.parametrize("error, status", [
+  (httpx.ReadTimeout("body stalled"), 504),
+  (httpx.ReadError("connection lost"), 502),
+])
+def test_proxy_get_classifies_mid_stream_failure_and_closes_response(
+  client, owner_token, monkeypatch, error, status,
+):
+  _pin_every_hop(monkeypatch)
+
+  class _FailingUpstream(_HopUpstream):
+    async def aiter_bytes(self):
+      yield b"partial body"
+      raise error
+
+  upstream = _FailingUpstream(200)
+  fake_client, sent = _hop_client([upstream])
+  monkeypatch.setattr("app.routes.proxy.httpx.AsyncClient", lambda **_: fake_client())
+
+  response = client.get(
+    "/api/proxy", params={"url": "https://site.example/mobius.json"},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+
+  assert response.status_code == status, response.text
+  assert "https://site.example/mobius.json" in response.json()["detail"]
+  assert "partial body" not in response.text
+  assert len(sent) == 1
+  assert upstream.closed
+
+
+@pytest.mark.parametrize("private_ip", ["127.0.0.1", "10.0.0.1", "169.254.169.254"])
+def test_proxy_get_rejects_private_redirect_before_sending_second_request(
+  client, owner_token, monkeypatch, private_ip,
+):
+  resolved = []
+
+  def fake_dns(host, *args, **kwargs):
+    resolved.append(host)
+    address = "93.184.216.34" if host == "site.example" else private_ip
+    return [(2, 1, 6, "", (address, 0))]
+
+  monkeypatch.setattr("app.net_utils.socket.getaddrinfo", fake_dns)
+  upstream = _HopUpstream(302, headers={"location": f"http://{private_ip}/private"})
+  fake_client, sent = _hop_client([upstream])
+  monkeypatch.setattr("app.routes.proxy.httpx.AsyncClient", lambda **_: fake_client())
+
+  response = client.get(
+    "/api/proxy", params={"url": "https://site.example/mobius.json"},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+
+  assert response.status_code == 400, response.text
+  assert "non-public address" in response.json()["detail"]
+  assert resolved == ["site.example", private_ip]
+  assert len(sent) == 1
+  assert upstream.closed
 
 
 def test_proxy_get_stops_after_the_install_redirect_limit(

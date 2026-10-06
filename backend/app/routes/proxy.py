@@ -225,6 +225,10 @@ async def _read_external_get(
           if name in upstream.headers
         },
       )
+    except httpx.TimeoutException as exc:
+      raise HTTPException(504, f"Timeout fetching {current_url}") from exc
+    except httpx.RequestError as exc:
+      raise HTTPException(502, f"Failed to fetch {current_url}: {exc}") from exc
     finally:
       await upstream.aclose()
   raise HTTPException(502, "Redirect resolution failed.")
