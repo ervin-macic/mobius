@@ -9,6 +9,7 @@ from starlette.requests import Request
 
 from app import account_browser_access as account, browser_access as access, models
 from app.config import get_settings
+from tests.browser_access_fixtures import link_grant
 
 
 def _grant(db, monkeypatch):
@@ -72,11 +73,10 @@ def test_account_pending_binds_cookie_state_epoch_and_replay(db, monkeypatch):
   _denied(lambda: account.start(db, grant.id))
 
 
-def test_account_pending_rechecks_owner_epoch_and_never_reissues_invitation(db, monkeypatch):
+def test_account_pending_rechecks_owner_epoch(db, monkeypatch):
   owner, grant = _grant(db, monkeypatch)
   cookie, url = account.start(db, grant.id)
   state = parse_qs(urlsplit(url).query)["state"][0]
-  _denied(lambda: access.reissue_invitation(db, owner, grant.id))
   owner.token_epoch += 1
   db.commit()
   _denied(lambda: account.pending_for_callback(db, state, cookie))
@@ -148,7 +148,6 @@ def test_account_route_registration_retry_and_revocation_cleanup(client, auth, d
   assert repeated.json()["grant"]["id"] == grant_id
   assert ids == [grant_id, grant_id]
   assert reply.json()["grant"]["kind"] == "account"
-  assert client.post(f"/api/connect/browser-access/{grant_id}/invitation", headers=auth).status_code == 401
   assert client.get("/api/connect/browser-access/shared", headers=auth).json() == {"instances": []}
   response = client.delete(f"/api/connect/browser-access/{grant_id}", headers=auth)
   assert response.status_code == 202
@@ -352,7 +351,7 @@ def test_account_origin_rejects_unsafe_config(monkeypatch, invalid):
 def test_callback_requires_same_origin_finalize_and_redirects_without_code(client, db, monkeypatch):
   from app.routes import browser_access as routes
   owner, grant = _grant(db, monkeypatch)
-  _, old_invite = access.create_invitation(db, owner, "old browser")
+  _, old_invite = link_grant(db, owner, "old browser")
   old_secret, _, _, _ = access.redeem_invitation(db, old_invite)
   client.cookies.set("mobius_shared_browser", old_secret,
     path="/api/connect/browser-access/session")
