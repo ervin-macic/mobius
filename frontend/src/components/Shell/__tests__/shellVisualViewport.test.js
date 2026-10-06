@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { fitShellToVisualViewport } from '../useShellVisualViewport.js'
+import { fitShellToVisualViewport, installedViewportOptions } from '../useShellVisualViewport.js'
 
 function fakeShell(layoutHeight, zoom = 1) {
   const properties = new Map()
@@ -148,4 +148,19 @@ test('missing viewport or leaving installed mode clears fitted geometry', () => 
   fitShellToVisualViewport(root, { height: 980 }, installed)
   assert.equal(fitShellToVisualViewport(root, { height: 980 }), false)
   assert.equal(root.property('--shell-safe-bottom-inset'), undefined)
+})
+
+test('installed options scale the device bottom inset by the platform reserve', () => {
+  const style = values => ({ getPropertyValue: name => values[name] ?? '' })
+  assert.deepEqual(installedViewportOptions(style({
+    '--shell-fit-visual-viewport': ' 1',
+    '--shell-device-bottom-inset': ' 34px',
+    '--shell-bottom-inset-reserve': ' 0.5',
+  })), { fitViewport: true, safeBottomInset: 17 })
+  assert.deepEqual(installedViewportOptions(style({
+    '--shell-device-bottom-inset': '24px',
+  })), { fitViewport: false, safeBottomInset: 24 }, 'no reserve keeps the whole inset')
+  assert.equal(installedViewportOptions(style({
+    '--shell-device-bottom-inset': '34px', '--shell-bottom-inset-reserve': '3',
+  })).safeBottomInset, 34, 'the reserve never exceeds the safe area')
 })

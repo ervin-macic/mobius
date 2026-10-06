@@ -202,12 +202,17 @@ html, body, #root {
 }
 
 /* Let the viewport hook measure installed WebKit's drawable bottom rather
-   than adding a device's safe area to a dynamic viewport unit. */
+   than adding a device's safe area to a dynamic viewport unit.
+   The reserve is the share of that bottom safe area the chat composer keeps
+   clear. iOS's Home-indicator area is deliberately generous and the indicator
+   occupies only its lowest few points, so reserving a quarter of it places the
+   composer where Android's smaller gesture inset puts it. */
 @supports (-webkit-touch-callout: none) {
   @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
     .shell {
       --shell-fit-visual-viewport: 1;
       --shell-device-bottom-inset: env(safe-area-inset-bottom, 0px);
+      --shell-bottom-inset-reserve: 0.25;
     }
   }
 }

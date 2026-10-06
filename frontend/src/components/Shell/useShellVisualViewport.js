@@ -52,6 +52,22 @@ export function fitShellToVisualViewport(root, viewport, { fitViewport = false, 
   return true
 }
 
+/**
+ * Read the installed-display contract the stylesheet publishes on the shell.
+ * `--shell-bottom-inset-reserve` is the share of the device's bottom safe area
+ * the composer keeps clear (1 when the platform does not set one).
+ */
+export function installedViewportOptions(style) {
+  const read = name => style.getPropertyValue(name).trim()
+  const inset = Number.parseFloat(read('--shell-device-bottom-inset')) || 0
+  const reserve = Number.parseFloat(read('--shell-bottom-inset-reserve'))
+  const share = Number.isFinite(reserve) ? Math.min(1, Math.max(0, reserve)) : 1
+  return {
+    fitViewport: read('--shell-fit-visual-viewport') === '1',
+    safeBottomInset: inset * share,
+  }
+}
+
 export default function useShellVisualViewport(rootRef) {
   useLayoutEffect(() => {
     const viewport = window.visualViewport
@@ -61,11 +77,7 @@ export default function useShellVisualViewport(rootRef) {
     let frameRequest = 0
     const apply = () => {
       frameRequest = 0
-      const style = getComputedStyle(root)
-      fitShellToVisualViewport(root, viewport, {
-        fitViewport: style.getPropertyValue('--shell-fit-visual-viewport').trim() === '1',
-        safeBottomInset: Number.parseFloat(style.getPropertyValue('--shell-device-bottom-inset')) || 0,
-      })
+      fitShellToVisualViewport(root, viewport, installedViewportOptions(getComputedStyle(root)))
     }
     const applySoon = () => {
       if (!frameRequest) frameRequest = requestAnimationFrame(apply)
