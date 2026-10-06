@@ -4233,16 +4233,12 @@ async def install_from_manifest(
     expected_upstream_commit=expected_upstream_commit,
     publication_handoff_app_id=publication_handoff_app_id,
   )
-  # These passes reconcile live refs/files under lifecycle and source locks.
-  # Moving their clone/fetch ahead of identity selection would require a new
-  # staging/activation protocol. Keep locked network Git short instead.
-  with app_git.network_transfer_timeout(30):
-    try:
-      return await install_candidate(python_check=None)
-    except _UncheckedPythonTree as unchecked:
-      pending = unchecked
-    python_check = await _check_reconciled_python(pending)
-    return await install_candidate(python_check=python_check)
+  try:
+    return await install_candidate(python_check=None)
+  except _UncheckedPythonTree as unchecked:
+    pending = unchecked
+  python_check = await _check_reconciled_python(pending)
+  return await install_candidate(python_check=python_check)
 
 
 async def _install_candidate(
@@ -5062,6 +5058,15 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
+  except app_git.GitTransferTimeout as exc:
+    db.rollback()
+    journal.rollback_materialization()
+    raise _git_source_error(
+      "git_update_unavailable",
+      "The app's Git update could not be merged.",
+      "The installed version was left unchanged.",
+      exc,
+    ) from exc
   except (HTTPException, _UncheckedPythonTree):
     db.rollback()
     journal.rollback_materialization()

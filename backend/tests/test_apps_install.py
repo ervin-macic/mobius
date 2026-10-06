@@ -7998,3 +7998,72 @@ def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
   src = Path(get_settings().data_dir) / "apps" / "fetch-ceiling"
   assert app_git.head_sha(src, app_git.UPSTREAM_BRANCH) == first
   assert (src / "index.jsx").read_text() == CLONE_INDEX_V1
+
+
+@pytest.mark.parametrize("operation", ["update", "resolver"])
+def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
+  client, auth, db, bypass_url_validation, monkeypatch, operation,
+):
+  from app import install
+
+  base = "https://unshallow-timeout.test/repo/"
+  manifest = {**MANIFEST_NEWS, "id": "unshallow-timeout"}
+  installed = _install_v1(client, auth, base, manifest, JSX_MULTI)
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  repo = Path(get_settings().data_dir) / "apps" / manifest["id"]
+  local = JSX_MULTI.replace("ORIGINAL TITLE", "LOCAL TITLE")
+  (repo / "index.jsx").write_text(local)
+  incoming = JSX_MULTI.replace("ORIGINAL TITLE", "UPSTREAM TITLE")
+  upstream_before = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
+
+  def hide_merge_base(source_dir):
+    # Model a depth-one upstream graft left by an earlier fetch. Local Git
+    # commands and the entire merge -> unshallow chain remain real.
+    app_git._run(source_dir, "remote", "add", "origin", base)
+    upstream = app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH)
+    (Path(source_dir) / ".git" / "shallow").write_text(upstream + "\n")
+
+  real_merge = app_git.merge_upstream
+  if operation == "update":
+    def merge_with_hidden_base(source_dir, **kwargs):
+      hide_merge_base(source_dir)
+      return real_merge(source_dir, **kwargs)
+
+    monkeypatch.setattr(app_git, "merge_upstream", merge_with_hidden_base)
+  else:
+    conflict = _update_v2(
+      client, auth, base, {**manifest, "version": "2.0.0"}, incoming,
+    )
+    assert conflict.status_code == 201, conflict.text
+    assert conflict.json()["mode"] == "conflict"
+    hide_merge_base(repo)
+    upstream_before = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
+
+  real_run = app_git.subprocess.run
+  seen = []
+
+  def slow_unshallow(cmd, *args, **kwargs):
+    if "--unshallow" in cmd:
+      seen.append(kwargs["timeout"])
+      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+    return real_run(cmd, *args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "run", slow_unshallow)
+  if operation == "update":
+    failed = _update_v2(
+      client, auth, base, {**manifest, "version": "2.0.0"}, incoming,
+    )
+  else:
+    failed = client.post(
+      f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth,
+    )
+
+  assert seen == [30]
+  assert failed.status_code == 409, failed.text
+  assert failed.json()["detail"]["code"] == "git_transfer_timeout"
+  assert (repo / "index.jsx").read_text() == local
+  assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == upstream_before
+  assert not install.pending_update_worktree(repo).exists()
+  db.expire_all()
+  assert db.get(models.App, app_id).version == manifest["version"]

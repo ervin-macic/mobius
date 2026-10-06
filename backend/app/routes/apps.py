@@ -1103,7 +1103,15 @@ def _park_pending_update(repo: Path, receipt: dict) -> list[str]:
       merge_base=override,
     )
   else:
-    merge = app_git.merge_upstream(repo)
+    try:
+      merge = app_git.merge_upstream(repo)
+    except app_git.GitTransferTimeout as exc:
+      raise install._git_source_error(
+        "git_update_unavailable",
+        "The app's Git update could not be merged.",
+        "The installed version was left unchanged.",
+        exc,
+      ) from exc
   if merge.status != "conflict" or not merge.conflict_paths:
     raise _conflict_state_changed()
   worktree.parent.mkdir(parents=True, exist_ok=True)

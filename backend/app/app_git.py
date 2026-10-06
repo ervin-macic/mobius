@@ -65,7 +65,6 @@ import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Callable, Iterable, Iterator
@@ -108,20 +107,14 @@ _GIT_EMAIL = "mobius@localhost"
 # repository, so one that runs longer than this is wedged, not slow.
 _GIT_TIMEOUT = 30
 
-# Network transfers (clone, fetch, unshallow) scale with the repository and the
-# connection. Callers holding lifecycle locks use a short wall-clock ceiling;
-# unlocked preview/inspection transfers can wait for a slow healthy download.
-# An HTTP transfer is abandoned when it moves fewer than
-# lowSpeedLimit bytes/second for lowSpeedTime seconds; the long overall ceiling
-# only catches transports curl does not bound, such as a hung SSH remote.
+# Network transfers (clone, fetch, unshallow) can run while lifecycle or source
+# locks are held. Bound every transfer to 30 seconds, including healthy but
+# slow downloads, so network work cannot monopolize those locks.
 _GIT_NETWORK_OPTIONS = (
   "-c", "http.lowSpeedLimit=1000",
   "-c", "http.lowSpeedTime=60",
 )
-_GIT_NETWORK_TIMEOUT = 30 * 60
-_network_timeout: ContextVar[int | None] = ContextVar(
-  "git_network_timeout", default=None,
-)
+_GIT_NETWORK_TIMEOUT = 30
 _STALLED_TRANSFER = re.compile(
   r"curl 28|operation too slow|timed out", re.IGNORECASE,
 )
@@ -441,26 +434,10 @@ def _run(
   )
 
 
-@contextmanager
-def network_transfer_timeout(seconds: int) -> Iterator[None]:
-  """Limit network Git while a caller holds lifecycle state.
-
-  Task-local context is copied by ``asyncio.to_thread``; a locked install must
-  not shorten an unrelated app's concurrent preview transfer.
-  """
-  token = _network_timeout.set(
-    min(seconds, _network_timeout.get() or _GIT_NETWORK_TIMEOUT),
-  )
-  try:
-    yield
-  finally:
-    _network_timeout.reset(token)
-
-
 def _run_network_command(
   cmd: list[str], env: dict[str, str], *, check: bool = True,
 ) -> subprocess.CompletedProcess:
-  """Run one network git command bounded by transfer progress.
+  """Run one network Git command with a short wall-clock ceiling.
 
   ``cmd`` starts with ``git``; the low-speed options are inserted as global
   options. A stalled or overlong transfer raises ``GitTransferTimeout`` (even
@@ -468,7 +445,7 @@ def _run_network_command(
   that the source is missing.
   """
   cmd = [cmd[0], *_GIT_NETWORK_OPTIONS, *cmd[1:]]
-  timeout = _network_timeout.get() or _GIT_NETWORK_TIMEOUT
+  timeout = _GIT_NETWORK_TIMEOUT
   try:
     result = subprocess.run(
       cmd, capture_output=True, text=True, timeout=timeout,
