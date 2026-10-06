@@ -145,7 +145,7 @@ test('installing an app asks for access first and installs exactly what was revi
 
   const access = page.getByRole('alertdialog', { name: 'Memory asks for access' })
   await expect(access).toBeVisible()
-  await expect(access.getByText('Shared memory')).toBeVisible()
+  await expect(access.getByText('Shared memory', { exact: true })).toBeVisible()
   await expect(access.getByRole('button', { name: 'Confirm and install' })).toBeFocused()
   // Nothing is installed while the access is being read.
   expect(requests.map(request => request.path)).toEqual(['preview'])

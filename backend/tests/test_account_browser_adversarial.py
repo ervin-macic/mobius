@@ -7,6 +7,7 @@ import pytest
 
 from app import account_browser_access as account, browser_access as access, models
 from app.config import get_settings
+from tests.browser_access_fixtures import link_grant
 
 ROOT = '/api/connect/browser-access'
 
@@ -137,7 +138,7 @@ def test_account_recipient_handle_uses_existing_issuer_hyphen_contract(client, d
 
 def test_cross_site_callback_defers_cookie_switch_until_same_origin_finalization(account_flow, db):
     client, owner, _, _, respond, callback = account_flow
-    previous_grant, invitation = access.create_invitation(db, owner, 'Previous person')
+    previous_grant, invitation = link_grant(db, owner, 'Previous person')
     previous_secret, previous_session, _, _ = access.redeem_invitation(db, invitation)
     # Cross-site callback deliberately lacks the old SameSite=Strict cookie.
     respond()

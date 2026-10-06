@@ -23,8 +23,8 @@ from app.goal_commands import (
   is_goal_continue,
   is_goal_command as _is_goal_command,
 )
-def recent_chat_digest_order(db: Session) -> list[str]:
-  """Chat ids whose digests new sessions may see, most recent activity first.
+def recent_chat_summary_order(db: Session) -> list[str]:
+  """Chat ids whose summaries new sessions may see, most recent activity first.
 
   Deleted chats are gone and archived chats are filed away; neither belongs in
   another session's picture of current work. An archived chat's note stays
