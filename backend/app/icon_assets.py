@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import threading
-import warnings
 from collections import OrderedDict
 
 from PIL import Image
@@ -18,7 +17,6 @@ from PIL import Image
 # packages instead warn and omit/preserve them for historical compatibility.
 # Install and update-check digests both omit refused icons.
 MAX_ICON_PIXELS = 32_000_000
-Image.MAX_IMAGE_PIXELS = MAX_ICON_PIXELS
 
 
 class InvalidIcon(ValueError):
@@ -59,13 +57,14 @@ def _normalize_uncached(raw: bytes) -> bytes:
     "an icon may have. Use a smaller image; 1024x1024 is plenty."
   )
   try:
-    # Image.open reads only the header; refuse an oversized image before
-    # load() allocates its pixel buffer. Promoting Pillow's own bomb warning
-    # to an error covers frames that declare a larger size than the header.
-    with warnings.catch_warnings():
-      warnings.simplefilter("error", Image.DecompressionBombWarning)
-      image = Image.open(io.BytesIO(raw))
-      image.load()
+    # Refuse from the header before load() allocates the pixel buffer. Do not
+    # rely on Pillow's process-global warning filters in concurrent workers.
+    image = Image.open(io.BytesIO(raw))
+    if image.width * image.height > MAX_ICON_PIXELS:
+      raise InvalidIcon(too_large)
+    image.load()
+  except InvalidIcon:
+    raise
   except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
     raise InvalidIcon(too_large) from exc
   except Exception as exc:
