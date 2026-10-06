@@ -8567,8 +8567,9 @@ def test_busy_resolver_retry_does_not_recreate_aborted_checkout(
   assert not checkout.exists()
 
 
-def test_stale_resolver_binding_does_not_block_current_revision(
-  client, auth, bypass_url_validation, monkeypatch,
+@pytest.mark.parametrize("state", ["idle", "live", "owner_question", "live_question"])
+def test_stale_resolver_binding_blocks_current_revision_only_while_busy(
+  client, auth, bypass_url_validation, monkeypatch, idle_resolver_runs, state,
 ):
   from app.database import SessionLocal
   apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
@@ -8579,11 +8580,25 @@ def test_stale_resolver_binding_does_not_block_current_revision(
   chat_id = opened.json()["chat_id"]
   with SessionLocal() as db:
     db.get(models.App, app_id).conflict_resolver_upstream_commit = "old-revision"
+    if state == "owner_question":
+      db.get(models.Chat, chat_id).pending_question_id = "open-owner-question"
     db.commit()
-  monkeypatch.setattr("app.chat.is_chat_running", lambda cid: cid == chat_id)
+  busy = state != "idle"
+  monkeypatch.setattr("app.chat.is_chat_running", lambda cid: state == "live" and cid == chat_id)
+  monkeypatch.setattr("app.questions.is_waiting", lambda cid: state == "live_question" and cid == chat_id)
   retry = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
-  assert retry.status_code == 200, retry.text
-  assert retry.json()["created"] is True
-  assert retry.json()["chat_id"] != chat_id
+  if busy:
+    assert retry.status_code == 409, retry.text
+    detail = retry.json()["detail"]
+    assert detail["chat_id"] == chat_id
+    assert apps[0][2] in detail["message"]
+    assert "earlier update" in detail["message"]
+    assert "open or stop" in detail["message"]
+  else:
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["created"] is True
+    assert retry.json()["chat_id"] != chat_id
   with SessionLocal() as db:
-    assert db.get(models.App, apps[1][0]).conflict_resolver_chat_id == chat_id
+    assert db.get(models.App, apps[1][0]).conflict_resolver_chat_id == (
+      chat_id if busy else None
+    )

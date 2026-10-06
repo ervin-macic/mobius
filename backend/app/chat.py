@@ -2852,13 +2852,11 @@ def is_chat_busy(
   db: Session, chat: models.Chat,
   *, run_statuses: Iterable[str] = models.NONTERMINAL_RUN_STATUSES,
 ) -> bool:
-  """Work or owner input remains queued, running, or resumable for this chat."""
+  """Work remains queued, running, or resumable for this chat."""
   return bool(
     is_chat_running(chat.id)
     or chat.pending_messages
     or run_state.has_run_in(db, chat.id, run_statuses)
-    or chat.pending_question_id is not None
-    or questions.is_waiting(chat.id)
   )
 
 

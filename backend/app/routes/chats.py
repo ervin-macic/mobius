@@ -91,6 +91,7 @@ from app.resource_access import (
   require_active_chat_access,
 )
 from app.run_state import (
+  has_nonterminal_run,
   has_running_run,
   running_chat_ids,
   running_goal_objective,
@@ -3260,6 +3261,7 @@ def _app_chat_started(chat: models.Chat, db: Session) -> bool:
   return bool(
     chat.has_messages
     or chat.messages
+    or chat.pending_question_id
     or chat.session_id
     or is_chat_busy(db, chat)
     or (goal and goal.get("status") in {"active", "paused", "completed", "cannot_complete", "cancelled"})
@@ -3583,8 +3585,9 @@ async def patch_app_chat(
       if (
         chat.system_prompt_snapshot_id
         or chat.messages
+        or chat.pending_messages
         or chat.session_id
-        or is_chat_busy(db, chat)
+        or has_nonterminal_run(db, chat_id)
       ):
         raise HTTPException(
           status_code=409,

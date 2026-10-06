@@ -1,4 +1,4 @@
-"""One busy definition protects resolver and chat-mutation admission."""
+"""Shared work admission preserves chat routes independently of owner questions."""
 
 from types import SimpleNamespace
 
@@ -11,7 +11,7 @@ from app import chat, models
   "idle", "live", "queued", "running", "parked", "resume_pending",
   "owner_question", "live_question",
 ])
-def test_chat_busy_includes_queued_running_resumable_and_owner_input(monkeypatch, state):
+def test_chat_busy_counts_work_but_not_open_owner_questions(monkeypatch, state):
   row = SimpleNamespace(
     id="busy-chat", pending_messages=[{}] if state == "queued" else [],
     pending_question_id="question" if state == "owner_question" else None,
@@ -25,7 +25,7 @@ def test_chat_busy_includes_queued_running_resumable_and_owner_input(monkeypatch
     return state in statuses
 
   monkeypatch.setattr(chat.run_state, "has_run_in", has_run)
-  assert chat.is_chat_busy(None, row) is (state != "idle")
+  assert chat.is_chat_busy(None, row) is (state not in {"idle", "owner_question", "live_question"})
   if seen:
     assert seen == [models.NONTERMINAL_RUN_STATUSES]
 

@@ -1242,15 +1242,13 @@ async def _start_conflict_resolver_turn(
   db: Session, chat_id: str, title: str, content: str, provider: str,
 ) -> bool:
   """Start the resolver turn only while the chat is empty and idle."""
-  from app.chat import is_chat_busy
-
   chat = (
     db.query(models.Chat)
     .filter(models.Chat.id == chat_id, models.Chat.deleted_at.is_(None))
     .first()
   )
   if (
-    chat is None or chat.messages or is_chat_busy(db, chat)
+    chat is None or chat.messages or _is_conflict_resolver_busy(db, chat)
   ):
     return False
   return await start_programmatic_chat_turn(
@@ -1753,12 +1751,29 @@ def _resolver_app_error(exc: HTTPException, app_id: int) -> HTTPException:
   return HTTPException(exc.status_code, {**detail, "app_id": app_id})
 
 
-def _check_conflict_resolver_bindings(
-  db: Session, apps: list[models.App],
-) -> tuple[models.Chat | None, list[models.App]]:
-  """Reuse busy current bindings, or an idle chat for the exact batch only."""
+def _is_conflict_resolver_busy(db: Session, chat: models.Chat) -> bool:
+  """An unanswered owner question still owns the resolver's private checkout."""
+  from app import questions
   from app.chat import is_chat_busy
 
+  return bool(
+    is_chat_busy(db, chat)
+    or chat.pending_question_id is not None
+    or questions.is_waiting(chat.id)
+  )
+
+
+@dataclass
+class _ConflictResolverBinding:
+  outcome: Literal["reuse_busy", "reuse_idle", "create"]
+  chat: models.Chat | None
+  displaced_apps: list[models.App]
+
+
+def _check_conflict_resolver_bindings(
+  db: Session, apps: list[models.App],
+) -> _ConflictResolverBinding:
+  """Reuse busy current bindings, or an idle chat for the exact batch only."""
   current = [app for app in apps if (
     app.conflict_resolver_chat_id is not None
     and app.conflict_resolver_upstream_commit == app.upstream_commit
@@ -1768,7 +1783,6 @@ def _check_conflict_resolver_bindings(
   displaced_apps = db.query(models.App).filter(
     models.App.conflict_resolver_chat_id.in_(displaced_ids),
   ).all() if displaced_ids else []
-  requested_ids = {app.id for app in apps}
   for chat_id in sorted(displaced_ids):
     chat = db.get(models.Chat, chat_id)
     if chat is None or chat.deleted_at is not None or chat.created_by_app_id is not None:
@@ -1776,29 +1790,34 @@ def _check_conflict_resolver_bindings(
     bound = [app for app in displaced_apps if (
       app.conflict_resolver_chat_id == chat_id and app.deleted_at is None
     )]
-    if is_chat_busy(db, chat):
-      if chat_id not in current_ids:
-        # A stale requested binding does not own this revision. Leave other
-        # apps with the live resolver instead of invalidating its whole batch.
-        displaced_apps = [app for app in displaced_apps if (
-          app.conflict_resolver_chat_id != chat_id or app.id in requested_ids
-        )]
-        continue
-      if len(current) == len(apps) and len(current_ids) == 1:
-        return chat, []
-      names = ", ".join(app.name for app in bound)
-      verb = "is" if len(bound) == 1 else "are"
+    if _is_conflict_resolver_busy(db, chat):
+      stale = [app for app in apps if (
+        app.conflict_resolver_chat_id == chat_id
+        and app.conflict_resolver_upstream_commit != app.upstream_commit
+      )]
+      if stale:
+        names = ", ".join(app.name for app in stale)
+        message = (
+          f"Another chat is still resolving an earlier update of {names}; "
+          "open or stop it there."
+        )
+      elif len(current) == len(apps) and len(current_ids) == 1:
+        return _ConflictResolverBinding("reuse_busy", chat, [])
+      else:
+        names = ", ".join(app.name for app in bound)
+        verb = "is" if len(bound) == 1 else "are"
+        message = f"{names} {verb} already being resolved in another chat; open it from there."
       raise HTTPException(409, {
         "code": "conflict_resolver_running",
-        "message": f"{names} {verb} already being resolved in another chat; open it from there.",
+        "message": message,
         "chat_id": chat_id,
         "app_ids": sorted(app.id for app in bound),
       })
     if {(app.id, app.conflict_resolver_upstream_commit) for app in bound} == {
       (app.id, app.upstream_commit) for app in apps
     }:
-      return chat, []
-  return None, displaced_apps
+      return _ConflictResolverBinding("reuse_idle", chat, [])
+  return _ConflictResolverBinding("create", None, displaced_apps)
 
 
 async def _create_conflict_resolver_chat(
@@ -1835,12 +1854,11 @@ async def _create_conflict_resolver_chat(
         raise _resolver_app_error(exc, app.id) from exc
       prepared.append((app, repo, receipt))
 
-    existing, displaced_apps = _check_conflict_resolver_bindings(
+    binding = _check_conflict_resolver_bindings(
       db, [app for app, *_ in prepared],
     )
-
-    from app.chat import is_chat_busy
-    if existing is not None and is_chat_busy(db, existing):
+    existing = binding.chat
+    if binding.outcome == "reuse_busy":
       return schemas.AppConflictResolverChatOut(
         chat_id=existing.id, created=False, started=False,
       )
@@ -1894,7 +1912,7 @@ async def _create_conflict_resolver_chat(
       db.add(chat)
       # A displaced chat still has its original seed. Invalidate every binding
       # to it, not only apps selected by the new batch, before rebinding.
-      for bound_app in displaced_apps:
+      for bound_app in binding.displaced_apps:
         bound_app.conflict_resolver_chat_id = None
         bound_app.conflict_resolver_upstream_commit = None
       for app, *_ in prepared:
