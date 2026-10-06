@@ -133,16 +133,16 @@ def test_agent_context_includes_evolving_chat_summary(
   client, auth, chat, monkeypatch,
 ):
   monkeypatch.setattr(
-    "app.compaction.load_cumulative_summary",
+    "app.compaction.load_full_digest",
     lambda _data_dir, chat_id: (
-      "The cumulative handoff." if chat_id == chat.id else None
+      "The full digest." if chat_id == chat.id else None
     ),
   )
   monkeypatch.setattr(
     "app.memory.load_chat_summary_metadata",
     lambda _data_dir, chat_id: {
       "description": "A one-line summary" if chat_id == chat.id else None,
-      "digest": "The bounded digest." if chat_id == chat.id else None,
+      "summary": "The short summary." if chat_id == chat.id else None,
     },
   )
   monkeypatch.setattr(
@@ -153,7 +153,7 @@ def test_agent_context_includes_evolving_chat_summary(
       entries=[{
         "name": "Older chat",
         "location": "chats/older/index.md",
-        "digest": "A bounded digest.",
+        "summary": "A short summary.",
       }],
       mode="recent_chats",
     ),
@@ -169,16 +169,16 @@ def test_agent_context_includes_evolving_chat_summary(
   payload = response.json()
   assert {
     key: payload[key]
-    for key in ("chat_description", "chat_digest", "chat_summary")
+    for key in ("chat_description", "chat_summary", "chat_digest")
   } == {
     "chat_description": "A one-line summary",
-    "chat_digest": "The bounded digest.",
-    "chat_summary": "The cumulative handoff.",
+    "chat_summary": "The short summary.",
+    "chat_digest": "The full digest.",
   }
   assert payload["recent_chat_entries"] == [{
     "name": "Older chat",
     "location": "chats/older/index.md",
-    "digest": "A bounded digest.",
+    "summary": "A short summary.",
   }]
   assert payload["system_prompt_origin"] == "platform"
 

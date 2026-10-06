@@ -176,6 +176,12 @@ test('the app frame relays a child frame\'s shell action only while that frame h
   frameDoc.focus(frameDoc.iframeOf(frameDoc.otherChild))
   frameDoc.message(frameDoc.child, action)
   assert.equal(frameDoc.shellPosts.length, 0, 'not while a different child frame is focused')
+  // Asking for the chord list stays open to every child frame, focused or not,
+  // so a nested frame can capture chords before it ever receives focus.
+  const listPosts = frameDoc.childPosts.length
+  frameDoc.message(frameDoc.child, { type: 'moebius:frame-shortcuts-request' })
+  assert.deepEqual(frameDoc.childPosts.slice(listPosts), [{ type: 'moebius:frame-shortcuts', shortcuts: searchShortcut }],
+    'an unfocused child frame still receives the chord list')
 
   frameDoc.focus({ tagName: 'BODY' })
   frameDoc.message(frameDoc.child, action)

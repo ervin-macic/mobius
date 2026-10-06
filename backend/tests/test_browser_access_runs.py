@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from app import models
-from app.browser_access import create_invitation, revoke_grant
+from app.browser_access import revoke_grant
 from app.delegations import DelegationIntent, create_or_attach_delegation
 from app.routes.delegations import _require_guest_child_lineage
 from app.chat_writer import (
@@ -16,6 +16,7 @@ from app.chat_writer import (
 )
 from app.routes.chats_stream import _browser_may_steer_run
 from app.schema_migrations import _add_chat_run_browser_lineage
+from tests.browser_access_fixtures import link_grant
 
 
 def test_chat_run_lineage_migration_is_idempotent_on_existing_table(tmp_path):
@@ -44,7 +45,7 @@ def test_run_lineage_revalidation_and_guest_steer_boundary(tmp_path):
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'guest')
+    grant, _ = link_grant(db, owner, 'guest')
     chat = models.Chat(id='chat')
     db.add(chat)
     db.add(models.ChatRun(
@@ -144,7 +145,7 @@ def test_revoked_guest_head_is_terminal_without_blocking_owner(tmp_path):
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'guest')
+    grant, _ = link_grant(db, owner, 'guest')
     chat = models.Chat(id='mixed-chat', provider='claude')
     guest = {
       'role': 'user', 'content': 'guest text', 'cid': 'guest-cid', 'ts': 1,
@@ -210,7 +211,7 @@ def test_revoked_grant_cannot_commit_start_turn_after_launch_race(tmp_path):
     db.add(owner)
     db.add(models.Chat(id='chat'))
     db.commit()
-    grant, _ = create_invitation(db, owner, 'guest')
+    grant, _ = link_grant(db, owner, 'guest')
     revoke_grant(db, grant.id, owner.id)
     actor = ChatWriterActor(session_factory=lambda: db)
     with pytest.raises(_PersistFailed):
@@ -233,7 +234,7 @@ def test_guest_submitted_child_under_owner_run_retains_guest_lineage(tmp_path):
     db.add(models.ChatRun(id='owner-run', chat_id='parent', status='running',
                           root_run_id='owner-run'))
     db.commit()
-    grant, _ = create_invitation(db, owner, 'guest')
+    grant, _ = link_grant(db, owner, 'guest')
     intent = DelegationIntent(app_id=None, parent_chat_id='parent',
       parent_root_run_id='owner-run', task_key='guest-work', prompt='work',
       provider='codex', model='gpt-5', effort='medium', cwd='/data',
@@ -245,7 +246,7 @@ def test_guest_submitted_child_under_owner_run_retains_guest_lineage(tmp_path):
     observed, attached = create_or_attach_delegation(db, replace(
       intent, browser_grant_id=None))
     assert attached and observed.browser_grant_id == grant.id
-    other, _ = create_invitation(db, owner, 'other guest')
+    other, _ = link_grant(db, owner, 'other guest')
     with pytest.raises(ValueError, match='browser authority'):
       create_or_attach_delegation(db, replace(intent, browser_grant_id=other.id))
     revoke_grant(db, grant.id, owner.id)
@@ -294,7 +295,7 @@ def test_exact_goal_resume_inherits_target_grant_not_intervening_owner_run(tmp_p
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'guest')
+    grant, _ = link_grant(db, owner, 'guest')
     base = datetime.now(UTC)
     db.add(models.Chat(id='chat', messages=[{'role': 'user', 'content': 'Work', 'ts': 1}]))
     db.add(models.ChatGoal(id='goal', chat_id='chat', objective='Finish work', status='stopped', revision=3))
@@ -336,7 +337,7 @@ def test_guest_cannot_resume_retained_owner_goal_through_its_intervening_run(tmp
     owner = models.Owner(username='owner', hashed_password='unused')
     db.add(owner)
     db.commit()
-    grant, _ = create_invitation(db, owner, 'guest')
+    grant, _ = link_grant(db, owner, 'guest')
     base = datetime.now(UTC)
     db.add(models.Chat(id='chat'))
     db.add(models.ChatGoal(id='goal', chat_id='chat', objective='Owner work', status='stopped', revision=3))
