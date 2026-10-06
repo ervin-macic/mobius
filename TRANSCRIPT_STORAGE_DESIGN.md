@@ -15,7 +15,7 @@ sees every chat completely. No updater, deployment controller or database
   and small lookup projections computed by `transcript_rows.attributes`:
   `message_key` (`str(id)`), the exact `message_id`, `client_id`
   (`chat_writer.cid_of`), `role`, the exact `ts` and `flags` (`EDIT_PREVIEW`,
-  `HIDDEN`, `GOAL_COMPLETION`, `PROSE`, `DERIVED_CID`). Rows are dense from 0.
+  `HIDDEN`, `GOAL_COMPLETION`, `PROSE`, `DERIVED_CID`, `ATTACHMENTS`). Rows are dense from 0.
 - Every row mutation goes through a `chat_writer` domain command calling
   `transcript_rows`; `chat_writer.create_chat` is the only way to create a chat.
   Mutations mark the chat dirty in its Session. One `before_commit` listener

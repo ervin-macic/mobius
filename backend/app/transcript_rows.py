@@ -44,6 +44,7 @@ HIDDEN = 8
 GOAL_COMPLETION = 16
 PROSE = 32
 DERIVED_CID = 64
+ATTACHMENTS = 128
 
 _PROSE_ROLES = ("user", "assistant")
 # Set by chat_writer on the actor's own Session: conversion there runs inline,
@@ -98,10 +99,14 @@ def attributes(body) -> dict:
   # Truthiness, as every reader of `hidden` (and the search rule) uses it.
   hidden = bool(body.get("hidden"))
   flags = HIDDEN if hidden else 0
+  if body.get("attachments"):
+    flags |= ATTACHMENTS
   blocks = body.get("blocks")
   for block in blocks if isinstance(blocks, list) else []:
     if not isinstance(block, dict):
       continue
+    if block.get("attachments"):
+      flags |= ATTACHMENTS
     if block.get("type") == "tool" and isinstance(block.get("edit_preview"), dict):
       flags |= EDIT_PREVIEW
     if _is_goal_tool(block):
@@ -627,6 +632,18 @@ def client_message_seq(db, chat, client_id: str, *, role: str = "user") -> int |
   return db.execute(select(_M.seq).where(
     _M.chat_id == _id(chat), _M.role == role, _M.client_id == client_id,
   ).order_by(_M.seq).limit(1)).scalar()
+
+
+def attachment_bodies(db, chat) -> list:
+  """Bodies of the rows that name attachments (on the message or a block).
+
+  Upload release asks whether anything still names a file; only these rows
+  can, so it never decodes the rest of the history.
+  """
+  require_rows(db, chat)
+  return list(db.execute(select(_M.body).where(
+    _M.chat_id == _id(chat), _M.flags.op("&")(ATTACHMENTS) != 0,
+  ).order_by(_M.seq)).scalars())
 
 
 def max_timestamp(db, chat):

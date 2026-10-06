@@ -409,6 +409,28 @@ def test_cid_lookup_and_timestamp_helpers_never_decode_history(monkeypatch):
   assert decoded == []  # Lookups read projections and raw ts text only.
 
 
+def test_upload_release_reads_only_rows_that_name_attachments(monkeypatch):
+  """Cancelling a queued message never decodes the rest of the history."""
+  from app.upload_lifecycle import release_uploads
+  card = {"role": "assistant", "ts": 50, "blocks": [
+    {"type": "question", "question_id": "q", "attachments": [{"name": "shown.txt"}]},
+  ]}
+  chat_id = seed(messages=[*({"role": "user", "content": "x" * 1000, "ts": i} for i in range(50)),
+                           card, {"role": "user", "ts": 51, "attachments": [{"name": "sent.txt"}]}])
+  decoded = []
+  real = models.TranscriptJSONText.process_result_value
+  monkeypatch.setattr(models.TranscriptJSONText, "process_result_value",
+                      lambda self, value, dialect: decoded.append(1) or real(self, value, dialect))
+  with SessionLocal() as db:
+    chat = db.get(models.Chat, chat_id)
+    chat.uploads = [{"name": name, "claimed": True} for name in ("shown.txt", "sent.txt", "gone.txt")]
+    release_uploads(chat, [{"attachments": [{"name": n} for n in ("shown.txt", "sent.txt", "gone.txt")]}])
+    assert {u["name"]: u["claimed"] for u in chat.uploads} == {
+      "shown.txt": True, "sent.txt": True, "gone.txt": False,
+    }
+  assert len(decoded) == 2  # Only the two rows that name a file.
+
+
 def test_cid_less_legacy_user_rows_match_their_derived_identity():
   chat_id = seed(messages=[{"role": "user", "content": "old", "ts": 5}])
   with SessionLocal() as db:
@@ -436,6 +458,13 @@ def test_this_release_serves_a_database_without_the_legacy_column(tmp_path):
     rows.append(db, "r2", {"role": "assistant", "content": "still works"})
     db.commit()
     assert [m["content"] for m in rows.read_all(db, "r2")] == ["hi", "still works"]
+    from app.upload_lifecycle import release_uploads
+    rows.append(db, "r2", {"role": "user", "content": "file", "attachments": [{"name": "kept.txt"}]})
+    chat = db.get(models.Chat, "r2")
+    chat.uploads = [{"name": "kept.txt", "claimed": True}, {"name": "freed.txt", "claimed": True}]
+    release_uploads(chat, [{"attachments": [{"name": "kept.txt"}, {"name": "freed.txt"}]}])
+    assert [u["claimed"] for u in chat.uploads] == [True, False]
+    db.commit()
     assert db.get(models.Chat, "r2").has_messages is True
     assert rows.unconverted_count(db) == 0
   other.dispose()
