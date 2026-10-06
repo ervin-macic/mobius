@@ -68,8 +68,12 @@ from app.compiler import (
   unlink_app_bundle,
 )
 from app.config import get_settings
+from app.manifest_identity import (
+  _MANIFEST_ID_MARKER, _canonical_base, _canonical_identity_key, requested_manifest_source,
+  stored_manifest_fetch_url, require_bound_manifest,
+)
 from app.manifest_contract import (
-  MANIFEST_FIELD_KINDS,
+  EXECUTABLE_MANIFEST_FIELDS,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
   SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
@@ -332,25 +336,6 @@ def _normalize_raw_base(raw_base: str) -> str:
   if parsed.query or parsed.fragment:
     raise HTTPException(400, "`raw_base` must not include query or fragment.")
   return base if base.endswith("/") else base + "/"
-
-
-_MANIFEST_ID_MARKER = "#manifest-id="
-
-
-def _canonical_base(url_or_base: str) -> str:
-  """The canonical base of a manifest URL: fragment, query string, a trailing
-  `/mobius.json`, and a trailing slash all stripped.
-
-  Strip BOTH fragment and query string. Without ?-strip, two paste-a-URL flows
-  for the same app (with vs without `?utm_source=…`) would canonicalise to
-  different keys and split the app into two App rows on the second install.
-  The identity key is `<base>#manifest-id=<id>`, so this base is ALSO the prefix
-  to match installed rows on regardless of the manifest id — callers that need
-  to ask "is this URL's app installed?" LIKE `<base>#manifest-id=%`."""
-  base = url_or_base.split("#", 1)[0].split("?", 1)[0]
-  if base.endswith("/mobius.json"):
-    base = base[: -len("/mobius.json")]
-  return base.rstrip("/")
 
 
 def _trusted_catalog_repo_base(url_or_base: str) -> str | None:
@@ -761,45 +746,6 @@ def pending_conflict_update_matches_app(
   )
 
 
-def _canonical_identity_key(url_or_base: str, manifest_id: str) -> str:
-  """Single canonical shape for the `manifest_url` column.
-
-  The two install paths (inline-manifest install with `raw_base`, and
-  URL install with `manifest_url=.../mobius.json`) used to write
-  visibly different strings into `App.manifest_url` for the same
-  underlying app. Re-installing via the other path then missed the
-  update branch and created a duplicate row. The fragment is purely a
-  marker — it's never dereferenced over the wire."""
-  return f"{_canonical_base(url_or_base)}{_MANIFEST_ID_MARKER}{manifest_id}"
-
-
-def stored_manifest_fetch_url(identity_key: str) -> str:
-  """The raw manifest behind an `App.manifest_url` identity key."""
-  return _canonical_base(identity_key) + "/mobius.json"
-
-
-def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
-  """Accept an installed app's own identity key wherever a manifest is fetched.
-
-  Returns the URL to fetch and, for an identity key, the manifest id it binds.
-  The fetched package must still carry that id (or name it as `previous_id`),
-  so the key keeps meaning one package. Any other URL passes through as is.
-  """
-  base, marker, manifest_id = manifest_url.rpartition(_MANIFEST_ID_MARKER)
-  if not marker or not base or not manifest_id:
-    return manifest_url, None
-  return stored_manifest_fetch_url(manifest_url), manifest_id
-
-
-def require_bound_manifest(manifest: dict, bound_id: str | None) -> None:
-  """A stored address names this package or its declared predecessor only."""
-  if bound_id is not None and bound_id not in (
-    manifest.get("id"), manifest.get("previous_id"),
-  ):
-    raise HTTPException(
-      409,
-      f"The manifest at this address is no longer the {bound_id!r} app.",
-    )
 
 
 async def _http_get(
@@ -1347,13 +1293,10 @@ def _benign_source_complete(
 ) -> bool:
   """Only keep ancillary conflicts for fully checked JavaScript packages.
 
-  Executable or unknown fields may introduce dependencies the JS checker
-  cannot establish. The shared manifest contract owns their classification.
+  Runtime features may load dependencies the JS checker cannot establish.
+  Fields the platform does not execute cannot introduce such dependencies.
   """
-  if any(
-    MANIFEST_FIELD_KINDS.get(field) not in {"metadata", "declared_files"}
-    for field in manifest
-  ):
+  if EXECUTABLE_MANIFEST_FIELDS.intersection(manifest):
     return False
   return not _source_completeness(tree, manifest, static_assets).errors
 
@@ -2358,7 +2301,7 @@ def _regenerate_skills_index(skills_dir: Path) -> None:
 def _source_completeness(
   tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
 ) -> SourceCheckResult:
-  """Check imports against the exact source and served static-asset bytes."""
+  """Check imports using caller-selected static bytes (opaque on publication)."""
   files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
   files.update({
     f"static/{dest}": data.decode("utf-8", "replace")
@@ -2397,10 +2340,14 @@ def _check_source_completeness(
   ``source_tree`` IS the whole declared tree (entry + every fetched
   ``source_files`` entry + the job script), so it is the sole source of bytes.
   Static-asset dests are recorded below their installer-owned ``static/``
-  directory so source checks see the exact path compilation sees. For example,
+  directory so source checks see the exact path compilation sees. Their bytes
+  remain opaque on publication, as generated assets may contain import-like
+  strings. For example,
   logical destination ``logo.js`` is importable as ``./static/logo.js``.
   """
-  result = _source_completeness(source_tree, manifest, static_assets)
+  result = _source_completeness(
+    source_tree, manifest, {dest: b"" for dest in static_assets},
+  )
   for warning in result.warnings:
     log.warning(
       "install: %s external-host reference in %s — %s",
@@ -5134,7 +5081,8 @@ async def _install_candidate(
       app_id=app.id,
       slug=app.slug,
       source=source,
-      reconciliation=reconciliation.as_dict(),
+      **({"kept_local_paths": list(reconciliation.kept_local_paths)}
+         if reconciliation.kept_local_paths else {}),
     )
 
     # Success: drop any .bak snapshots we made — the new bundle is

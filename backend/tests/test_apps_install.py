@@ -8,8 +8,6 @@ and force failure modes.
 """
 
 import asyncio
-import ast
-import inspect
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
@@ -243,11 +241,15 @@ def test_install_fresh_app_writes_everything(client, auth, tmp_path, bypass_url_
   with patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses),
-  ):
+  ), patch("app.install.activity.log_event") as activity_log:
     r = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
     })
   assert r.status_code == 201, r.text
+  events = [call for call in activity_log.call_args_list if call.args == ("app_install",)]
+  assert len(events) == 1
+  assert "kept_local_paths" not in events[0].kwargs
+  assert "reconciliation" not in events[0].kwargs
   payload = r.json()
   assert payload["mode"] == "install"
   assert payload["version"] == "1.0.0"
@@ -415,10 +417,11 @@ def test_install_static_site_assets_route_css_fonts_and_chunks(
   assert "text/html" not in bad_font_path.headers.get("content-type", "")
 
 
+@pytest.mark.parametrize("label", ["STATIC_MODULE_OK", "import x from './nope.js'"])
 def test_install_bundles_static_module_from_logical_destination(
-  client, auth, bypass_url_validation,
+  client, auth, bypass_url_validation, label,
 ):
-  """Logical static destination x is compiled from source path static/x."""
+  """Publication treats generated static JS as opaque, including import-like strings."""
   base = "https://static-module.test/repo/"
   entry = (
     "import label from './static/generated.js';\n"
@@ -436,7 +439,7 @@ def test_install_bundles_static_module_from_logical_destination(
   responses = {
     base + "mobius.json": (200, json.dumps(manifest).encode()),
     base + "index.jsx": (200, entry.encode()),
-    base + "build/generated.js": (200, b"export default 'STATIC_MODULE_OK'"),
+    base + "build/generated.js": (200, f"export default {json.dumps(label)}".encode()),
   }
   with patch(
     "app.install.httpx.AsyncClient",
@@ -448,7 +451,7 @@ def test_install_bundles_static_module_from_logical_destination(
 
   assert result.status_code == 201, result.text
   bundle = Path(result.json()["compiled_path"])
-  assert "STATIC_MODULE_OK" in bundle.read_text()
+  assert label in bundle.read_text()
 
 
 def test_static_site_asset_update_removes_old_manifest_owned_files(
@@ -4351,33 +4354,26 @@ def _install_readme_fixture(client, auth, tmp_path, app_id, manifest, files=None
   return base, work, bare, installed.json()["id"], source_dir
 
 
-def test_every_recognized_manifest_field_has_a_dependency_classification():
-  from app import app_capabilities, manifest_contract
+@pytest.mark.parametrize("field", [
+  "service", "setup", "schedule", "python", "agent_activities", "tools",
+  "project_templates", "model_provider",
+])
+def test_executable_manifest_features_are_excluded_from_ancillary_resolution(field):
+  from app import manifest_contract
 
-  # Read the contract's actual field accesses, not a second maintained list.
-  recognized = set(manifest_contract.REQUIRED_STRING_FIELDS)
-  for module in (manifest_contract, app_capabilities):
-    syntax = ast.parse(inspect.getsource(module))
-    for node in ast.walk(syntax):
-      if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-          and isinstance(node.func.value, ast.Name) and node.func.value.id == "manifest"
-          and node.func.attr == "get" and node.args
-          and isinstance(node.args[0], ast.Constant)):
-        recognized.add(node.args[0].value)
-      if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
-          and node.value.id == "manifest" and isinstance(node.slice, ast.Constant)):
-        recognized.add(node.slice.value)
-      if (isinstance(node, ast.For) and isinstance(node.target, ast.Name)
-          and isinstance(node.iter, (ast.Tuple, ast.List))
-          and any(isinstance(child, ast.Subscript)
-                  and isinstance(child.value, ast.Name) and child.value.id == "manifest"
-                  and isinstance(child.slice, ast.Name) and child.slice.id == node.target.id
-                  for statement in node.body for child in ast.walk(statement))):
-        recognized.update(ast.literal_eval(node.iter))
-  assert recognized <= manifest_contract.MANIFEST_FIELD_KINDS.keys()
-  assert set(manifest_contract.MANIFEST_FIELD_KINDS.values()) == {
-    "metadata", "declared_files", "executable",
+  # Every runtime feature validated by the contract must bypass the JS-only
+  # completeness gate, even when it is empty or disabled.
+  assert field in manifest_contract.EXECUTABLE_MANIFEST_FIELDS
+  manifest = {
+    "id": "runtime-feature", "name": "Runtime", "version": "1.0.0",
+    "entry": "index.jsx", "description": "Runtime feature", field: "invalid",
   }
+  with pytest.raises(ValueError, match=field):
+    manifest_contract.validate_manifest_contract(manifest)
+  assert not install._benign_source_complete(
+    {"index.jsx": b"export default function App() { return null }"},
+    {**manifest, field: None}, {},
+  )
 
 
 def test_update_package_paths_uses_declarations_not_metadata():
@@ -4514,17 +4510,19 @@ def test_directory_file_conflict_goes_to_resolver_on_retries(
     assert not (source_dir / "notes~main").exists()
 
 
-def test_unknown_runtime_field_keeps_ancillary_conflicts_in_the_resolver():
+def test_unimplemented_manifest_field_cannot_introduce_runtime_dependencies():
   manifest = {"entry": "index.jsx", "future_runtime": {"entry": "worker.py"}}
-  assert not install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
+  assert install._benign_source_complete({"index.jsx": b"export default 1"}, manifest, {})
 
 
 @pytest.mark.parametrize("store_shaped", [False, True])
 def test_conflict_outside_the_package_keeps_local_and_updates(
   client, auth, tmp_path, bypass_url_validation, store_shaped,
 ):
-  """A file no manifest declares is never served, so its conflict must not
-  block the update: the owner's version stays and the package updates."""
+  """Ancillary README conflicts keep the owner's version while updating.
+
+  Undeclared listing media under static/store can still be served.
+  """
   manifest = {
     "id": "undeclared-conflict", "name": "Undeclared", "version": "1.0.0",
     "description": "README.md", "entry": "index.jsx",
@@ -4534,6 +4532,12 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
   if store_shaped:
     manifest.update({
       "author": "Example", "license": "MIT", "homepage": "https://example.test",
+      "store": {
+        "tagline": "Example community app", "description": "A community utility.",
+        "screenshots": [{"src": "static/store/screen.png", "alt": "App screen"}],
+      },
+      "categories": ["utilities"],
+      "system_app": False,
       "runtime": "react", "skills": ["guide.md"], "system_prompt": "prompt.md",
       "source_files": ["cards.js", "guide.md", "prompt.md"],
     })
@@ -4556,7 +4560,8 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
   assert updated.status_code == 201, updated.text
   receipt = updated.json()["reconciliation"]
   assert any(
-    call.args == ("app_install",) and call.kwargs.get("reconciliation") == receipt
+    call.args == ("app_install",) and call.kwargs.get("kept_local_paths") == receipt["kept_local_paths"]
+    and "reconciliation" not in call.kwargs
     for call in activity_log.call_args_list
   )
   assert updated.json()["mode"] == "update"

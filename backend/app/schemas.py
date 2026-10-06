@@ -11,6 +11,7 @@ from pydantic import (
   model_validator,
 )
 
+from app.manifest_identity import requested_manifest_source
 from app.providers import PROVIDERS, _model_belongs_to_other_provider
 
 
@@ -251,8 +252,6 @@ class AppOut(BaseModel):
     """Return the public source contract without exposing identity parsing."""
     if not self.manifest_url:
       return None
-    from app.install import requested_manifest_source
-
     url, manifest_id = requested_manifest_source(self.manifest_url)
     if manifest_id is None:
       return None
