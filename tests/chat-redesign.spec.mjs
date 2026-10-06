@@ -950,6 +950,7 @@ test.describe('Error block: persists across chat return', () => {
       })
     )
 
+    await mockDeliveryReady(page)
     await page.goto(BASE, { waitUntil: 'domcontentloaded' })
     await page.waitForFunction(
       () => !!(document.querySelector('[data-chat-surface="painted"] .chat__empty-wrap')
@@ -1020,6 +1021,7 @@ test.describe('Error block: persists across chat return', () => {
       })
     )
 
+    await mockDeliveryReady(page)
     await page.goto(BASE, { waitUntil: 'domcontentloaded' })
     await page.waitForFunction(
       () => !!(document.querySelector('[data-chat-surface="painted"] .chat__empty-wrap')
