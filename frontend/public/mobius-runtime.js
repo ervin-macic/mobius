@@ -3298,6 +3298,7 @@ function makeSplit() {
 }
 function makeNav({ location = null } = {}) {
 	let locationText = validNavLocationText(location);
+	let navigationReady = false;
 	const stack = [];
 	const entries = /* @__PURE__ */ new Set();
 	const entriesByRequestId = /* @__PURE__ */ new Map();
@@ -3309,10 +3310,15 @@ function makeNav({ location = null } = {}) {
 			}, window.location.origin);
 		} catch (e) {}
 	}
-	function onForwardMessage(event) {
+	function onHostMessage(event) {
 		if (event.origin !== window.location.origin) return;
 		if (event.source !== window.parent) return;
 		const msg = event.data;
+		if (msg?.type === "moebius:frame-visibility") {
+			navigationReady = msg.visible === true && msg.navigationReady !== false;
+			if (navigationReady) for (const entry of entries) entry.send?.();
+			return;
+		}
 		if (msg?.type !== "moebius:nav-forward" || typeof msg.requestId !== "string") return;
 		const entry = entriesByRequestId.get(msg.requestId);
 		if (!entry || !entry.reversible || entry.done || entry.disposed) {
@@ -3343,7 +3349,7 @@ function makeNav({ location = null } = {}) {
 		}
 		postForwardResult("moebius:nav-forward-ack", msg.requestId);
 	}
-	if (window.parent !== window) window.addEventListener("message", onForwardMessage);
+	if (window.parent !== window) window.addEventListener("message", onHostMessage);
 	function open(label, onBackOrHandlers, onForwardArg) {
 		for (const old of [...entries]) if (!old.active && old.settled) old.dispose?.();
 		const handlers = onBackOrHandlers && typeof onBackOrHandlers === "object" ? onBackOrHandlers : {
@@ -3358,6 +3364,8 @@ function makeNav({ location = null } = {}) {
 			done: false,
 			disposed: false,
 			settled: false,
+			sent: false,
+			send: null,
 			cleanupTimer: null,
 			readyResolve: null,
 			outcomeResolve: null,
@@ -3384,14 +3392,7 @@ function makeNav({ location = null } = {}) {
 				entry.readyResolve = null;
 			}
 		};
-		const timer = setTimeout(() => {
-			entry.done = true;
-			settleOutcome("timeout");
-			entry.cleanupTimer = setTimeout(() => {
-				entry.settled = true;
-				dispose();
-			}, 3e4);
-		}, 5e3);
+		let timer = null;
 		const dispose = () => {
 			if (entry.disposed) return;
 			entry.disposed = true;
@@ -3419,6 +3420,7 @@ function makeNav({ location = null } = {}) {
 			if (!entry.settled) {
 				entry.done = true;
 				settleOutcome("cancelled");
+				if (!entry.sent) dispose();
 				return;
 			}
 			if (!entry.reversible || !entry.settled) dispose();
@@ -3475,19 +3477,32 @@ function makeNav({ location = null } = {}) {
 				}
 			};
 		}
-		try {
-			window.parent.postMessage({
-				type: "moebius:nav-push",
-				label: label || "app-detail",
-				requestId,
-				reversible: entry.reversible
-			}, window.location.origin);
-		} catch (e) {
-			clearTimeout(timer);
-			entry.settled = true;
-			settleOutcome("error");
-			dispose();
-		}
+		entry.send = () => {
+			if (!navigationReady || entry.sent || entry.done) return;
+			entry.sent = true;
+			timer = setTimeout(() => {
+				entry.done = true;
+				settleOutcome("timeout");
+				entry.cleanupTimer = setTimeout(() => {
+					entry.settled = true;
+					dispose();
+				}, 3e4);
+			}, 5e3);
+			try {
+				window.parent.postMessage({
+					type: "moebius:nav-push",
+					label: label || "app-detail",
+					requestId,
+					reversible: entry.reversible
+				}, window.location.origin);
+			} catch (e) {
+				clearTimeout(timer);
+				entry.settled = true;
+				settleOutcome("error");
+				dispose();
+			}
+		};
+		entry.send();
 		return {
 			ready,
 			outcome,

@@ -406,9 +406,64 @@ async function withFakeWindow(fn) {
   }
 }
 
-test('nav helper waits for ack before owning a back entry', async () => {
+// Existing ownership tests start in an already promoted, visible document.
+function makeVisibleNav(options) {
+  const nav = makeNav(options)
+  window.emit?.({ type: 'moebius:frame-visibility', visible: true })
+  return nav
+}
+
+test('nav restoration waits for trusted visibility and starts its timeout at send', async () => {
+  const previousSetTimeout = globalThis.setTimeout
+  const previousClearTimeout = globalThis.clearTimeout
+  const timers = []
+  globalThis.setTimeout = (cb, ms) => { timers.push({ cb, ms }); return timers.length }
+  globalThis.clearTimeout = () => {}
+  try {
+    await withFakeWindow(async ({ window, parent }) => {
+      const nav = makeNav({ location: '{"detail":"notes"}' })
+      const first = nav.open('collection')
+      const second = nav.open('detail')
+      window.emit({ type: 'moebius:frame-visibility', visible: false })
+      window.emit({ type: 'moebius:frame-visibility', visible: true, navigationReady: false })
+      window.emit({ type: 'moebius:frame-visibility', visible: true }, { source: {} })
+      window.emit({ type: 'moebius:frame-visibility', visible: true }, { origin: 'https://other.test' })
+      assert.equal(parent.messages.length, 0)
+      assert.equal(timers.length, 0, 'hidden restoration has no ownership deadline')
+      window.emit({ type: 'moebius:frame-visibility', visible: true })
+      assert.deepEqual(parent.messages.map(msg => msg.data.label), ['collection', 'detail'])
+      assert.deepEqual(timers.map(timer => timer.ms), [5000, 5000])
+      window.emit({ type: 'moebius:frame-visibility', visible: true })
+      assert.equal(parent.messages.length, 2, 'visibility replay must not resend')
+      for (const msg of parent.messages) {
+        window.emit({ type: 'moebius:nav-push-ack', requestId: msg.data.requestId })
+      }
+      assert.equal(await first.ready, true)
+      assert.equal(await second.ready, true)
+      first.close()
+      second.close()
+    })
+  } finally {
+    globalThis.setTimeout = previousSetTimeout
+    globalThis.clearTimeout = previousClearTimeout
+  }
+})
+
+test('closing a deferred nav request cancels it before visibility can send it', async () => {
   await withFakeWindow(async ({ window, parent }) => {
     const nav = makeNav()
+    const handle = nav.open('detail')
+    handle.close()
+    assert.deepEqual(await handle.outcome, { status: 'cancelled' })
+    assert.equal(await handle.ready, false)
+    window.emit({ type: 'moebius:frame-visibility', visible: true })
+    assert.equal(parent.messages.length, 0)
+  })
+})
+
+test('nav helper waits for ack before owning a back entry', async () => {
+  await withFakeWindow(async ({ window, parent }) => {
+    const nav = makeVisibleNav()
     let backed = false
     const handle = nav.open('detail', () => { backed = true })
     const push = parent.messages.at(-1).data
@@ -459,7 +514,7 @@ test('projects runtime sends bounded requests and accepts only its parent respon
 test('reversible nav restores the same app view on Forward and can unwind again', async () => {
   await withFakeWindow(async ({ window, parent }) => {
     const events = []
-    const nav = makeNav()
+    const nav = makeVisibleNav()
     const handle = nav.open('report', {
       onBack: () => events.push('back'),
       onForward: () => events.push('forward'),
@@ -487,7 +542,7 @@ test('reversible nav restores the same app view on Forward and can unwind again'
 test('a reversible in-app close keeps Forward restoration but emits one pop', async () => {
   await withFakeWindow(async ({ window, parent }) => {
     let forwards = 0
-    const handle = makeNav().open('report', {
+    const handle = makeVisibleNav().open('report', {
       onBack() {},
       onForward() { forwards += 1 },
     })
@@ -505,7 +560,7 @@ test('a reversible in-app close keeps Forward restoration but emits one pop', as
 
 test('a fresh runtime explicitly rejects Forward state it cannot reconstruct', async () => {
   await withFakeWindow(async ({ window, parent }) => {
-    makeNav()
+    makeVisibleNav()
     window.emit({ type: 'moebius:nav-forward', requestId: 'missing-entry' })
     assert.deepEqual(parent.messages.at(-1).data, {
       type: 'moebius:nav-forward-rejected',
@@ -517,7 +572,7 @@ test('a fresh runtime explicitly rejects Forward state it cannot reconstruct', a
 test('Forward is rejected when onForward synchronously closes the restored view', async () => {
   await withFakeWindow(async ({ window, parent }) => {
     let handle
-    handle = makeNav().open('report', {
+    handle = makeVisibleNav().open('report', {
       onBack() {},
       onForward() { handle.close() },
     })
@@ -739,7 +794,7 @@ test('capabilities reject direct top-level use instead of bypassing the host', a
 
 test('nav helper ignores same-origin messages from non-parent frames', async () => {
   await withFakeWindow(async ({ window, parent }) => {
-    const nav = makeNav()
+    const nav = makeVisibleNav()
     const handle = nav.open('detail')
     const push = parent.messages.at(-1).data
 
@@ -757,7 +812,7 @@ test('nav helper ignores same-origin messages from non-parent frames', async () 
 
 test('nav helper handles rejected pushes without owning or popping', async () => {
   await withFakeWindow(async ({ window, parent }) => {
-    const nav = makeNav()
+    const nav = makeVisibleNav()
     const handle = nav.open('detail')
     const push = parent.messages.at(-1).data
 
@@ -771,7 +826,7 @@ test('nav helper handles rejected pushes without owning or popping', async () =>
 
 test('nav helper close after ownership emits one pop and is idempotent', async () => {
   await withFakeWindow(async ({ window, parent }) => {
-    const handle = makeNav().open('detail')
+    const handle = makeVisibleNav().open('detail')
     const push = parent.messages.at(-1).data
     window.emit({ type: 'moebius:nav-push-ack', requestId: push.requestId })
     await handle.outcome
@@ -784,7 +839,7 @@ test('nav helper close after ownership emits one pop and is idempotent', async (
 
 test('nav helper auto-pops a late ack after local close', async () => {
   await withFakeWindow(async ({ window, parent }) => {
-    const nav = makeNav()
+    const nav = makeVisibleNav()
     const handle = nav.open('detail')
     const push = parent.messages.at(-1).data
 
@@ -809,7 +864,7 @@ test('nav helper rejects direct top-level use instead of growing a second host',
   standalone.parent = standalone
   globalThis.window = standalone
   try {
-    const handle = makeNav().open('detail')
+    const handle = makeVisibleNav().open('detail')
     assert.deepEqual(await handle.outcome, { status: 'unavailable' })
     assert.equal(await handle.ready, false)
     assert.equal(listeners.size, 0)
@@ -829,7 +884,7 @@ test('nav helper reports timeout and compensates a late acknowledgement', async 
   globalThis.clearTimeout = () => {}
   try {
     await withFakeWindow(async ({ window, parent }) => {
-      const handle = makeNav().open('detail')
+      const handle = makeVisibleNav().open('detail')
       const push = parent.messages.at(-1).data
       timers.find((timer) => timer.ms === 5000).cb()
       assert.deepEqual(await handle.outcome, { status: 'timeout' })
@@ -848,7 +903,7 @@ test('nav helper reports timeout and compensates a late acknowledgement', async 
 test('nav helper reports a postMessage error without rejecting either promise', async () => {
   await withFakeWindow(async ({ parent }) => {
     parent.postMessage = () => { throw new Error('frame detached') }
-    const handle = makeNav().open('detail')
+    const handle = makeVisibleNav().open('detail')
     assert.deepEqual(await handle.outcome, { status: 'error' })
     assert.equal(await handle.ready, false)
   })
@@ -857,7 +912,7 @@ test('nav helper reports a postMessage error without rejecting either promise', 
 test('nav helper sends shell back only to the most recent owned entry', async () => {
   await withFakeWindow(async ({ window, parent }) => {
     const backed = []
-    const nav = makeNav()
+    const nav = makeVisibleNav()
     const first = nav.open('first', () => backed.push('first'))
     const firstPush = parent.messages.at(-1).data
     window.emit({ type: 'moebius:nav-push-ack', requestId: firstPush.requestId })
@@ -877,7 +932,7 @@ test('nav helper sends shell back only to the most recent owned entry', async ()
 
 test('nav location reports bounded JSON to the parent and exposes the restored place', async () => {
   await withFakeWindow(async ({ parent }) => {
-    const nav = makeNav({ location: '{"tab":"browse","item":"notes"}' })
+    const nav = makeVisibleNav({ location: '{"tab":"browse","item":"notes"}' })
     assert.deepEqual(nav.location, { tab: 'browse', item: 'notes' })
 
     nav.setLocation({ tab: 'browse', item: 'notes' })
@@ -900,7 +955,7 @@ test('nav location reports bounded JSON to the parent and exposes the restored p
 
 test('nav location rejects oversized or non-JSON values without reporting them', async () => {
   await withFakeWindow(async ({ parent }) => {
-    const nav = makeNav()
+    const nav = makeVisibleNav()
     assert.throws(() => nav.setLocation({ query: 'x'.repeat(5000) }), RangeError)
     assert.throws(() => nav.setLocation(() => {}), TypeError)
     const cyclic = {}
@@ -913,9 +968,9 @@ test('nav location rejects oversized or non-JSON values without reporting them',
 
 test('nav location ignores restored text that is not bounded JSON', async () => {
   await withFakeWindow(async () => {
-    assert.equal(makeNav({ location: '{broken' }).location, null)
-    assert.equal(makeNav({ location: JSON.stringify({ q: 'x'.repeat(5000) }) }).location, null)
-    assert.equal(makeNav({ location: { tab: 'object, not text' } }).location, null)
+    assert.equal(makeVisibleNav({ location: '{broken' }).location, null)
+    assert.equal(makeVisibleNav({ location: JSON.stringify({ q: 'x'.repeat(5000) }) }).location, null)
+    assert.equal(makeVisibleNav({ location: { tab: 'object, not text' } }).location, null)
   })
 })
 

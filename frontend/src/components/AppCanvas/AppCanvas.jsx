@@ -13,6 +13,7 @@ import {
   liveAppToken, resolveLatchedToken,
 } from '../../lib/appToken.js'
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
+import { validNavLocationText } from '../../lib/appNavLocation.js'
 import { readAppNavLocation, writeAppNavLocation } from '../../lib/appNavLocationStore.js'
 import {
   cacheAppToken, readAppFrameStorage, readCachedAppToken,
@@ -126,6 +127,10 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      drawer opens over the selected app, the frame stays visible beneath the
 //      scrim but synchronously cancels any Android compositor scroll already in
 //      flight. Hidden/incoming frames receive false too.
+//
+//   3c. {type: 'moebius:frame-visibility', visible, navigationReady} parent → frame
+//      visible keeps painted frames foreground during shell handoffs;
+//      navigationReady requires a mounted, promoted, logically visible frame.
 //
 // Intra-app nav (`moebius:nav-push` / `nav-pop` / `nav-push-ack` /
 // `nav-push-rejected` / `nav-back`) is handled below — see the
@@ -535,6 +540,8 @@ const AppCanvas = forwardRef(function AppCanvas({
   // listener is live and it can receive frame-init/theme/insets. Per frame,
   // because the two buffered frames finish loading independently.
   const loadedDocsRef = useRef(new Set())
+  // Each document keeps its init installation identity and any pre-promotion report.
+  const frameNavRef = useRef(new Map())
   // version -> last immersive request ({ value, mode }) that frame declared.
   // Recorded for every frame, including a hidden incoming one whose real-time post
   // is withheld (only the visible frame drives chrome live). On a swap we replay
@@ -571,6 +578,7 @@ const AppCanvas = forwardRef(function AppCanvas({
           if (v === liveVersionRef.current) onNavReset?.(appId)
           framesRef.current.delete(v)
           loadedDocsRef.current.delete(v)
+          frameNavRef.current.delete(v)
           frameImmersiveRef.current.delete(v)
           cache.delete(v)
         }
@@ -692,6 +700,9 @@ const AppCanvas = forwardRef(function AppCanvas({
     if (!token) return
     const win = framesRef.current.get(v)?.contentWindow
     if (!win) return
+    if (!frameNavRef.current.has(v)) {
+      frameNavRef.current.set(v, { instanceId: appTokenIdentity(token)?.appInstanceId })
+    }
     // NOTE: do NOT gate on `theme`. Previously this returned early until the
     // theme query resolved, to avoid a one-frame flash from the iframe's
     // fallback theme repainting when `frame-theme` arrives. But offline (cold
@@ -718,7 +729,7 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
-        navLocation: readAppNavLocation(appId, appTokenIdentity(token)?.appInstanceId),
+        navLocation: readAppNavLocation(appId, frameNavRef.current.get(v).instanceId),
       },
       '*',
     )
@@ -905,6 +916,22 @@ const AppCanvas = forwardRef(function AppCanvas({
         return
       }
 
+      // Incoming reports become authoritative only on promotion. Bind writes to
+      // this document's init, never a token rotated while it is still running.
+      if (msg.type === 'moebius:nav-location') {
+        const nav = frameNavRef.current.get(srcVersion)
+        if (!nav) return
+        const location = validNavLocationText(msg.location)
+        if (srcVersion === liveVersionRef.current) {
+          writeAppNavLocation(appId, nav.instanceId, location)
+          // A live report can arrive before the promotion effect flushes.
+          delete nav.location
+        } else {
+          nav.location = location
+        }
+        return
+      }
+
       // Everything below is a concern of the VISIBLE frame only. Ignore it from
       // a hidden incoming frame: it isn't interactive and shouldn't emit these,
       // but a mount-time nav-push must never install a shell history sentinel for
@@ -912,17 +939,6 @@ const AppCanvas = forwardRef(function AppCanvas({
       // browsing context). Route acks back to the source frame via e.source
       // directly — it is the verified sender window.
       if (srcVersion !== liveVersionRef.current) return
-
-      // A replacement frame still loading in the background may report its
-      // start screen before it restores, so only the live frame's place counts.
-      if (msg.type === 'moebius:nav-location') {
-        writeAppNavLocation(
-          appId,
-          appTokenIdentity(hostTokenRef.current)?.appInstanceId,
-          msg.location,
-        )
-        return
-      }
 
       if (msg.type === 'moebius:clipboard-write') {
         if (!visibleRef.current) return
@@ -1394,7 +1410,13 @@ const AppCanvas = forwardRef(function AppCanvas({
   // (swap.liveVersion change), so a freshly-promoted frame immediately learns
   // whether it is foreground.
   function sendVisibility(v, visible) {
-    postToFrame(v, { type: 'moebius:frame-visibility', visible })
+    postToFrame(v, {
+      type: 'moebius:frame-visibility',
+      visible,
+      // A chat handoff can keep pixels foreground after logical navigation ends.
+      navigationReady: visible && visibleRef.current
+        && v === liveVersionRef.current && swap.liveLoaded,
+    })
   }
 
   function sendInteractivity(v, enabled, frameIsVisible = frameVisibleRef.current) {
@@ -1416,10 +1438,15 @@ const AppCanvas = forwardRef(function AppCanvas({
 
   useEffect(() => {
     if (loadedDocsRef.current.has(swap.liveVersion)) {
+      const nav = frameNavRef.current.get(swap.liveVersion)
+      if (nav && 'location' in nav) {
+        writeAppNavLocation(appId, nav.instanceId, nav.location)
+        delete nav.location
+      }
       sendVisibility(swap.liveVersion, frameVisible)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frameVisible, swap.liveVersion])
+  }, [frameVisible, visible, swap.liveVersion, swap.liveLoaded])
 
   // Layout timing is deliberate. A drawer-open render removes the shell canvas
   // from hit-testing and sends this message before paint; app-frame.html then
@@ -1643,6 +1670,7 @@ const AppCanvas = forwardRef(function AppCanvas({
       )
       dispatchSwap({ type: 'live-reload', version: v })
     }
+    frameNavRef.current.delete(v)
     loadedDocsRef.current.add(v)
     sendInit(v)
     sendOnlineStatus(v)
@@ -1651,12 +1679,12 @@ const AppCanvas = forwardRef(function AppCanvas({
     sendShellShortcuts(v)
     // A booting incoming frame is invisible by construction and must not
     // start audio/rAF work before promotion, so it learns `visible:false`
-    // here; the live frame gets the real visible verdict. Promotion re-sends
-    // via the [frameVisible, swap.liveVersion] effect above. Interactivity is a
+    // here; even a live document waits for its mounted signal. Promotion re-sends
+    // via the mount/promotion effect above. Interactivity is a
     // separate gate (drawer-open momentum cancel); its "painted" argument tracks
     // `frameVisible` post active->visible split, its enabled argument tracks
     // `interactive` (focused pane, drawer-aware).
-    sendVisibility(v, v === liveVersionRef.current ? frameVisibleRef.current : false)
+    sendVisibility(v, false)
     sendInteractivity(
       v,
       v === liveVersionRef.current ? interactiveRef.current : false,

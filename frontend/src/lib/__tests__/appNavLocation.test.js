@@ -1,7 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { makeNav } from '../../../public/mobius-runtime.js'
 import {
   APP_NAV_LOCATION_MAX_BYTES,
   encodeNavLocation,
@@ -24,37 +23,6 @@ function memoryStore(initial = {}) {
     items,
   }
 }
-
-function withFrameWindow(fn) {
-  const previous = globalThis.window
-  const parent = { messages: [], postMessage(data) { this.messages.push(data) } }
-  globalThis.window = {
-    location: { origin: 'https://mobius.test' },
-    parent,
-    addEventListener() {},
-    removeEventListener() {},
-  }
-  try {
-    return fn(parent)
-  } finally {
-    globalThis.window = previous
-  }
-}
-
-test('a place reported by one frame is handed to the next frame of the same app', () => {
-  const store = memoryStore()
-  const reported = withFrameWindow((parent) => {
-    makeNav().setLocation({ tab: 'browse', detail: 'notes' })
-    return parent.messages.at(-1)
-  })
-  // AppCanvas stores the live frame's report under its app and installation.
-  writeAppNavLocation(39, 'nonce-a', reported.location, store)
-
-  const restored = withFrameWindow(() => makeNav({
-    location: readAppNavLocation(39, 'nonce-a', store),
-  }).location)
-  assert.deepEqual(restored, { tab: 'browse', detail: 'notes' })
-})
 
 test('locations stay per app and per installation', () => {
   const store = memoryStore()

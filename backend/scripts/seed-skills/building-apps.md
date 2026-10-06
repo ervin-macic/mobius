@@ -1127,37 +1127,22 @@ Store update), when the bounded frame cache evicts it, after a crash, and when
 the shell itself reloads. In-memory state, including `nav.open` handlers, is
 gone then. Settings writes (pin, rename, permissions, icon) do not reload it.
 
-An app with nested views reports where it is and restores that on start:
-
-```jsx
-const nav = window.mobius?.nav
-const keepsPlace = typeof nav?.setLocation === 'function'
-const restoredRef = useRef(!keepsPlace)
-
-// Once the data the saved view needs has loaded:
-useEffect(() => {
-  if (!loaded || restoredRef.current) return
-  restoredRef.current = true
-  const saved = nav.location
-  const item = items.find(i => i.id === saved?.itemId)
-  if (saved?.view === 'detail' && item) openDetail(item) // the user-tap path
-}, [loaded])
-
-// After every navigation change, once restored:
-useEffect(() => {
-  if (!keepsPlace || !restoredRef.current) return
-  nav.setLocation(selected ? { view: 'detail', itemId: selected.id } : { view: 'list' })
-}, [selected])
-```
+An app with nested views reads `window.mobius.nav.location` on start and reports
+its current place with `nav.setLocation(value)`.
 
 - The location is a small JSON value: at most 4 KiB as UTF-8 JSON
   (`RangeError` above that, `TypeError` for non-JSON). Keep ids and view names
   in it, and drafts or larger state in `window.mobius.storage`.
   `setLocation(null)` clears it.
-- Restore before you report: the first report replaces the saved place.
+- Finish asynchronous restoration before reporting: the first report replaces
+  the saved place. Restore outer views before inner views, and cancel a pending
+  restoration if a newer destination arrives or the component unmounts.
 - Restore through the same path as a user action, so a restored nested view
   calls `nav.open(...)` and Back still works. Treat the saved value as untrusted
   input: check its ids against loaded data and fall back to the start view.
+  `nav.open` waits until the frame is promoted and visible before requesting
+  history ownership; its timeout starts then. Closing an unsent handle cancels
+  it. Mount the app before awaiting restoration; do not add timers to retry it.
 - The shell keeps one location per app installation for the current browser
   tab. It survives a shell reload, not closing the tab, and is cleared on sign
   out or an app data wipe. Other apps never receive it.

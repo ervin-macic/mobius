@@ -88,8 +88,6 @@ export default function StandaloneApp({ initialApp }) {
     }
     return current
   }, [app, initialApp.id, queryClient])
-  const refreshAppRef = useRef(refreshApp)
-  refreshAppRef.current = refreshApp
 
   const captureCrash = useCallback((_appId, error) => {
     setCrash({
@@ -107,9 +105,9 @@ export default function StandaloneApp({ initialApp }) {
     if (event.type === 'app_deleted') {
       setRemoved(true)
     } else if (['app_updated', 'app_recovered', 'app_preview_ready'].includes(event.type)) {
-      void refreshAppRef.current().catch(() => {})
+      void refreshApp().catch(() => {})
     }
-  }, [initialApp.id]), {
+  }, [initialApp.id, refreshApp]), {
     // Reconnect reconciliation is best-effort; the next system event or
     // explicit update tap retries it without leaking a rejected promise.
     onOpen: () => { void refreshApp().catch(() => {}) },
