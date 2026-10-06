@@ -146,7 +146,7 @@ the additions. Its own search tables are left to it; it reconciles them from
   replacement, so an escaped lone surrogate cannot fail a query.
 - Boot checks the transcript triggers (`schema_migrations.TRANSCRIPT_TRIGGERS`,
   one `sqlite_master` read) while `chats.messages` exists and reinstalls any
-  that are missing from 0086's frozen DDL, logging it. When the detection
+  that are missing from 0087's frozen DDL, logging it. When the detection
   trigger itself was missing, the same transaction clears every conversion
   marker, so each chat re-converts from `chats.messages`, which is exact in
   every case (this release's mirror or the previous release's newer write): a later table rebuild
@@ -162,7 +162,7 @@ default of its own and is skipped by `mapped_schema_gaps` (column info
 `legacy_transcript`). When the column is absent (`transcript_rows.legacy_present`
 is false, after release 2 dropped it) this release reads and writes rows only,
 so rolling back from release 2 to release 1 is safe. SQLite is the only
-supported database; migration `0086_transcript_rows` refuses others.
+supported database; migration `0087_transcript_rows` refuses others.
 
 ## Release 2 (later)
 
