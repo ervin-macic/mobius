@@ -279,6 +279,7 @@ def test_install_fresh_app_writes_everything(client, auth, tmp_path, bypass_url_
   assert row["theme_color"] == "#223344"
   assert row["background_color"] == "#101820"
   assert row["display"] == "fullscreen"
+  assert payload["frame_version"] == row["frame_version"]
 
 
 def test_install_fresh_service_app_syncs_aliases_during_activation(
