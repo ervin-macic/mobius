@@ -68,10 +68,10 @@ it. It has three parts:
 
 - **Name** (`title`) — concise, sentence case. Set it in your first turn once the topic is clear;
   rename only when the main topic genuinely shifts. A name the owner chose always wins.
-- **Summary** (`summary`) — one short paragraph: the owner's goal, actual
+- **Summary** (`chat_summary`) — one short paragraph: the owner's goal, actual
   progress, and the next step or blocker. Each save replaces it; new sessions
   see only recent chats' names and Summaries.
-- **Digest** (`digest`) — append only new continuation-critical facts since
+- **Digest** (`digest_entry`) — append only new continuation-critical facts since
   the last save: decisions, verified results, failed approaches, corrections
   (say what they supersede), and open work or approval boundaries. Do not repeat
   earlier entries, the Summary, raw tool output, or an execution diary. Keep
@@ -83,7 +83,7 @@ earlier before a handoff, owner-input card, restart, or risky/long-running work
 when losing the latest decisions would make recovery unsafe or costly. After
 an early save, the final checkpoint includes only further new substance; skip
 it if nothing changed. Never postpone necessary recovery saves until compaction.
-Send `title` and `summary` only when they need changing; combine them with the
+Send `title` and `chat_summary` only when they need changing; combine them with the
 same checkpoint, not separate calls. Omitted fields stay unchanged. Use the
 tool evidence already in context to write the delta; reread the note or selected
 source only when context is missing or verification is needed, not routinely

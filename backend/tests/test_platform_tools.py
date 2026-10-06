@@ -33,11 +33,14 @@ def test_checkpoint_chat_saves_a_short_summary_and_a_cumulative_digest_uncapped(
   description = definition["description"]
   properties = definition["inputSchema"]["properties"]
 
-  assert "summary replaces its short current paragraph" in description
-  assert "digest appends one entry to its cumulative Digest" in description
-  assert set(properties) == {"title", "summary", "digest"}
-  assert "maxLength" not in properties["summary"]
-  assert "maxLength" not in properties["digest"]
+  assert "chat_summary replaces its short Summary" in description
+  assert "digest_entry appends one entry to its cumulative Digest" in description
+  assert set(properties) == {"title", "chat_summary", "digest_entry"}
+  assert "maxLength" not in properties["chat_summary"]
+  assert "maxLength" not in properties["digest_entry"]
+  # A save written for the old plain field names is refused, not misfiled.
+  with pytest.raises(ValueError, match="chat_summary, digest_entry"):
+    control._call_checkpoint_chat({"summary": "Facts written for the old meaning."})
 
 
 def test_notify_owner_leaves_owner_input_cards_to_their_own_notification():

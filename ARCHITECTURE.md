@@ -1387,8 +1387,8 @@ Each chat maintains a **growing per-chat note** at
 `description`, mirroring the chat title), a short replaceable `## Summary`, and
 an append-only full `## Digest`. The **working agent authors it** as it works
 through the run-bound `checkpoint_chat` MCP tool: `title` renames the chat
-unless the owner locked a name, `summary` replaces the Summary, and `digest`
-appends one timestamped Digest entry. Neither layer has a length cap. `POST /api/chat/continuity/checkpoints` admits only
+unless the owner locked a name, `chat_summary` replaces the Summary, and
+`digest_entry` appends one timestamped Digest entry. Neither layer has a length cap. `POST /api/chat/continuity/checkpoints` admits only
 the chat's live run (`AuthorizeCheckpoint` in the writer actor), then rewrites
 the file atomically under the chat's transition lock
 (`backend/app/chat_continuity.py`). There is no summarizer model, second store,

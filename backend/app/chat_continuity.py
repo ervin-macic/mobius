@@ -25,7 +25,7 @@ _RETIRED_KEYS = frozenset({
   "source_message_count", "source_messages_sha256", "continuity_version", "revision",
 })
 # Readers split the note on level-two headings, so agent text may not add one.
-_SECTION_HEADING = re.compile(r"^## ", re.MULTILINE)
+_SECTION_HEADING = re.compile(r"^[ \t]*## ", re.MULTILINE)
 
 
 def _as_note_text(value: str) -> str:

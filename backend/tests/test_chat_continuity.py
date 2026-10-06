@@ -43,8 +43,11 @@ def test_saves_replace_the_summary_append_to_the_digest_and_name_the_chat(
   agent = _start(chat)
 
   assert _save(client, agent, title="  Fixing the\nsync bug ",
-               summary="Found the cause.", digest="Cause: stale cursor.").status_code == 204
-  assert _save(client, agent, summary="Fix shipped.", digest="Fixed and tested.").status_code == 204
+               chat_summary="Found the cause.", digest_entry="Cause: stale cursor.").status_code == 204
+  assert _save(client, agent, chat_summary="Fix shipped.", digest_entry="Fixed and tested.").status_code == 204
+  # Saves written for the old plain field names are refused, never misfiled.
+  assert _save(client, agent, summary="Old meaning.").status_code == 422
+  assert _save(client, agent, digest="Old meaning.").status_code == 422
 
   note = _note(chat)
   assert parse_frontmatter(note)["description"] == "Fixing the sync bug"
@@ -57,11 +60,11 @@ def test_saves_replace_the_summary_append_to_the_digest_and_name_the_chat(
 
 def test_batched_delta_preserves_omitted_fields_and_prior_evidence(client, chat):
   agent = _start(chat)
-  assert _save(client, agent, title="Investigating sync", summary="Repairing sync.",
-               digest="Preserve offline edits.").status_code == 204
+  assert _save(client, agent, title="Investigating sync", chat_summary="Repairing sync.",
+               digest_entry="Preserve offline edits.").status_code == 204
   before = _note(chat)
   delta = "Cause: stale cursor. Replaced cursor ownership. Offline replay passed."
-  assert _save(client, agent, digest=delta).status_code == 204
+  assert _save(client, agent, digest_entry=delta).status_code == 204
   after = _note(chat)
   assert parse_frontmatter(after)["description"] == parse_frontmatter(before)["description"]
   assert extract_section(after, "Summary") == extract_section(before, "Summary")
@@ -70,7 +73,7 @@ def test_batched_delta_preserves_omitted_fields_and_prior_evidence(client, chat)
   assert history.count(delta) == 1
   assert history.count("### ") == 2  # Initial evidence plus one combined delta.
   # A summary-only change must not append an empty or repeated Digest entry.
-  assert _save(client, agent, summary="Repair verified.").status_code == 204
+  assert _save(client, agent, chat_summary="Repair verified.").status_code == 204
   assert extract_full_digest(_note(chat)) == history
 
 
@@ -80,7 +83,7 @@ def test_a_name_the_owner_chose_always_wins(client, chat, db):
   db.commit()
   agent = _start(chat)
 
-  assert _save(client, agent, title="Generated title", summary="Working.").status_code == 204
+  assert _save(client, agent, title="Generated title", chat_summary="Working.").status_code == 204
 
   db.expire_all()
   assert db.get(models.Chat, chat.id).title == "Owner title"
@@ -93,11 +96,11 @@ def test_only_the_chats_live_run_can_save(client, auth, chat, db):
   db.commit()
   stale = auth_module.create_agent_token(chat.id, "test", 0, run_id="stale-run")
 
-  response = _save(client, {"Authorization": f"Bearer {stale}"}, summary="Must not land.")
+  response = _save(client, {"Authorization": f"Bearer {stale}"}, chat_summary="Must not land.")
   assert response.status_code == 409
   assert not note_path(get_settings().data_dir, chat.id).exists()
   # An owner browser session is not a run and cannot impersonate one.
-  assert _save(client, auth, summary="Nope.").status_code in {401, 403}
+  assert _save(client, auth, chat_summary="Nope.").status_code in {401, 403}
 
 
 def test_existing_notes_keep_their_history_and_other_sections():
@@ -127,12 +130,13 @@ def test_agent_markdown_cannot_add_or_split_note_sections():
     digest="Result\n## Related\n- not a section",
     now=datetime(2026, 9, 24, 21, 0),
   )
-  note = apply_checkpoint(note, name="Chat", digest="Second entry.")
+  note = apply_checkpoint(note, name="Chat", digest="Second entry.\n  ## Digest\nindented")
 
   assert note.count("\n## Digest") == 1 and "\n## Related" not in note
+  assert "\n  ## Digest" not in note
   assert extract_section(note, "Summary") == "Now:\n### Digest\nfake"
   history = extract_full_digest(note)
-  assert "### Related\n- not a section" in history and history.endswith("Second entry.")
+  assert "### Related\n- not a section" in history and history.endswith("Second entry.\n### Digest\nindented")
 
 
 def test_retirement_rescues_journal_saves_into_the_note(tmp_path, monkeypatch):

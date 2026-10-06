@@ -448,14 +448,14 @@ def test_checkpoint_route_binds_detailed_note_without_renaming_or_changing_save_
   token = auth.create_agent_token(chat.id, "test", 0, run_id="run")
   headers = {"Authorization": f"Bearer {token}"}
   response = client.post("/api/chat/continuity/checkpoints", headers=headers,
-                         json={"digest": "Owner also forbids publication.", "summary": "Drafting."})
+                         json={"digest_entry": "Owner also forbids publication.", "chat_summary": "Drafting."})
   assert response.status_code == 204
   path = note_path(get_settings().data_dir, chat.id)
   digest, tail = recovery_source(path.read_text(), list(row.messages))
   assert "Preserve old files" in digest and "forbids publication" in digest
   assert tail == list(row.messages)[2:]
   response = client.post("/api/chat/continuity/checkpoints", headers=headers,
-                         json={"summary": "Shorter."})
+                         json={"chat_summary": "Shorter."})
   assert response.status_code == 204
   assert recovery_source(path.read_text(), list(row.messages)) == (digest, tail)
 
