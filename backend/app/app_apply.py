@@ -44,6 +44,7 @@ from app.manifest_contract import (
   PACKAGE_MAX_BYTES,
   ManifestContractError,
   package_bytes_on_disk,
+  package_limit_message,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
@@ -374,11 +375,7 @@ def _read_manifest(snapshot_dir: Path) -> dict:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
   size = package_bytes_on_disk(snapshot_dir, manifest)
   if size > PACKAGE_MAX_BYTES:
-    raise AppApplyError(
-      "package_too_large",
-      f"The app package is {size} bytes; installs and the Store accept at "
-      f"most {PACKAGE_MAX_BYTES}.",
-    )
+    raise AppApplyError("package_too_large", package_limit_message(size))
   return dict(manifest)
 
 

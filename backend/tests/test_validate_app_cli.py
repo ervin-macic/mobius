@@ -75,9 +75,9 @@ def test_validator_help_and_icon_free_app_work_without_site_packages(tmp_path):
 
 @pytest.mark.parametrize("icon_name", ["icon.png", "icon.svg"])
 def test_validator_checks_package_budget_before_reading_icon(
-  tmp_path, monkeypatch, icon_name,
+  tmp_path, monkeypatch, capsys, icon_name,
 ):
-  from app.manifest_contract import PACKAGE_MAX_BYTES
+  from app.manifest_contract import PACKAGE_MAX_BYTES, package_limit_message
 
   _write_app(tmp_path, "export default function App(){ return null }")
   _declare(tmp_path, "icon", icon_name)
@@ -102,6 +102,10 @@ def test_validator_checks_package_budget_before_reading_icon(
   monkeypatch.setattr(Path, "read_text", guarded_read_text)
   monkeypatch.setattr(sys, "argv", [str(SCRIPT), str(tmp_path)])
   assert script["main"]() == 1
+  total = (tmp_path / "index.jsx").stat().st_size + icon.stat().st_size
+  assert capsys.readouterr().err == (
+    f"[ERROR] mobius.json: {package_limit_message(total)}\n"
+  )
 
 
 def test_validator_explains_missing_icon_dependency(tmp_path):
@@ -444,9 +448,7 @@ def test_validator_rejects_a_package_over_the_limit_install_and_store_share(
 
   result = _run(tmp_path)
   assert result.returncode == 1
-  assert f"installs and the Store accept at most {PACKAGE_MAX_BYTES}" in (
-    result.stderr
-  )
+  assert "MiB app package limit" in result.stderr
 
 
 def test_validator_accepts_inline_seeds(tmp_path):
@@ -469,9 +471,7 @@ def test_validator_counts_every_declaration_of_a_shared_file(tmp_path):
 
   result = _run(tmp_path)
   assert result.returncode == 1
-  assert f"installs and the Store accept at most {PACKAGE_MAX_BYTES}" in (
-    result.stderr
-  )
+  assert "MiB app package limit" in result.stderr
 
 
 def test_validator_rejects_an_app_too_large_for_the_shell_to_load(tmp_path):
