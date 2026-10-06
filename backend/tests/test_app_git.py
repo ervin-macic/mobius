@@ -4775,3 +4775,37 @@ def test_stalled_network_git_surfaces_as_a_timeout(tmp_path, monkeypatch, outcom
   monkeypatch.setattr(app_git.subprocess, "run", fake_run)
   with pytest.raises(app_git.GitTransferTimeout):
     app_git._run_network(tmp_path, "fetch", "--unshallow", "origin", check=False)
+
+
+def test_network_ceiling_is_task_local_and_restored(tmp_path, monkeypatch):
+  """Locked activation stays short without shortening another app's preview."""
+  import asyncio
+
+  seen = {}
+
+  def fake_run(cmd, *args, **kwargs):
+    seen[cmd[-1]] = kwargs["timeout"]
+    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+  monkeypatch.setattr(app_git.subprocess, "run", fake_run)
+
+  async def transfer(name):
+    await asyncio.to_thread(app_git._run_network, tmp_path, "fetch", name)
+
+  async def locked_install():
+    with app_git.network_transfer_timeout(30):
+      await transfer("locked")
+    await transfer("restored")
+
+  async def concurrent_preview():
+    await transfer("preview")
+
+  async def run():
+    await asyncio.gather(locked_install(), concurrent_preview())
+
+  asyncio.run(run())
+  assert seen == {
+    "locked": 30,
+    "restored": app_git._GIT_NETWORK_TIMEOUT,
+    "preview": app_git._GIT_NETWORK_TIMEOUT,
+  }

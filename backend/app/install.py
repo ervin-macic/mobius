@@ -87,7 +87,10 @@ from app.manifest_contract import (
 # the install tests patch `app.install._validate_url_safe`. The canonical
 # validator now lives in net_utils (shared with routes/proxy.py) — see
 # net_utils.py for why the two SSRF validators were unified.
-from app.net_utils import validate_url_safe as _validate_url_safe
+from app.net_utils import (
+  MAX_REDIRECTS as _MAX_REDIRECTS,
+  validate_url_safe as _validate_url_safe,
+)
 from app.storage_io import atomic_write
 from app.terminal_output import strip_terminal_noise
 from app.app_identity import (
@@ -236,13 +239,6 @@ def _prune_empty_skill_folder(root: Path, rel: str) -> None:
 _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
 
 _HTTP_TIMEOUT = 15.0
-
-# Hard cap on redirect hops. Real GitHub raw URLs don't redirect at
-# all; legitimate community hosts shouldn't need more than a couple.
-# The cap is the safety net against redirect loops + redirect-based
-# SSRF where each hop slips through validation by aiming at a
-# different host.
-_MAX_REDIRECTS = 5
 
 # Tests override this module attribute to prevent production cron mutation.
 CRON_SCAFFOLD = app_cron.BAKED_CRON_SCAFFOLD
@@ -4160,12 +4156,16 @@ async def install_from_manifest(
     expected_upstream_commit=expected_upstream_commit,
     publication_handoff_app_id=publication_handoff_app_id,
   )
-  try:
-    return await install_candidate(python_check=None)
-  except _UncheckedPythonTree as unchecked:
-    pending = unchecked
-  python_check = await _check_reconciled_python(pending)
-  return await install_candidate(python_check=python_check)
+  # These passes reconcile live refs/files under lifecycle and source locks.
+  # Moving their clone/fetch ahead of identity selection would require a new
+  # staging/activation protocol. Keep locked network Git short instead.
+  with app_git.network_transfer_timeout(30):
+    try:
+      return await install_candidate(python_check=None)
+    except _UncheckedPythonTree as unchecked:
+      pending = unchecked
+    python_check = await _check_reconciled_python(pending)
+    return await install_candidate(python_check=python_check)
 
 
 async def _install_candidate(

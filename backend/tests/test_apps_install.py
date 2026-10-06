@@ -7512,3 +7512,75 @@ def test_install_rejects_source_files_inside_git_metadata(
   assert "`.git` directory" in r.json()["detail"]
   data_dir = Path(get_settings().data_dir)
   assert not (data_dir / "apps" / "git-metadata-app").exists()
+
+
+def test_install_git_network_has_short_lifecycle_ceiling(
+  client, auth, db, bypass_url_validation, monkeypatch,
+):
+  """An unopened connection must not monopolize app lifecycle work."""
+  base = "https://raw.githubusercontent.com/acme/unopened/main/"
+  manifest = {
+    "id": "unopened", "name": "Unopened", "version": "1.0.0",
+    "description": "Connection never opens", "entry": "index.jsx",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  seen = []
+  real_run = app_git.subprocess.run
+
+  def unopened_connection(cmd, *args, **kwargs):
+    if "clone" in cmd or "fetch" in cmd:
+      seen.append(kwargs["timeout"])
+      assert 0 < kwargs["timeout"] <= 30
+      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+    return real_run(cmd, *args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "run", unopened_connection)
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ):
+    failed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert seen
+  assert failed.status_code == 409, failed.text
+  assert failed.json()["detail"]["code"] == "git_transfer_timeout"
+  assert db.query(models.App).filter_by(slug="unopened").first() is None
+
+
+def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
+  client, auth, tmp_path, bypass_url_validation, monkeypatch,
+):
+  base = "https://raw.githubusercontent.com/acme/fetch-ceiling/main/"
+  manifest = {
+    "id": "fetch-ceiling", "name": "Fetch ceiling", "version": "1.0.0",
+    "description": "Locked update transfer", "entry": "index.jsx",
+  }
+  _, bare, first = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+  )
+  assert installed.status_code == 201, installed.text
+  real_run = app_git.subprocess.run
+  seen = []
+
+  def unopened_connection(cmd, *args, **kwargs):
+    if "fetch" in cmd:
+      seen.append(kwargs["timeout"])
+      assert 0 < kwargs["timeout"] <= 30
+      raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+    return real_run(cmd, *args, **kwargs)
+
+  monkeypatch.setattr(app_git.subprocess, "run", unopened_connection)
+  failed = _install_clone_fixture(
+    client, auth, base, {**manifest, "version": "2.0.0"},
+    CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+  )
+  assert seen
+  assert failed.status_code == 409, failed.text
+  assert failed.json()["detail"]["code"] == "git_transfer_timeout"
+  src = Path(get_settings().data_dir) / "apps" / "fetch-ceiling"
+  assert app_git.head_sha(src, app_git.UPSTREAM_BRANCH) == first
+  assert (src / "index.jsx").read_text() == CLONE_INDEX_V1

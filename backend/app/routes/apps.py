@@ -1646,19 +1646,14 @@ async def update_candidate_preview(
       )
     except HTTPException:
       raise
-    except app_git.GitTransferTimeout as exc:
+    except (
+      OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
+    ) as exc:
       raise install._git_source_error(
         "git_update_unavailable",
         "This app does not have a usable Git update source.",
         "The installed version was left unchanged.",
         exc,
-      ) from exc
-    # Package-size failures belong before this generic Git-source fallback.
-    except (
-      OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
-    ) as exc:
-      raise HTTPException(
-        409, "This app does not have a usable Git update source.",
       ) from exc
   previous_source = _recorded_update_source(previous_tree, candidate.runtime_tree)
   upstream_diff = await asyncio.to_thread(
