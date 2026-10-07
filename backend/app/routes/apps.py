@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, defer
 from app import chat_writer
 from app import transcript_rows
 from app import (
-  activity, app_activity, app_apply, app_capability_acceptance, app_git,
+  activity, app_activity, app_apply, app_badge, app_capability_acceptance, app_git,
   app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
   icon_cache, models, project_git, providers, schemas,
   source_dirs, workspace_files,
@@ -583,6 +583,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   db.query(models.AppRecencyState).filter(
     models.AppRecencyState.app_id == deleted_app_id,
   ).delete(synchronize_session=False)
+  app_badge.clear(db, deleted_app_id)
   db.query(models.ChatAppArtifact).filter(
     models.ChatAppArtifact.app_id == deleted_app_id,
   ).delete(synchronize_session=False)
@@ -692,9 +693,9 @@ async def list_apps(
     )
     .all()
   )
-  return app_recency.annotate_apps(
+  return app_badge.annotate_apps(db, app_recency.annotate_apps(
     db, app_activity.annotate_apps(db, apps)
-  )
+  ))
 
 
 @router.get(
@@ -2165,9 +2166,9 @@ def get_app(
 ):
   """Returns a single mini-app by ID (404 for a tombstoned one)."""
   app = live_app_or_404(db, app_id)
-  return app_recency.annotate_apps(
+  return app_badge.annotate_apps(db, app_recency.annotate_apps(
     db, app_activity.annotate_apps(db, [app])
-  )[0]
+  ))[0]
 
 
 @router.post(
@@ -2206,6 +2207,46 @@ def mark_app_activity_seen(
   live_app_or_404(db, app_id)
   app_activity.mark_seen(db, app_id, body.activity_version)
   db.commit()
+  return Response(status_code=204)
+
+
+class AppBadgeRequest(BaseModel):
+  count: int = Field(ge=0, le=app_badge.MAX_BADGE_COUNT)
+  # Optional ever-increasing order of the report (e.g. a nanosecond timestamp
+  # taken before counting); a report not newer than the stored one is ignored.
+  version: int | None = Field(default=None, ge=0, le=app_badge.MAX_BADGE_VERSION)
+
+
+@router.put(
+  "/{app_id}/badge",
+  status_code=204,
+  dependencies=[Depends(reject_cross_site)],
+)
+def set_app_badge(
+  app_id: int,
+  body: AppBadgeRequest,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal_or_public_service),
+):
+  """Set the unread count shown on the app's sidebar row (0 clears it).
+
+  The owner or the app itself may set it, including its service while
+  answering a public request: unread items usually arrive that way (another
+  instance delivering a message), and, like notifying the owner, a count is
+  reviewed-safe for that narrow scope. An app token cannot badge a sibling.
+  A real change nudges live shells to refetch.
+  """
+  require_nondelegated_owner_or_app_control(principal)
+  if principal.app_id is not None and principal.app_id != app_id:
+    raise HTTPException(
+      status_code=403, detail="App token can only set its own badge.",
+    )
+  live_app_or_404(db, app_id)
+  changed = app_badge.set_count(db, app_id, body.count, body.version)
+  db.commit()
+  if changed:
+    from app.broadcast import get_system_broadcast
+    get_system_broadcast().publish({"type": "app_activity", "appId": str(app_id)})
   return Response(status_code=204)
 
 
@@ -2915,6 +2956,9 @@ async def delete_app_data(
     # recreate the erased tree after the wipe, and a fresh runtime gets a clean
     # browser-local generation instead of adopting an old outbox.
     app.token_nonce = secrets.token_hex(16)
+    # The badge counted data that no longer exists; forgetting it also resets
+    # the app's report ordering for its fresh start.
+    app_badge.clear(db, app.id)
     # Advance updated_at so the iframe cache-buster changes and a currently-open
     # app remounts against its now-empty storage.
     app.updated_at = now_naive_utc()

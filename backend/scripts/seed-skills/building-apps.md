@@ -859,6 +859,34 @@ app-to-shell messages use `'*'`. For reply protocols, require
 are routing guards, not authorization; privileged operations still require the
 app's server-verified bearer.
 
+### Unread badge on the sidebar row
+
+An app with its own notion of unread items (messages, mentions, tasks waiting
+on the owner) can show that number as a pill on its sidebar row. The app owns
+the count: report the current total whenever it changes, and `0` to clear it.
+The pill replaces the generic new-activity dot while it is shown.
+
+```jsx
+await fetch(`/api/apps/${appId}/badge`, {
+  method: 'PUT',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ count: unreadTotal }),
+})
+```
+
+Report from wherever the count actually changes. If items can arrive while the
+app is closed, report from the app's service or job (with its `APP_TOKEN`), not
+only from the open frame. An app token can only set its own badge.
+
+When reports can run concurrently (a service handling several requests at
+once), add `version`: a value that only ever increases, taken *before*
+computing the count. A nanosecond timestamp (`time.time_ns()` /
+`Date.now() * 1e6`) is the simplest choice. The platform ignores a report whose
+version is not newer than the stored one, so a slow, stale report cannot
+overwrite a fresh one. Do not use a counter kept in the app's own data: wiping
+or restoring that data restarts it lower, and every later report would be
+ignored. An unversioned report always applies and resets the ordering.
+
 ### Shell shortcuts
 
 Shell shortcuts (Cmd/Ctrl+K search, Cmd/Ctrl+N new chat, Cmd/Ctrl+, back, and
