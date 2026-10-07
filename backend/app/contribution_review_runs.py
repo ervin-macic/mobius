@@ -187,7 +187,7 @@ def review_comment_body(outcome: dict) -> str:
   if (outcome.get("tests") or "").strip():
     parts += ["", f"**Checks:** {outcome['tests'].strip()}"]
   parts += ["", f"_Reviewed at {str(outcome.get('head_sha') or '')[:12]}._"]
-  return "\n".join(parts)[:60000]
+  return "\n".join(parts)
 
 
 def post_review(gh, cwd, target, body):

@@ -63,6 +63,54 @@ def report(setup, **changes):
   return asyncio.run(routes.report_outcome(1, row.id, routes.ReviewOutcome(**data), db, principal))
 
 
+def test_review_evidence_over_4000_characters_survives_reporting(setup):
+  db, row, _ = setup
+  row.mode = "review"
+  db.commit()
+  summary = "finding " * 700
+  tests = "check " * 900
+  item = report(setup, summary=summary, tests=tests)["run"]["items"][0]
+  assert item["summary"] == summary
+  assert item["tests"] == tests
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)]["summary"] == summary
+  assert row.outcomes_json[domain.key(ITEM)]["tests"] == tests
+
+
+def test_review_evidence_models_do_not_cap_prose_at_4000_characters():
+  evidence = "e" * 4001
+  assert routes.ReviewOutcome(**ITEM, state="needs_you", summary=evidence, tests=evidence).summary == evidence
+  assert routes.RepairCheckout(**ITEM, findings=evidence).findings == evidence
+  assert routes.RepairPublish(**ITEM, summary=evidence, tests=evidence, tests_passed=True).tests == evidence
+  assert routes.DraftReady(**ITEM, reviewed_base_sha=BASE, independent_receipt_id="receipt",
+    summary=evidence, scope=sorted(routes.SCOPE), tests=evidence, tests_passed=True).summary == evidence
+
+
+def test_public_review_formatter_preserves_evidence_past_60000_characters():
+  summary = "s" * 61000
+  tests = "checks completed after the long summary"
+  body = domain.review_comment_body({"state": "all_clear", "summary": summary,
+    "tests": tests, "head_sha": SHA})
+  assert summary in body
+  assert f"**Checks:** {tests}" in body
+  assert f"_Reviewed at {SHA[:12]}._" in body
+  assert len(body) > 60000
+
+
+def test_owner_requested_public_review_posts_full_long_evidence(setup, monkeypatch):
+  _public_review_run(setup)
+  posted = []
+  monkeypatch.setattr(domain, "post_review", lambda _gh, _cwd, _target, body:
+    posted.append(body) or {"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"})
+  summary = "s" * 61000
+  tests = "checks after the long summary"
+  item = report(setup, summary=summary, tests=tests)["run"]["items"][0]
+  assert item["public_review"]["state"] == "posted"
+  assert len(posted) == 1
+  assert summary in posted[0] and tests in posted[0]
+  assert f"_Reviewed at {SHA[:12]}._" in posted[0]
+
+
 def test_review_only_never_merges_even_own_pr(setup, monkeypatch):
   db, row, _ = setup
   row.mode = "review"
