@@ -2360,10 +2360,16 @@
   z-index: -1;
 }
 
-/* Installed iOS: product choice to match the Android composer position rather
-   than UIKit's full safe-area rest. The Home indicator sits in the lowest
-   few points of its 34 pt area, so a quarter of the inset keeps the pill clear
-   of it. Android and browser tabs keep the full inset. */
+/* Installed iOS: a deliberate product decision, not a tuning leftover. The
+   closed-keyboard composer matches the Android Möbius position (pill ~17 pt
+   above the edge on a portrait iPhone) rather than UIKit's native rest on the
+   full 34 pt safe area. It was chosen on a physical iPhone next to Android:
+   the full inset and 0.5 both read as too high. It was kept after review
+   (PR #1632), which asked for the native position. The Home indicator
+   occupies only the lowest few points, so a quarter of the inset keeps the
+   pill clear of it. Do not change this value or restore the full inset
+   without the product owner's sign-off. Android and browser tabs keep the
+   full inset; while the keyboard is up, the shell zeroes the gap entirely. */
 @supports (-webkit-touch-callout: none) {
   @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
     .chat {
