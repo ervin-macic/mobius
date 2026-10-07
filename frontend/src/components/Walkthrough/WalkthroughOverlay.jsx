@@ -13,7 +13,8 @@ import { ThemeChangeDemo } from './WalkthroughTheme.jsx'
 import WalkthroughAppGroup from './WalkthroughAppGroup.jsx'
 import WalkthroughInstall from './WalkthroughInstall.jsx'
 import { Reveal, Typewriter, WordReveal } from './WalkthroughMotion.jsx'
-import WalkthroughProfile from './WalkthroughProfile.jsx'
+import WalkthroughProfile, { useAccountProfile } from './WalkthroughProfile.jsx'
+import { returningHandle } from './returningOwner.js'
 import WalkthroughAccessConfirm from './WalkthroughAccessConfirm.jsx'
 import WalkthroughStore, { STORE_WINDOW_APPS, useStoreCatalog } from './WalkthroughStore.jsx'
 import { useAppInstall } from './useAppInstall.js'
@@ -84,11 +85,6 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   const barFrom = previousStepRef.current
   useEffect(() => { previousStepRef.current = stepIndex }, [stepIndex])
   const [handoffAppId, setHandoffAppId] = useState(null)
-  // The handle of an owner who already had one when the guide opened (a new Möbius made from an existing
-  // account), else null. `openedWithHandle` is settled once, so going Back never turns a handle claimed in
-  // the guide into a returning owner.
-  const [returningHandle, setReturningHandle] = useState(null)
-  const openedWithHandle = useRef(null)
   const [direction, setDirection] = useState(1)
   const screen = SCREENS[stepIndex]
   const [plainTitle, accentTitle] = screen.title
@@ -100,6 +96,9 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   const confirming = installer.confirmation
   const confirmingApp = confirming ? APP_GROUPS.flatMap(group => group.apps).find(app => app.id === confirming.id) : null
   const identityApp = apps.find(app => app.slug === 'identity') || null
+  // One profile for the whole guide, so Back to the welcome screen never refetches it or loses who claimed what.
+  const account = useAccountProfile(() => { if (identityApp) openApp(identityApp.id) })
+  const skipHandle = returningHandle({ handle: account.identity?.profile?.handle, claimedHere: account.claimedHere, editing: false })
 
   // The shell's history restore must not queue chat-composer focus while this
   // guide is handing back from another app. Publish the lease at the same commit
@@ -112,9 +111,12 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   // Back from the hand-off, the guide opens again where the owner left it.
   const wasSuspendedRef = useRef(false)
   useEffect(() => {
-    if (wasSuspendedRef.current && !suspended) setHandoffAppId(null)
+    if (wasSuspendedRef.current && !suspended) {
+      setHandoffAppId(null)
+      account.reload()
+    }
     wasSuspendedRef.current = suspended
-  }, [suspended])
+  }, [suspended]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // A modal dialog: focus starts on the title, Tab stays inside the card, the page behind is inert,
   // and focus returns to where it was when the guide goes away. Escape dismisses it exactly like the
@@ -159,13 +161,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
       <div className={`wt__slide ${direction < 0 ? 'is-back' : 'is-forward'}`} role="region" aria-labelledby="wt-title" tabIndex={0} key={screen.id}>
         <h2 id="wt-title" ref={titleRef} tabIndex={-1}><Title kind={(MOTION[screen.id] || MOTION.agent).title} plain={plainTitle} accent={accentTitle} /></h2>
         <p className="wt__lead"><LeadText kind={(MOTION[screen.id] || MOTION.agent).lead} text={screen.lead} /></p>
-        {screen.content === 'profile' && <>
-          <WalkthroughProfile identityApp={identityApp} onSignIn={() => openApp(identityApp.id)} openedWithHandle={openedWithHandle} onClaimedChange={setReturningHandle} />
-          {returningHandle && <div className="wt-returning" role="note">
-            <strong>Welcome back, @{returningHandle}.</strong>
-            <span>Your profile is already set, so you can head straight to connecting your agent, or take a quick look around first.</span>
-          </div>}
-        </>}
+        {screen.content === 'profile' && <WalkthroughProfile identityApp={identityApp} controller={account} />}
         {screen.content === 'chat' && <AgentChatDemo />}
         {screen.content === 'theme' && <ThemeChangeDemo />}
         {screen.content === 'brain' && <AgentBrainFlow />}
@@ -184,7 +180,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
       {confirming && confirmingApp && <WalkthroughAccessConfirm confirmation={confirming} app={confirmingApp} icon={store.icons[confirmingApp.id]} onApprove={installer.approve} onCancel={installer.dismiss} />}
       <div className="wt__footer">
         {stepIndex > 0 && <button type="button" className="wt__back" onClick={() => goTo(stepIndex - 1)}>Back</button>}
-        {screen.content === 'profile' && returningHandle && <button type="button" className="wt__back" onClick={() => goTo(CONNECT_INDEX)}>Skip to agent setup</button>}
+        {screen.content === 'profile' && skipHandle && <button type="button" className="wt__back" onClick={() => goTo(CONNECT_INDEX)}>Skip to agent setup</button>}
         <button type="button" className="wt__next" onClick={() => stepIndex === LAST ? finish() : goTo(stepIndex + 1)}>
           {stepIndex === LAST ? 'Finish guide' : 'Continue'}<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8h10M9 4l4 4-4 4" /></svg>
         </button>

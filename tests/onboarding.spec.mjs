@@ -213,3 +213,14 @@ test('claiming a handle in the guide does not turn a new owner into a returning 
   await guide.getByRole('button', { name: 'Back' }).click()
   await expect(guide.getByRole('note')).toHaveCount(0)
 })
+
+test('a short desktop window keeps the chat preview reachable instead of squashing it', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 640 })
+  const { guide } = await openGuide(page)
+  await goToScreen(guide, 'Meet your agent')
+  const preview = guide.locator('.wt-chatmock')
+  expect((await preview.boundingBox()).height).toBeGreaterThanOrEqual(334)
+  const composer = guide.locator('.wt-chatmock__composer')
+  await composer.scrollIntoViewIfNeeded()
+  await expect(composer).toBeInViewport()
+})

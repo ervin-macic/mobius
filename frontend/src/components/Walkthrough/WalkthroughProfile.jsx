@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { apiFetch, getAuthHeaders, BASE } from '../../api/client.js'
 import { detailToMessage } from '../../lib/errorDetail.js'
 import { CheckIcon } from './WalkthroughIcons.jsx'
+import { returningHandle } from './returningOwner.js'
 
 const HANDLE_PATTERN = /^[a-z0-9_]{3,30}$/
 const AVATAR_TYPES = ['image/jpeg', 'image/png', 'image/webp']
@@ -36,8 +37,11 @@ function useAvatarUrl(avatarKey) {
 
 /* The owner's profile: { loading, error, identity, avatarUrl, claim, uploadAvatar, signIn }.
    claim and uploadAvatar reject with a user-facing Error message. */
-function useAccountProfile(onSignIn) {
+export function useAccountProfile(onSignIn) {
   const [state, setState] = useState({ identity: null, loading: true, error: '' })
+  // Set when this owner's first handle is claimed in the guide; `reload` refetches after the sign-in hand-off.
+  const [claimedHere, setClaimedHere] = useState(false)
+  const [reloads, setReloads] = useState(0)
   useEffect(() => {
     const controller = new AbortController()
     apiFetch('/identity', { signal: controller.signal, timeoutMs: 15_000 }).then(async response => {
@@ -48,7 +52,7 @@ function useAccountProfile(onSignIn) {
       setState({ identity: null, loading: false, error: error.message || 'Your profile is not available right now.' })
     })
     return () => controller.abort()
-  }, [])
+  }, [reloads])
   const avatarUrl = useAvatarUrl(state.identity?.profile?.avatar_url)
   const setIdentity = identity => setState(current => ({ ...current, identity }))
 
@@ -56,6 +60,7 @@ function useAccountProfile(onSignIn) {
     const response = await apiFetch('/identity/profile', { method: 'PATCH', body: JSON.stringify({ handle }), timeoutMs: 20_000 })
     const data = await response.json().catch(() => ({}))
     if (!response.ok) throw new Error(detailToMessage(data.detail, 'Could not claim that handle.'))
+    if (!state.identity?.profile?.handle) setClaimedHere(true)
     setIdentity(data)
   }
   async function uploadAvatar(file) {
@@ -67,7 +72,7 @@ function useAccountProfile(onSignIn) {
     if (!response.ok) throw new Error(detailToMessage(data.detail, 'Could not update your avatar.'))
     setIdentity(data)
   }
-  return { ...state, avatarUrl, claim, uploadAvatar, signIn: onSignIn }
+  return { ...state, avatarUrl, claimedHere, claim, uploadAvatar, signIn: onSignIn, reload: () => setReloads(count => count + 1) }
 }
 
 function Avatar({ url, name, busy, onPick }) {
@@ -83,8 +88,7 @@ function Avatar({ url, name, busy, onPick }) {
   </div>
 }
 
-export default function WalkthroughProfile({ identityApp, onSignIn, openedWithHandle, onClaimedChange }) {
-  const controller = useAccountProfile(onSignIn)
+export default function WalkthroughProfile({ identityApp, controller }) {
   const identityAvailable = Boolean(identityApp)
   const { identity, loading, error: loadError, avatarUrl } = controller
   const [editing, setEditing] = useState(false)
@@ -95,10 +99,6 @@ export default function WalkthroughProfile({ identityApp, onSignIn, openedWithHa
   const [error, setError] = useState('')
   const profile = identity?.profile
   const handle = profile?.handle
-  // Tell the guide when this owner already had a handle as the guide opened, so it can offer to skip ahead.
-  // A handle claimed in the guide does not count: the first answer is kept in the guide's ref.
-  if (openedWithHandle.current === null && identity) openedWithHandle.current = Boolean(handle)
-  useEffect(() => { onClaimedChange(openedWithHandle.current && handle && !editing ? handle : null) }, [handle, editing, openedWithHandle, onClaimedChange])
   const valid = HANDLE_PATTERN.test(value)
   const signedOut = identity && !profile && identity.account_mode === 'signed_out'
   const canEdit = Boolean(profile) && !identity?.account_unavailable
@@ -156,7 +156,9 @@ export default function WalkthroughProfile({ identityApp, onSignIn, openedWithHa
   if (!canEdit) return <p className="wt-note" role="status">Your Möbius account can’t be reached right now. You can pick a handle later in Möbius · You.</p>
 
   const showForm = !handle || editing
-  return <div className={`wt-profile${handle && !editing ? ' is-claimed' : ''}`}>
+  const returning = returningHandle({ handle, claimedHere: controller.claimedHere, editing })
+  return <>
+  <div className={`wt-profile${handle && !editing ? ' is-claimed' : ''}`}>
     {showForm && <h3 className="wt-profile__title">Claim a handle and upload a picture <span>(optional)</span> to get started.</h3>}
     <div className="wt-profile__body">
     <div className="wt-profile__picture">
@@ -184,4 +186,9 @@ export default function WalkthroughProfile({ identityApp, onSignIn, openedWithHa
     </div>
     </div>
   </div>
+  {returning && <div className="wt-returning" role="note">
+    <strong>Welcome back, @{returning}.</strong>
+    <span>Your profile is already set, so you can head straight to connecting your agent, or take a quick look around first.</span>
+  </div>}
+  </>
 }

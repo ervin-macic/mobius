@@ -1,6 +1,6 @@
 /* Pieces of the real Möbius that several guide previews copy, built from the real classes and icons
    so they cannot drift from the app: the composer's primary button and the menu. */
-import { ArrowUp, Stop } from '@openai/apps-sdk-ui/components/Icon'
+import { PrimaryActionGlyphs } from '../ChatView/ChatInputBar.jsx'
 import ComposerMicIcon from '../ChatView/ComposerMicIcon.jsx'
 import { AppsNavIcon, NewChatNavIcon, ProjectsNavIcon, SearchNavIcon, SettingsNavIcon } from '../navigationIcons.js'
 
@@ -8,12 +8,8 @@ import { AppsNavIcon, NewChatNavIcon, ProjectsNavIcon, SearchNavIcon, SettingsNa
    is something to send, and the red stop square while the agent is working. Decorative here. */
 export function ComposerAction({ kind }) {
   if (kind === 'mic') return <span className="chat__action chat__mic" aria-hidden="true"><ComposerMicIcon /></span>
-  const stop = kind === 'stop'
-  return <span className={`chat__action ${stop ? 'chat__stop' : 'chat__send'}`} aria-hidden="true">
-    <span className={`chat__action-glyphs chat__action-glyphs--${kind}`}>
-      <ArrowUp className="chat__action-glyph chat__action-glyph--send" width={24} height={24} />
-      <Stop className="chat__action-glyph chat__action-glyph--stop" width={28} height={28} />
-    </span>
+  return <span className={`chat__action ${kind === 'stop' ? 'chat__stop' : 'chat__send'}`} aria-hidden="true">
+    <PrimaryActionGlyphs action={kind} />
   </span>
 }
 
