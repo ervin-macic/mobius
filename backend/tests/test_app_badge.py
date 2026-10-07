@@ -112,6 +112,20 @@ def test_public_service_invocation_can_badge_only_its_own_app(client, auth, db):
                     json={"count": 1}).status_code == 403
 
 
+def test_app_token_without_an_installation_binding_fails_closed(
+  client, auth, db,
+):
+  # Without its installation nonce the fence would compare the row to itself.
+  app = _app(db, "badge-unbound")
+  owner = db.query(models.Owner).first()
+  token = create_app_token(app.id, owner.username, owner.token_epoch)
+  reply = client.put(f"/api/apps/{app.id}/badge",
+                     headers={"Authorization": f"Bearer {token}"},
+                     json={"count": 3})
+  assert reply.status_code == 401, reply.text
+  assert _badge(client, auth, app.id) == 0
+
+
 def test_stale_revisions_are_ignored_and_unrevisioned_reports_reset(
   client, auth, db,
 ):

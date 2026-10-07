@@ -2237,19 +2237,37 @@ async def set_app_badge(
   The answer is the stored badge and whether this report applied, so an app
   can tell a stale report (a newer one already landed) from a restore (its own
   revision went backwards) and reset with an unrevisioned report.
+
+  That reset is deliberately open to every allowed caller (the app or the
+  owner): it clears the stored revision, after which a delayed older report
+  applies again until the app's next revisioned report. Reopening the ordering
+  is the price of a simple restore path; the count is a hint, never data.
+
+  The write runs under the app's storage lock; keep it a tiny transition.
   """
   require_nondelegated_owner_or_app_control(principal)
   if principal.app_id is not None and principal.app_id != app_id:
     raise HTTPException(
       status_code=403, detail="App token can only set its own badge.",
     )
-  # An app token is bound to the installation that minted it; an owner request
-  # to the installation it resolved now. Either way, recheck under the lock a
-  # data wipe or uninstall holds, so a request authorized before one cannot
-  # write afterwards (nor into a replacement that reused the id).
-  expected_nonce = (
-    principal.app_instance_id if principal.app_id is not None else None
-  ) or live_app_or_404(db, app_id).token_nonce
+  # An app token is bound to the installation that minted it; recheck it under
+  # the lock a data wipe or uninstall holds, so a request authorized before one
+  # cannot write afterwards (nor into a replacement that reused the id). Every
+  # app token is minted with that binding; one without it fails closed rather
+  # than comparing the row to itself. An owner request has no such binding: it
+  # pins the installation it resolves just before taking the lock, so the
+  # recheck only covers that short gap.
+  if principal.app_id is not None:
+    if principal.app_instance_id is None:
+      raise HTTPException(
+        status_code=401, detail="App token is not bound to an installation.",
+      )
+    expected_nonce = principal.app_instance_id
+  else:
+    expected_nonce = live_app_or_404(db, app_id).token_nonce
+  # The per-app storage lock is held across the write and commit: keep the
+  # work inside it to this tiny read-decide-write. It also means a report waits
+  # behind any long operation holding the lock (a wipe, an uninstall).
   async with fs_locks.app_storage_lock(app_id):
     recheck_app_identity(db, app_id, expected_nonce)
     if live_app(db, app_id, populate=True) is None:
