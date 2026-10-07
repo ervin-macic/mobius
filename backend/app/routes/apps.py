@@ -78,7 +78,7 @@ from app.deps import (
   get_owner_or_app_with_manage_apps, reject_cross_site,
   require_nondelegated_owner_control, require_nondelegated_owner_or_app_control,
 )
-from app.resource_access import live_app, live_app_or_404
+from app.resource_access import live_app, live_app_or_404, recheck_app_identity
 from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
 
 router = APIRouter(prefix="/api/apps", tags=["apps"])
@@ -2211,43 +2211,57 @@ def mark_app_activity_seen(
 
 
 class AppBadgeRequest(BaseModel):
-  count: int = Field(ge=0, le=app_badge.MAX_BADGE_COUNT)
-  # Optional ever-increasing order of the report (e.g. a nanosecond timestamp
-  # taken before counting); a report not newer than the stored one is ignored.
-  version: int | None = Field(default=None, ge=0, le=app_badge.MAX_BADGE_VERSION)
+  count: int = Field(ge=0, le=app_badge.MAX_BADGE_INTEGER)
+  # The app's state revision captured with the count. A report not newer than
+  # the stored revision is stale and ignored; omit it to reset the ordering.
+  revision: int | None = Field(default=None, ge=0, le=app_badge.MAX_BADGE_INTEGER)
 
 
 @router.put(
   "/{app_id}/badge",
-  status_code=204,
   dependencies=[Depends(reject_cross_site)],
 )
-def set_app_badge(
+async def set_app_badge(
   app_id: int,
   body: AppBadgeRequest,
   db: Session = Depends(get_db),
   principal: Principal = Depends(get_principal_or_public_service),
 ):
-  """Set the unread count shown on the app's sidebar row (0 clears it).
+  """Report the unread count shown on the app's sidebar row (0 clears it).
 
-  The owner or the app itself may set it, including its service while
+  The owner or the app itself may report, including its service while
   answering a public request: unread items usually arrive that way (another
   instance delivering a message), and, like notifying the owner, a count is
   reviewed-safe for that narrow scope. An app token cannot badge a sibling.
-  A real change nudges live shells to refetch.
+
+  The answer is the stored badge and whether this report applied, so an app
+  can tell a stale report (a newer one already landed) from a restore (its own
+  revision went backwards) and reset with an unrevisioned report.
   """
   require_nondelegated_owner_or_app_control(principal)
   if principal.app_id is not None and principal.app_id != app_id:
     raise HTTPException(
       status_code=403, detail="App token can only set its own badge.",
     )
-  live_app_or_404(db, app_id)
-  changed = app_badge.set_count(db, app_id, body.count, body.version)
-  db.commit()
-  if changed:
+  # An app token is bound to the installation that minted it; an owner request
+  # to the installation it resolved now. Either way, recheck under the lock a
+  # data wipe or uninstall holds, so a request authorized before one cannot
+  # write afterwards (nor into a replacement that reused the id).
+  expected_nonce = (
+    principal.app_instance_id if principal.app_id is not None else None
+  ) or live_app_or_404(db, app_id).token_nonce
+  async with fs_locks.app_storage_lock(app_id):
+    recheck_app_identity(db, app_id, expected_nonce)
+    if live_app(db, app_id, populate=True) is None:
+      raise HTTPException(status_code=404, detail="App not found.")
+    report = app_badge.apply_report(db, app_id, body.count, body.revision)
+    db.commit()
+  if report.changed:
     from app.broadcast import get_system_broadcast
     get_system_broadcast().publish({"type": "app_activity", "appId": str(app_id)})
-  return Response(status_code=204)
+  return {
+    "count": report.count, "revision": report.revision, "applied": report.applied,
+  }
 
 
 @router.patch(

@@ -77,7 +77,7 @@ import {
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import { drawerNameMaxLength, saveDrawerRename } from './drawerRename.js'
-import { appBadgeLabel } from './appBadge.js'
+import { drawerRowUnread } from './appBadge.js'
 import './Drawer.css'
 
 const LIST_TABS = ['recents', 'archived']
@@ -1697,7 +1697,7 @@ const DrawerRow = memo(function DrawerRow({
   const label = kind === 'chat' ? item.title : item.name
   const projectChip = recentsProjectChip(kind, item)
   const pinned = !!item.pinned_at
-  const badgeLabel = kind === 'app' ? appBadgeLabel(item.badge_count) : null
+  const { badgeLabel, attentionDot } = drawerRowUnread(kind, item, attention)
   const waiting = kind === 'chat' && item.handoff?.kind === 'automatic'
   const recovery = kind === 'chat' && item.handoff?.kind === 'recovery'
   const onHold = kind === 'chat' && item.handoff?.kind === 'on_hold'
@@ -2360,7 +2360,7 @@ const DrawerRow = memo(function DrawerRow({
             aria-label="Building"
             title="Building…"
           />
-        ) : attention && !badgeLabel ? (
+        ) : attentionDot ? (
           <span
             className="drawer__attention-dot"
             role="img"
@@ -2370,8 +2370,7 @@ const DrawerRow = memo(function DrawerRow({
         ) : null}
         <span className={`drawer__item-text${badgeLabel ? ' drawer__item-text--unread' : ''}`}>{label}</span>
         {badgeLabel && (
-          // The app's own unread count. It supersedes the generic activity dot:
-          // a number already says "something new" and how much.
+          // The app's own unread count (see appBadge.js).
           <span className="drawer__badge" role="img" aria-label={`${badgeLabel} unread`}>
             {badgeLabel}
           </span>

@@ -1,53 +1,66 @@
-"""App-reported unread counts shown as a pill on the app's sidebar row."""
+"""App-reported unread counts shown as a pill on the app's sidebar row.
 
-from sqlalchemy import or_, update
-from sqlalchemy.exc import IntegrityError
+The app owns the number; the platform stores and displays it. Reports carry an
+optional ``revision``: the app's own state revision, captured together with the
+count. A report whose revision is not newer than the stored one is stale and
+ignored, so concurrent reports that land out of order cannot regress the
+count. An unrevisioned report always applies and resets the ordering; an app
+whose revisions restart lower (for example after restoring its data from a
+backup) sends one to recover. Wiping the app's data forgets its badge.
+
+Every mutation runs under ``fs_locks.app_storage_lock(app_id)`` — the boundary
+that data wipes and uninstalls already hold — after the caller rechecks the
+installation identity there. Within that lock the read, the stale check, the
+change decision, and the write form one serialized transition.
+"""
+
+from dataclasses import dataclass
+
 from sqlalchemy.orm import Session
 
 from app import models
 
-# The pill renders "99+" past 99; this only bounds what an app may store.
-MAX_BADGE_COUNT = 1_000_000
-MAX_BADGE_VERSION = 2**63 - 1
+# SQLite INTEGER is a signed 64-bit value; counts and revisions use its range.
+# The pill itself shows "99+" past 99 (frontend appBadge.js).
+MAX_BADGE_INTEGER = 2**63 - 1
 
 
-def set_count(
-  db: Session, app_id: int, count: int, version: int | None = None,
-) -> bool:
-  """Record the app's badge inside the caller's transaction.
+@dataclass(frozen=True)
+class BadgeReport:
+  """The stored badge after a report, and what the report did."""
 
-  ``version`` orders concurrent reports: a value that only increases (for
-  example a nanosecond timestamp taken before counting). A report not newer
-  than the stored one is ignored, so reports landing out of order cannot leave
-  a stale count. An unversioned report (the owner, or an app that does not
-  order its reports) always applies and resets the ordering, which is also the
-  recovery path if an app's versions ever restart lower. Returns whether the
-  shown count changed, so callers only nudge live shells for real changes.
-  """
-  state = models.AppBadgeState
-  row = db.get(state, app_id)
-  if row is None:
-    try:
-      with db.begin_nested():
-        db.add(state(app_id=app_id, count=count, version=version))
-        db.flush()
-      return count > 0
-    except IntegrityError:
-      # A concurrent first report created the row; order against it below.
-      row = db.get(state, app_id)
-  previous = row.count
-  newer = True if version is None else or_(
-    state.version.is_(None), state.version < version,
+  count: int
+  revision: int | None
+  applied: bool
+  changed: bool
+
+
+def apply_report(
+  db: Session, app_id: int, count: int, revision: int | None,
+) -> BadgeReport:
+  """Apply one report; the caller holds the app's storage lock and commits."""
+  row = (
+    db.query(models.AppBadgeState)
+    .populate_existing()
+    .filter(models.AppBadgeState.app_id == app_id)
+    .first()
   )
-  values = {"count": count, "version": version}
-  applied = db.execute(
-    update(state).where(state.app_id == app_id, newer).values(**values)
-  ).rowcount
-  return bool(applied) and previous != count
+  if (
+    row is not None and revision is not None and row.revision is not None
+    and revision <= row.revision
+  ):
+    return BadgeReport(row.count, row.revision, applied=False, changed=False)
+  previous = row.count if row is not None else 0
+  if row is None:
+    row = models.AppBadgeState(app_id=app_id)
+    db.add(row)
+  row.count = count
+  row.revision = revision
+  return BadgeReport(count, revision, applied=True, changed=previous != count)
 
 
 def clear(db: Session, app_id: int) -> None:
-  """Forget the app's badge, e.g. when its data is wiped."""
+  """Forget the app's badge, e.g. when its data is wiped or it is removed."""
   db.query(models.AppBadgeState).filter(
     models.AppBadgeState.app_id == app_id,
   ).delete(synchronize_session=False)
