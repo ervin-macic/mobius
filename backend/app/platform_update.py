@@ -67,7 +67,7 @@ from typing import Callable, Literal, NotRequired, TypedDict
 
 from sqlalchemy.orm import Session
 
-from app import app_git, platform_activation, runtime_provenance
+from app import app_git, local_change_tests, platform_activation, runtime_provenance
 from app.platform_activation import PlatformActivationImpact
 from app.restart_util import run_candidate_startup_check
 
@@ -2779,6 +2779,18 @@ def _finalize_update(
   frontend_changed = any(path in _FRONTEND_DEPENDENCY_INPUTS for path in changed)
   touched_frontend = any(path.startswith("frontend/") for path in changed)
 
+  # Local edits that bring their own tests are checked across the update: run
+  # them on the served tree now (still ``pre`` on disk) and on the candidate
+  # after activation, so only tests the update newly breaks roll it back.
+  backend_probe = platform_activation.backend_import_probe_required(changed)
+  local_tests = (
+    local_change_tests.select(repo, target, tip) if backend_probe and tip != target else []
+  )
+  if local_tests:
+    if progress:
+      progress(PlatformUpdatePhase.VALIDATING)
+    local_baseline = local_change_tests.run(repo, local_tests)
+
   if (overlay or {}).get("mode") == "net" and tip != pre:
     # The new linear commit replaces the old local commit chain. Keep the
     # latest replaced chain reachable for undo; main's reflog has older ones.
@@ -2789,7 +2801,7 @@ def _finalize_update(
   # A text-clean merge can fail at import or the candidate startup smoke. Roll it
   # back before accepting the update. Skip the probe when no served backend
   # code changed: that tree is byte-identical to the already-running version.
-  if platform_activation.backend_import_probe_required(changed):
+  if backend_probe:
     if progress:
       progress(PlatformUpdatePhase.VALIDATING)
     ok, err = _import_probe(repo)
@@ -2797,6 +2809,13 @@ def _finalize_update(
       return _roll_back_update(
         repo, local, pre, tip, target, err, err,
       )
+  if local_tests:
+    broken = local_change_tests.newly_failing(
+      local_baseline, local_change_tests.run(repo, local_tests),
+    )
+    if broken:
+      message = local_change_tests.describe(broken)
+      return _roll_back_update(repo, local, pre, tip, target, message, message)
 
   previous_upstream_sha = _rev(repo, UPSTREAM_BRANCH) or None
   result = ReconcileResult(

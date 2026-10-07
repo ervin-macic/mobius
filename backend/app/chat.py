@@ -4761,30 +4761,37 @@ async def run_chat(
             "(reconciliation will repair)", chat_id, exc_info=True,
           )
     else:
+      # The failure is saved into the transcript, not only broadcast: a live
+      # event alone flashes past and reloads as an unanswered message, leaving
+      # the owner nothing to read or report. Resume retries once it is fixed.
+      message = (
+        "This turn failed before the agent could start "
+        f"({type(exc).__name__}: {str(exc)[:300]}). Your message is saved; "
+        "the full error is in the server log."
+      )
       bc = get_broadcast(chat_id) if chat_id else None
       if bc is not None:
-        message = (
-          "This turn failed before the agent could start "
-          f"({type(exc).__name__}). Your message is saved; the full error "
-          "is in the server log."
-        )
-        bc.publish({
-          "type": "error",
-          "message": message,
-        })
+        bc.publish(_pause_note(message))
         bc.publish({"type": "done"})
         bc.mark_completed()
       if chat_id:
         _publish_chat_run_finished(chat_id)
         try:
-          await _finish_run_strict(
-            chat_id, run_token or "", terminal_status="failed",
-          )
+          await _recover_wedged_run_strict(chat_id, run_token or "", message=message)
         except Exception:
           _get_logger().warning(
-            "setup-failure FinishRun did not persist chat_id=%s "
-            "(reconciliation will repair)", chat_id, exc_info=True,
+            "setup-failure error block did not persist chat_id=%s; "
+            "failing the run instead", chat_id, exc_info=True,
           )
+          try:
+            await _finish_run_strict(
+              chat_id, run_token or "", terminal_status="failed",
+            )
+          except Exception:
+            _get_logger().warning(
+              "setup-failure FinishRun did not persist chat_id=%s "
+              "(reconciliation will repair)", chat_id, exc_info=True,
+            )
   finally:
     browser_cancelled = None
     sink = get_active_sink(chat_id) if chat_id else None

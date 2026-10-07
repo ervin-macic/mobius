@@ -2,8 +2,8 @@
 
 The 2026-08-04 outage: an exception raised before the agent process started
 died inside the fire-and-forget task — the run row stayed 'running' forever
-and the owner saw an eternal spinner. run_chat now publishes the terminal
-failure and durably fails the run.
+and the owner saw an eternal spinner. run_chat now saves the failure as a
+readable, resumable error in the transcript and closes the run.
 """
 
 import asyncio
@@ -16,20 +16,33 @@ from app.agent_admission import AgentTurnDeferred
 from app.broadcast import create_broadcast, remove_broadcast
 
 
-@pytest.mark.asyncio
-async def test_setup_exception_publishes_error_and_fails_run(chat, monkeypatch):
+class _Writer:
+  def __init__(self, *, fail: bool = False):
+    self.submitted = []
+    self.fail = fail
+
+  def submit(self, command):
+    self.submitted.append(command)
+    ack = Future()
+    if self.fail:
+      ack.set_exception(RuntimeError("writer unavailable"))
+    else:
+      ack.set_result(True)
+    return ack
+
+
+async def _run_broken_setup(chat, monkeypatch, writer):
   async def broken_impl(*_args, **_kwargs):
-    raise RuntimeError("no such column: apps.connections_manage")
+    raise AttributeError("'Chat' object has no attribute 'messages'")
 
   monkeypatch.setattr(chat_mod, "_run_chat_impl", broken_impl)
-
+  monkeypatch.setattr(chat_mod, "get_writer", lambda: writer)
   finished = []
 
   async def record_finish(chat_id, run_token="", terminal_status="completed"):
     finished.append((chat_id, run_token, terminal_status))
 
   monkeypatch.setattr(chat_mod, "_finish_run_strict", record_finish)
-
   bc = create_broadcast(chat.id)
   events = []
   real_publish = bc.publish
@@ -46,12 +59,42 @@ async def test_setup_exception_publishes_error_and_fails_run(chat, monkeypatch):
     )
   finally:
     remove_broadcast(chat.id)
+  return events, finished
+
+
+@pytest.mark.asyncio
+async def test_setup_exception_leaves_a_readable_error_in_the_transcript(chat, monkeypatch):
+  """The live error alone flashed past and reloaded as an unanswered message;
+  the owner could not read or report the cause. It must be saved, readable,
+  and resumable, and the run must be closed rather than left spinning."""
+  writer = _Writer()
+  events, finished = await _run_broken_setup(chat, monkeypatch, writer)
 
   kinds = [event.get("type") for event in events]
   assert "error" in kinds, kinds
   assert kinds[-1] == "done"
-  message = next(e["message"] for e in events if e.get("type") == "error")
-  assert "RuntimeError" in message
+  assert len(writer.submitted) == 1
+  recovered = writer.submitted[0]
+  assert isinstance(recovered, chat_mod.RecoverWedgedRun)
+  assert recovered.run_token == "tok-1"
+  assert recovered.parked_until is None
+  block = recovered.interruption_block
+  assert "AttributeError" in block["message"]
+  assert "has no attribute 'messages'" in block["message"]
+  assert block["resumable"] is True
+  assert "pause" not in block
+  live = next(e for e in events if e.get("type") == "error")
+  assert live["message"] == block["message"]
+  assert finished == []
+
+
+@pytest.mark.asyncio
+async def test_setup_exception_still_fails_the_run_when_the_error_cannot_be_saved(
+  chat, monkeypatch,
+):
+  events, finished = await _run_broken_setup(chat, monkeypatch, _Writer(fail=True))
+
+  assert [event.get("type") for event in events][-1] == "done"
   assert finished == [(chat.id, "tok-1", "failed")]
 
 

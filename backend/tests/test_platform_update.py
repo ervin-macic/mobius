@@ -7799,3 +7799,82 @@ def test_failed_split_index_companion_capture_refuses_resolver_removal(clone_env
   assert resolver.exists()
   assert raw_path.read_bytes() == raw
   assert pu.RECONCILE_PRE_FLAG.exists()
+
+
+# --- Local edits that carry their own tests ----------------------------------
+# A local edit can import cleanly yet use something the release removed, so it
+# breaks only when a chat turn runs it. Its own tests are the evidence.
+
+_TEST_RUNNER = 'cd "$(dirname "$0")/../backend" && exec python3 -m pytest "$@"\n'
+_STORE_PY = "MESSAGES = ['hello']\n"
+_LOCAL_VOICE = {
+  "backend/app/voice.py": "def last():\n  from app import store\n  return store.MESSAGES[-1]\n",
+  "backend/tests/test_voice.py": "from app import voice\n\n\ndef test_last_reads_the_store():\n  assert voice.last() == 'hello'\n",
+}
+
+
+def _release_with_test_runner(origin: Path, platform: Path) -> None:
+  _advance_origin(origin, edits={
+    "scripts/wt-pytest.sh": _TEST_RUNNER, "backend/app/store.py": _STORE_PY,
+  }, msg="release with a test runner")
+  assert pu.reconcile_clone(platform).status == "updated"
+
+
+def test_update_rolls_back_when_it_breaks_a_local_edits_own_test(clone_env):
+  origin, platform = clone_env
+  _release_with_test_runner(origin, platform)
+  pre = _local_commit(platform, edits=_LOCAL_VOICE, msg="local voice")
+  # Text-clean and import-clean: only running the local code shows the break.
+  _advance_origin(origin, edits={"backend/app/store.py": "LEGACY = ['hello']\n"},
+                  msg="rename store field")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "rolled_back"
+  assert _served_sha(platform) == pre
+  assert "test_last_reads_the_store" in pu._read_rolled_back_flag()["error"]
+  assert (platform / "backend/app/store.py").read_text() == _STORE_PY
+
+
+def test_update_proceeds_when_local_edits_own_tests_still_pass(clone_env):
+  origin, platform = clone_env
+  _release_with_test_runner(origin, platform)
+  _local_commit(platform, edits=_LOCAL_VOICE, msg="local voice")
+  _advance_origin(origin, edits={"backend/app/store.py": _STORE_PY + "OTHER = 1\n"},
+                  msg="unrelated store change")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "updated"
+  assert "OTHER = 1" in (platform / "backend/app/store.py").read_text()
+  assert (platform / "backend/app/voice.py").exists()
+
+
+def test_already_failing_local_test_does_not_hold_updates_back(clone_env):
+  origin, platform = clone_env
+  _release_with_test_runner(origin, platform)
+  _local_commit(platform, edits={
+    **_LOCAL_VOICE,
+    "backend/tests/test_voice.py": _LOCAL_VOICE["backend/tests/test_voice.py"]
+    + "\n\ndef test_known_broken():\n  assert False\n",
+  }, msg="local voice with a known failure")
+  _advance_origin(origin, edits={"backend/app/store.py": _STORE_PY + "OTHER = 1\n"},
+                  msg="unrelated store change")
+
+  assert pu.reconcile_clone(platform).status == "updated"
+
+
+def test_uncommitted_local_edit_is_tested_across_the_update(clone_env):
+  origin, platform = clone_env
+  _release_with_test_runner(origin, platform)
+  for rel, content in _LOCAL_VOICE.items():
+    (platform / rel).parent.mkdir(parents=True, exist_ok=True)
+    (platform / rel).write_text(content)
+  _advance_origin(origin, edits={"backend/app/store.py": "LEGACY = ['hello']\n"},
+                  msg="rename store field")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "rolled_back"
+  assert (platform / "backend/app/voice.py").exists()
+  assert (platform / "backend/app/store.py").read_text() == _STORE_PY
