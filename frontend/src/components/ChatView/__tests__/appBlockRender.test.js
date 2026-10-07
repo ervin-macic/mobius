@@ -99,7 +99,7 @@ test('inline session keeps the action in the row without a visible app panel', (
 test('compact live receipts preserve tags and diff counts but replace obsolete saved badges', () => {
   const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
     app: 'contribute', intent: 'review:a', title: 'Fix it', interaction: 'inline',
-    pull: { repo: 'owner/repo', state: 'proposed', files: 5, additions: 91, deletions: 16,
+    pull: { repo: 'owner/repo', state: 'open', number: 42, url: 'https://github.com/owner/repo/pull/42', files: 5, additions: 91, deletions: 16,
       labels: [{ name: 'bug', color: 'd73a4a' }], badges: [{ label: '3 linked PRs', tone: 'neutral' }] },
   }) })
   const html = renderToStaticMarkup(createElement(PullSnapshot, { block, pull: block.pull,
@@ -109,7 +109,8 @@ test('compact live receipts preserve tags and diff counts but replace obsolete s
   assert.match(html, />Contribution</)
   assert.match(html, />Open</)
   assert.match(html, />bug</)
-  assert.match(html, /owner\/repo</)
+  assert.match(html, /href="https:\/\/github\.com\/owner\/repo"[^>]*>owner\/repo</)
+  assert.match(html, /href="https:\/\/github\.com\/owner\/repo\/pull\/42"[^>]*>View PR #42</)
   assert.match(html, /5 files <ins>\+91<\/ins> <del>−16<\/del>/)
   assert.match(html, /View PR #42/)
   assert.doesNotMatch(html, /3 linked PRs|Review details|Not sent yet/)

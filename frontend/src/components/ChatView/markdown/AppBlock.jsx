@@ -34,7 +34,7 @@ function labelStyle(hex) {
  *  underneath, and the app's one action takes the bottom-right corner. */
 export function PullSnapshot({ block, pull, href, open, action, session, compact = false }) {
   const files = pull.files === null ? null : `${pull.files} ${pull.files === 1 ? 'file' : 'files'}`
-  const ref = pull.number ? `${pull.repo}#${pull.number}` : pull.repo
+  const ref = !compact && pull.number ? `${pull.repo}#${pull.number}` : pull.repo
   const status = session?.status || STATE_NAMES[pull.state]
   const statusTone = session?.status ? session.statusTone : STATE_TONES[pull.state]
   return <div className={`md-app-pull${compact ? ' md-app-pull--compact' : ''}`}>
@@ -48,7 +48,7 @@ export function PullSnapshot({ block, pull, href, open, action, session, compact
     </div>
     <div className="md-app-pull__footer">
       <div className="md-app-pull__meta">
-        <a className="md-app-pull__repo" href={pull.url || pull.repoUrl} target="_blank" rel="noopener noreferrer">{ref}</a>
+        <a className="md-app-pull__repo" href={compact ? pull.repoUrl : pull.url || pull.repoUrl} target="_blank" rel="noopener noreferrer">{ref}</a>
         {pull.author ? <span>{pull.author}</span> : null}
         {files ? <span>{files}{pull.additions !== null ? <> <ins>+{pull.additions}</ins> <del>−{pull.deletions ?? 0}</del></> : null}</span> : null}
         {!compact ? <span className={`md-app-pull__badge is-${statusTone}`}>{status}</span> : null}
