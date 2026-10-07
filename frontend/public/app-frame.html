@@ -612,7 +612,7 @@
     //      registered before iframe.onLoad fires in the parent).
     //   2. parent (AppCanvas.jsx) posts
     //      {type:'moebius:frame-init', token, themeCss, bg,
-    //       capabilityContract} on
+    //       capabilityContract, blockSession} on
     //      its iframe.onLoad handler.
     //   3. iframe applies theme and requests its compiled module from the
     //      parent. The controlled shell can read the versioned service-worker
@@ -649,6 +649,8 @@
     let initialized = false;
     let currentToken = null;
     let currentCapabilityContract = null;
+    // Passive context selects an opted-in app entry point without activating an action.
+    let currentBlockSession = null;
     let tokenRefreshPromise = null;
     let tokenRefreshResolve = null;
     let mountedRoot = null;
@@ -1093,7 +1095,10 @@
       mountedRoot.render(
         createElement(Fragment, null,
           createElement(MountSignal),
-          createElement(mountedComponent, { appId: _FRAME_APP_ID, token: currentToken })
+          createElement(mountedComponent, {
+            appId: _FRAME_APP_ID, token: currentToken,
+            ...(supportsAppBlocks ? { blockSession: currentBlockSession } : {})
+          })
         )
       );
     }
@@ -1548,6 +1553,7 @@
         acceptToken(msg.token);
         if (initialized) return;
         initialized = true;
+        currentBlockSession = msg.blockSession || null;
         if (typeof window.__mobiusHydrateLocalStorage === 'function') {
           window.__mobiusHydrateLocalStorage(msg.storage);
         }

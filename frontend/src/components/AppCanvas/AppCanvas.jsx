@@ -720,6 +720,7 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
+        blockSession: blockSessionRef.current,
       },
       '*',
     )
