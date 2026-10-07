@@ -9,6 +9,7 @@ import useDialogFocus from '../../hooks/useDialogFocus.js'
 import { escapeShouldDismissGuide } from './guideEscape.js'
 import WalkthroughSetup from './WalkthroughSetup.jsx'
 import { AgentBrainFlow, AgentChatDemo } from './WalkthroughAgent.jsx'
+import { ThemeChangeDemo } from './WalkthroughTheme.jsx'
 import WalkthroughAppGroup from './WalkthroughAppGroup.jsx'
 import WalkthroughInstall from './WalkthroughInstall.jsx'
 import { Reveal, Typewriter, WordReveal } from './WalkthroughMotion.jsx'
@@ -23,7 +24,8 @@ import './WalkthroughScreens.css'
 // `title` is [plain, accent]: the second phrase is set in the accent color.
 const SCREENS = [
   { id: 'welcome', eyebrow: 'Welcome', title: ['Welcome to Möbius.', 'Your personal agent.'], lead: 'Möbius is your personal agent. It is the interface for the AI agents you choose, with chat, memory, and the apps they build all in one workspace.', typedLead: true, content: 'profile' },
-  { id: 'agent', eyebrow: 'Meet your agent', title: ['Say what you need.', 'Get a working app.'], lead: 'Describe it like you would to a friend. Your agent builds it and shows you the result.', content: 'chat' },
+  { id: 'agent', eyebrow: 'Meet your agent', title: ['Say what you need.', 'Get a working app.'], lead: 'Describe it like you would to a friend. Attach images, PDFs, or code if it helps. Your agent builds it and shows you the result.', content: 'chat' },
+  { id: 'shape', eyebrow: 'Shape Möbius', title: ['Your workspace.', 'Your rules.'], lead: 'Möbius is built to be reshaped. Ask your agent for a new theme, a different layout, or a feature you wish it had, and it changes the app you are using, right away.', content: 'theme' },
   { id: 'brain', eyebrow: 'How it thinks', title: ['One agent.', 'Endless errands.'], lead: 'Behind every chat sits your agent. It does the work, then hands you something real.', content: 'brain' },
   { id: 'store', eyebrow: 'App Store', title: ['Grab an app.', 'Make it yours.'], lead: 'Install what you need, publish what you build, and ask your agent to change anything.', content: 'store' },
   ...APP_GROUPS.map(group => ({ id: group.id, eyebrow: group.eyebrow, title: group.title, lead: group.lead, content: 'group', group })),
@@ -31,6 +33,7 @@ const SCREENS = [
   { id: 'finish', eyebrow: 'All set', title: ['Good luck.', 'Enjoy Möbius.'], lead: 'Your guide is done. Start in Chat and ask for anything.', content: 'finish' },
 ]
 const LAST = SCREENS.length - 1
+const CONNECT_INDEX = SCREENS.findIndex(item => item.content === 'connect')
 
 // Bars that change on a jump do so in order, starting next to where the guide was: forward fills them
 // left to right, backward empties them right to left.
@@ -45,6 +48,7 @@ function barRippleDelay(from, to, index) {
 const MOTION = {
   welcome: { title: 'mask', lead: 'typed' },
   agent: { title: 'rise', lead: 'rise' },
+  shape: { title: 'mask', lead: 'blur' },
   brain: { title: 'blur', lead: 'words' },
   store: { title: 'drift', lead: 'blur' },
   system: { title: 'mask', lead: 'rise' },
@@ -80,6 +84,11 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   const barFrom = previousStepRef.current
   useEffect(() => { previousStepRef.current = stepIndex }, [stepIndex])
   const [handoffAppId, setHandoffAppId] = useState(null)
+  // The handle of an owner who already had one when the guide opened (a new Möbius made from an existing
+  // account), else null. `openedWithHandle` is settled once, so going Back never turns a handle claimed in
+  // the guide into a returning owner.
+  const [returningHandle, setReturningHandle] = useState(null)
+  const openedWithHandle = useRef(null)
   const [direction, setDirection] = useState(1)
   const screen = SCREENS[stepIndex]
   const [plainTitle, accentTitle] = screen.title
@@ -150,8 +159,15 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
       <div className={`wt__slide ${direction < 0 ? 'is-back' : 'is-forward'}`} role="region" aria-labelledby="wt-title" tabIndex={0} key={screen.id}>
         <h2 id="wt-title" ref={titleRef} tabIndex={-1}><Title kind={(MOTION[screen.id] || MOTION.agent).title} plain={plainTitle} accent={accentTitle} /></h2>
         <p className="wt__lead"><LeadText kind={(MOTION[screen.id] || MOTION.agent).lead} text={screen.lead} /></p>
-        {screen.content === 'profile' && <WalkthroughProfile identityApp={identityApp} onSignIn={() => openApp(identityApp.id)} />}
+        {screen.content === 'profile' && <>
+          <WalkthroughProfile identityApp={identityApp} onSignIn={() => openApp(identityApp.id)} openedWithHandle={openedWithHandle} onClaimedChange={setReturningHandle} />
+          {returningHandle && <div className="wt-returning" role="note">
+            <strong>Welcome back, @{returningHandle}.</strong>
+            <span>Your profile is already set, so you can head straight to connecting your agent, or take a quick look around first.</span>
+          </div>}
+        </>}
         {screen.content === 'chat' && <AgentChatDemo />}
+        {screen.content === 'theme' && <ThemeChangeDemo />}
         {screen.content === 'brain' && <AgentBrainFlow />}
         {screen.content === 'store' && <WalkthroughStore store={store} />}
         {screen.content === 'group' && <WalkthroughAppGroup group={screen.group} store={store} statusOf={installer.statusOf} locked={installer.busy} onInstall={installer.begin} />}
@@ -168,6 +184,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
       {confirming && confirmingApp && <WalkthroughAccessConfirm confirmation={confirming} app={confirmingApp} icon={store.icons[confirmingApp.id]} onApprove={installer.approve} onCancel={installer.dismiss} />}
       <div className="wt__footer">
         {stepIndex > 0 && <button type="button" className="wt__back" onClick={() => goTo(stepIndex - 1)}>Back</button>}
+        {screen.content === 'profile' && returningHandle && <button type="button" className="wt__back" onClick={() => goTo(CONNECT_INDEX)}>Skip to agent setup</button>}
         <button type="button" className="wt__next" onClick={() => stepIndex === LAST ? finish() : goTo(stepIndex + 1)}>
           {stepIndex === LAST ? 'Finish guide' : 'Continue'}<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8h10M9 4l4 4-4 4" /></svg>
         </button>

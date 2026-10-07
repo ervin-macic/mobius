@@ -83,7 +83,7 @@ function Avatar({ url, name, busy, onPick }) {
   </div>
 }
 
-export default function WalkthroughProfile({ identityApp, onSignIn }) {
+export default function WalkthroughProfile({ identityApp, onSignIn, openedWithHandle, onClaimedChange }) {
   const controller = useAccountProfile(onSignIn)
   const identityAvailable = Boolean(identityApp)
   const { identity, loading, error: loadError, avatarUrl } = controller
@@ -95,6 +95,10 @@ export default function WalkthroughProfile({ identityApp, onSignIn }) {
   const [error, setError] = useState('')
   const profile = identity?.profile
   const handle = profile?.handle
+  // Tell the guide when this owner already had a handle as the guide opened, so it can offer to skip ahead.
+  // A handle claimed in the guide does not count: the first answer is kept in the guide's ref.
+  if (openedWithHandle.current === null && identity) openedWithHandle.current = Boolean(handle)
+  useEffect(() => { onClaimedChange(openedWithHandle.current && handle && !editing ? handle : null) }, [handle, editing, openedWithHandle, onClaimedChange])
   const valid = HANDLE_PATTERN.test(value)
   const signedOut = identity && !profile && identity.account_mode === 'signed_out'
   const canEdit = Boolean(profile) && !identity?.account_unavailable
