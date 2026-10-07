@@ -41,6 +41,9 @@ test('pull-request snapshots carry a validated GitHub row and drop malformed par
     assert.equal(appBlockFromToken(token({app:'contribute',intent:'pull-request:owner/repo#7',title:'x',pull})).pull,null)
   }
   assert.equal(appBlockFromToken(token({app:'contribute',intent:'pull-request:owner/repo#7',title:'x',pull:{repo:'owner/repo',number:7,state:'open',url:'javascript:alert(1)'}})).pull.url,undefined)
+  for (const url of ['https://example.com/not-the-pr', 'https://github.com/other/repo/pull/7', 'https://github.com/owner/repo/pull/8']) {
+    assert.equal(appBlockFromToken(token({app:'contribute',intent:'pull-request:owner/repo#7',title:'x',pull:{repo:'owner/repo',number:7,state:'open',url}})).pull.url,undefined)
+  }
 })
 test('an app may name its inline expand control, bounded and never required', () => {
   const named = appBlockFromToken(token({app:'contribute',intent:'chat-prepared:rec-1',title:'Fix',expand_label:'  Review and send  '}))

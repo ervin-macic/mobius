@@ -3,6 +3,7 @@ import { Branch, ChevronDown, ChevronRight } from '@openai/apps-sdk-ui/component
 import { appQueries } from '../../../hooks/queries.js'
 import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
 import { inlineBlockState } from './appBlock.js'
+import useAppBlockCapability from '../hooks/useAppBlockCapability.js'
 import './AppBlock.css'
 
 const AppCanvas = lazy(() => import('../../AppCanvas/AppCanvas.jsx'))
@@ -81,6 +82,11 @@ export default function AppBlock({ block, onInternalNav }) {
       .map(action => ({ key: action.intent, intent: action.intent, label: action.label })),
   } : null, [isSession, negotiating, sessionId, block])
   const allowedKeys = useMemo(() => new Set(blockSession?.actions.map(action => action.key) || []), [blockSession])
+  const onSessionFallback = useCallback(key => {
+    setLegacyMode('view'); setViewIntent(key); setBlockEvent(null); setSessionState(null)
+  }, [])
+  const blockCapability = useAppBlockCapability({ allowedKeys, onFallback: onSessionFallback })
+  const blockSupported = blockCapability.supported
   useEffect(() => {
     if (!isSession || !rootRef.current || typeof IntersectionObserver === 'undefined') return
     const observer = new IntersectionObserver(entries => {
@@ -95,16 +101,23 @@ export default function AppBlock({ block, onInternalNav }) {
   }, [sessionId, allowedKeys])
   const actionState = key => sessionState?.actions.find(item => item.key === key)
   const competingBusy = sessionState?.actions.some(item => item.busy)
-  const dispatchBlockEvent = useCallback((key, event) => setBlockEvent({ sessionId, key, event, nonce: crypto.randomUUID() }), [sessionId])
+  const dispatchBlockEvent = useCallback((key, event) => {
+    const message = { sessionId, key, event, nonce: crypto.randomUUID() }
+    blockCapability.remember(message)
+    setBlockEvent(message)
+  }, [sessionId, blockCapability.remember])
   const onBlockCapability = useCallback(supported => {
-    if (isSession) return
+    if (isSession) {
+      blockCapability.observe(supported)
+      return
+    }
     const intent = viewIntentRef.current
     if (!intent) return
     if (supported && allowedKeys.has(intent)) {
       setLegacyMode('inline')
       dispatchBlockEvent(intent, 'activate')
     } else setLegacyMode('view')
-  }, [isSession, allowedKeys, dispatchBlockEvent])
+  }, [isSession, allowedKeys, dispatchBlockEvent, blockCapability.observe])
   // The open view's intent: the block's own, or its action's. null = closed.
   const [delivered, setDelivered] = useState(false)
   const pending = useMemo(() => viewIntent ? { intent: viewIntent, nonce: crypto.randomUUID() } : null, [viewIntent])
@@ -130,8 +143,8 @@ export default function AppBlock({ block, onInternalNav }) {
     event.preventDefault(); navigate(target)
   }
   const open = openHref(block.href)
-  const show = intent => { setViewIntent(intent); setLegacyMode(null); setDelivered(false); setSessionState(null); setBlockEvent(null) }
-  const actionButton = target => (isSession || legacyMode === 'inline') && app && target
+  const show = intent => { setViewIntent(intent); setLegacyMode(isSession && blockSupported === false ? 'view' : null); setDelivered(false); setSessionState(null); setBlockEvent(null) }
+  const actionButton = target => (isSession && blockSupported !== false || legacyMode === 'inline') && app && target
     ? (() => {
       const state = actionState(target.intent)
       if (state?.hidden) return null
@@ -155,7 +168,7 @@ export default function AppBlock({ block, onInternalNav }) {
       onClick={() => show(viewIntent === null ? block.intent : null)}>
       <ChevronDown width={16} height={16} aria-hidden="true" />{viewIntent !== null ? 'Hide details' : block.expandLabel || 'Show details here'}</button>
     : null
-  const view = isSession && app && nearViewport ? <div className="md-app-block__session-host" aria-hidden="true" inert="">
+  const view = isSession && blockSupported !== false && app && nearViewport ? <div className="md-app-block__session-host" aria-hidden="true" inert="">
     <Suspense fallback={null}><AppCanvas appId={app.id} appName={app.name} appSlug={app.slug}
       version={app.updated_at || 0} offlineCapable={app.offline_capable} capabilityContract={app.capabilities}
       active={false} visible={false} interactive={false} blockSession={blockSession} blockEvent={blockEvent}

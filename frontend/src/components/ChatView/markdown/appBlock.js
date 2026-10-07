@@ -65,7 +65,8 @@ function pullSnapshot(value) {
     repo: value.repo, repoUrl: `https://github.com/${value.repo}`, number: numbered ? value.number : null, state: value.state, badges,
     author: typeof value.author === 'string' && /^[\w-]{1,100}(\[bot\])?$/.test(value.author) ? value.author : null,
     files: count(value.files), additions: count(value.additions), deletions: count(value.deletions),
-    labels, url: safeHttps(value.url),
+    labels, url: numbered && safeHttps(value.url) === `https://github.com/${value.repo}/pull/${value.number}`
+      ? `https://github.com/${value.repo}/pull/${value.number}` : undefined,
   }
 }
 
