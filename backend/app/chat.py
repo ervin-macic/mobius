@@ -4766,16 +4766,10 @@ async def run_chat(
       # the owner nothing to read or report. Resume retries once it is fixed.
       message = (
         "This turn failed before the agent could start "
-        f"({type(exc).__name__}: {str(exc)[:300]}). Your message is saved; "
+        f"({type(exc).__name__}). Your message is saved; "
         "the full error is in the server log."
       )
-      bc = get_broadcast(chat_id) if chat_id else None
-      if bc is not None:
-        bc.publish(_pause_note(message))
-        bc.publish({"type": "done"})
-        bc.mark_completed()
       if chat_id:
-        _publish_chat_run_finished(chat_id)
         try:
           await _recover_wedged_run_strict(chat_id, run_token or "", message=message)
         except Exception:
@@ -4792,6 +4786,16 @@ async def run_chat(
               "setup-failure FinishRun did not persist chat_id=%s "
               "(reconciliation will repair)", chat_id, exc_info=True,
             )
+      # Persistence may yield to Stop and a successor. The writer fences the
+      # old run's durable changes; fence its live terminal events as well.
+      still_ours = run_gen is None or current_run_generation(chat_id) == run_gen
+      bc = get_broadcast(chat_id) if chat_id else None
+      if bc is not None and still_ours:
+        bc.publish(_pause_note(message))
+        bc.publish({"type": "done"})
+        bc.mark_completed()
+      if chat_id and still_ours:
+        _publish_chat_run_finished(chat_id)
   finally:
     browser_cancelled = None
     sink = get_active_sink(chat_id) if chat_id else None

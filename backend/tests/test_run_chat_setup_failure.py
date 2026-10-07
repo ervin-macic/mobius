@@ -17,12 +17,15 @@ from app.broadcast import create_broadcast, remove_broadcast
 
 
 class _Writer:
-  def __init__(self, *, fail: bool = False):
+  def __init__(self, *, fail: bool = False, on_submit=None):
     self.submitted = []
     self.fail = fail
+    self.on_submit = on_submit
 
   def submit(self, command):
     self.submitted.append(command)
+    if self.on_submit is not None:
+      self.on_submit()
     ack = Future()
     if self.fail:
       ack.set_exception(RuntimeError("writer unavailable"))
@@ -31,9 +34,9 @@ class _Writer:
     return ack
 
 
-async def _run_broken_setup(chat, monkeypatch, writer):
+async def _run_broken_setup(chat, monkeypatch, writer, *, error=None):
   async def broken_impl(*_args, **_kwargs):
-    raise AttributeError("'Chat' object has no attribute 'messages'")
+    raise error or AttributeError("'Chat' object has no attribute 'messages'")
 
   monkeypatch.setattr(chat_mod, "_run_chat_impl", broken_impl)
   monkeypatch.setattr(chat_mod, "get_writer", lambda: writer)
@@ -48,6 +51,7 @@ async def _run_broken_setup(chat, monkeypatch, writer):
   real_publish = bc.publish
 
   def recording_publish(event):
+    assert writer.submitted, "terminal events must follow durable recovery"
     events.append(event)
     return real_publish(event)
 
@@ -80,7 +84,7 @@ async def test_setup_exception_leaves_a_readable_error_in_the_transcript(chat, m
   assert recovered.parked_until is None
   block = recovered.interruption_block
   assert "AttributeError" in block["message"]
-  assert "has no attribute 'messages'" in block["message"]
+  assert "has no attribute 'messages'" not in block["message"]
   assert block["resumable"] is True
   assert "pause" not in block
   live = next(e for e in events if e.get("type") == "error")
@@ -96,6 +100,33 @@ async def test_setup_exception_still_fails_the_run_when_the_error_cannot_be_save
 
   assert [event.get("type") for event in events][-1] == "done"
   assert finished == [(chat.id, "tok-1", "failed")]
+
+
+@pytest.mark.asyncio
+async def test_setup_error_payload_never_enters_transcript_or_live_events(chat, monkeypatch):
+  private_payload = "synthetic-credential-and-private-query"
+  writer = _Writer()
+  events, _ = await _run_broken_setup(
+    chat, monkeypatch, writer, error=RuntimeError(private_payload),
+  )
+  assert "RuntimeError" in writer.submitted[0].interruption_block["message"]
+  assert private_payload not in repr(writer.submitted)
+  assert private_payload not in repr(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_fails", [False, True])
+async def test_setup_failure_does_not_end_a_successor_stream(chat, monkeypatch, writer_fails):
+  generation = chat_mod.current_run_generation(chat.id)
+  def successor_started():
+    monkeypatch.setattr(chat_mod, "current_run_generation", lambda _chat_id: generation + 1)
+
+  published_finishes = []
+  monkeypatch.setattr(chat_mod, "_publish_chat_run_finished", published_finishes.append)
+  writer = _Writer(fail=writer_fails, on_submit=successor_started)
+  events, _ = await _run_broken_setup(chat, monkeypatch, writer)
+  assert events == []
+  assert published_finishes == []
 
 
 @pytest.mark.asyncio

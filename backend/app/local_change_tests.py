@@ -6,18 +6,14 @@ importing while calling something the release removed, and fail only when a
 chat turn runs it. When local edits carry their own tests, those tests are the
 cheapest evidence that the edits still work on the new release.
 
-``select`` names the tests owned by the local delta between the release and the
-candidate: changed test files plus ``tests/test_<module>.py`` for each changed
-backend module. ``run`` executes them with the checkout's isolated
-``scripts/wt-pytest.sh`` runner and reports failing test ids. The update runs
-them on the served tree before activation and on the candidate after it, so only
-tests that newly fail block the update; a test that was already failing never
-holds an owner's updates hostage.
+``select`` is a best-effort filename convention, not proof of full coverage.
+Runs must use frozen isolated checkouts and the same selected files. Only an
+observed pass before and failure after is a regression; missing, skipped or
+incomplete runs are retained as incomplete evidence, never an all-clear.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import signal
 import subprocess
@@ -26,22 +22,22 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
 RUNNER = "scripts/wt-pytest.sh"
 TIMEOUT_SECONDS = 600
 _SCRUBBED_ENV = (
   "PYTHONPATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
   "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-  "DATABASE_URL", "DATA_DIR", "SECRET_KEY",
+  "DATABASE_URL", "DATA_DIR", "SECRET_KEY", "BASH_ENV", "ENV", "PYTEST_ADDOPTS",
 )
 
 
 @dataclass(frozen=True)
 class LocalTestRun:
-  """Failing test ids from one run, or why the run produced no evidence."""
+  """Executed outcomes from one run, or why the run produced no evidence."""
 
+  passed: frozenset[str] = frozenset()
   failed: frozenset[str] = frozenset()
+  skipped: frozenset[str] = frozenset()
   unavailable: str | None = None
 
 
@@ -49,7 +45,7 @@ def _changed_backend_paths(repo: Path, release: str, candidate: str) -> list[str
   proc = subprocess.run(
     ["git", "-C", str(repo), "diff", "--name-only", "--no-renames",
      "--diff-filter=d", release, candidate, "--", "backend/"],
-    capture_output=True, text=True, check=False,
+    capture_output=True, text=True, check=True,
   )
   return [line for line in proc.stdout.splitlines() if line.endswith(".py")]
 
@@ -75,58 +71,118 @@ def select(repo: Path, release: str, candidate: str) -> list[str]:
   return sorted(path.removeprefix("backend/") for path in owned)
 
 
-def _failed_ids(report: Path) -> frozenset[str]:
-  failed = set()
-  for case in ET.parse(report).getroot().iter("testcase"):
-    if case.find("failure") is not None or case.find("error") is not None:
-      failed.add(f"{case.get('classname', '')}::{case.get('name', '')}")
-  return frozenset(failed)
+def _read_report(report: Path, exit_code: int) -> LocalTestRun:
+  # Pytest's collection/internal/usage exits are not executed test failures.
+  if exit_code not in (0, 1):
+    return LocalTestRun(unavailable=f"local tests did not complete (exit {exit_code})")
+  root = ET.parse(report).getroot()
+  cases = list(root.iter("testcase"))
+  suites = list(root.iter("testsuite"))
+  try:
+    accounted = bool(suites) and all(
+      sum(int(suite.get(attribute, "-1")) for suite in suites) == count
+      for attribute, count in (
+        ("tests", len(cases)),
+        ("failures", sum(case.find("failure") is not None for case in cases)),
+        ("errors", sum(case.find("error") is not None for case in cases)),
+        ("skipped", sum(case.find("skipped") is not None for case in cases)),
+      )
+    )
+  except ValueError:
+    accounted = False
+  if not accounted:
+    return LocalTestRun(unavailable="local test report totals do not account for its test cases")
+  passed, failed, skipped = set(), set(), set()
+  for case in cases:
+    ident = f"{case.get('classname', '')}::{case.get('name', '')}"
+    if not case.get("classname") or not case.get("name") or ident in passed | failed | skipped:
+      return LocalTestRun(unavailable="local test report has missing or duplicate test identities")
+    if case.find("error") is not None:
+      return LocalTestRun(unavailable="local tests had collection, setup or teardown errors")
+    if case.find("failure") is not None:
+      failed.add(ident)
+    elif case.find("skipped") is not None:
+      skipped.add(ident)
+    else:
+      passed.add(ident)
+  if not passed | failed | skipped or bool(failed) != (exit_code == 1):
+    return LocalTestRun(unavailable="local test report does not account for the runner exit status")
+  return LocalTestRun(frozenset(passed), frozenset(failed), frozenset(skipped))
 
 
 def run(repo: Path, tests: list[str], *, timeout: int = TIMEOUT_SECONDS) -> LocalTestRun:
-  """Run the present subset of ``tests`` in the checkout as it is on disk now."""
-  present = [test for test in tests if (repo / "backend" / test).is_file()]
-  if not present:
-    return LocalTestRun()
+  """Execute exactly the selection; never silently drop missing test files."""
+  if not tests:
+    return LocalTestRun(unavailable="no local tests selected by filename convention")
+  missing = [test for test in tests if not (repo / "backend" / test).is_file()]
+  if missing:
+    return LocalTestRun(unavailable="selected test files are missing: " + ", ".join(missing))
   if not (repo / RUNNER).is_file():
     return LocalTestRun(unavailable=f"{RUNNER} is missing")
   env = {key: value for key, value in os.environ.items() if key not in _SCRUBBED_ENV}
   with tempfile.TemporaryDirectory(prefix="mobius-local-tests-") as tmp:
     report = Path(tmp) / "report.xml"
-    # The runner's own children (pytest) must die with it on timeout.
-    proc = subprocess.Popen(
-      ["bash", RUNNER, *present, "-q", f"--junitxml={report}"],
-      cwd=str(repo), env=env, start_new_session=True,
-      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
+    # Contain the runner's runtime directories too: SIGKILL cannot run its trap.
+    env["TMPDIR"] = tmp
     try:
-      output, _ = proc.communicate(timeout=timeout)
+      proc = subprocess.Popen(
+        ["bash", RUNNER, *tests, "-q", f"--junitxml={report}"],
+        cwd=str(repo), env=env, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+      )
+    except OSError:
+      return LocalTestRun(unavailable="local test runner could not start")
+    try:
+      proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-      os.killpg(proc.pid, signal.SIGKILL)
-      proc.communicate()
       return LocalTestRun(unavailable=f"local tests timed out after {timeout}s")
+    finally:
+      # Also reap descendants left behind by a runner that exited early.
+      try:
+        os.killpg(proc.pid, signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+      proc.wait()
     if not report.is_file():
-      tail = (output or "").strip()[-500:]
-      return LocalTestRun(unavailable=f"local tests did not run (exit {proc.returncode}): {tail}")
+      # Runner output may contain private local code or environment values.
+      return LocalTestRun(unavailable=f"local tests produced no report (exit {proc.returncode})")
     try:
-      return LocalTestRun(failed=_failed_ids(report))
-    except ET.ParseError as exc:
-      return LocalTestRun(unavailable=f"local test report was unreadable: {exc}")
+      return _read_report(report, proc.returncode)
+    except (ET.ParseError, OSError):
+      return LocalTestRun(unavailable="local test report was unreadable")
+
+
+def compare(tests: list[str], before: LocalTestRun, after: LocalTestRun) -> dict:
+  """Comparable proof and its limits, suitable for retained prepare diagnostics."""
+  incomplete = []
+  for label, result in (("baseline", before), ("candidate", after)):
+    if result.unavailable:
+      incomplete.append(f"{label}: {result.unavailable}")
+  if not incomplete:
+    before_ids = before.passed | before.failed | before.skipped
+    after_ids = after.passed | after.failed | after.skipped
+    if before_ids != after_ids:
+      incomplete.append("test identities differ between baseline and candidate")
+    if before.skipped or after.skipped:
+      incomplete.append("selected tests were skipped")
+  broken = newly_failing(before, after)
+  return {
+    "status": "regression" if broken else "incomplete" if incomplete else "compared",
+    "selected": tests,
+    "regressions": broken or [],
+    "incomplete": incomplete,
+    "baseline": {"passed": sorted(before.passed), "failed": sorted(before.failed),
+                 "skipped": sorted(before.skipped)},
+    "candidate": {"passed": sorted(after.passed), "failed": sorted(after.failed),
+                  "skipped": sorted(after.skipped)},
+  }
 
 
 def newly_failing(before: LocalTestRun, after: LocalTestRun) -> list[str] | None:
-  """Tests the update broke; ``None`` when the comparison has no evidence.
-
-  An unavailable baseline counts as "nothing was failing": the served tree is
-  the one these edits were written against, so a failure only after the update
-  is still the update's to explain. An unavailable candidate run after a
-  working baseline is itself a regression the update introduced.
-  """
-  if after.unavailable is not None:
-    if before.unavailable is not None:
-      return None
-    return [after.unavailable]
-  return sorted(after.failed - before.failed)
+  """Only passing-before/failing-after proves a regression."""
+  if before.unavailable or after.unavailable:
+    return None
+  return sorted(after.failed & before.passed)
 
 
 def describe(broken: list[str]) -> str:

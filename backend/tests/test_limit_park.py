@@ -3532,5 +3532,6 @@ async def test_setup_failure_is_saved_as_a_resumable_error_in_the_transcript(
   assert tail["role"] == "assistant"
   error = tail["blocks"][-1]
   assert error["type"] == "error"
-  assert "has no attribute 'messages'" in error["message"]
+  assert "AttributeError" in error["message"]
+  assert "has no attribute 'messages'" not in error["message"]
   assert error["resumable"] is True
