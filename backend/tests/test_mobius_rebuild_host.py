@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import os
 import shutil
@@ -148,6 +149,7 @@ def _worker_paths(tmp_path: Path, monkeypatch):
   monkeypatch.setattr(host, "STATUS", state / "status.json")
   monkeypatch.setattr(host, "IMAGES", state / "images.json")
   monkeypatch.setattr(host, "TRANSACTION", state / "transaction.json")
+  monkeypatch.setattr(host, "FAILED_TARGET_LOG", state / "failed-target.json")
   data = tmp_path / "data"
   data.mkdir()
   config = {
@@ -845,6 +847,115 @@ def test_first_rollback_is_journaled_before_rearm_and_uses_exact_image(
   host.rollback(config, transaction["operation_id"], transaction["expected_sha"], "new", "new")
   assert [call[0] for call in calls] == ["docker", "rearm-cutover", "compose", "finalize-cutover"]
   assert calls[2][1]["image"] == transaction["previous_image"]
+
+
+def test_failed_target_evidence_precedes_replacement_and_preserves_both_streams(
+  interrupted_rollback, monkeypatch,
+):
+  config, transaction, calls = interrupted_rollback
+  transaction.pop("phase")
+  host.write_transaction(transaction)
+  target_cid = "a" * 64
+  snapshots = iter([
+    (target_cid, transaction["target_image"], "unhealthy"),
+    ("previous", transaction["previous_image"], "healthy"),
+  ])
+  monkeypatch.setattr(host, "container_health", lambda _c: next(snapshots))
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
+
+  def logs(cid):
+    assert cid == target_cid
+    calls.append(("logs", cid))
+    return b"startup stdout", b"startup stderr", False
+
+  monkeypatch.setattr(host, "_bounded_docker_logs", logs)
+  host.rollback(config, transaction["operation_id"], transaction["expected_sha"], "x", "y")
+  assert [call[0] for call in calls[:4]] == ["logs", "docker", "rearm-cutover", "compose"]
+  artifact = host.read_json(host.FAILED_TARGET_LOG)
+  assert artifact["container_id"] == target_cid
+  assert artifact["target_image"] == transaction["target_image"]
+  assert base64.b64decode(artifact["stdout_b64"]) == b"startup stdout"
+  assert base64.b64decode(artifact["stderr_b64"]) == b"startup stderr"
+  assert host.FAILED_TARGET_LOG.stat().st_mode & 0o777 == 0o600
+  assert host.read_json(host.STATUS)["evidence_capture"] == "saved"
+  assert "startup stdout" not in json.dumps(host.read_json(host.STATUS))
+  assert "startup stderr" not in json.dumps(host.read_json(config["control_dir"] / "status.json"))
+
+
+@pytest.mark.parametrize("observed", ["sha256:previous", "sha256:alien", ""])
+def test_non_target_container_never_captured(interrupted_rollback, monkeypatch, observed):
+  config, transaction, calls = interrupted_rollback
+  transaction.pop("phase")
+  host.write_transaction(transaction)
+  monkeypatch.setattr(host, "container_health", lambda _c: ("b" * 64, observed, "unhealthy"))
+  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: pytest.fail("wrong target"))
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
+  host.rollback(config, transaction["operation_id"], transaction["expected_sha"], "x", "y")
+  assert not host.FAILED_TARGET_LOG.exists()
+
+
+@pytest.mark.parametrize("capture_error", [PermissionError(), OSError("disk full"),
+                                               subprocess.TimeoutExpired("docker logs", 0.1)])
+def test_evidence_replay_does_not_overwrite_and_capture_error_does_not_block(
+  interrupted_rollback, monkeypatch, capture_error,
+):
+  config, transaction, calls = interrupted_rollback
+  cid = "c" * 64
+  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: (b"first", b"error", False))
+  assert host.capture_failed_target(transaction["operation_id"], cid, transaction["target_image"]) == "saved"
+  first = host.FAILED_TARGET_LOG.read_bytes()
+  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: pytest.fail("replayed logs"))
+  assert host.capture_failed_target(transaction["operation_id"], cid, transaction["target_image"]) == "saved"
+  assert host.FAILED_TARGET_LOG.read_bytes() == first
+  transaction.pop("phase")
+  host.write_transaction(transaction)
+  monkeypatch.setattr(host, "container_health", lambda _c: ("d" * 64, transaction["target_image"], "dead"))
+  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: (_ for _ in ()).throw(capture_error))
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
+  assert host.rollback(config, transaction["operation_id"], transaction["expected_sha"], "x", "y") == 1
+  assert [call[0] for call in calls[:3]] == ["docker", "rearm-cutover", "compose"]
+  assert host.read_json(host.STATUS)["evidence_capture"] == "failed"
+  assert host.FAILED_TARGET_LOG.read_bytes() == first
+
+
+def test_docker_log_capture_has_byte_and_wall_clock_bounds(monkeypatch):
+  import sys
+  import time
+
+  original = subprocess.Popen
+  monkeypatch.setattr(host, "FAILED_TARGET_LOG_BYTES", 2048)
+  monkeypatch.setattr(host, "FAILED_TARGET_LOG_SECONDS", 0.2)
+
+  def popen(_args, **kwargs):
+    return original([sys.executable, "-c",
+                     "import sys,time; sys.stdout.write('x'*100000); "
+                     "sys.stderr.write('e'*100000); sys.stdout.flush(); "
+                     "sys.stderr.flush(); time.sleep(30)"], **kwargs)
+
+  monkeypatch.setattr(host.subprocess, "Popen", popen)
+  started = time.monotonic()
+  out, err, truncated = host._bounded_docker_logs("e" * 64)
+  assert time.monotonic() - started < 3
+  assert truncated and len(out) + len(err) <= 2048
+
+
+def test_docker_log_timeout_kills_pipe_holding_descendant(tmp_path, monkeypatch):
+  import sys
+  import time
+
+  original = subprocess.Popen
+  marker = tmp_path / "orphan-finished"
+  child = f"import time; time.sleep(0.7); open({str(marker)!r}, 'w').close()"
+  parent = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
+  monkeypatch.setattr(host, "FAILED_TARGET_LOG_SECONDS", 0.1)
+  monkeypatch.setattr(host.subprocess, "Popen",
+                      lambda _args, **kwargs: original([sys.executable, "-c", parent], **kwargs))
+  started = time.monotonic()
+  with pytest.raises(subprocess.TimeoutExpired):
+    host._bounded_docker_logs("e" * 64)
+  assert time.monotonic() - started < 2
+  time.sleep(0.8)
+  assert not marker.exists()
 
 
 def test_rollback_refuses_another_operations_receipt(interrupted_rollback):

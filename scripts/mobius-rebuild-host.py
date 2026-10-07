@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import stat
@@ -49,7 +51,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 3
+WORKER_REVISION = 5
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -57,6 +59,9 @@ WORKER_IN_IMAGE = "/app/platform-baked/scripts/mobius-rebuild-host.py"
 MAX_WORKER_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 4096
 ROLLBACK_HEALTH_SECONDS = 300
+FAILED_TARGET_LOG = STATE_DIR / "failed-target.json"
+FAILED_TARGET_LOG_BYTES = 32 * 1024
+FAILED_TARGET_LOG_SECONDS = 5
 _REVISION_LINE = re.compile(rb"^WORKER_REVISION\s*=.*$", re.MULTILINE)
 _REVISION_EXACT = re.compile(rb"^WORKER_REVISION = ([1-9][0-9]{0,5})$")
 
@@ -174,7 +179,7 @@ def write_status(config_value: dict, **fields) -> dict:
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     if "operation_id" in fields and fields["operation_id"] != current.get("operation_id"):
-        current.update(failure_code=None, failure_detail=None)
+        current.update(failure_code=None, failure_detail=None, evidence_capture=None)
     current.update(fields)
     current["handoff"] = HANDOFF_VERSION
     current["request_versions"] = REQUEST_VERSIONS
@@ -215,6 +220,95 @@ def docker_command(args: list[str], *, timeout: float = 10, check: bool = True,
     if check:
         result.check_returncode()
     return result
+
+
+def _bounded_docker_logs(cid: str) -> tuple[bytes, bytes, bool]:
+    """Keep at most one small prefix of each Docker output stream in total.
+
+    Pipes are drained only until the byte or wall-clock limit; the process
+    group is then killed, including a Docker CLI descendant holding a pipe.
+    """
+    args = ["docker", "logs", "--timestamps", "--tail", "1000", cid]
+    out, err = bytearray(), bytearray()
+    deadline = time.monotonic() + FAILED_TARGET_LOG_SECONDS
+    truncated = False
+    timed_out = False
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    completed = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            for pipe, sink in ((process.stdout, out), (process.stderr, err)):
+                selector.register(pipe, selectors.EVENT_READ, sink)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                ready = selector.select(remaining)
+                if not ready:
+                    timed_out = True
+                    break
+                for key, _ in ready:
+                    budget = FAILED_TARGET_LOG_BYTES - len(out) - len(err)
+                    if budget <= 0:
+                        truncated = True
+                        break
+                    chunk = os.read(key.fd, min(4096, budget + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    else:
+                        key.data.extend(chunk[:budget])
+                        if len(chunk) > budget or len(out) + len(err) >= FAILED_TARGET_LOG_BYTES:
+                            truncated = True
+                            break
+                if truncated:
+                    break
+        if timed_out:
+            raise subprocess.TimeoutExpired(args, FAILED_TARGET_LOG_SECONDS)
+        if truncated or process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=1)
+        completed = True
+        if process.returncode and not truncated:
+            raise subprocess.CalledProcessError(process.returncode, args)
+        return bytes(out), bytes(err), truncated
+    finally:
+        if not completed:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=1)
+        process.stdout.close()
+        process.stderr.close()
+
+
+def capture_failed_target(operation: str, cid: str, image: str) -> str:
+    """Best-effort, root-private evidence for this journaled target only."""
+    if not CONTAINER_RE.fullmatch(cid):
+        return "failed"
+    try:
+        try:
+            previous = (read_json(FAILED_TARGET_LOG)
+                        if FAILED_TARGET_LOG.stat().st_size <= 128 * 1024 else {})
+        except (OSError, ValueError):
+            previous = {}
+        if previous.get("operation_id") == operation and previous.get("container_id") == cid:
+            return "saved"  # interrupted rollback replay must not erase evidence
+        stdout, stderr, truncated = _bounded_docker_logs(cid)
+        _atomic_json(FAILED_TARGET_LOG, {
+            "operation_id": operation, "container_id": cid, "target_image": image[:128],
+            "captured_at": now(), "truncated": truncated,
+            "stdout_b64": base64.b64encode(stdout).decode("ascii"),
+            "stderr_b64": base64.b64encode(stderr).decode("ascii"),
+        })
+        return "saved"
+    except Exception:
+        return "failed"
 
 
 def compose(config_value: dict, *args: str, image: str | None = None,
@@ -460,6 +554,14 @@ def rollback(config_value: dict, operation: str, expected: str,
             write_status(config_value, state="needs_recovery", code="rollback_failed",
                          message=f"Rollback is not serviceable: {detail}"[:300])
             return 1
+        # Compose force-recreate below destroys this exact failed container's
+        # logs. Never inspect the previous healthy image or an alien image.
+        if current == transaction.get("target_image") and cid:
+            evidence = capture_failed_target(operation, cid, current)
+            try:
+                write_status(config_value, evidence_capture=evidence)
+            except OSError:
+                pass  # optional diagnostics must not prevent the restore
         docker_command(["docker", "tag", previous_image, ROLLBACK_TAG])
         # Journal BEFORE rearming: an interruption at this boundary must not
         # authorize another boot. An ambiguous outcome needs manual recovery.
