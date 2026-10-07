@@ -42,7 +42,10 @@ test('a cold long chat loads older edits from the authoritative route', async ()
   const authoritative = {
     id: 'older-than-loaded-window',
     ts: '2026-08-20T08:00:00Z',
-    preview: small,
+    preview: {
+      diff: 'diff --git a//data/platform/src/a.js b//data/platform/src/a.js\n--- a//data/platform/src/a.js\n+++ b//data/platform/src/a.js\n@@ -1 +1 @@\n-old\n+new',
+      truncated: false,
+    },
   }
   const entries = await loadChatDiffEntries('chat with history', {
     signal: 'request-signal',
@@ -65,6 +68,6 @@ test('a cold long chat loads older edits from the authoritative route', async ()
   assert.equal(coldEntries.length, 1)
   assert.deepEqual(
     chatChanges(coldEntries).files.map(file => file.path),
-    ['src/a.js'],
+    ['/data/platform/src/a.js'],
   )
 })

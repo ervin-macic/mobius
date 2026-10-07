@@ -65,16 +65,34 @@ test('changed files group by owning project', () => {
   ])
 })
 
-test('scratch, review worktrees and runtime storage are not source changes', () => {
+test('Changes keeps source work while excluding non-source and traversing paths', () => {
+  const projectId = '123e4567-e89b-42d3-a456-426614174000'
   const changes = chatChanges([
     entry('source', '/data/platform/frontend/a.jsx'),
+    entry('app-source', '/data/apps/notes/index.jsx'),
+    entry('project-source', `/data/projects/${projectId}/src/main.js`),
     entry('tmp', '/tmp/contrib-review/app/a.jsx'),
     entry('review', '/data/contrib/private-review/worktree/a.jsx'),
     entry('app-data', '/data/apps/80/settings.json'),
+    entry('credential', '/data/.secret-key'),
+    entry('outside', '/etc/passwd'),
+    entry('traversal', '/data/apps/notes/../80/settings.json'),
+    entry('platform-traversal', '/data/platform/../.secret-key'),
+    { ...entry('rename-from-private', '/data/platform/copied.txt'), preview: {
+      files: [{ path: '/data/platform/copied.txt', oldPath: '/data/.secret-key',
+        newPath: '/data/platform/copied.txt', hunks: [] }],
+    } },
   ])
 
-  assert.deepEqual(changes.files.map(file => file.path), ['/data/platform/frontend/a.jsx'])
-  assert.equal(changes.entries.length, 1)
+  assert.deepEqual(changes.files.map(file => file.path), [
+    '/data/apps/notes/index.jsx', '/data/platform/frontend/a.jsx',
+    `/data/projects/${projectId}/src/main.js`,
+  ])
+  assert.equal(changes.entries.length, 3)
+  assert.deepEqual(changes.groups.map(group => [group.id, group.files.length]), [
+    ['/data/platform', 1], ['/data/apps/notes', 1],
+    [`/data/projects/${projectId}`, 1],
+  ])
 })
 
 test('excerpt-only edits and the latest edit time are reported', () => {

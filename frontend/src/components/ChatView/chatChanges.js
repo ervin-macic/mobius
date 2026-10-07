@@ -9,31 +9,21 @@ function cleanPath(value) {
   return normalized
 }
 
-function entryPaths(entry) {
-  return (entry?.preview?.files || [])
-    .map(file => cleanPath(file?.path))
-    .filter(Boolean)
-}
-
-// Scratch space, transcripts, shared memory, databases, credentials and app
-// data are not source changes this chat made to a project.
+// Changes is a source view, not a second view of arbitrary transcript edits.
+// Project workspaces have UUID roots; installed app source has a named slug.
 function isSourcePath(value) {
   const path = cleanPath(value)
-  if (!path || path === '/tmp' || path.startsWith('/tmp/')) return false
-  if (
-    path === '/data/contrib' || path.startsWith('/data/contrib/')
-    || path === '/data/agent-scratch' || path.startsWith('/data/agent-scratch/')
-    || path === '/data/chats' || path.startsWith('/data/chats/')
-    || path === '/data/shared' || path.startsWith('/data/shared/')
-    || path === '/data/db' || path.startsWith('/data/db/')
-    || path === '/data/cli-auth' || path.startsWith('/data/cli-auth/')
-    || /^\/data\/apps\/\d+(?:\/|$)/.test(path)
-  ) return false
-  return true
+  if (!path || path.split('/').some(part => part === '.' || part === '..')) return false
+  return path.startsWith('/data/platform/')
+    || /^\/data\/apps\/[A-Za-z0-9_.-]*[A-Za-z_.-][A-Za-z0-9_.-]*\/.+/.test(path)
+    || /^\/data\/projects\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\/.+/.test(path)
 }
 
 function sourceEntry(entry) {
-  const files = (entry?.preview?.files || []).filter(file => isSourcePath(file?.path))
+  const files = (entry?.preview?.files || []).filter(file => (
+    isSourcePath(file?.path)
+    && [file?.oldPath, file?.newPath].every(path => path == null || isSourcePath(path))
+  ))
   return files.length ? { ...entry, preview: { ...entry.preview, files } } : null
 }
 
@@ -49,6 +39,8 @@ function changeSource(path) {
   if (clean === '/data/platform' || clean.startsWith('/data/platform/')) {
     return { id: '/data/platform', label: 'Möbius' }
   }
+  const project = clean.match(/^\/data\/projects\/([^/]+)\//)
+  if (project) return { id: `/data/projects/${project[1]}`, label: 'Project' }
   const parts = clean.split('/').filter(Boolean)
   const id = clean.startsWith('/') ? `/${parts.slice(0, 2).join('/')}` : parts[0] || 'other'
   return { id, label: parts.at(-2) || parts[0] || 'Other project' }
