@@ -1,7 +1,7 @@
 /* First-screen profile setup. A hosted or already-linked owner picks a handle
    and avatar right here; a self-hosted owner who has not linked yet signs in
    with Möbius through Möbius · You, which owns the account-link handshake. */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { apiFetch, getAuthHeaders, BASE } from '../../api/client.js'
 import { detailToMessage } from '../../lib/errorDetail.js'
 import { CheckIcon } from './WalkthroughIcons.jsx'
@@ -35,13 +35,16 @@ function useAvatarUrl(avatarKey) {
   return url
 }
 
-/* The owner's profile: { loading, error, identity, avatarUrl, claim, uploadAvatar, signIn }.
+/* The owner's profile: { loading, error, identity, avatarUrl, editing, returning, claim, uploadAvatar, signIn, reload }.
+   `returning` is the handle of an owner who arrived with one, or null (see returningOwner.js).
    claim and uploadAvatar reject with a user-facing Error message. */
 export function useAccountProfile(onSignIn) {
   const [state, setState] = useState({ identity: null, loading: true, error: '' })
   // Set when this owner's first handle is claimed in the guide; `reload` refetches after the sign-in hand-off.
   const [claimedHere, setClaimedHere] = useState(false)
+  const [editing, setEditing] = useState(false)
   const [reloads, setReloads] = useState(0)
+  const reload = useCallback(() => setReloads(count => count + 1), [])
   useEffect(() => {
     const controller = new AbortController()
     apiFetch('/identity', { signal: controller.signal, timeoutMs: 15_000 }).then(async response => {
@@ -49,7 +52,10 @@ export function useAccountProfile(onSignIn) {
       setState({ identity: await response.json(), loading: false, error: '' })
     }).catch(error => {
       if (error.name === 'AbortError') return
-      setState({ identity: null, loading: false, error: error.message || 'Your profile is not available right now.' })
+      // A refresh that fails keeps the profile the owner already saw; only the first load shows the error.
+      setState(current => (current.identity
+        ? { ...current, loading: false }
+        : { identity: null, loading: false, error: error.message || 'Your profile is not available right now.' }))
     })
     return () => controller.abort()
   }, [reloads])
@@ -72,7 +78,8 @@ export function useAccountProfile(onSignIn) {
     if (!response.ok) throw new Error(detailToMessage(data.detail, 'Could not update your avatar.'))
     setIdentity(data)
   }
-  return { ...state, avatarUrl, claimedHere, claim, uploadAvatar, signIn: onSignIn, reload: () => setReloads(count => count + 1) }
+  const returning = returningHandle({ handle: state.identity?.profile?.handle, claimedHere, editing })
+  return { ...state, avatarUrl, claimedHere, editing, setEditing, returning, claim, uploadAvatar, signIn: onSignIn, reload }
 }
 
 function Avatar({ url, name, busy, onPick }) {
@@ -90,8 +97,7 @@ function Avatar({ url, name, busy, onPick }) {
 
 export default function WalkthroughProfile({ identityApp, controller }) {
   const identityAvailable = Boolean(identityApp)
-  const { identity, loading, error: loadError, avatarUrl } = controller
-  const [editing, setEditing] = useState(false)
+  const { identity, loading, error: loadError, avatarUrl, editing, setEditing, returning } = controller
   const [value, setValue] = useState('')
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -156,7 +162,6 @@ export default function WalkthroughProfile({ identityApp, controller }) {
   if (!canEdit) return <p className="wt-note" role="status">Your Möbius account can’t be reached right now. You can pick a handle later in Möbius · You.</p>
 
   const showForm = !handle || editing
-  const returning = returningHandle({ handle, claimedHere: controller.claimedHere, editing })
   return <>
   <div className={`wt-profile${handle && !editing ? ' is-claimed' : ''}`}>
     {showForm && <h3 className="wt-profile__title">Claim a handle and upload a picture <span>(optional)</span> to get started.</h3>}

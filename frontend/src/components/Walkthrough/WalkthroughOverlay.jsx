@@ -14,7 +14,6 @@ import WalkthroughAppGroup from './WalkthroughAppGroup.jsx'
 import WalkthroughInstall from './WalkthroughInstall.jsx'
 import { Reveal, Typewriter, WordReveal } from './WalkthroughMotion.jsx'
 import WalkthroughProfile, { useAccountProfile } from './WalkthroughProfile.jsx'
-import { returningHandle } from './returningOwner.js'
 import WalkthroughAccessConfirm from './WalkthroughAccessConfirm.jsx'
 import WalkthroughStore, { STORE_WINDOW_APPS, useStoreCatalog } from './WalkthroughStore.jsx'
 import { useAppInstall } from './useAppInstall.js'
@@ -98,7 +97,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   const identityApp = apps.find(app => app.slug === 'identity') || null
   // One profile for the whole guide, so Back to the welcome screen never refetches it or loses who claimed what.
   const account = useAccountProfile(() => { if (identityApp) openApp(identityApp.id) })
-  const skipHandle = returningHandle({ handle: account.identity?.profile?.handle, claimedHere: account.claimedHere, editing: false })
+  const reloadAccount = account.reload
 
   // The shell's history restore must not queue chat-composer focus while this
   // guide is handing back from another app. Publish the lease at the same commit
@@ -113,10 +112,10 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
   useEffect(() => {
     if (wasSuspendedRef.current && !suspended) {
       setHandoffAppId(null)
-      account.reload()
+      reloadAccount()
     }
     wasSuspendedRef.current = suspended
-  }, [suspended]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [suspended, reloadAccount])
 
   // A modal dialog: focus starts on the title, Tab stays inside the card, the page behind is inert,
   // and focus returns to where it was when the guide goes away. Escape dismisses it exactly like the
@@ -180,7 +179,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
       {confirming && confirmingApp && <WalkthroughAccessConfirm confirmation={confirming} app={confirmingApp} icon={store.icons[confirmingApp.id]} onApprove={installer.approve} onCancel={installer.dismiss} />}
       <div className="wt__footer">
         {stepIndex > 0 && <button type="button" className="wt__back" onClick={() => goTo(stepIndex - 1)}>Back</button>}
-        {screen.content === 'profile' && skipHandle && <button type="button" className="wt__back" onClick={() => goTo(CONNECT_INDEX)}>Skip to agent setup</button>}
+        {screen.content === 'profile' && account.returning && <button type="button" className="wt__back" onClick={() => goTo(CONNECT_INDEX)}>Skip to agent setup</button>}
         <button type="button" className="wt__next" onClick={() => stepIndex === LAST ? finish() : goTo(stepIndex + 1)}>
           {stepIndex === LAST ? 'Finish guide' : 'Continue'}<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8h10M9 4l4 4-4 4" /></svg>
         </button>

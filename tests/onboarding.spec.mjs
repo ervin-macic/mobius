@@ -195,6 +195,12 @@ test('an owner who arrives with a handle is welcomed back and can skip to agent 
   await stubIdentity(page, linked('ada'))
   const { guide } = await openGuide(page)
   await expect(guide.getByRole('note')).toContainText('Welcome back, @ada.')
+  // While the handle form is open, the note and the skip step aside together.
+  await guide.getByRole('button', { name: 'Change', exact: true }).click()
+  await expect(guide.getByRole('note')).toHaveCount(0)
+  await expect(guide.getByRole('button', { name: 'Skip to agent setup' })).toHaveCount(0)
+  await guide.getByRole('button', { name: 'Cancel' }).click()
+  await expect(guide.getByRole('note')).toContainText('Welcome back, @ada.')
   await guide.getByRole('button', { name: 'Skip to agent setup' }).click()
   await expect(guide.getByRole('heading', { name: /Bring your/ })).toBeFocused()
 })
@@ -219,8 +225,11 @@ test('a short desktop window keeps the chat preview reachable instead of squashi
   const { guide } = await openGuide(page)
   await goToScreen(guide, 'Meet your agent')
   const preview = guide.locator('.wt-chatmock')
-  expect((await preview.boundingBox()).height).toBeGreaterThanOrEqual(334)
+  // Layout pixels: the shell zooms the page on desktop, which would skew an on-screen measurement.
+  expect(await preview.evaluate(element => element.offsetHeight)).toBeGreaterThanOrEqual(334)
   const composer = guide.locator('.wt-chatmock__composer')
   await composer.scrollIntoViewIfNeeded()
   await expect(composer).toBeInViewport()
+  const [inner, outer] = [await composer.boundingBox(), await preview.boundingBox()]
+  expect(inner.y + inner.height).toBeLessThanOrEqual(outer.y + outer.height + 1)
 })
