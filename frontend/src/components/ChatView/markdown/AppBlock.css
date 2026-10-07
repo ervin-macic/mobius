@@ -74,3 +74,27 @@
 .md-app-batch__list .md-app-pull__title { font-size:15px; }
 .md-app-batch__title { display:block; padding:10px 16px; color:var(--text); font-weight:600; }
 .md-app-batch__foot { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:8px 12px; padding:10px 16px 12px; border-top:1px solid var(--border); }
+
+/* Inline contribution receipts share the chat notice geometry, not its Goal tone. */
+.md-app-block--compact { background:color-mix(in srgb, var(--text) 3%, var(--surface)); border-color:color-mix(in srgb, var(--muted) 24%, var(--border-light, var(--border))); margin:10px 0; }
+.md-app-pull--compact { grid-template-columns:28px minmax(0, 1fr); gap:4px 10px; padding:10px 12px; }
+.md-app-pull__identity-icon { grid-column:1; grid-row:1 / span 3; display:flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:8px; background:color-mix(in srgb, var(--muted) 12%, transparent); color:var(--muted); }
+.md-app-pull__identity { grid-column:2; display:flex; flex-wrap:wrap; gap:8px; font-size:13px; font-weight:600; line-height:1.4; }
+.md-app-pull__status { color:var(--muted); font-weight:500; }
+.md-app-pull__status.is-attention { color:var(--warning, var(--text)); }
+.md-app-pull__status.is-danger { color:var(--danger); }
+.md-app-pull--compact .md-app-pull__headline { grid-column:2; display:flex; flex-wrap:wrap; gap:4px; line-height:1.4; }
+.md-app-pull--compact .md-app-pull__title { flex-basis:100%; font-size:13px; margin:0; }
+.md-app-pull--compact .md-app-pull__label { margin:0; font-size:12px; line-height:20px; }
+.md-app-pull--compact .md-app-pull__footer { grid-column:2; align-items:center; flex-wrap:wrap; gap:4px 12px; }
+.md-app-pull--compact .md-app-pull__meta { flex:1 1 auto; font-size:12px; gap:4px 10px; }
+.md-app-pull--compact a.md-app-pull__repo { color:var(--muted); font-weight:400; }
+.md-app-pull--compact .md-app-block__links { margin-left:auto; font-size:13px; }
+.md-app-pull--compact .md-app-block__links a { display:inline-flex; align-items:center; min-height:44px; text-decoration:none; }
+.md-app-pull--compact .md-app-block__links a:hover { text-decoration:underline; text-underline-offset:3px; }
+.md-app-pull--compact .md-app-block__note { grid-column:2; padding:0; font-size:12px; }
+.md-app-pull--compact .md-app-block__controls { margin-left:auto; }
+.md-app-pull--compact a:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:3px; }
+@media (max-width:480px) {
+  .md-app-pull--compact .md-app-block__links { flex-basis:100%; margin-left:0; }
+}

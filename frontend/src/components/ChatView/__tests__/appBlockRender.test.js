@@ -4,7 +4,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
-import AppBlock from '../markdown/AppBlock.jsx'
+import AppBlock, { PullSnapshot } from '../markdown/AppBlock.jsx'
 import { appBlockFromToken } from '../markdown/appBlock.js'
 import { appQueries } from '../../../hooks/queries.js'
 
@@ -94,4 +94,23 @@ test('inline session keeps the action in the row without a visible app panel', (
   assert.match(html, /md-app-block__controls/)
   assert.match(html, />Contribute<\/button>/)
   assert.doesNotMatch(html, /md-app-block__view|md-app-block__toggle|md-app-block__session-host/)
+})
+
+test('compact live receipts preserve tags and diff counts but replace obsolete saved badges', () => {
+  const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
+    app: 'contribute', intent: 'review:a', title: 'Fix it', interaction: 'inline',
+    pull: { repo: 'owner/repo', state: 'proposed', files: 5, additions: 91, deletions: 16,
+      labels: [{ name: 'bug', color: 'd73a4a' }], badges: [{ label: '3 linked PRs', tone: 'neutral' }] },
+  }) })
+  const html = renderToStaticMarkup(createElement(PullSnapshot, { block, pull: block.pull,
+    href: block.href, compact: true, session: { status: 'Open', statusTone: 'neutral', badges: [],
+      links: [{ label: 'View PR #42', url: 'https://github.com/owner/repo/pull/42' }] } }))
+  assert.match(html, /md-app-pull--compact/)
+  assert.match(html, />Contribution</)
+  assert.match(html, />Open</)
+  assert.match(html, />bug</)
+  assert.match(html, /owner\/repo</)
+  assert.match(html, /5 files <ins>\+91<\/ins> <del>−16<\/del>/)
+  assert.match(html, /View PR #42/)
+  assert.doesNotMatch(html, /3 linked PRs|Review details|Not sent yet/)
 })

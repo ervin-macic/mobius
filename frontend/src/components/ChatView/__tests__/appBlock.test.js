@@ -100,3 +100,12 @@ test('inline state is session and key scoped, bounded, plain, and uncredentialed
   assert.deepEqual(state.actions[0].links, [{ label: 'PR', url: 'https://github.com/owner/repo/pull/1' }])
   assert.equal(state.notice.length, 500)
 })
+
+test('live badges may replace a saved snapshot without granting an action or markup', () => {
+  const state = badges => inlineBlockState({ type: 'moebius:app-block-state', sessionId: 's',
+    actions: [{ key: 'x:1', ...(badges === undefined ? {} : { badges }) }] }, 's', new Set(['x:1'])).actions[0]
+  assert.equal(Object.hasOwn(state(), 'badges'), false)
+  assert.deepEqual(state([]).badges, [])
+  assert.deepEqual(state([{ label: 'Current', tone: 'neon' }, null]).badges, [{ label: 'Current', tone: 'neutral' }])
+  assert.equal(state([]).confirming, false)
+})

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
+import { Branch, ChevronDown, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { appQueries } from '../../../hooks/queries.js'
 import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
 import { inlineBlockState } from './appBlock.js'
@@ -31,10 +31,16 @@ function labelStyle(hex) {
 
 /** A PR as a compact row: the title is the link into the app, details sit
  *  underneath, and the app's one action takes the bottom-right corner. */
-function PullSnapshot({ block, pull, href, open, action, session }) {
+export function PullSnapshot({ block, pull, href, open, action, session, compact = false }) {
   const files = pull.files === null ? null : `${pull.files} ${pull.files === 1 ? 'file' : 'files'}`
   const ref = pull.number ? `${pull.repo}#${pull.number}` : pull.repo
-  return <div className="md-app-pull">
+  const status = session?.status || STATE_NAMES[pull.state]
+  const statusTone = session?.status ? session.statusTone : STATE_TONES[pull.state]
+  return <div className={`md-app-pull${compact ? ' md-app-pull--compact' : ''}`}>
+    {compact ? <>
+      <span className="md-app-pull__identity-icon" aria-hidden="true"><Branch width={18} height={18} /></span>
+      <div className="md-app-pull__identity"><span>Contribution</span><span className={`md-app-pull__status is-${statusTone}`}>{status}</span></div>
+    </> : null}
     <div className="md-app-pull__headline">
       <a className="md-app-pull__title" href={href} onClick={open}>{block.title}</a>
       {pull.labels.map(label => <span key={label.name} className="md-app-pull__label" style={labelStyle(label.color)}>{label.name}</span>)}
@@ -44,8 +50,8 @@ function PullSnapshot({ block, pull, href, open, action, session }) {
         <a className="md-app-pull__repo" href={pull.url || pull.repoUrl} target="_blank" rel="noopener noreferrer">{ref}</a>
         {pull.author ? <span>{pull.author}</span> : null}
         {files ? <span>{files}{pull.additions !== null ? <> <ins>+{pull.additions}</ins> <del>−{pull.deletions ?? 0}</del></> : null}</span> : null}
-        <span className={`md-app-pull__badge is-${session?.status ? session.statusTone : STATE_TONES[pull.state]}`}>{session?.status || STATE_NAMES[pull.state]}</span>
-        {pull.badges.map(badge => <span key={badge.label} className={`md-app-pull__badge is-${badge.tone}`}>{badge.label}</span>)}
+        {!compact ? <span className={`md-app-pull__badge is-${statusTone}`}>{status}</span> : null}
+        {(session?.badges ?? pull.badges).map(badge => <span key={badge.label} className={`md-app-pull__badge is-${badge.tone}`}>{badge.label}</span>)}
       </div>
       {session?.links?.length ? <span className="md-app-block__links">{session.links.map(link => <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer">{link.label}</a>)}</span> : null}
       {action}
@@ -166,12 +172,12 @@ export default function AppBlock({ block, onInternalNav }) {
     ? <p>{apps.isLoading ? 'Checking installed apps…' : `${block.app} is not available. The saved snapshot remains here.`}</p>
     : null
   if (block.items.length > 0) {
-    return <section ref={rootRef} className="md-app-block md-app-block--batch" aria-label={block.title}>
+    return <section ref={rootRef} className={`md-app-block md-app-block--batch${isSession ? ' md-app-block--compact' : ''}`} aria-label={block.title}>
       <header className="md-app-batch__head"><strong>{block.title}</strong><span>{block.items.length} {block.items.length === 1 ? 'item' : 'items'}</span></header>
       <ul className="md-app-batch__list">
         {block.items.map(item => <li key={item.intent}>
           {item.pull
-            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} session={actionState(item.action?.intent)} />
+            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} session={actionState(item.action?.intent)} compact={isSession} />
             : <a className="md-app-batch__title" href={sharedBrowserShellHref(item.href)} onClick={openHref(item.href)}>{item.title}</a>}
         </li>)}
       </ul>
@@ -187,8 +193,8 @@ export default function AppBlock({ block, onInternalNav }) {
     // The title already opens the app, so a PR row has no separate Open link
     // or details toggle: its one action is the only inline view.
     const label = block.pull.number ? `Pull request ${block.pull.repo}#${block.pull.number}` : `Proposed pull request for ${block.pull.repo}`
-    return <section ref={rootRef} className="md-app-block md-app-block--pull" aria-label={label}>
-      <PullSnapshot block={block} pull={block.pull} href={href} open={open} action={action} session={actionState(block.action?.intent)} />
+    return <section ref={rootRef} className={`md-app-block md-app-block--pull${isSession ? ' md-app-block--compact' : ''}`} aria-label={label}>
+      <PullSnapshot block={block} pull={block.pull} href={href} open={open} action={action} session={actionState(block.action?.intent)} compact={isSession} />
       {sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}
       {view}
     </section>

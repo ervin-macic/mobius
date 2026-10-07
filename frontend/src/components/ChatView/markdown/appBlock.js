@@ -18,6 +18,12 @@ function safeHttps(value) {
   } catch { return undefined }
 }
 
+function pullBadges(value) {
+  return (Array.isArray(value) ? value : [])
+    .filter(badge => shortText(badge?.label, 40)).slice(0, 3)
+    .map(badge => ({ label: shortText(badge.label, 40), tone: TONES.has(badge.tone) ? badge.tone : 'neutral' }))
+}
+
 /** The iframe contributes text and links, never markup or action authority. */
 export function inlineBlockState(message, sessionId, keys) {
   if (!message || message.type !== 'moebius:app-block-state' || message.sessionId !== sessionId
@@ -35,7 +41,9 @@ export function inlineBlockState(message, sessionId, keys) {
       hidden: raw.hidden === true, note: shortText(raw.note, 500),
       tone: SESSION_TONES.has(raw.tone) ? raw.tone : 'neutral',
       status: shortText(raw.status, 40),
-      statusTone: SESSION_TONES.has(raw.statusTone) ? raw.statusTone : 'neutral', links })
+      statusTone: SESSION_TONES.has(raw.statusTone) ? raw.statusTone : 'neutral', links,
+      // Omission preserves the saved snapshot; an empty list deliberately clears it.
+      ...(Array.isArray(raw.badges) ? { badges: pullBadges(raw.badges) } : {}) })
   }
   return { actions, notice: shortText(message.notice, 500) }
 }
@@ -52,9 +60,7 @@ function pullSnapshot(value) {
   const labels = (Array.isArray(value.labels) ? value.labels : []).slice(0, 12)
     .filter(label => typeof label?.name === 'string' && label.name.trim() && label.name.length <= 50)
     .map(label => ({ name: label.name, ...(/^[0-9a-f]{6}$/i.test(label.color || '') ? { color: label.color } : {}) }))
-  const badges = (Array.isArray(value.badges) ? value.badges : [])
-    .filter(badge => shortText(badge?.label, 40)).slice(0, 3)
-    .map(badge => ({ label: shortText(badge.label, 40), tone: TONES.has(badge.tone) ? badge.tone : 'neutral' }))
+  const badges = pullBadges(value.badges)
   return {
     repo: value.repo, repoUrl: `https://github.com/${value.repo}`, number: numbered ? value.number : null, state: value.state, badges,
     author: typeof value.author === 'string' && /^[\w-]{1,100}(\[bot\])?$/.test(value.author) ? value.author : null,
