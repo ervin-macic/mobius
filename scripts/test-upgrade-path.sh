@@ -93,7 +93,14 @@ field() {  # <json> <python expression over d>; JSON on stdin (a preview can exc
 # handoff, not proof of a completed host upgrade. Other external work is not
 # covered by this fixture and must remain a failing, actionable result.
 helper_maintenance_pending() {
-  [ "$(field "$1" 'd.get("activation", {}).get("required_actions") == ["host_maintenance"] and any(r.get("code") == "host_helper_migration" and r.get("paths") == ["deployment/self-hosted-helper.required"] for r in d.get("activation", {}).get("reasons", []))')" = True ]
+  [ "$(field "$1" 'd.get("activation", {}).get("required_actions") == ["host_maintenance"] and len(d.get("activation", {}).get("reasons", [])) == 1 and any(r.get("code") == "host_helper_migration" and r.get("paths") == ["deployment/self-hosted-helper.required"] for r in d.get("activation", {}).get("reasons", []))')" = True ]
+}
+
+# Before activation, the same migration may also need an ordinary server
+# restart. That restart must disappear after boot; only the exact helper work
+# may remain. Do not treat proxy, topology, or image work as this handoff.
+reviewed_helper_preview() {
+  [ "$(field "$1" 'set((d.get("activation") or {}).get("required_actions") or []) in ({"host_maintenance"}, {"server_restart", "host_maintenance"}) and any(r.get("code") == "host_helper_migration" and r.get("paths") == ["deployment/self-hosted-helper.required"] for r in (d.get("activation") or {}).get("reasons", []))')" = True ]
 }
 
 previous=$(image_sha "$PREVIOUS")
@@ -166,8 +173,12 @@ conflicts=$(field "$preview" 'len(d.get("conflict_paths") or []) + len(d.get("bl
 plan=$(field "$preview" 'json.dumps({k: d.get(k) for k in ("plan_id", "current_sha", "target_sha", "image_digest")})')
 needs_image=$(field "$preview" '"image_rebuild" in ((d.get("activation") or {}).get("required_actions") or [])')
 needs_helper=false
-if helper_maintenance_pending "$preview"; then
+if reviewed_helper_preview "$preview"; then
   needs_helper=true
+fi
+if [ "$(field "$preview" '"host_maintenance" in ((d.get("activation") or {}).get("required_actions") or [])')" = True ] \
+    && [ "$needs_helper" != true ]; then
+  fail "the review includes host work outside the supported helper-only handoff: $preview"
 fi
 if [ "$local_edits" = true ] && [ "$needs_image" = True ]; then
   [ "$(field "$preview" '"Dockerfile" in (d.get("local_image_paths") or [])')" = True ] \
@@ -219,7 +230,7 @@ else
   # restart_needed); conflict, rolled_back or an error is a refusal.
   applied_state=$([ "$(code "$reply")" = 200 ] && field "$(body "$reply")" 'd.get("state")')
   if [ "$needs_helper" = true ]; then
-    [ "$applied_state" = activation_needed ] && helper_maintenance_pending "$(body "$reply")" \
+    [ "$applied_state" = activation_needed ] && reviewed_helper_preview "$(body "$reply")" \
       || fail "the installed candidate lost its reviewed helper-maintenance handoff: $(body "$reply")"
   else
     case "$applied_state" in

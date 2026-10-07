@@ -51,7 +51,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 7
+WORKER_REVISION = 8
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -1359,15 +1359,17 @@ def recover(config_value: dict, transaction: dict) -> None:
 
 def reconcile() -> int:
     config_value = config()
-    try:
-        current = read_json(STATUS)
-    except (OSError, ValueError, json.JSONDecodeError):
-        current = None
     with LOCK.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        # Status and the journal belong to the lock owner. A previous owner
+        # may have settled and cleared the journal before we acquired it.
+        try:
+            current = read_json(STATUS)
+        except (OSError, ValueError, json.JSONDecodeError):
+            current = None
         # A hard power loss can strand the already-claimed request before or
         # after the first status write. Once no worker owns the lock, it is no
         # longer runnable and must not accumulate in the root-controlled area.

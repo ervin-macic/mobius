@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -608,6 +610,108 @@ def test_reconcile_marks_interrupted_active_worker_failed(tmp_path, monkeypatch)
   assert host.reconcile() == 0
   assert written[-1]["code"] == "worker_interrupted"
   assert not abandoned.exists()
+
+
+@pytest.mark.parametrize("state", ["verifying", "needs_recovery", "succeeded"])
+def test_reconcile_lock_loser_leaves_owner_files_untouched(tmp_path, monkeypatch, state):
+  config, inbox = _worker_paths(tmp_path, monkeypatch)
+  host.write_status(config, operation_id="1" * 32, request_nonce="2" * 32,
+                    expected_sha="a" * 40, state=state, code="owner-status")
+  host.write_transaction(host.transaction_record(
+    "1" * 32, "a" * 40, "2" * 32, "sha256:previous", "sha256:target",
+  ))
+  request = inbox / "request.json"
+  request.write_text(json.dumps({"version": 2, "expected_sha": "b" * 40, "nonce": "3" * 32}))
+  claimed = config["control_dir"] / f'.request-{"1" * 32}.json'
+  claimed.write_bytes(request.read_bytes())
+  paths = (host.STATUS, config["control_dir"] / "status.json", host.TRANSACTION, request, claimed)
+
+  def snapshot():
+    return [(path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths]
+
+  before = snapshot()
+  monkeypatch.setattr(host, "read_json", lambda *_a: pytest.fail("lock loser read owner state"))
+  monkeypatch.setattr(host, "docker_command", lambda *_a, **_k: pytest.fail("lock loser ran Docker"))
+  with host.LOCK.open("a+") as owner:
+    host.fcntl.flock(owner, host.fcntl.LOCK_EX | host.fcntl.LOCK_NB)
+    assert host.reconcile() == 0
+    with host.LOCK.open("a+") as contender:
+      with pytest.raises(BlockingIOError):
+        host.acquire_lock(contender, timeout=0)
+  assert snapshot() == before
+
+
+@pytest.mark.parametrize("state", ["succeeded", "rolled_back"])
+@pytest.mark.parametrize("finalized", [False, True])
+def test_reconcile_reads_status_after_other_reconciler_settles(
+  tmp_path, monkeypatch, state, finalized,
+):
+  config, transaction, ledger, now = _real_cutover(tmp_path, monkeypatch)
+  host.write_status(config, operation_id=transaction["operation_id"], state="verifying",
+                    expected_sha=transaction["expected_sha"], request_nonce=transaction["request_nonce"])
+  image = transaction["target_image"] if state == "succeeded" else transaction["previous_image"]
+  monkeypatch.setattr(host, "container_health", lambda _c: ("cid", image, "healthy"))
+  monkeypatch.setattr(host, "wait_healthy", lambda *_a: True)
+  monkeypatch.setattr(host, "verify_served_generation", lambda *_a: None)
+  monkeypatch.setattr(host, "retain_images", lambda *_a: None)
+  monkeypatch.setattr(host, "adopt_from_image", lambda *_a: "not adopted")
+  monkeypatch.setattr(host, "compose", lambda *_a, **_k: pytest.fail("must not recreate"))
+
+  def docker(args, **kwargs):
+    assert args[:3] == ["docker", "ps", "-aq"]
+    return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+  calls = []
+
+  def finalize(_config, _cid, command, operation, **kwargs):
+    assert command == "finalize-cutover" and operation == transaction["operation_id"]
+    calls.append(command)
+    return finalized and ledger.finalize_cutover(operation, now=now + 4)
+
+  monkeypatch.setattr(host, "docker_command", docker)
+  monkeypatch.setattr(host, "restart_ledger", finalize)
+  at_lock, settled = threading.Event(), threading.Event()
+  local = threading.local()
+  flock = host.fcntl.flock
+
+  def pause_before_lock(fd, operation):
+    if getattr(local, "delayed", False):
+      at_lock.set()
+      assert settled.wait(10), "other reconciler did not settle"
+    return flock(fd, operation)
+
+  def delayed_reconcile():
+    local.delayed = True
+    return host.reconcile()
+
+  monkeypatch.setattr(host.fcntl, "flock", pause_before_lock)
+  # Both reconcilers use real kernel locks, journal settlement, both status
+  # publications and journal removal. Only scheduling before flock is gated.
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    delayed = pool.submit(delayed_reconcile)
+    try:
+      assert at_lock.wait(10)
+      assert pool.submit(host.reconcile).result(timeout=10) == 0
+      assert not host.TRANSACTION.exists()
+      owner_status = host.read_json(host.STATUS)
+      assert owner_status["state"] == state
+      expected_code = (None if state == "succeeded" else "worker_interrupted") if finalized else "handoff_finalize_unconfirmed"
+      assert owner_status["code"] == expected_code
+      assert host.read_json(config["control_dir"] / "status.json") == owner_status
+    finally:
+      settled.set()
+    assert delayed.result(timeout=10) == 0
+
+  # Capability refresh may advance the timestamp, not overwrite the outcome.
+  for path in (host.STATUS, config["control_dir"] / "status.json"):
+    actual = host.read_json(path)
+    assert {k: v for k, v in actual.items() if k != "updated_at"} == {
+      k: v for k, v in owner_status.items() if k != "updated_at"
+    }
+  assert not host.TRANSACTION.exists()
+  assert calls == ["finalize-cutover"]
+  assert ledger.CUTOVER_RECEIPT_PATH.exists() is not finalized
+  assert not ledger.ACCEPTED_PATH.exists()
 
 
 def test_reconcile_cleans_claim_abandoned_before_first_status(tmp_path, monkeypatch):
