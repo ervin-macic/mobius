@@ -3,6 +3,7 @@ from app import chat_writer
 from app.chat_writer import create_chat
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -858,9 +859,27 @@ def test_changed_github_account_skips_the_public_review(setup, monkeypatch):
 
 def test_post_review_writes_a_comment_review_bound_to_the_head():
   calls = []
-  def gh(_cwd, *args):
-    calls.append(args)
+  def gh(_cwd, *args, input_text):
+    calls.append((args, json.loads(input_text)))
     return SimpleNamespace(stdout='{"id": 5, "html_url": "https://github.com/x"}')
   assert domain.post_review(gh, "/tmp", TARGET, "Body") == {"id": 5, "url": "https://github.com/x"}
-  assert "event=COMMENT" in calls[0] and f"commit_id={SHA}" in calls[0]
-  assert not any("APPROVE" in part or "REQUEST_CHANGES" in part for part in calls[0])
+  args, payload = calls[0]
+  assert args[-2:] == ("--input", "-")
+  assert payload == {"event": "COMMENT", "commit_id": SHA, "body": "Body"}
+
+
+def test_public_review_transports_large_unicode_evidence_through_subprocess_stdin(tmp_path, monkeypatch):
+  from app import github_contribution_git as git
+
+  executable = tmp_path / "gh"
+  executable.write_text(f"#!{sys.executable}\n" + '''import json, pathlib, sys
+assert sys.argv[1:] == ["api", "--method", "POST", "repos/example/project/pulls/7/reviews", "--input", "-"]
+pathlib.Path("received.json").write_text(sys.stdin.read())
+print(json.dumps({"id": 5, "html_url": "https://github.com/example/project/pull/7#pullrequestreview-5"}))
+''')
+  executable.chmod(0o755)
+  monkeypatch.setattr(git, "_git_env", lambda _cwd: {"PATH": str(tmp_path), "LC_ALL": "C.UTF-8"})
+  body = "finding " * 25000 + '\nRésumé 🧭 "quoted" evidence'
+  assert domain.post_review(git._gh, tmp_path, TARGET, body)["id"] == 5
+  payload = json.loads((tmp_path / "received.json").read_text())
+  assert payload == {"event": "COMMENT", "commit_id": SHA, "body": body}

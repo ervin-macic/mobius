@@ -195,7 +195,9 @@ def post_review(gh, cwd, target, body):
   response = gh(
     cwd, "api", "--method", "POST",
     f"repos/{target['repo']}/pulls/{target['number']}/reviews",
-    "-f", f"commit_id={target['head_sha']}", "-f", "event=COMMENT", "-f", f"body={body}",
+    "--input", "-", input_text=json.dumps({
+      "commit_id": target["head_sha"], "event": "COMMENT", "body": body,
+    }),
   ).stdout
   result = json.loads(response)
   if not isinstance(result, dict) or not result.get("id"):
