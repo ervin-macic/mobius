@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { appBlockFromToken } from '../markdown/appBlock.js'
+import { appBlockFromToken, inlineBlockState } from '../markdown/appBlock.js'
 
 const token = value => ({ type:'code', lang:'mobius-app', text:JSON.stringify(value) })
 test('app blocks carry a destination and snapshot, not authority', () => {
@@ -74,4 +74,29 @@ test('a batch block keeps up to 12 valid items, each its own destination, under 
   assert.equal(block.items[0].pull.state, 'proposed')
   assert.deepEqual(block.action, { label: 'Contribute all', intent: 'chat-send-batch:rec-0,rec-1' })
   assert.deepEqual(appBlockFromToken(token({ app: 'contribute', intent: 'x:1', title: 't' })).items, [])
+})
+
+test('inline sessions are opt-in and preserve link-only and legacy blocks', () => {
+  assert.equal(appBlockFromToken(token({ app: 'contribute', intent: 'x:1', title: 'x', interaction: 'inline' })).interaction, 'inline')
+  assert.equal(appBlockFromToken(token({ app: 'contribute', intent: 'x:1', title: 'x' })).interaction, null)
+  assert.equal(appBlockFromToken(token({ app: 'contribute', intent: 'x:1', title: 'x', inline: false, interaction: 'inline' })).interaction, null)
+})
+
+test('inline state is session and key scoped, bounded, plain, and uncredentialed HTTPS only', () => {
+  const keys = new Set(['x:1'])
+  assert.equal(inlineBlockState({ type: 'moebius:app-block-state', sessionId: 'other', actions: [] }, 'live', keys), null)
+  const state = inlineBlockState({ type: 'moebius:app-block-state', sessionId: 'live', notice: 'n'.repeat(600), actions: [
+    { key: 'x:1', label: 'L'.repeat(80), note: 'N'.repeat(600), status: 'Contributing', statusTone: 'attention', links: [
+      { label: 'PR', url: 'https://github.com/owner/repo/pull/1' },
+      { label: 'bad', url: 'https://user:password@github.com/owner/repo/pull/2' },
+      { label: 'bad', url: 'javascript:alert(1)' },
+    ] },
+    { key: 'unknown', label: 'Wrong' },
+  ] }, 'live', keys)
+  assert.equal(state.actions.length, 1)
+  assert.equal(state.actions[0].label.length, 40)
+  assert.equal(state.actions[0].note.length, 500)
+  assert.equal(state.actions[0].status, 'Contributing')
+  assert.deepEqual(state.actions[0].links, [{ label: 'PR', url: 'https://github.com/owner/repo/pull/1' }])
+  assert.equal(state.notice.length, 500)
 })

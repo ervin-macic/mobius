@@ -1,7 +1,8 @@
-import { lazy, Suspense, useCallback, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { appQueries } from '../../../hooks/queries.js'
 import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
+import { inlineBlockState } from './appBlock.js'
 import './AppBlock.css'
 
 const AppCanvas = lazy(() => import('../../AppCanvas/AppCanvas.jsx'))
@@ -30,7 +31,7 @@ function labelStyle(hex) {
 
 /** A PR as a compact row: the title is the link into the app, details sit
  *  underneath, and the app's one action takes the bottom-right corner. */
-function PullSnapshot({ block, pull, href, open, action }) {
+function PullSnapshot({ block, pull, href, open, action, session }) {
   const files = pull.files === null ? null : `${pull.files} ${pull.files === 1 ? 'file' : 'files'}`
   const ref = pull.number ? `${pull.repo}#${pull.number}` : pull.repo
   return <div className="md-app-pull">
@@ -43,21 +44,62 @@ function PullSnapshot({ block, pull, href, open, action }) {
         <a className="md-app-pull__repo" href={pull.url || pull.repoUrl} target="_blank" rel="noopener noreferrer">{ref}</a>
         {pull.author ? <span>{pull.author}</span> : null}
         {files ? <span>{files}{pull.additions !== null ? <> <ins>+{pull.additions}</ins> <del>−{pull.deletions ?? 0}</del></> : null}</span> : null}
-        <span className={`md-app-pull__badge is-${STATE_TONES[pull.state]}`}>{STATE_NAMES[pull.state]}</span>
+        <span className={`md-app-pull__badge is-${session?.status ? session.statusTone : STATE_TONES[pull.state]}`}>{session?.status || STATE_NAMES[pull.state]}</span>
         {pull.badges.map(badge => <span key={badge.label} className={`md-app-pull__badge is-${badge.tone}`}>{badge.label}</span>)}
       </div>
+      {session?.links?.length ? <span className="md-app-block__links">{session.links.map(link => <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer">{link.label}</a>)}</span> : null}
       {action}
     </div>
+    {session?.note ? <p className={`md-app-block__note is-${session.tone}`} role="status">{session.note}</p> : null}
   </div>
 }
 
-/** Reuse the normal opaque app host, only when the reader opens this block. */
+/** Reuse the opaque app host; inline sessions hydrate only near the viewport. */
 export default function AppBlock({ block, onInternalNav }) {
   const apps = appQueries.list.useQuery()
   const app = (apps.data || []).find(item => item.slug === block.app && !item.deleted_at)
   const canExpand = block.inline !== false
-  // The open view's intent: the block's own, or its action's. null = closed.
+  const isSession = block.interaction === 'inline'
+  const [legacyMode, setLegacyMode] = useState(null)
+  const rootRef = useRef(null)
+  const [nearViewport, setNearViewport] = useState(false)
+  const [sessionId] = useState(() => crypto.randomUUID())
+  const [blockEvent, setBlockEvent] = useState(null)
+  const [sessionState, setSessionState] = useState(null)
   const [viewIntent, setViewIntent] = useState(null)
+  const viewIntentRef = useRef(viewIntent)
+  viewIntentRef.current = viewIntent
+  const negotiating = !isSession && canExpand && viewIntent !== null
+  const blockSession = useMemo(() => (isSession || negotiating) ? {
+    sessionId, actions: [block.action, ...block.items.map(item => item.action)].filter(Boolean)
+      .map(action => ({ key: action.intent, intent: action.intent, label: action.label })),
+  } : null, [isSession, negotiating, sessionId, block])
+  const allowedKeys = useMemo(() => new Set(blockSession?.actions.map(action => action.key) || []), [blockSession])
+  useEffect(() => {
+    if (!isSession || !rootRef.current || typeof IntersectionObserver === 'undefined') return
+    const observer = new IntersectionObserver(entries => {
+      if (entries[0]?.isIntersecting) setNearViewport(true)
+    }, { rootMargin: '400px 0px' })
+    observer.observe(rootRef.current)
+    return () => observer.disconnect()
+  }, [isSession])
+  const onBlockState = useCallback(message => {
+    const safe = inlineBlockState(message, sessionId, allowedKeys)
+    if (safe) setSessionState(safe)
+  }, [sessionId, allowedKeys])
+  const actionState = key => sessionState?.actions.find(item => item.key === key)
+  const competingBusy = sessionState?.actions.some(item => item.busy)
+  const dispatchBlockEvent = useCallback((key, event) => setBlockEvent({ sessionId, key, event, nonce: crypto.randomUUID() }), [sessionId])
+  const onBlockCapability = useCallback(supported => {
+    if (isSession) return
+    const intent = viewIntentRef.current
+    if (!intent) return
+    if (supported && allowedKeys.has(intent)) {
+      setLegacyMode('inline')
+      dispatchBlockEvent(intent, 'activate')
+    } else setLegacyMode('view')
+  }, [isSession, allowedKeys, dispatchBlockEvent])
+  // The open view's intent: the block's own, or its action's. null = closed.
   const [delivered, setDelivered] = useState(false)
   const pending = useMemo(() => viewIntent ? { intent: viewIntent, nonce: crypto.randomUUID() } : null, [viewIntent])
   const href = sharedBrowserShellHref(block.href)
@@ -82,37 +124,62 @@ export default function AppBlock({ block, onInternalNav }) {
     event.preventDefault(); navigate(target)
   }
   const open = openHref(block.href)
-  const show = intent => { setViewIntent(intent); setDelivered(false) }
-  const actionButton = target => canExpand && app && target
+  const show = intent => { setViewIntent(intent); setLegacyMode(null); setDelivered(false); setSessionState(null); setBlockEvent(null) }
+  const actionButton = target => (isSession || legacyMode === 'inline') && app && target
+    ? (() => {
+      const state = actionState(target.intent)
+      if (state?.hidden) return null
+      return <span className="md-app-block__controls">
+        {state?.confirming ? <button type="button" className="md-app-block__cancel" disabled={competingBusy}
+          onClick={() => dispatchBlockEvent(target.intent, 'cancel')}>Not now</button> : null}
+        <button type="button" className="md-app-block__action" disabled={state?.disabled || competingBusy}
+          title={state?.label || target.label}
+          aria-busy={state?.busy || undefined}
+          onClick={() => dispatchBlockEvent(target.intent, state?.confirming ? 'confirm' : 'activate')}>
+          {state?.busy ? 'Contributing…' : state?.confirming ? 'Confirm' : state?.label || target.label}</button>
+      </span>
+    })()
+    : canExpand && app && target
     ? <button type="button" className="md-app-block__action" aria-pressed={viewIntent === target.intent}
       onClick={() => show(viewIntent === target.intent ? null : target.intent)}>{target.label}</button>
     : null
   const action = actionButton(block.action)
-  const toggle = canExpand && app
+  const toggle = canExpand && app && !isSession && legacyMode !== 'inline'
     ? <button type="button" className="md-app-block__toggle" aria-expanded={viewIntent !== null}
       onClick={() => show(viewIntent === null ? block.intent : null)}>
       <ChevronDown width={16} height={16} aria-hidden="true" />{viewIntent !== null ? 'Hide details' : block.expandLabel || 'Show details here'}</button>
     : null
-  const view = canExpand && app && pending && <div className="md-app-block__view" style={{ height: block.height }}>
-    <Suspense fallback={<p role="status">Opening details…</p>}><AppCanvas key={viewIntent} appId={app.id} appName={app.name} appSlug={app.slug}
+  const view = isSession && app && nearViewport ? <div className="md-app-block__session-host" aria-hidden="true" inert="">
+    <Suspense fallback={null}><AppCanvas appId={app.id} appName={app.name} appSlug={app.slug}
       version={app.updated_at || 0} offlineCapable={app.offline_capable} capabilityContract={app.capabilities}
-      active={false} visible interactive pendingIntent={delivered ? null : pending}
+      active={false} visible={false} interactive={false} blockSession={blockSession} blockEvent={blockEvent}
+      onBlockState={onBlockState} onHostRequest={hostRequest} /></Suspense>
+  </div> : canExpand && app && pending && !isSession && <div className={legacyMode === 'view' ? 'md-app-block__view' : 'md-app-block__session-host'}
+    style={legacyMode === 'view' ? { height: block.height } : undefined} aria-hidden={legacyMode !== 'view' ? 'true' : undefined} inert={legacyMode !== 'view' ? '' : undefined}>
+    <Suspense fallback={legacyMode === 'view' ? <p role="status">Opening details…</p> : null}><AppCanvas key={viewIntent} appId={app.id} appName={app.name} appSlug={app.slug}
+      version={app.updated_at || 0} offlineCapable={app.offline_capable} capabilityContract={app.capabilities}
+      active={false} visible={legacyMode === 'view'} interactive={legacyMode === 'view'} pendingIntent={legacyMode === 'view' && !delivered ? pending : null}
+      blockSession={blockSession} blockEvent={blockEvent} onBlockState={onBlockState} onBlockCapability={onBlockCapability}
       onIntentDelivered={() => setDelivered(true)} onHostRequest={hostRequest} /></Suspense>
   </div>
   const unavailable = canExpand && !app
     ? <p>{apps.isLoading ? 'Checking installed apps…' : `${block.app} is not available. The saved snapshot remains here.`}</p>
     : null
   if (block.items.length > 0) {
-    return <section className="md-app-block md-app-block--batch" aria-label={block.title}>
+    return <section ref={rootRef} className="md-app-block md-app-block--batch" aria-label={block.title}>
       <header className="md-app-batch__head"><strong>{block.title}</strong><span>{block.items.length} {block.items.length === 1 ? 'item' : 'items'}</span></header>
       <ul className="md-app-batch__list">
         {block.items.map(item => <li key={item.intent}>
           {item.pull
-            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} />
+            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} session={actionState(item.action?.intent)} />
             : <a className="md-app-batch__title" href={sharedBrowserShellHref(item.href)} onClick={openHref(item.href)}>{item.title}</a>}
         </li>)}
       </ul>
-      {action ? <footer className="md-app-batch__foot">{action}</footer> : null}
+      {action ? <footer className="md-app-batch__foot">
+        {action}
+      </footer> : null}
+      {actionState(block.action?.intent)?.note ? <p className={`md-app-block__note is-${actionState(block.action.intent).tone}`} role="status">{actionState(block.action.intent).note}</p> : null}
+      {sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}
       {view}
     </section>
   }
@@ -120,14 +187,18 @@ export default function AppBlock({ block, onInternalNav }) {
     // The title already opens the app, so a PR row has no separate Open link
     // or details toggle: its one action is the only inline view.
     const label = block.pull.number ? `Pull request ${block.pull.repo}#${block.pull.number}` : `Proposed pull request for ${block.pull.repo}`
-    return <section className="md-app-block md-app-block--pull" aria-label={label}>
-      <PullSnapshot block={block} pull={block.pull} href={href} open={open} action={action} />
+    return <section ref={rootRef} className="md-app-block md-app-block--pull" aria-label={label}>
+      <PullSnapshot block={block} pull={block.pull} href={href} open={open} action={action} session={actionState(block.action?.intent)} />
+      {sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}
       {view}
     </section>
   }
-  return <section className={`md-app-block${canExpand ? '' : ' md-app-block--link'}`} aria-label={block.title}>
-    <header><strong>{block.title}</strong><span className="md-app-block__header-actions">{action}<a href={href} onClick={open}>Open{app ? ` in ${app.name}` : ''}<ChevronRight width={16} height={16} aria-hidden="true" /></a></span></header>
+  return <section ref={rootRef} className={`md-app-block${canExpand ? '' : ' md-app-block--link'}`} aria-label={block.title}>
+    <header><strong>{block.title}</strong><span className="md-app-block__header-actions">
+      {actionState(block.action?.intent)?.links.length ? <span className="md-app-block__links">{actionState(block.action.intent).links.map(link =>
+        <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer">{link.label}</a>)}</span> : null}
+      {action}<a href={href} onClick={open}>Open{app ? ` in ${app.name}` : ''}<ChevronRight width={16} height={16} aria-hidden="true" /></a></span></header>
     {block.facts.length > 0 && <dl>{block.facts.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd>{fact.href ? <a href={fact.href} target="_blank" rel="noopener noreferrer">{fact.value}</a> : fact.value}</dd></div>)}</dl>}
-    {toggle}{unavailable}{view}
+    {toggle}{unavailable}{sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}{view}
   </section>
 }

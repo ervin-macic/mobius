@@ -46,3 +46,15 @@ test('the frame acknowledges after app handlers get two commit turns', () => {
   assert.match(acknowledgement, /type: 'moebius:app-intent-applied'/)
   assert.match(frame, /msg\.type === 'moebius:app-intent'[\s\S]*acknowledgeAppIntent\(msg\.nonce\)/)
 })
+
+test('app-block capability is reported only after the module commits and live source is attributed', () => {
+  assert.match(frame, /supportsAppBlocks = mod\.appBlockSessions === true/)
+  assert.match(frame, /function signalFrameMounted\(node\)[\s\S]*type: 'moebius:frame-mounted', appId: _FRAME_APP_ID, supportsAppBlocks/)
+  assert.match(canvas, /const srcVersion = attributedFrameVersion\(framesRef\.current, e\.source\)[\s\S]*if \(srcVersion == null\) return/)
+  assert.match(canvas, /msg\.type === 'moebius:frame-mounted'[\s\S]*srcVersion === liveVersionRef\.current\) onBlockCapabilityRef\.current\?\.\(msg\.supportsAppBlocks === true\)/)
+  assert.match(canvas, /msg\.type === 'moebius:app-block-state'[\s\S]*srcVersion === liveVersionRef\.current && blockSessionRef\.current\?\.sessionId === msg\.sessionId/)
+  const blockDelivery = canvas.slice(canvas.indexOf('Inline transcript sessions'), canvas.indexOf('// ── P1-A:'))
+  assert.match(blockDelivery, /if \(!blockSession \|\| !swap\.liveLoaded\) return/)
+  assert.match(blockDelivery, /type: 'moebius:app-block-init'/)
+  assert.match(blockDelivery, /sentBlockEventRef\.current === blockEvent\.nonce/)
+})

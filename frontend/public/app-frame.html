@@ -653,6 +653,7 @@
     let tokenRefreshResolve = null;
     let mountedRoot = null;
     let mountedComponent = null;
+    let supportsAppBlocks = false;
     let createRoot = null;
     let createElement = null;
     let Fragment = null;
@@ -1191,7 +1192,7 @@
       if (!node || window.__frameMounted) return;
       window.__frameMounted = true;
       window.parent.postMessage(
-        { type: 'moebius:frame-mounted', appId: _FRAME_APP_ID },
+        { type: 'moebius:frame-mounted', appId: _FRAME_APP_ID, supportsAppBlocks },
         window.location.origin
       );
     }
@@ -1433,6 +1434,7 @@
         createElement = compiledRuntime.createElement;
         Fragment = compiledRuntime.Fragment;
         const Component = mod.default;
+        supportsAppBlocks = mod.appBlockSessions === true;
         if (!Component) {
           showErr('Module error', 'The app module has no default export.');
           return;

@@ -91,7 +91,7 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      The host is a fallback for engines that deny clipboard access inside an
 //      opaque frame; source attribution and visibility gate the side effect.
 //
-//   2. {type: 'moebius:frame-mounted', appId}              frame → parent
+//   2. {type: 'moebius:frame-mounted', appId, supportsAppBlocks} frame → parent
 //      Fired by the frame AFTER its first render COMMITS (MountSignal's
 //      stable DOM ref in app-frame.html — NOT right after
 //      `createRoot.render()` returns, which only schedules the render). The
@@ -158,6 +158,9 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      handlers and their resulting React commits have had a chance to run.
 //      AppCanvas keeps the destination covered until that acknowledgement, so
 //      a direct link never flashes the app's home screen first.
+//   6b. moebius:app-block-init/action/state is an optional, source-attributed
+//       transcript view-model session. It does not grant app authority; an old
+//       block negotiates via supportsAppBlocks before any legacy intent is sent.
 //
 //   7. moebius:capability-*                                bidirectional
 //      One versioned session protocol for every host-mediated browser feature.
@@ -344,6 +347,7 @@ const AppCanvas = forwardRef(function AppCanvas({
   // background content cannot keep coasting beneath the drawer.
   interactive = visible,
   pendingIntent = null,
+  blockSession = null, blockEvent = null, onBlockState, onBlockCapability,
   shellShortcuts = null,
   onNavPush, onNavPop, onNavReset, onNavForwardResult,
   onAppFocus, onImmersive, onIntentDelivered, onAppError, onHostRequest,
@@ -475,6 +479,13 @@ const AppCanvas = forwardRef(function AppCanvas({
   // an older destination from uncovering a newer handoff.
   const pendingIntentRef = useRef(pendingIntent)
   pendingIntentRef.current = pendingIntent
+  const blockSessionRef = useRef(blockSession)
+  blockSessionRef.current = blockSession
+  const onBlockStateRef = useRef(onBlockState)
+  onBlockStateRef.current = onBlockState
+  const onBlockCapabilityRef = useRef(onBlockCapability)
+  onBlockCapabilityRef.current = onBlockCapability
+  const sentBlockEventRef = useRef(null)
   const storageHost = useMemo(() => createAppStorageHost({
     appId,
     getCurrentToken: () => hostTokenRef.current,
@@ -802,6 +813,13 @@ const AppCanvas = forwardRef(function AppCanvas({
       const srcVersion = attributedFrameVersion(framesRef.current, e.source)
       if (srcVersion == null) return   // not one of our frames (stale/unknown)
 
+      if (msg.type === 'moebius:app-block-state') {
+        if (srcVersion === liveVersionRef.current && blockSessionRef.current?.sessionId === msg.sessionId) {
+          onBlockStateRef.current?.(msg)
+        }
+        return
+      }
+
       if (msg.type === 'moebius:module-request') {
         serveModuleRequest({
           message: msg, source: e.source, appId, frameVersion: srcVersion,
@@ -826,6 +844,7 @@ const AppCanvas = forwardRef(function AppCanvas({
       // frame-mounted: the reducer routes it — promotion if it's the incoming
       // frame, first-load settle if it's the live frame, ignored if stale.
       if (msg.type === 'moebius:frame-mounted' && String(msg.appId) === String(appId)) {
+        if (srcVersion === liveVersionRef.current) onBlockCapabilityRef.current?.(msg.supportsAppBlocks === true)
         dispatchSwap({ type: 'frame-mounted', version: srcVersion })
         return
       }
@@ -1291,6 +1310,20 @@ const AppCanvas = forwardRef(function AppCanvas({
       nonce: pendingIntent.nonce,
     })
   }, [swap.liveLoaded, swap.liveVersion, pendingIntent])
+
+  // Inline transcript sessions are optional. Unlike an app intent, init has no
+  // action and is repeated only when a newly promoted document needs it.
+  useEffect(() => {
+    if (!blockSession || !swap.liveLoaded) return
+    postToFrame(swap.liveVersion, { type: 'moebius:app-block-init',
+      sessionId: blockSession.sessionId, actions: blockSession.actions, initialAction: null })
+  }, [swap.liveLoaded, swap.liveVersion, blockSession])
+  useEffect(() => {
+    if (!blockSession || !blockEvent || !swap.liveLoaded || blockEvent.sessionId !== blockSession.sessionId) return
+    if (sentBlockEventRef.current === blockEvent.nonce) return
+    sentBlockEventRef.current = blockEvent.nonce
+    postToFrame(swap.liveVersion, { type: 'moebius:app-block-action', ...blockEvent })
+  }, [swap.liveLoaded, swap.liveVersion, blockSession, blockEvent])
 
   // ── P1-A: probed-online forwarding ──────────────────────────────
   // Forward the shell's real reachability verdict (from useOnlineStatus, which

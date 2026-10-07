@@ -85,3 +85,13 @@ test('a batch renders every item as its own linked row with one shared action', 
   assert.match(html, />Contribute<\/button>/)
   assert.doesNotMatch(html, /md-app-block__view/)
 })
+
+test('inline session keeps the action in the row without a visible app panel', () => {
+  const html = render({ app: 'contribute', intent: 'review:1', title: 'Fix it', interaction: 'inline',
+    action: { label: 'Contribute', intent: 'chat-send:1' },
+    pull: { repo: 'owner/repo', state: 'proposed' } },
+  [{ id: 80, slug: 'contribute', name: 'Contribute' }])
+  assert.match(html, /md-app-block__controls/)
+  assert.match(html, />Contribute<\/button>/)
+  assert.doesNotMatch(html, /md-app-block__view|md-app-block__toggle|md-app-block__session-host/)
+})

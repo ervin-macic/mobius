@@ -5,6 +5,7 @@
 // `proposed` is a reviewed change that is not on GitHub yet, so it has no number.
 const PULL_STATES = new Set(['proposed', 'open', 'draft', 'merged', 'closed'])
 const TONES = new Set(['success', 'attention', 'danger', 'accent', 'neutral'])
+const SESSION_TONES = new Set(['neutral', 'success', 'attention', 'danger'])
 const INTENT = /^[a-z][a-z0-9-]*:[^\s]{1,256}$/
 const shortText = (value, max) => typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : ''
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null
@@ -15,6 +16,28 @@ function safeHttps(value) {
     const url = new URL(value)
     return url.protocol === 'https:' && !url.username && !url.password ? url.href : undefined
   } catch { return undefined }
+}
+
+/** The iframe contributes text and links, never markup or action authority. */
+export function inlineBlockState(message, sessionId, keys) {
+  if (!message || message.type !== 'moebius:app-block-state' || message.sessionId !== sessionId
+    || !Array.isArray(message.actions) || message.actions.length > 24) return null
+  const seen = new Set()
+  const actions = []
+  for (const raw of message.actions) {
+    if (!raw || !keys.has(raw.key) || seen.has(raw.key)) continue
+    seen.add(raw.key)
+    const links = (Array.isArray(raw.links) ? raw.links : []).slice(0, 12)
+      .map(link => ({ label: shortText(link?.label, 120), url: safeHttps(link?.url) }))
+      .filter(link => link.label && link.url)
+    actions.push({ key: raw.key, label: shortText(raw.label, 40),
+      disabled: raw.disabled === true, busy: raw.busy === true, confirming: raw.confirming === true,
+      hidden: raw.hidden === true, note: shortText(raw.note, 500),
+      tone: SESSION_TONES.has(raw.tone) ? raw.tone : 'neutral',
+      status: shortText(raw.status, 40),
+      statusTone: SESSION_TONES.has(raw.statusTone) ? raw.statusTone : 'neutral', links })
+  }
+  return { actions, notice: shortText(message.notice, 500) }
 }
 
 /* A pull-request snapshot renders like a GitHub PR row. Anything malformed is
@@ -55,6 +78,7 @@ export function appBlockFromToken(token) {
         return { label: fact.label.slice(0, 80), value: fact.value.slice(0, 240), ...(href ? { href } : {}) }
       })
     const inline = value.inline !== false
+    const interaction = inline && value.interaction === 'inline' ? 'inline' : null
     // An app may offer one primary action (and one per batch item). It only
     // opens the app's own view with a second intent; whatever that view then
     // does is the app's to check.
@@ -69,7 +93,7 @@ export function appBlockFromToken(token) {
       .slice(0, 12)
       .map(item => ({ title: item.title.trim().slice(0, 240), intent: item.intent, pull: pullSnapshot(item.pull), href: href(item.intent), action: actionOf(item.action) }))
     return { app: value.app, intent: value.intent, title: value.title, facts, pull: pullSnapshot(value.pull),
-      inline, action, items,
+      inline, interaction, action, items,
       expandLabel: shortText(value.expand_label, 40),
       height: Math.max(240, Math.min(640, Number(value.height) || 480)),
       href: href(value.intent) }
