@@ -819,3 +819,19 @@ test('shell reconciles both durable drawer lists whenever the system stream reco
     'open chats and durable running chats reconcile even when run events were missed')
   assert.match(shellSource, /useSystemEventStream\(handleSystemEvent, \{\s*onOpen: reconcileSystemStateOnOpen[,\s]/)
 })
+
+test('event-fed caches are fully invalidated on a reconnect; the first open refreshes only restored entries', () => {
+  const shellSource = readFileSync(new URL('../Shell.jsx', import.meta.url), 'utf8')
+  assert.match(shellSource, /const reconcileSystemStateOnOpen = useCallback\(async \(\{ signal, reconnect = true \} = \{\}\)/)
+  assert.match(shellSource, /reconcileSystemStateOnOpen[\s\S]*?\.\.\.\(reconnect\s*\? invalidateEventFedCachesAfterReconnect\(queryClient\)\s*: invalidateRestoredEventFedCaches\(queryClient, PAGE_LOADED_AT\)\),\s*reconcileDeletedAppIdentities\(\)\.then\(\(\) => refreshApps\(/,
+    'the durable app list stays an every-open read beside the reconnect-only invalidations')
+  const helper = shellSource.match(/function invalidateEventFedCachesAfterReconnect\(queryClient\) \{[\s\S]*?\n\}/)?.[0] ?? ''
+  for (const invalidation of [
+    'modelQueries.registry.invalidate(queryClient)',
+    'authQueries.provider.statuses.invalidate(queryClient)',
+    'appSourceQueries.invalidate(queryClient)',
+    'chatAppArtifactQueries.invalidateAll(queryClient)',
+    'invalidateAllChatActivity(queryClient)',
+  ]) assert.ok(helper.includes(invalidation), `reconnect still invalidates ${invalidation}`)
+  assert.doesNotMatch(helper, /refreshApps|fetchFreshChats/, 'list reads are never reconnect-only')
+})

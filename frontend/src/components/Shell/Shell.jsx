@@ -1,4 +1,5 @@
 import { fetchFreshShellList, letSystemStreamOwnListRefresh } from './shellListReconciliation.js'
+import { invalidateRestoredEventFedCaches } from './eventFedCaches.js'
 import { requestChatChanges } from '../../lib/chatChangesNavigation.js'
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useReducer, useRef } from 'react'
 import { flushSync } from 'react-dom'
@@ -233,6 +234,26 @@ const incomingProjectCopy = (() => {
   try { session = window.sessionStorage } catch { /* fragment-only in restricted browsers */ }
   return consumeProjectCopyRequest(window.location.href, session)
 })()
+
+// Each of these caches is kept current by system events, so only a reconnect
+// can have missed an update. The first open of a page load would only refetch
+// what its mount-time queries are already reading (provider status pays a
+// remote balance call), so it skips them. The chat and app lists are not here:
+// the open barrier itself is their live read on every open.
+// Captured at module load: anything fetched before it was restored from storage.
+const PAGE_LOADED_AT = Date.now()
+
+function invalidateEventFedCachesAfterReconnect(queryClient) {
+  return [
+    modelQueries.registry.invalidate(queryClient),
+    authQueries.provider.statuses.invalidate(queryClient),
+    appSourceQueries.invalidate(queryClient),
+    chatAppArtifactQueries.invalidateAll(queryClient),
+    invalidateAllChatActivity(queryClient),
+    queryClient.invalidateQueries({ queryKey: ['projects', 'files'] }),
+    queryClient.invalidateQueries({ queryKey: ['projects', 'git'] }),
+  ]
+}
 
 export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null }) {
   const sharedGrantId = sharedBrowserAccess?.grant.id
@@ -3330,19 +3351,15 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // the durable app list after every initial connection/reconnect; after the
   // first list establishes the session baseline, fresh chat-owned rows flow
   // through the same idempotent placement resolver as live app_preview_ready events.
-  const reconcileSystemStateOnOpen = useCallback(async ({ signal } = {}) => {
+  const reconcileSystemStateOnOpen = useCallback(async ({ signal, reconnect = true } = {}) => {
     // A stream can reopen on the draining process; readiness owns delivery.
     reconcileNotifications()
     // App/project refreshes own different state. They must not hold the chat
     // catch-up barrier open when an editor request or offline cache is stalled.
     void Promise.allSettled([
-      modelQueries.registry.invalidate(queryClient),
-      authQueries.provider.statuses.invalidate(queryClient),
-      appSourceQueries.invalidate(queryClient),
-      chatAppArtifactQueries.invalidateAll(queryClient),
-      invalidateAllChatActivity(queryClient),
-      queryClient.invalidateQueries({ queryKey: ['projects', 'files'] }),
-      queryClient.invalidateQueries({ queryKey: ['projects', 'git'] }),
+      ...(reconnect
+        ? invalidateEventFedCachesAfterReconnect(queryClient)
+        : invalidateRestoredEventFedCaches(queryClient, PAGE_LOADED_AT)),
       reconcileDeletedAppIdentities().then(() => refreshApps({ timeoutMs: SYSTEM_RECONNECT_LIST_TIMEOUT_MS, signal })),
     ])
     await reconcileDeletedChatIdentities()
