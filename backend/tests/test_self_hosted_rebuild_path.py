@@ -94,3 +94,59 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   # The helper echoes the exact request the app bound to the update.
   assert bound == [{"controller": "host", "id": status["request_nonce"]}]
   assert outcome["request_nonce"] == status["request_nonce"]
+
+
+@pytest.mark.asyncio
+async def test_real_host_recovery_journal_remains_owned_when_restore_cannot_start(
+  tmp_path, monkeypatch,
+):
+  """Current worker and caller share the same isolated durable status path."""
+  control, inbox = tmp_path / "data" / "mobius-rebuild", tmp_path / "data" / "mobius-rebuild" / "inbox"
+  state = tmp_path / "host-state"
+  inbox.mkdir(parents=True)
+  state.mkdir()
+  monkeypatch.setattr(host, "STATE_DIR", state)
+  monkeypatch.setattr(host, "STATUS", state / "status.json")
+  monkeypatch.setattr(host, "TRANSACTION", state / "transaction.json")
+  monkeypatch.setattr(dc, "_control_dir", lambda: control)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  target, nonce, operation_id = "c" * 40, "e" * 32, "a" * 32
+  operation = {"controller": "host", "id": nonce}
+  prepared_path = tmp_path / "prepared-update.json"
+  prepared_path.write_text(json.dumps({
+    "state": "prepared", "target": target, "operation": operation,
+    "requires_image": True,
+  }), encoding="utf-8")
+  monkeypatch.setattr(dc.platform_update, "PREPARED_UPDATE_PATH", prepared_path)
+  monkeypatch.setattr(dc.platform_update, "RECONCILE_LOCK", tmp_path / "reconcile.lock")
+  journal = host.transaction_record(
+    operation_id, target, nonce, "sha256:" + "1" * 64, "sha256:" + "2" * 64,
+  )
+  host.write_transaction(journal)
+
+  def restore_unavailable(args, **_kwargs):
+    raise subprocess.CalledProcessError(1, args)
+
+  monkeypatch.setattr(host.subprocess, "Popen", restore_unavailable)
+  host.recover({
+    "project": "recovery-test", "control_dir": control, "data_dir": tmp_path / "data",
+  }, journal)
+  assert host.read_transaction()["operation_id"] == operation_id
+  queued = {"version": 2, "expected_sha": target, "nonce": "f" * 32}
+  (inbox / "request.json").write_text(json.dumps(queued), encoding="utf-8")
+  status = await dc.read_rebuild_status()
+  assert (status["state"], status["request_nonce"], status["operation_id"]) == (
+    "needs_recovery", nonce, operation_id,
+  )
+  assert dc.platform_update.read_prepared_update()["operation"] == operation
+  for action in (
+    dc.release_ended_binding,
+    lambda: dc._request_self_hosted_rebuild(expected_sha=target, final_check=lambda: None),
+    dc.withdraw_unclaimed_host_request,
+  ):
+    with pytest.raises(dc.DeploymentControlError) as exc:
+      await action()
+    assert exc.value.code == "recovery_required"
+  assert host.read_transaction()["operation_id"] == operation_id
+  assert dc.platform_update.read_prepared_update()["operation"] == operation
+  assert json.loads((inbox / "request.json").read_text(encoding="utf-8")) == queued
