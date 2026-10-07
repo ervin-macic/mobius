@@ -197,16 +197,14 @@ test.describe('Stream reconnection', () => {
       window.__resumeFixtureEmit({ type: 'text', content: 'The resumed reply is streaming.' })
     }, { successorId })
     await expect(surface).toContainText('The resumed reply is streaming.')
-    await expect(surface.locator('.chat__text--error')).toHaveCount(1)
-    await expect(surface.locator('.chat__text--error')).toContainText('Paused · Continued')
+    await expect(surface.locator('.chat__text--error')).toHaveCount(0)
     await expect(surface.locator('.chat__resume')).toHaveCount(0)
     await expect(surface.locator('.chat__resume-nudge')).toHaveCount(0)
     await page.evaluate(() => window.__resumeFixtureEmit({
       type: 'text', content: ' A later live chunk also arrives.',
     }))
     await expect(surface).toContainText('A later live chunk also arrives.')
-    await expect(surface.locator('.chat__text--error')).toHaveCount(1)
-    await expect(surface.locator('.chat__text--error')).toContainText('Paused · Continued')
+    await expect(surface.locator('.chat__text--error')).toHaveCount(0)
     await expect(surface).toContainText('Progress saved before the restart.')
   })
 

@@ -119,16 +119,7 @@ export default function ErrorCard({
         className="chat__error-status"
         role={vm.benign ? undefined : 'alert'}
       >
-        {block.recovery_completed ? (
-          <>
-            <div className="chat__recovery-title chat__recovery-title--paused">
-              {vm.label} · Continued
-            </div>
-            <div className="chat__recovery-copy">
-              {block.message || 'This response was paused.'}
-            </div>
-          </>
-        ) : vm.parked || vm.modelCapacity ? (
+        {vm.parked || vm.modelCapacity ? (
           <>
             <div className="chat__recovery-title">{recoveryTitle}</div>
             <div className="chat__recovery-copy">{recoveryCopy}</div>

@@ -62,7 +62,7 @@ export function chatEntryFrame({
 }
 
 /**
- * Retire a completed pause's action while preserving its place in history.
+ * A confirmed continuation replaces its actionable pause with one resume notice.
  * The durable transcript is untouched. Runtime and stream identity can confirm
  * the successor before its transcript row has been hydrated.
  */
@@ -83,13 +83,11 @@ export function supersedeResumedPauseBlocks(messages, {
     if (previous?.role !== 'assistant' || tail?.type !== 'error'
         || tail.resumable !== true) return
     if (projected === messages) projected = [...messages]
+    const remainingBlocks = blocks.slice(0, -1)
     projected[index] = {
       ...previous,
-      blocks: [...blocks.slice(0, -1), {
-        ...tail,
-        resumable: false,
-        recovery_completed: true,
-      }],
+      blocks: remainingBlocks,
+      ...(remainingBlocks.length === 0 ? { hidden: true } : {}),
     }
   }
   for (let index = 0; index < messages.length; index += 1) {
