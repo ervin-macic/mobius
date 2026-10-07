@@ -51,7 +51,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 6
+WORKER_REVISION = 7
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -957,9 +957,8 @@ def run() -> int:
         acquire_lock(lock)
     except BlockingIOError:
         lock.close()
-        write_status(config_value, operation_id=operation, state="failed",
-                     expected_sha=expected, code="already_running",
-                     message="Another container rebuild is already running.")
+        # The lock owner owns the shared status too. Leave both its operation
+        # and this still-queued request untouched.
         return 1
     # Everything below, including rollback and transaction settlement after
     # a failure, runs under the lock the installer and reconcile also take.
@@ -1112,10 +1111,17 @@ def run() -> int:
                                  state="needs_recovery", expected_sha=expected,
                                  code="rollback_failed", message=detail[:300])
                     return 1
+            if TRANSACTION.exists():
+                # Drain may have accepted a one-shot boot authorization even
+                # when its response (or the following status write) failed.
+                # The source still running does not prove cancellation; keep
+                # recovery ownership without pretending replacement started.
+                write_status(config_value, operation_id=operation,
+                             state="needs_recovery", expected_sha=expected,
+                             code="replacement_failed", message=detail)
+                return 1
             if image_ref and pulled_recorded:
                 discard_pulled_image(image_ref)
-            # A failure before replacement leaves the running app in place.
-            clear_transaction()
             write_status(config_value, operation_id=operation, state="failed",
                          expected_sha=expected, code="replacement_failed", message=detail)
             return 1

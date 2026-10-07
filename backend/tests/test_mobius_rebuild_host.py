@@ -414,6 +414,39 @@ def test_failed_request_claim_is_terminal_and_retryable(tmp_path, monkeypatch):
   assert request.exists()
 
 
+@pytest.mark.parametrize("state", ["replacing", "verifying", "needs_recovery"])
+def test_lock_loser_preserves_active_operation_and_queued_request(tmp_path, monkeypatch, state):
+  config, inbox = _worker_paths(tmp_path, monkeypatch)
+  host.write_status(
+    config, operation_id="1" * 32, request_nonce="2" * 32,
+    expected_sha="a" * 40, state=state, code="active-operation",
+  )
+  host.write_transaction(host.transaction_record(
+    "1" * 32, "a" * 40, "2" * 32, "sha256:previous", "sha256:target",
+  ))
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "b" * 40, "nonce": "3" * 32,
+  }))
+  paths = (host.STATUS, config["control_dir"] / "status.json", host.TRANSACTION, request)
+  before = [(path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths]
+  acquire = host.acquire_lock
+  monkeypatch.setattr(host, "acquire_lock", lambda lock: acquire(lock, timeout=0))
+  monkeypatch.setattr(host, "docker_command", lambda *_a, **_k: pytest.fail("lock loser ran Docker"))
+
+  # Separate open file descriptions contend through the real kernel flock,
+  # not a mock that merely raises BlockingIOError.
+  with host.LOCK.open("a+") as owner:
+    host.fcntl.flock(owner, host.fcntl.LOCK_EX | host.fcntl.LOCK_NB)
+    assert host.run() == 1
+    with host.LOCK.open("a+") as contender:
+      with pytest.raises(BlockingIOError):
+        acquire(contender, timeout=0)
+
+  assert [(path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths] == before
+  assert not list(config["control_dir"].glob(".request-*.json"))
+
+
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
@@ -1516,6 +1549,129 @@ def test_installer_stops_before_publishing_units_when_seeding_refuses(tmp_path):
   )
   assert result.returncode == 1
   assert not published.exists()
+
+
+@pytest.mark.parametrize("failure", [
+  "open_response", "prepare_response", "accept_rejected",
+  "accept_response", "accept_oserror", "accept_timeout",
+  "replacing_status", "recovery_status",
+])
+def test_run_keeps_real_drain_authorization_owned_until_recovery(tmp_path, monkeypatch, failure):
+  import time
+  from tests.test_restart_ledger import _bind, _load_supervisor
+  from app import restart_ledger as platform_ledger
+
+  proof = host.cutover_boot_consumed
+  config, inbox = _worker_paths(tmp_path, monkeypatch)
+  monkeypatch.setattr(host, "cutover_boot_consumed", lambda c, op:
+                      proof(c, op, trusted_uid=os.getuid(), trusted_gid=os.getgid()))
+  ledger = _load_supervisor()
+  _bind(ledger, config["data_dir"], monkeypatch)
+  now = time.time()
+  source_boot = "source-boot-1234"
+  assert not ledger.begin_boot(source_boot, now=now)
+  expected, nonce = "a" * 40, "2" * 32
+  request = inbox / "request.json"
+  request.write_text(json.dumps({"version": 2, "expected_sha": expected, "nonce": nonce}))
+  calls = []
+
+  def command(args, **_kwargs):
+    result = True
+    if args[1] == "exec":
+      operation = args[-1]
+      action = args[-2]
+      calls.append(action)
+      if action == "open-cutover":
+        assert ledger.open_cutover(operation, now=now + 1)
+        result = failure != "open_response"
+      elif action.endswith("prepare-container-cutover.py"):
+        platform_ledger.publish_cutover_intent(
+          boot_id=source_boot, nonce=nonce, cutover_id=operation, runs=[], now=now + 1,
+        )
+        result = failure != "prepare_response"
+      elif action == "accept-cutover":
+        if failure == "accept_rejected":
+          result = False
+        else:
+          assert ledger.accept_cutover(operation, now=now + 2)
+          if failure == "accept_oserror":
+            raise OSError("accept response lost")
+          if failure == "accept_timeout":
+            raise subprocess.TimeoutExpired(args, 10)
+          result = failure != "accept_response"
+      else:
+        pytest.fail(f"unexpected ledger action: {action}")
+    return subprocess.CompletedProcess(args, 0 if result else 1, stdout="", stderr="")
+
+  write_status = host.write_status
+
+  def status(config_value, **fields):
+    if failure in {"replacing_status", "recovery_status"} and (
+      fields.get("state") == "replacing" or
+      (failure == "recovery_status" and fields.get("state") == "needs_recovery")
+    ):
+      raise OSError("status publication failed")
+    return write_status(config_value, **fields)
+
+  monkeypatch.setattr(host, "docker_command", command)
+  monkeypatch.setattr(host, "write_status", status)
+  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", "sha256:previous"))
+  monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
+  monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
+    expected if "revision" in template else host.IMAGE_SOURCE if "source" in template
+    else "amd64" if "Architecture" in template else "sha256:target"
+  ))
+  monkeypatch.setattr(host, "compose", lambda *_a, **_k: pytest.fail("must not recreate the source"))
+
+  # Real run -> request_drain -> restart_ledger; only Docker transport is fake.
+  if failure == "recovery_status":
+    with pytest.raises(OSError, match="status publication failed"):
+      host.run()
+  else:
+    assert host.run() == 1
+  transaction = host.read_transaction()
+  assert transaction is not None
+  if failure != "recovery_status":
+    assert host.read_json(host.STATUS)["state"] == "needs_recovery"
+  assert transaction["request_nonce"] == nonce
+  assert transaction["expected_sha"] == expected
+  assert transaction["previous_image"] == "sha256:previous"
+  assert transaction["target_image"] == "sha256:target"
+  assert "phase" not in transaction  # draining is not replacement or rollback
+  assert "outcome" not in transaction
+  assert host.read_json(host.IMAGES)["sha_refs"] == [f"{host.IMAGE}:sha-{expected}"]
+  assert not request.exists()
+  accepted = failure not in {"open_response", "prepare_response", "accept_rejected"}
+  assert ledger.ACCEPTED_PATH.exists() == accepted
+  authorization = ledger.ACCEPTED_PATH.read_bytes() if accepted else None
+  if accepted:
+    assert json.loads(authorization)["cutover_id"] == transaction["operation_id"]
+
+  # The pending journal prevents a different request from taking ownership.
+  request.write_text(json.dumps({"version": 2, "expected_sha": "b" * 40, "nonce": "3" * 32}))
+  pending_request = request.read_bytes()
+  before = host.TRANSACTION.read_bytes(), host.STATUS.read_bytes(), list(calls)
+  assert host.run() == 0
+  assert (host.TRANSACTION.read_bytes(), host.STATUS.read_bytes(), calls) == before
+  assert request.read_bytes() == pending_request
+
+  # The still-healthy source is NOT evidence that acceptance was cancelled.
+  # Real reconciliation keeps the exact authorization under manual recovery,
+  # without finalizing it or arming another boot, including repeated attempts.
+  monkeypatch.setattr(host, "write_status", write_status)
+  monkeypatch.setattr(host, "container_health", lambda _c: ("cid", "sha256:previous", "healthy"))
+  monkeypatch.setattr(host, "wait_healthy", lambda *_a, **_k: True)
+  for _ in range(2):
+    assert host.reconcile() == 0
+    assert host.read_transaction()["operation_id"] == transaction["operation_id"]
+    assert "outcome" not in host.read_transaction()
+    assert host.read_json(host.STATUS)["code"] == "handoff_boot_unconfirmed"
+    assert host.read_json(host.STATUS)["state"] == "needs_recovery"
+    assert ledger.ACCEPTED_PATH.exists() == accepted
+    if accepted:
+      assert ledger.ACCEPTED_PATH.read_bytes() == authorization
+    assert calls == before[2]
+    assert request.read_bytes() == pending_request
 
 
 def _real_cutover(tmp_path, monkeypatch, *, consume=True):
