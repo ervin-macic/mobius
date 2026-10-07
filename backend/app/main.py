@@ -298,6 +298,10 @@ async def lifespan(app):
   )
   database_boot = await run_startup_plan(startup_context)
   _set_database_boot_state(database_boot)
+  if database_boot.serviceable:
+    # A database that failed its boot check is left untouched for Recovery.
+    from app.database import open_wal_anchor
+    open_wal_anchor()
   from app.runtime_supervisors import RuntimeSupervisors
   supervisors = RuntimeSupervisors(
     settings=settings,
@@ -366,6 +370,10 @@ async def lifespan(app):
       stop_writer()
     except Exception as exc:
       _log.error("chat writer stop failed: %s", exc, exc_info=True)
+    # Last database user out: closing the anchor lets SQLite checkpoint the
+    # log on the way down.
+    from app.database import close_wal_anchor
+    close_wal_anchor()
 
 settings = get_settings()
 
