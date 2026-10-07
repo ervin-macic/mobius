@@ -418,6 +418,10 @@ def fresh_db():
   # test seeing an earlier test's immutable artifact for the same numeric id.
   for _sub in ("apps", "app-secrets", "app-runtime", "app-envs", "shared", "compiled", "cli-auth"):
     _shutil.rmtree(_os.path.join(_data_dir, _sub), ignore_errors=True)
+  # The shared Möbius provider holds broker identity/balance reads briefly;
+  # one test's linked account must not answer the next test's auth check.
+  from app.providers import mobius_account_changed as _forget_mobius_reads
+  _forget_mobius_reads()
 
   # Installed apps' model-provider declarations are projected into the
   # process-global provider registry, and that projection is read-throttled

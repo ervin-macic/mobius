@@ -168,15 +168,20 @@ def test_managed_web_login_enrolls_the_local_model_identity(monkeypatch, db):
 
   monkeypatch.setattr(auth_routes, "_exchange_mobius_receipt", exchange)
   monkeypatch.setattr(auth_routes, "_mobius_broker_request", broker_request)
+  monkeypatch.setattr(
+    auth_routes, "mobius_account_changed", lambda: calls.append("forget held account reads"),
+  )
 
   response = asyncio.run(auth_routes._complete_mobius_web_login(
     db, {}, "authorization-code",
   ))
 
   assert response.headers["location"] == "/shell/?mobius_login=1"
+  # The new link must not be hidden behind a held "not linked" identity read.
   assert calls == [
     ("GET", "/identity", None),
     ("POST", "/identity/enroll", {"receipt": "header.payload.signature"}),
+    "forget held account reads",
   ]
 
 

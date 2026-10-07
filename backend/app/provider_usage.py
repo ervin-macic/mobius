@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 from app import providers
 from app.runtime_identity import broker_request
@@ -1257,7 +1258,8 @@ def _snapshot_resets_are_current(
 
 async def _provider_snapshot(provider_id: str, data_dir: str) -> dict[str, Any]:
   provider = providers.PROVIDERS[provider_id]
-  if provider.check_auth(data_dir) is not None:
+  # check_auth may be a broker round trip (Möbius); keep it off the loop.
+  if await run_in_threadpool(provider.check_auth, data_dir) is not None:
     return {
       "state": "disconnected",
       "plan_label": None,

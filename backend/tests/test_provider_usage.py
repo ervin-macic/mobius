@@ -2324,3 +2324,21 @@ def test_a_saved_reading_past_the_stale_bound_is_not_served(monkeypatch, tmp_pat
   body = asyncio.run(provider_usage.read_provider_usage("claude", str(tmp_path)))
 
   assert body["state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_usage_snapshot_checks_provider_auth_off_the_event_loop(monkeypatch, tmp_path):
+  """Möbius check_auth is a synchronous broker call (3 s timeout); a stalled
+  broker must not freeze every other request on the loop."""
+  from app import provider_usage
+  loop_thread = threading.get_ident()
+  seen = []
+
+  def check_auth(_data_dir):
+    seen.append(threading.get_ident())
+    return "not connected"
+
+  monkeypatch.setattr(provider_usage.providers.PROVIDERS["mobius"], "check_auth", check_auth)
+  snapshot = await provider_usage._provider_snapshot("mobius", str(tmp_path))
+  assert snapshot["state"] == "disconnected"
+  assert seen and loop_thread not in seen
