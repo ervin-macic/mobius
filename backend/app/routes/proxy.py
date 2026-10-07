@@ -8,17 +8,19 @@ owner or an app-scoped token.
 """
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.deps import authorize_current_owner_or_app_detached, reject_cross_site
 from app.net_utils import validate_url_safe
+from app.pinned_http_clients import PinnedHostClientPool
 
 router = APIRouter(prefix="/api/proxy", tags=["proxy"])
 
@@ -42,6 +44,74 @@ _FORWARDED_RESPONSE_HEADERS = (
   "x-ratelimit-reset",
   "x-ratelimit-used",
 )
+
+# The owner proxy reuses keep-alive connections per (Host, SNI); see
+# app.pinned_http_clients for why one global client would be unsafe.
+_proxy_clients = PinnedHostClientPool()
+
+# Browser freshness the owner proxy will grant at most, whatever upstream says.
+_PROXY_MAX_BROWSER_AGE = 24 * 60 * 60
+# Validators a browser adds itself when revalidating a cached proxy response.
+_FORWARDED_CONDITIONAL_HEADERS = ("if-none-match", "if-modified-since")
+
+ResponseCacheHeaders = Callable[[httpx.Response], dict[str, str]]
+
+
+def forward_upstream_cache_headers(upstream: httpx.Response) -> dict[str, str]:
+  """Pass upstream cache headers through unchanged (anonymous public apps)."""
+  return {
+    name: upstream.headers[name]
+    for name in ("cache-control", "etag", "expires", "last-modified")
+    if name in upstream.headers
+  }
+
+
+def _cache_directives(value: str) -> dict[str, str]:
+  directives: dict[str, str] = {}
+  for part in value.split(","):
+    name, _, argument = part.strip().partition("=")
+    if name:
+      directives[name.strip().lower()] = argument.strip().strip('"')
+  return directives
+
+
+def private_browser_cache_headers(upstream: httpx.Response) -> dict[str, str]:
+  """Let the requesting browser, and only it, reuse a proxied public read.
+
+  The proxy URL is requested with a bearer token, so an upstream `public` or
+  `s-maxage` must never reach a shared cache (a CDN in front of Möbius) that
+  could replay owner-fetched bytes, and the list of URLs the owner reads, to
+  anyone without a token. Freshness is therefore always rewritten to `private`
+  and clamped; upstream `no-store` stays `no-store`; only successful reads and
+  revalidations carry validators. Nothing here is cached server-side.
+  """
+  if upstream.status_code not in (200, 304):
+    return {}
+  directives = _cache_directives(upstream.headers.get("cache-control", ""))
+  if "no-store" in directives:
+    return {"cache-control": "no-store"}
+  headers = {
+    name: upstream.headers[name]
+    for name in ("etag", "last-modified")
+    if name in upstream.headers
+  }
+  try:
+    max_age = int(directives.get("max-age", ""))
+  except ValueError:
+    max_age = None
+  if "no-cache" in directives or max_age is None or max_age <= 0:
+    if headers:
+      headers["cache-control"] = "private, no-cache"
+    return headers
+  headers["cache-control"] = (
+    f"private, max-age={min(max_age, _PROXY_MAX_BROWSER_AGE)}"
+  )
+  return headers
+
+
+async def close_proxy_clients() -> None:
+  await _proxy_clients.close()
+
 
 # Reference cards use this bounded resolver so redirects, custom icon paths,
 # and ordinary root icons share one SSRF-safe loading path.
@@ -244,7 +314,7 @@ async def _capped_response(
   client: httpx.AsyncClient,
   req: httpx.Request,
   *,
-  forward_cache_headers: bool = False,
+  cache_headers: ResponseCacheHeaders | None = None,
 ) -> Response:
   """Sends `req` streaming and reads at most `_MAX_BYTES` into memory. The prior
   code read the FULL body (`r.content`) before slicing, so a huge or malicious
@@ -268,10 +338,8 @@ async def _capped_response(
       for name in _FORWARDED_RESPONSE_HEADERS
       if name in r.headers
     }
-    if forward_cache_headers:
-      for name in ("cache-control", "etag", "expires", "last-modified"):
-        if name in r.headers:
-          headers[name] = r.headers[name]
+    if cache_headers is not None:
+      headers.update(cache_headers(r))
     return Response(
       content=bytes(buf),
       status_code=r.status_code,
@@ -336,6 +404,7 @@ async def proxy_favicon(
 @router.get("")
 async def proxy_get(
   url: str,
+  request: Request,
   _: None = Depends(authorize_current_owner_or_app_detached),
 ):
   """Fetches a URL via GET and returns the raw response body.
@@ -345,18 +414,27 @@ async def proxy_get(
   read-only, requires a bearer token (and therefore a CORS preflight), and keeps
   the SSRF allow/deny checks below, so the mutation-oriented CSRF dependency is
   intentionally not applied here. The POST proxy remains guarded.
+
+  Map tiles and documents are re-read often, so upstream freshness and
+  validators reach the caller's browser as private cache headers, and the
+  browser's own revalidation headers reach upstream to earn a cheap 304.
   """
   pinned_url, host_header, sni_host = await asyncio.to_thread(
     validate_url_safe, url,
   )
-  async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+  async with _proxy_clients.lease(host_header, sni_host) as client:
     req = client.build_request("GET", pinned_url)
     req.headers["host"] = host_header
     req.headers["user-agent"] = _PROXY_USER_AGENT
+    for name in _FORWARDED_CONDITIONAL_HEADERS:
+      if name in request.headers:
+        req.headers[name] = request.headers[name]
     # httpcore/anyio require text here. Bytes reach idna2008_resolve(), which
     # calls .encode() itself and turns every real HTTPS proxy request into 502.
     req.extensions["sni_hostname"] = sni_host
-    return await _capped_response(client, req)
+    return await _capped_response(
+      client, req, cache_headers=private_browser_cache_headers,
+    )
 
 
 @router.post("", dependencies=[Depends(reject_cross_site)])
@@ -370,7 +448,7 @@ async def proxy_post(
   pinned_url, host_header, sni_host = await asyncio.to_thread(
     validate_url_safe, body.url,
   )
-  async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+  async with _proxy_clients.lease(host_header, sni_host) as client:
     req = client.build_request(
       "POST", pinned_url,
       content=body.body.encode(),
