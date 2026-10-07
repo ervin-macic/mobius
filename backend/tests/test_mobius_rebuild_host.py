@@ -122,7 +122,63 @@ def test_served_generation_requires_the_image_runtime(monkeypatch):
     return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
 
   monkeypatch.setattr(host, "docker_command", mounted)
-  with pytest.raises(RuntimeError, match="image's protected runtime"):
+  with pytest.raises(host.ProvenanceRejected, match="image's protected runtime"):
+    host.verify_served_generation("cid", "a" * 40)
+
+
+def _provenance_command(scenario, calls):
+  expected = "a" * 40
+
+  def command(args, **_kwargs):
+    if "curl" in args:
+      calls.append("curl")
+      if scenario == "curl_oserror":
+        raise OSError("private Docker failure")
+      output = (
+        "{" if scenario == "invalid_json" else
+        "[]" if scenario == "invalid_version_shape" else
+        '{"sha":"not-a-sha"}' if scenario == "invalid_sha" else
+        json.dumps({"sha": "b" * 40 if scenario == "wrong_revision" else expected})
+      )
+      return subprocess.CompletedProcess(
+        args, 7 if scenario == "curl_nonzero" else 0, stdout=output, stderr="private stderr",
+      )
+    if args[1:3] == ["container", "inspect"]:
+      calls.append("mount_probe")
+      if scenario == "mount_timeout":
+        raise subprocess.TimeoutExpired(args, 10)
+      if scenario == "mount_calledprocess":
+        raise subprocess.CalledProcessError(1, args)
+      output = (
+        "{" if scenario == "invalid_mount_json" else
+        "{}" if scenario == "invalid_mount_shape" else
+        "[null]" if scenario == "invalid_mount_item" else
+        '[{"Destination":"/app/runtime"}]' if scenario == "protected_runtime" else
+        "[]"
+      )
+      return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+    calls.append("other_docker")
+    return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+  return command
+
+
+@pytest.mark.parametrize("scenario", [
+  "curl_nonzero", "invalid_json", "invalid_version_shape", "invalid_sha",
+  "invalid_mount_json", "invalid_mount_shape", "invalid_mount_item",
+  "curl_oserror", "mount_timeout", "mount_calledprocess",
+])
+def test_unconfirmed_served_provenance_never_claims_rejection(monkeypatch, scenario):
+  monkeypatch.setattr(host, "docker_command", _provenance_command(scenario, []))
+  with pytest.raises(host.ProvenanceUnconfirmed) as error:
+    host.verify_served_generation("cid", "a" * 40)
+  assert "private" not in str(error.value)
+
+
+@pytest.mark.parametrize("scenario", ["wrong_revision", "protected_runtime"])
+def test_well_formed_served_mismatch_is_proven_rejection(monkeypatch, scenario):
+  monkeypatch.setattr(host, "docker_command", _provenance_command(scenario, []))
+  with pytest.raises(host.ProvenanceRejected):
     host.verify_served_generation("cid", "a" * 40)
 
 
@@ -208,7 +264,7 @@ def test_no_change_does_not_drain_active_chats(tmp_path, monkeypatch):
   )
   monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "same"))
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
-  monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "docker_command", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
     expected if "revision" in template else
     host.IMAGE_SOURCE if "source" in template else
@@ -250,7 +306,7 @@ def test_request_is_claimed_on_the_control_filesystem(tmp_path, monkeypatch):
   monkeypatch.setattr(host.os, "replace", same_filesystem_replace)
   monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "same"))
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
-  monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "docker_command", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
     expected if "revision" in template else
     host.IMAGE_SOURCE if "source" in template else
@@ -289,7 +345,7 @@ def test_worker_locks_before_exposing_claim_to_reconcile(tmp_path, monkeypatch):
   monkeypatch.setattr(host.os, "replace", record_replace)
   monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "same"))
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
-  monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "docker_command", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
     expected if "revision" in template else
     host.IMAGE_SOURCE if "source" in template else
@@ -322,7 +378,7 @@ def test_worker_waits_for_boot_reconcile_before_claiming(tmp_path, monkeypatch):
   monkeypatch.setattr(host.time, "sleep", lambda _delay: None)
   monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "same"))
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
-  monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "docker_command", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
     expected if "revision" in template else
     host.IMAGE_SOURCE if "source" in template else
@@ -369,7 +425,7 @@ def test_replacement_drains_then_rolls_back_after_cutover_error(tmp_path, monkey
   )
   monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "sha256:old"))
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
-  monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "docker_command", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
     expected if "revision" in template else
     host.IMAGE_SOURCE if "source" in template else
@@ -425,7 +481,7 @@ def test_verified_success_never_rolls_back_for_handoff_or_outcome_write_failure(
     host, "app_container", lambda _config: ("cid", "new" if replaced else "old"),
   )
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
-  monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "docker_command", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
     expected if "revision" in template else
     host.IMAGE_SOURCE if "source" in template else
@@ -568,7 +624,7 @@ def test_drain_requires_root_open_prepare_accept_order(tmp_path, monkeypatch):
     return subprocess.CompletedProcess([], 0)
 
   monkeypatch.setattr(host, "restart_ledger", ledger)
-  monkeypatch.setattr(host.subprocess, "run", execute)
+  monkeypatch.setattr(host, "docker_command", execute)
 
   result = host.request_drain(
     {"data_dir": data, "control_dir": data / "mobius-rebuild"},
@@ -578,6 +634,185 @@ def test_drain_requires_root_open_prepare_accept_order(tmp_path, monkeypatch):
 
   assert result is None
   assert order == ["open-cutover", "prepare", "accept-cutover"]
+
+
+def test_docker_observations_and_drain_use_finite_deadlines(tmp_path, monkeypatch):
+  config, _inbox = _worker_paths(tmp_path, monkeypatch)
+  calls = []
+
+  def command(args, **kwargs):
+    calls.append((args, kwargs))
+    return subprocess.CompletedProcess(args, 0, stdout="sha256:image\n", stderr="")
+
+  monkeypatch.setattr(host, "docker_command", command)
+  monkeypatch.setattr(host, "compose", lambda *_a, **_k:
+                      subprocess.CompletedProcess([], 0, stdout="cid\n", stderr=""))
+  monkeypatch.setattr(host, "restart_ledger", lambda *_a, **_k: True)
+  assert host.inspect_image("image", "{{.Id}}") == "sha256:image"
+  assert host.app_container(config) == ("cid", "sha256:image")
+  assert str(host._docker_root()) == "sha256:image"
+  host.request_drain(config, "a" * 32, "cid")
+  host.discard_pulled_image(f"{host.IMAGE}:sha-{'b' * 40}")
+  assert [args[1:3] for args, _ in calls] == [
+    ["image", "inspect"], ["container", "inspect"], ["info", "--format"],
+    ["exec", "cid"], ["image", "rm"],
+  ]
+  assert [kwargs["timeout"] for _, kwargs in calls] == [30, 30, 30, 90, 30]
+
+
+def test_drain_timeout_does_not_accept_an_unfinished_handoff(tmp_path, monkeypatch):
+  config, _inbox = _worker_paths(tmp_path, monkeypatch)
+  ledger = []
+  monkeypatch.setattr(host, "restart_ledger", lambda _c, _cid, command, _operation:
+                      ledger.append(command) or True)
+  monkeypatch.setattr(host, "docker_command", lambda args, **kwargs:
+                      (_ for _ in ()).throw(subprocess.TimeoutExpired(args, kwargs["timeout"])))
+  with pytest.raises(subprocess.TimeoutExpired):
+    host.request_drain(config, "a" * 32, "cid")
+  assert ledger == ["open-cutover"]
+
+
+def test_uncertain_image_removal_keeps_its_recorded_reference(tmp_path, monkeypatch):
+  _config, _inbox = _worker_paths(tmp_path, monkeypatch)
+  target = f"{host.IMAGE}:sha-{'b' * 40}"
+  host.record_pulled_image(target)
+  monkeypatch.setattr(host, "docker_command", lambda args, **kwargs:
+                      (_ for _ in ()).throw(subprocess.TimeoutExpired(args, kwargs["timeout"])))
+  with pytest.raises(subprocess.TimeoutExpired):
+    host.discard_pulled_image(target)
+  assert host.read_json(host.IMAGES)["sha_refs"] == [target]
+
+
+@pytest.mark.parametrize("stage", ["pull", "drain", "target_tag", "post_inspect"])
+def test_run_timeout_never_guesses_the_replacement_outcome(
+  tmp_path, monkeypatch, stage,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  expected = "f" * 40
+  (inbox / "request.json").write_text(
+    f'{{"version":1,"expected_sha":"{expected}"}}', encoding="utf-8",
+  )
+  observations = []
+  compose_calls = []
+  deadlines = []
+
+  def app_container(_config):
+    observations.append("inspect")
+    if stage == "post_inspect" and len(observations) == 2:
+      raise subprocess.TimeoutExpired("docker container inspect", 30)
+    return "cid", "sha256:old" if len(observations) == 1 else "sha256:new"
+
+  def command(args, **kwargs):
+    deadlines.append((args[1:3], kwargs["timeout"]))
+    if ((stage == "pull" and args[1] == "pull") or
+        (stage == "target_tag" and args[1:3] == ["tag", "sha256:new"])):
+      raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+    return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+  def drain(*_args):
+    if stage == "drain":
+      raise subprocess.TimeoutExpired("docker exec prepare", 90)
+
+  monkeypatch.setattr(host, "app_container", app_container)
+  monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
+  monkeypatch.setattr(host, "docker_command", command)
+  monkeypatch.setattr(host, "request_drain", drain)
+  monkeypatch.setattr(host, "compose", lambda *_a, **_k: compose_calls.append(1))
+  monkeypatch.setattr(host, "wait_healthy", lambda *_a: True)
+  monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
+    expected if "revision" in template else host.IMAGE_SOURCE if "source" in template
+    else "amd64" if "Architecture" in template else "sha256:new"
+  ))
+
+  assert host.run() == 1
+  status = host.read_json(host.STATUS)
+  assert status["code"] == "observation_timed_out"
+  assert status["state"] == ("failed" if stage == "pull" else "needs_recovery")
+  transaction = host.read_transaction()
+  assert (transaction is None) == (stage == "pull")
+  if transaction:
+    assert transaction["previous_image"] == "sha256:old"
+    assert transaction.get("phase") == (None if stage == "drain" else "replacement_started")
+  assert compose_calls == ([1] if stage == "post_inspect" else [])
+  assert (["pull", f"{host.IMAGE}:sha-{expected}"], 3600) in deadlines
+  if stage != "pull":
+    assert (["tag", "sha256:old"], 30) in deadlines
+  if stage in {"target_tag", "post_inspect"}:
+    assert (["tag", "sha256:new"], 30) in deadlines
+
+
+@pytest.mark.parametrize("scenario", [
+  "curl_nonzero", "invalid_json", "invalid_mount_shape", "invalid_mount_item",
+  "curl_oserror", "mount_timeout", "mount_calledprocess",
+  "wrong_revision", "protected_runtime",
+])
+def test_run_preserves_unknown_provenance_but_rolls_back_proven_rejection(
+  tmp_path, monkeypatch, scenario,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  expected = "a" * 40
+  (inbox / "request.json").write_text(
+    f'{{"version":1,"expected_sha":"{expected}"}}', encoding="utf-8",
+  )
+  containers = iter([("old", "sha256:old"), ("new", "sha256:new")])
+  monkeypatch.setattr(host, "app_container", lambda _c: next(containers))
+  monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
+  monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
+    expected if "revision" in template else host.IMAGE_SOURCE if "source" in template
+    else "amd64" if "Architecture" in template else "sha256:new"
+  ))
+  docker_calls = []
+  monkeypatch.setattr(host, "docker_command", _provenance_command(scenario, docker_calls))
+  monkeypatch.setattr(host, "request_drain", lambda *_a: None)
+  compose_images = []
+  monkeypatch.setattr(host, "compose", lambda *_a, image=None, **_k:
+                      compose_images.append(image))
+  monkeypatch.setattr(host, "wait_healthy", lambda *_a, **_k: True)
+  health = iter([("new", "sha256:new", "healthy"),
+                 ("old", "sha256:old", "healthy")])
+  monkeypatch.setattr(host, "container_health", lambda _c: next(health))
+  monkeypatch.setattr(host, "restart_ledger", lambda *_a, **_k: True)
+
+  assert host.run() == 1
+  status = host.read_json(host.STATUS)
+  if scenario in {"wrong_revision", "protected_runtime"}:
+    assert status["state"] == "rolled_back"
+    assert status["code"] == "replacement_failed"
+    assert host.read_transaction() is None
+    assert compose_images == [host.TARGET_TAG, "sha256:old"]
+  else:
+    assert status["state"] == "needs_recovery"
+    assert status["code"] == "observation_unconfirmed"
+    assert host.read_transaction()["phase"] == "replacement_started"
+    assert compose_images == [host.TARGET_TAG]
+  assert "private" not in json.dumps(status)
+
+
+@pytest.mark.parametrize("scenario, code", [
+  ("curl_nonzero", "observation_unconfirmed"),
+  ("wrong_revision", "provenance_failed"),
+])
+def test_no_change_provenance_failure_never_drains_or_rolls_back(
+  tmp_path, monkeypatch, scenario, code,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  expected = "a" * 40
+  (inbox / "request.json").write_text(
+    f'{{"version":1,"expected_sha":"{expected}"}}', encoding="utf-8",
+  )
+  monkeypatch.setattr(host, "app_container", lambda _c: ("same", "sha256:new"))
+  monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
+  monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
+    expected if "revision" in template else host.IMAGE_SOURCE if "source" in template
+    else "amd64" if "Architecture" in template else "sha256:new"
+  ))
+  monkeypatch.setattr(host, "docker_command", _provenance_command(scenario, []))
+  monkeypatch.setattr(host, "request_drain", lambda *_a: pytest.fail("no-change drained"))
+  assert host.run() == 1
+  assert host.read_json(host.STATUS)["code"] == code
+  assert host.read_json(host.STATUS)["state"] == "failed"
+  assert "private" not in host.STATUS.read_text(encoding="utf-8")
+  assert host.read_transaction() is None
 
 
 def test_the_helper_accepts_both_request_versions_and_echoes_only_the_nonce():
@@ -866,7 +1101,7 @@ def test_failed_target_evidence_precedes_replacement_and_preserves_both_streams(
   def logs(cid):
     assert cid == target_cid
     calls.append(("logs", cid))
-    return b"startup stdout", b"startup stderr", False
+    return b"startup stdout", b"startup stderr", False, False
 
   monkeypatch.setattr(host, "_bounded_docker_logs", logs)
   host.rollback(config, transaction["operation_id"], transaction["expected_sha"], "x", "y")
@@ -901,7 +1136,7 @@ def test_evidence_replay_does_not_overwrite_and_capture_error_does_not_block(
 ):
   config, transaction, calls = interrupted_rollback
   cid = "c" * 64
-  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: (b"first", b"error", False))
+  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: (b"first", b"error", False, False))
   assert host.capture_failed_target(transaction["operation_id"], cid, transaction["target_image"]) == "saved"
   first = host.FAILED_TARGET_LOG.read_bytes()
   monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: pytest.fail("replayed logs"))
@@ -934,9 +1169,9 @@ def test_docker_log_capture_has_byte_and_wall_clock_bounds(monkeypatch):
 
   monkeypatch.setattr(host.subprocess, "Popen", popen)
   started = time.monotonic()
-  out, err, truncated = host._bounded_docker_logs("e" * 64)
+  out, err, truncated, timed_out = host._bounded_docker_logs("e" * 64)
   assert time.monotonic() - started < 3
-  assert truncated and len(out) + len(err) <= 2048
+  assert truncated and not timed_out and len(out) + len(err) <= 2048
 
 
 def test_docker_log_timeout_kills_pipe_holding_descendant(tmp_path, monkeypatch):
@@ -951,11 +1186,32 @@ def test_docker_log_timeout_kills_pipe_holding_descendant(tmp_path, monkeypatch)
   monkeypatch.setattr(host.subprocess, "Popen",
                       lambda _args, **kwargs: original([sys.executable, "-c", parent], **kwargs))
   started = time.monotonic()
-  with pytest.raises(subprocess.TimeoutExpired):
-    host._bounded_docker_logs("e" * 64)
+  out, err, truncated, timed_out = host._bounded_docker_logs("e" * 64)
+  assert (out, err) == (b"", b"")
+  assert truncated and timed_out
   assert time.monotonic() - started < 2
   time.sleep(0.8)
   assert not marker.exists()
+
+
+def test_docker_log_timeout_saves_partial_private_evidence(tmp_path, monkeypatch):
+  import sys
+
+  _config, _inbox = _worker_paths(tmp_path, monkeypatch)
+  original = subprocess.Popen
+  monkeypatch.setattr(host, "FAILED_TARGET_LOG_SECONDS", 0.3)
+  monkeypatch.setattr(host, "FAILED_TARGET_LOG_BYTES", 16)
+  monkeypatch.setattr(host.subprocess, "Popen", lambda _args, **kwargs:
+                      original([sys.executable, "-c",
+                                "import sys,time; sys.stdout.buffer.write(b'partial'); "
+                                "sys.stdout.flush(); time.sleep(30)"], **kwargs))
+  assert host.capture_failed_target("a" * 32, "b" * 64, "sha256:target") == "saved"
+  evidence = host.read_json(host.FAILED_TARGET_LOG)
+  assert base64.b64decode(evidence["stdout_b64"]) == b"partial"
+  assert base64.b64decode(evidence["stderr_b64"]) == b""
+  assert evidence["truncated"] is True
+  assert evidence["timed_out"] is True
+  assert host.FAILED_TARGET_LOG.stat().st_mode & 0o777 == 0o600
 
 
 def test_rollback_refuses_another_operations_receipt(interrupted_rollback):
@@ -1153,6 +1409,56 @@ def test_interrupted_target_boot_gets_observed_before_rollback(interrupted_rollb
   assert host.read_transaction() is None
   assert adopted == [transaction["target_image"]]
   assert host.read_json(host.STATUS)["worker_adoption"] == "adopted"
+
+
+@pytest.mark.parametrize("scenario", ["wrong_revision", "protected_runtime"])
+def test_recovery_rolls_back_only_proven_served_rejection(
+  interrupted_rollback, monkeypatch, scenario,
+):
+  config, transaction, calls = interrupted_rollback
+  transaction["phase"] = "replacement_started"
+  transaction.pop("failure_code")
+  transaction.pop("failure_detail")
+  host.write_transaction(transaction)
+  observations = iter([
+    ("target", transaction["target_image"], "healthy"),
+    ("target", transaction["target_image"], "healthy"),
+    ("previous", transaction["previous_image"], "healthy"),
+  ])
+  monkeypatch.setattr(host, "container_health", lambda _c: next(observations))
+  monkeypatch.setattr(host, "wait_healthy", lambda *_a: True)
+  docker_calls = []
+  monkeypatch.setattr(host, "docker_command", _provenance_command(scenario, docker_calls))
+  host.recover(config, transaction)
+  assert [call[0] for call in calls] == ["rearm-cutover", "compose", "finalize-cutover"]
+  assert calls[1][1]["image"] == transaction["previous_image"]
+  assert docker_calls[-1] == "other_docker"  # exact previous image tag
+  assert host.read_json(host.STATUS)["state"] == "rolled_back"
+  assert host.read_json(host.STATUS)["code"] == "replacement_failed"
+  assert host.read_transaction() is None
+
+
+@pytest.mark.parametrize("scenario", [
+  "curl_nonzero", "invalid_json", "invalid_mount_shape", "invalid_mount_item",
+  "curl_oserror", "mount_timeout", "mount_calledprocess",
+])
+def test_recovery_does_not_rollback_unconfirmed_provenance(
+  interrupted_rollback, monkeypatch, scenario,
+):
+  config, transaction, calls = interrupted_rollback
+  transaction["phase"] = "replacement_started"
+  host.write_transaction(transaction)
+  monkeypatch.setattr(host, "container_health", lambda _c:
+                      ("target", transaction["target_image"], "healthy"))
+  docker_calls = []
+  monkeypatch.setattr(host, "docker_command", _provenance_command(scenario, docker_calls))
+  host.recover(config, transaction)
+  assert not calls
+  assert "other_docker" not in docker_calls
+  assert host.read_json(host.STATUS)["state"] == "needs_recovery"
+  assert host.read_json(host.STATUS)["code"] == "observation_unconfirmed"
+  assert "private" not in host.STATUS.read_text(encoding="utf-8")
+  assert host.read_transaction()["phase"] == "replacement_started"
 
 
 def test_transient_health_query_failure_does_not_undo_boot(monkeypatch):

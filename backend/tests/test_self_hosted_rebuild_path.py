@@ -58,7 +58,7 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   monkeypatch.setattr(host, "app_container", lambda _config: next(containers))
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
   monkeypatch.setattr(
-    host.subprocess, "run",
+    host, "docker_command",
     lambda args, **_kwargs: subprocess.CompletedProcess(args, 0, "", ""),
   )
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (

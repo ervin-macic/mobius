@@ -51,7 +51,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 5
+WORKER_REVISION = 6
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -222,11 +222,12 @@ def docker_command(args: list[str], *, timeout: float = 10, check: bool = True,
     return result
 
 
-def _bounded_docker_logs(cid: str) -> tuple[bytes, bytes, bool]:
+def _bounded_docker_logs(cid: str) -> tuple[bytes, bytes, bool, bool]:
     """Keep at most one small prefix of each Docker output stream in total.
 
     Pipes are drained only until the byte or wall-clock limit; the process
     group is then killed, including a Docker CLI descendant holding a pipe.
+    A timed-out prefix is still useful evidence, but is always incomplete.
     """
     args = ["docker", "logs", "--timestamps", "--tail", "1000", cid]
     out, err = bytearray(), bytearray()
@@ -264,18 +265,16 @@ def _bounded_docker_logs(cid: str) -> tuple[bytes, bytes, bool]:
                             break
                 if truncated:
                     break
-        if timed_out:
-            raise subprocess.TimeoutExpired(args, FAILED_TARGET_LOG_SECONDS)
-        if truncated or process.poll() is None:
+        if timed_out or truncated or process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         process.wait(timeout=1)
         completed = True
-        if process.returncode and not truncated:
+        if process.returncode and not (truncated or timed_out):
             raise subprocess.CalledProcessError(process.returncode, args)
-        return bytes(out), bytes(err), truncated
+        return bytes(out), bytes(err), truncated or timed_out, timed_out
     finally:
         if not completed:
             try:
@@ -299,10 +298,10 @@ def capture_failed_target(operation: str, cid: str, image: str) -> str:
             previous = {}
         if previous.get("operation_id") == operation and previous.get("container_id") == cid:
             return "saved"  # interrupted rollback replay must not erase evidence
-        stdout, stderr, truncated = _bounded_docker_logs(cid)
+        stdout, stderr, truncated, timed_out = _bounded_docker_logs(cid)
         _atomic_json(FAILED_TARGET_LOG, {
             "operation_id": operation, "container_id": cid, "target_image": image[:128],
-            "captured_at": now(), "truncated": truncated,
+            "captured_at": now(), "truncated": truncated, "timed_out": timed_out,
             "stdout_b64": base64.b64encode(stdout).decode("ascii"),
             "stderr_b64": base64.b64encode(stderr).decode("ascii"),
         })
@@ -323,9 +322,9 @@ def compose(config_value: dict, *args: str, image: str | None = None,
 
 
 def inspect_image(image: str, template: str) -> str:
-    result = subprocess.run(
+    result = docker_command(
         ["docker", "image", "inspect", "--format", template, image],
-        text=True, capture_output=True, check=True,
+        timeout=30,
     )
     return result.stdout.strip()
 
@@ -335,9 +334,9 @@ def app_container(config_value: dict) -> tuple[str, str]:
     cid = result.stdout.strip()
     if not cid:
         raise RuntimeError("the recorded Möbius app container is not running")
-    inspected = subprocess.run(
+    inspected = docker_command(
         ["docker", "container", "inspect", "--format", "{{.Image}}", cid],
-        text=True, capture_output=True, check=True,
+        timeout=30,
     )
     return cid, inspected.stdout.strip()
 
@@ -379,37 +378,58 @@ def wait_healthy(config_value: dict, timeout: int = 180) -> bool:
     return False
 
 
+class ProvenanceRejected(RuntimeError):
+    """A well-formed observation proves the served image is not acceptable."""
+
+
+class ProvenanceUnconfirmed(RuntimeError):
+    """The served image could not be proved either correct or incorrect."""
+
+
 def verify_served_generation(cid: str, expected_sha: str) -> None:
     """Prove the running container serves the requested immutable image."""
-    result = docker_command(
-        ["docker", "exec", cid, "curl", "-fsS",
-         "http://127.0.0.1:8000/api/version"],
-        check=False,
-    )
+    try:
+        result = docker_command(
+            ["docker", "exec", cid, "curl", "-fsS",
+             "http://127.0.0.1:8000/api/version"],
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ProvenanceUnconfirmed("build provenance could not be observed") from exc
     if result.returncode != 0:
-        raise RuntimeError("the container did not expose build provenance")
+        raise ProvenanceUnconfirmed("build provenance could not be observed")
     try:
         version = json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("the container returned invalid build provenance") from exc
-    if not isinstance(version, dict) or version.get("sha") != expected_sha:
-        raise RuntimeError("the container is not serving the requested image revision")
-    mounts = docker_command(
-        ["docker", "container", "inspect", "--format", "{{json .Mounts}}", cid],
-        check=True,
-    )
+        raise ProvenanceUnconfirmed("the container returned invalid build provenance") from exc
+    if (not isinstance(version, dict) or not isinstance(version.get("sha"), str)
+            or not SHA_RE.fullmatch(version["sha"])):
+        raise ProvenanceUnconfirmed("the container returned invalid build provenance")
+    if version["sha"] != expected_sha:
+        raise ProvenanceRejected("the container is not serving the requested image revision")
+    try:
+        mounts = docker_command(
+            ["docker", "container", "inspect", "--format", "{{json .Mounts}}", cid],
+            check=True,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ProvenanceUnconfirmed("mount provenance could not be observed") from exc
     try:
         mounted = json.loads(mounts.stdout)
     except (TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("the container returned invalid mount provenance") from exc
+        raise ProvenanceUnconfirmed("the container returned invalid mount provenance") from exc
+    if not isinstance(mounted, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("Destination"), str)
+            for item in mounted):
+        raise ProvenanceUnconfirmed("the container returned invalid mount provenance")
     if any(item.get("Destination") == "/app/runtime" for item in mounted):
-        raise RuntimeError("the container is not using the image's protected runtime")
+        raise ProvenanceRejected("the container is not using the image's protected runtime")
 
 
 def _docker_root() -> Path:
-    result = subprocess.run(
+    result = docker_command(
         ["docker", "info", "--format", "{{.DockerRootDir}}"],
-        text=True, capture_output=True, check=True,
+        timeout=30,
     )
     return Path(result.stdout.strip())
 
@@ -452,10 +472,10 @@ def restart_ledger(config_value: dict, cid: str, command: str,
 def request_drain(config_value: dict, operation: str, cid: str) -> None:
     if not restart_ledger(config_value, cid, "open-cutover", operation):
         raise RuntimeError("the running image does not support safe Host cutover")
-    result = subprocess.run(
+    result = docker_command(
         ["docker", "exec", cid, "python3",
          "/data/platform/backend/scripts/prepare-container-cutover.py", operation],
-        text=True, capture_output=True,
+        check=False, timeout=90,
     )
     if result.returncode != 0:
         raise RuntimeError("the running server could not complete a safe chat drain")
@@ -491,7 +511,7 @@ def record_pulled_image(target_ref: str) -> None:
 
 def discard_pulled_image(target_ref: str) -> None:
     state = _image_state()
-    subprocess.run(["docker", "image", "rm", target_ref], capture_output=True, text=True)
+    docker_command(["docker", "image", "rm", target_ref], check=False, timeout=30)
     _atomic_json(IMAGES, {
         **state,
         "sha_refs": [ref for ref in state["sha_refs"] if ref != target_ref],
@@ -985,8 +1005,7 @@ def run() -> int:
             write_status(config_value, operation_id=operation, state="preparing",
                          expected_sha=expected, code=None,
                          message="Downloading and checking the official image.")
-            subprocess.run(["docker", "pull", image_ref], check=True,
-                           text=True, capture_output=True)
+            docker_command(["docker", "pull", image_ref], timeout=3600)
             record_pulled_image(image_ref)
             pulled_recorded = True
             # Bind everything that follows to the exact image this pull
@@ -1004,7 +1023,7 @@ def run() -> int:
             if previous == digest:
                 try:
                     verify_served_generation(cid, expected)
-                except RuntimeError as exc:
+                except ProvenanceRejected as exc:
                     write_status(
                         config_value, operation_id=operation, state="failed",
                         expected_sha=expected, code="provenance_failed",
@@ -1019,8 +1038,7 @@ def run() -> int:
                     worker_adoption=adopt_from_image(digest),
                 )
                 return 0
-            subprocess.run(["docker", "tag", previous, ROLLBACK_TAG], check=True,
-                           text=True, capture_output=True)
+            docker_command(["docker", "tag", previous, ROLLBACK_TAG], timeout=30)
             transaction = transaction_record(operation, expected, nonce,
                                              previous, digest)
             # From here an interruption can leave chats drained or the app
@@ -1033,8 +1051,7 @@ def run() -> int:
             replacement_started = True
             transaction["phase"] = "replacement_started"
             write_transaction(transaction)
-            subprocess.run(["docker", "tag", digest, TARGET_TAG], check=True,
-                           text=True, capture_output=True)
+            docker_command(["docker", "tag", digest, TARGET_TAG], timeout=30)
             compose(config_value, "up", "-d", "--no-build", "--no-deps",
                     "--force-recreate", "app", image=TARGET_TAG)
             write_status(config_value, operation_id=operation, state="verifying",
@@ -1059,6 +1076,12 @@ def run() -> int:
                                       state="succeeded", code=None,
                                       message="Container rebuilt successfully.")
             return 0 if settled else 1
+        except ProvenanceUnconfirmed:
+            write_status(config_value, operation_id=operation,
+                         state="needs_recovery" if TRANSACTION.exists() else "failed",
+                         expected_sha=expected, code="observation_unconfirmed",
+                         message="Target provenance could not be observed; no outcome was inferred.")
+            return 1
         except subprocess.TimeoutExpired:
             if replacement_started:
                 write_status(config_value, state="needs_recovery", code="observation_timed_out",
@@ -1304,7 +1327,18 @@ def recover(config_value: dict, transaction: dict) -> None:
                 if wait_healthy(config_value):
                     cid, current, health = container_health(config_value)
             if health == "healthy" and current == transaction["target_image"]:
-                verify_served_generation(cid, expected)
+                try:
+                    verify_served_generation(cid, expected)
+                except ProvenanceRejected as exc:
+                    rollback(config_value, operation, expected,
+                             "replacement_failed", str(exc)[:300], previous)
+                    return
+                except (ProvenanceUnconfirmed, OSError, ValueError, subprocess.SubprocessError):
+                    write_status(config_value, operation_id=operation,
+                                 state="needs_recovery", expected_sha=expected,
+                                 code="observation_unconfirmed", **fields,
+                                 message="Target provenance could not be observed; recovery is still needed.")
+                    return
                 finish_verified(config_value, transaction, cid, current,
                                 state="succeeded", code=None,
                                 message="Container rebuilt successfully.")
