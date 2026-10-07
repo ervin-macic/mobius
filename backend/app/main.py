@@ -72,7 +72,7 @@ from app.response_policy import (
 )
 from app.storage_io import ParentIsFile, atomic_write
 from app.account_browser_access import SharedAccessError
-from app import activity, models
+from app import activity, models, tracing
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
 # uvicorn boot. See the
@@ -390,6 +390,9 @@ app = FastAPI(
   version="0.1.0",
   lifespan=lifespan,
 )
+
+# Opt-in, off unless <data_dir>/tracing.json enables it; see app.tracing.
+tracing.configure(app, engine)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
