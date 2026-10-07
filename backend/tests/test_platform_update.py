@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import os
+import select
 import signal
 import subprocess
 import stat
@@ -7989,6 +7990,33 @@ def test_local_runner_rejects_missing_files_and_exit_report_disagreement(tmp_pat
   assert lt._read_report(report, 1).unavailable
 
 
+def _process_has_exited(pid, timeout_ms):
+  """Observe kernel exit, not the scheduling instant after group SIGKILL."""
+  try:
+    fd = os.pidfd_open(pid)
+  except ProcessLookupError:
+    return True
+  try:
+    poll = select.poll()
+    poll.register(fd, select.POLLIN)
+    return bool(poll.poll(timeout_ms))
+  finally:
+    os.close(fd)
+
+
+def test_process_exit_observation_rejects_a_surviving_child():
+  child = subprocess.Popen(["sleep", "60"])
+  try:
+    assert not _process_has_exited(child.pid, 0)
+    child.kill()
+    assert _process_has_exited(child.pid, 5000)
+  finally:
+    if child.poll() is None:
+      child.kill()
+    child.wait()
+  assert _process_has_exited(child.pid, 0)
+
+
 def test_local_runner_timeout_kills_descendants_and_removes_runtime(tmp_path):
   from app import local_change_tests as lt
   _git(tmp_path, "init", "-q")
@@ -8002,9 +8030,8 @@ def test_local_runner_timeout_kills_descendants_and_removes_runtime(tmp_path):
   result = lt.run(tmp_path, ["tests/test_local.py"], timeout=1)
   assert "timed out" in result.unavailable
   assert not Path((tmp_path / "runtime-path").read_text().strip()).exists()
-  pid = (tmp_path / "child-pid").read_text().strip()
-  stat_path = Path(f"/proc/{pid}/stat")
-  assert not stat_path.exists() or stat_path.read_text().split()[2] == "Z"
+  pid = int((tmp_path / "child-pid").read_text().strip())
+  assert _process_has_exited(pid, 5000), "runner descendant survived timeout cleanup"
 
 
 def test_local_runner_unavailable_output_is_not_retained(tmp_path):
