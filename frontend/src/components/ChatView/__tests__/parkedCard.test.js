@@ -641,3 +641,20 @@ for (const kind of ['memory', 'storage', 'model_capacity', 'restart']) {
     })
   }
 }
+
+for (const reason of ['manual', 'restart']) {
+  test(`completed ${reason} resume preserves a read-only restart pause without a future promise`, () => {
+    const block = {
+      type: 'error', message: 'Paused for a platform update.',
+      resumable: false, recovery_completed: true, pause: { kind: 'restart' },
+    }
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: { role: 'assistant', blocks: [block] },
+      isLastMsg: true, onResume() {}, continuationWait: 'restart_required',
+      handoff: { kind: 'automatic', reason },
+    }))
+    assert.match(html, /Paused · Continued/)
+    assert.match(html, /Paused for a platform update/)
+    assert.doesNotMatch(html, />Resume<\/button>|will continue|Waiting for a server restart/)
+  })
+}

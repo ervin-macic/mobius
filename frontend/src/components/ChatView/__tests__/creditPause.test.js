@@ -77,8 +77,14 @@ test('credit resume keeps existing pending and unavailable button states', () =>
 test('accepted resume supersedes the old credit pause only in the render projection', () => {
   const messages = [message, { role: 'user', kind: 'continuation', content: '' }]
   const projected = supersedeResumedPauseBlocks(messages)
-  assert.equal(projected[0].hidden, true)
-  assert.deepEqual(projected[0].blocks, [])
+  assert.notEqual(projected[0].hidden, true)
+  assert.deepEqual(projected[0].blocks, [{ ...creditBlock, resumable: false, recovery_completed: true }])
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: projected[0], isLastMsg: true, onResume() {},
+  }))
+  assert.match(html, /Credits needed · Continued/)
+  assert.doesNotMatch(html, />Resume<\/button>|auto-continue|then Resume/)
+
   assert.deepEqual(messages[0].blocks, [creditBlock])
   assert.equal(supersedeResumedPauseBlocks([message])[0], message)
 })
