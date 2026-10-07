@@ -9,7 +9,7 @@ import './AppBlock.css'
 const AppCanvas = lazy(() => import('../../AppCanvas/AppCanvas.jsx'))
 
 const STATE_NAMES = { proposed: 'Not sent yet', open: 'Open', draft: 'Draft', merged: 'Merged', closed: 'Closed' }
-// Purple is for links, so the state reads as a status pill in its own tone.
+// State pills use their own tone, distinct from link styling.
 const STATE_TONES = { proposed: 'neutral', open: 'success', draft: 'neutral', merged: 'success', closed: 'danger' }
 
 /** GitHub's label treatment: tinted fill with lifted text in dark mode, the
@@ -172,8 +172,8 @@ export default function AppBlock({ block, onInternalNav }) {
     <Suspense fallback={null}><AppCanvas appId={app.id} appName={app.name} appSlug={app.slug}
       version={app.updated_at || 0} offlineCapable={app.offline_capable} capabilityContract={app.capabilities}
       active={false} visible={false} interactive={false} blockSession={blockSession} blockEvent={blockEvent}
-      onBlockState={onBlockState} onHostRequest={hostRequest} /></Suspense>
-  </div> : canExpand && app && pending && !isSession && <div className={legacyMode === 'view' ? 'md-app-block__view' : 'md-app-block__session-host'}
+      onBlockState={onBlockState} onBlockCapability={onBlockCapability} onHostRequest={hostRequest} /></Suspense>
+  </div> : canExpand && app && pending && (!isSession || blockSupported === false) && <div className={legacyMode === 'view' ? 'md-app-block__view' : 'md-app-block__session-host'}
     style={legacyMode === 'view' ? { height: block.height } : undefined} aria-hidden={legacyMode !== 'view' ? 'true' : undefined} inert={legacyMode !== 'view' ? '' : undefined}>
     <Suspense fallback={legacyMode === 'view' ? <p role="status">Opening details…</p> : null}><AppCanvas key={viewIntent} appId={app.id} appName={app.name} appSlug={app.slug}
       version={app.updated_at || 0} offlineCapable={app.offline_capable} capabilityContract={app.capabilities}
