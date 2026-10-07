@@ -436,13 +436,3 @@
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-
-/* A grouped card's shared files sit once, at card level, below the answers. */
-.qcard--grouped > .qcard__answer-files {
-  padding: 12px 16px 0;
-}
-@media (max-width: 560px) {
-  .qcard--grouped > .qcard__answer-files {
-    padding-inline: 14px;
-  }
-}

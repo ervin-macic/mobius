@@ -25,6 +25,31 @@ def test_question_attachments_resolve_once_per_upload(tmp_path, monkeypatch):
   assert resolved == [{"name": "photo.png", "size": 5, "mime_type": "image/png"}]
 
 
+def test_question_attachments_keep_the_answer_they_belong_to(tmp_path, monkeypatch):
+  monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
+  uploads = []
+  for name in ("a.png", "b.pdf", "c.txt"):
+    path = tmp_path / "chats" / "chat-a" / "uploads" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x")
+    uploads.append({"name": name, "path": str(path), "size": 1, "mime_type": "x/y"})
+  card = {"questions": [{"question": "First?"}, {"question": "Second?"}]}
+  resolved = chats_stream._canonical_question_attachments(
+    SimpleNamespace(uploads=uploads),
+    [{"name": "a.png", "question": "First?"}, {"name": "b.pdf", "question": "Second?"},
+     {"name": "c.txt"}],
+    card,
+  )
+  assert [(f["name"], f.get("question")) for f in resolved] == [
+    ("a.png", "First?"), ("b.pdf", "Second?"), ("c.txt", None),
+  ]
+  with pytest.raises(HTTPException) as exc:
+    chats_stream._canonical_question_attachments(
+      SimpleNamespace(uploads=uploads), [{"name": "a.png", "question": "Third?"}], card,
+    )
+  assert exc.value.status_code == 422
+
+
 def test_question_attachments_are_bounded(tmp_path, monkeypatch):
   monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
   too_many = [{"name": f"f{i}.txt"} for i in range(chats_stream.MAX_QUESTION_ATTACHMENTS + 1)]
