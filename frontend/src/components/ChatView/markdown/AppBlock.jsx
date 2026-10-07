@@ -85,8 +85,8 @@ export default function AppBlock({ block, onInternalNav }) {
   const onSessionFallback = useCallback(key => {
     setLegacyMode('view'); setViewIntent(key); setBlockEvent(null); setSessionState(null)
   }, [])
-  const blockCapability = useAppBlockCapability({ allowedKeys, onFallback: onSessionFallback })
-  const blockSupported = blockCapability.supported
+  const { supported: blockSupported, remember: rememberBlockEvent, observe: observeBlockCapability } =
+    useAppBlockCapability({ allowedKeys, onFallback: onSessionFallback })
   useEffect(() => {
     if (!isSession || !rootRef.current || typeof IntersectionObserver === 'undefined') return
     const observer = new IntersectionObserver(entries => {
@@ -103,12 +103,12 @@ export default function AppBlock({ block, onInternalNav }) {
   const competingBusy = sessionState?.actions.some(item => item.busy)
   const dispatchBlockEvent = useCallback((key, event) => {
     const message = { sessionId, key, event, nonce: crypto.randomUUID() }
-    blockCapability.remember(message)
+    rememberBlockEvent(message)
     setBlockEvent(message)
-  }, [sessionId, blockCapability.remember])
+  }, [sessionId, rememberBlockEvent])
   const onBlockCapability = useCallback(supported => {
     if (isSession) {
-      blockCapability.observe(supported)
+      observeBlockCapability(supported)
       return
     }
     const intent = viewIntentRef.current
@@ -117,7 +117,7 @@ export default function AppBlock({ block, onInternalNav }) {
       setLegacyMode('inline')
       dispatchBlockEvent(intent, 'activate')
     } else setLegacyMode('view')
-  }, [isSession, allowedKeys, dispatchBlockEvent, blockCapability.observe])
+  }, [isSession, allowedKeys, dispatchBlockEvent, observeBlockCapability])
   // The open view's intent: the block's own, or its action's. null = closed.
   const [delivered, setDelivered] = useState(false)
   const pending = useMemo(() => viewIntent ? { intent: viewIntent, nonce: crypto.randomUUID() } : null, [viewIntent])
