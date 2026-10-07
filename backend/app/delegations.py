@@ -22,6 +22,8 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, load_only
 
+from app import chat_writer
+from app import transcript_rows
 from app import auth, models
 from app.browser_access import BrowserLineage, require_live
 from app.timeutil import now_naive_utc
@@ -234,7 +236,7 @@ def create_or_attach_delegation(
       intent.parent_chat_id if intent.source_work_id is not None else None
     ),
   )
-  child = models.Chat(
+  child = chat_writer.create_chat(
     id=child_id,
     title=f"Delegation · {intent.task_key}",
     messages=[],
@@ -374,7 +376,7 @@ async def retry_limit_park(
   action and accepts only the latest, still-owned usage-limit park; active,
   terminal, cancelled, or superseded child attempts remain idempotent no-ops.
   """
-  status, run, _ = derived_status(db, row)
+  status, run, _ = derived_status(db, row, load_result=False)
   if (
     status != "paused"
     or run is None
@@ -478,7 +480,7 @@ def normalize_cwd(raw: str | None) -> str:
 
 
 def _first_user_prompt(chat: models.Chat) -> str | None:
-  for message in list(chat.messages or []):
+  for message in list(transcript_rows.history(chat)):
     if isinstance(message, dict) and message.get("role") == "user":
       content = message.get("content")
       return content if isinstance(content, str) else None
@@ -593,7 +595,7 @@ def _assistant_result(chat: models.Chat) -> str:
   blocks are progress narration split off by tools or provider items) plus
   its latest error, so a failed or stopped helper stays actionable.
   """
-  for message in reversed(list(chat.messages or [])):
+  for message in reversed(transcript_rows.history(chat)):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
     blocks = message.get("blocks")
@@ -2550,8 +2552,7 @@ def safe_parent_wake_startup_writer_orphan(
     return False
   if safe_parent_activity_startup_writer_orphan(db, chat, physical):
     return True
-  messages = list(chat.messages or [])
-  continuation = messages[-1] if messages else None
+  continuation = transcript_rows.at(db, chat, -1)
   committed = _committed_parent_wake(db, chat, continuation)
   return bool(
     committed is not None
@@ -2617,7 +2618,7 @@ def _committed_parent_wake_is_unowned(
     return False
   physical, _rows, _carried = committed
   if physical.status in ("interrupted", "stopped"):
-    messages = list(chat.messages or [])
+    messages = list(transcript_rows.history(chat))
     wake_cid = message.get("cid")
     matches = [
       index for index, candidate in enumerate(messages)
@@ -2815,7 +2816,7 @@ async def _deliver_parent_wake_once(
       # deterministic ChatRun still owns its pre-upgrade recovery attempt.
       committed = next((
         candidate
-        for message in reversed(list(parent_chat.messages or []))
+        for message in reversed(transcript_rows.history(parent_chat))
         if (
           (candidate := _committed_parent_wake(db, parent_chat, message))
           is not None
@@ -2892,7 +2893,7 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
         .first()
       )
       if row is not None and row.source_work_id is not None:
-        status, _, _ = derived_status(db, row)
+        status, _, _ = derived_status(db, row, load_result=False)
         if status in TERMINAL_DELEGATION_STATUSES:
           row.source_work_active_chat_id = None
         _record_lifecycle(db, row, status)
@@ -2905,7 +2906,7 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
       from app.goal_plans import publish_plan_for_delegation
       publish_plan_for_delegation(db, row)
       publish_parent_waiting_changed(row.parent_chat_id)
-      status, _, _ = derived_status(db, row)
+      status, _, _ = derived_status(db, row, load_result=False)
       if status in TERMINAL_DELEGATION_STATUSES:
         publish_chat_activity_changed(row.parent_chat_id)
       if (

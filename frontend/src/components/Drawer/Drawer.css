@@ -1092,11 +1092,3 @@
   color: var(--border);
   user-select: none;
 }
-
-.drawer__list-caption {
-  margin: 6px 12px 4px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 16px;
-  font-variant-numeric: tabular-nums;
-}

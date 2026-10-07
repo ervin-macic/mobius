@@ -21,14 +21,16 @@ Design choices:
   Only Stop and owner-card termination interrupt the connected client.
 - `system_prompt` is passed on EVERY turn, not just the first. The
   installed SDK transport
-  (`claude_agent_sdk/_internal/transport/subprocess_cli.py:227-228`)
+  (`claude_agent_sdk/_internal/transport/subprocess_cli.py`)
   serializes `system_prompt is None → --system-prompt ""`, which on
   resume silently wipes the original session's system prompt. Since
   ClaudeAgentOptions defaults `system_prompt` to `None`, omitting the
   kwarg has the same effect. Always passing `skill_text` keeps the
   skill load-bearing across resumes and matches our "skill is always-
-  on" contract — passing the same text on resume is a no-op; passing
-  updated text after a deploy correctly updates the resumed session.
+  on" contract. The CLI records the prompt on a conversation's first
+  request and reuses that record on resume until compaction
+  (`--system-prompt-snapshot` defaults on), so updated text reaches an
+  existing session only after it compacts.
 - We deliberately pass `skill_text` as a custom string (not
   `SystemPromptPreset{append=skill_text, exclude_dynamic_sections=True}`).
   The preset+append form would layer Claude Code's default
@@ -40,6 +42,9 @@ Design choices:
   `--help`), so for our custom-string path it would be a no-op
   even if we set it. Möbius owns its system prompt end-to-end;
   the skill is the contract, not a layer on top of someone else's.
+- That custom prompt reaches the CLI through `--system-prompt-file`, never as
+  a `--system-prompt` argument: Linux refuses to start a process with any
+  single argument of 128 KiB or more, so a long prompt would stop every turn.
 """
 
 from __future__ import annotations
@@ -48,12 +53,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import shutil
-import re
+import tempfile
 from collections import deque
-from collections.abc import Awaitable
-from contextlib import ExitStack
+from collections.abc import Awaitable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from uuid import uuid4
 from typing import Any, Literal
@@ -271,6 +277,20 @@ def _system_prompt_with_register(skill_text: str) -> str:
   if not register:
     return skill_text
   return skill_text.rstrip() + "\n\n" + register + "\n"
+
+
+@contextmanager
+def _system_prompt_file(text: str) -> Iterator[str]:
+  """Yield the path the Claude CLI reads its system prompt from.
+
+  The file is anonymous, so nothing is left behind after a crash, and stays
+  open for the client's whole lifetime. Like the MCP config, the CLI opens it
+  through this process's ``/proc`` fd.
+  """
+  with tempfile.TemporaryFile(prefix="mobius-prompt-", suffix=".md") as handle:
+    handle.write(text.encode("utf-8"))
+    handle.flush()
+    yield f"/proc/{os.getpid()}/fd/{handle.fileno()}"
 
 
 _CLAUDE_CLI = "/usr/local/bin/claude"
@@ -1429,7 +1449,9 @@ async def run_claude_sdk_turn(
     # 0600 config file path instead. After connect(), replace that fd with
     # /dev/null but keep its number reserved until teardown: simply closing it
     # would let the argv-visible path alias an unrelated descriptor later.
-    connector_config_stack = ExitStack()
+    # The system-prompt file shares this stack; it carries no credential, so
+    # it is not retired.
+    startup_file_stack = ExitStack()
     connector_config_handle = None
     # Durable delegated children need the same provider-neutral network tools as
     # their parent.
@@ -1440,7 +1462,7 @@ async def run_claude_sdk_turn(
         claude_control_servers,
         expected_control_tool_names,
       )
-      connector_config_handle = connector_config_stack.enter_context(
+      connector_config_handle = startup_file_stack.enter_context(
         claude_mcp_config_handle(
           connector_plan,
           extra_servers=claude_control_servers(
@@ -1451,18 +1473,24 @@ async def run_claude_sdk_turn(
       if connector_config_handle:
         options_kwargs["mcp_servers"] = connector_config_handle.path
     except Exception:
-      connector_config_stack.close()
-      connector_config_stack = ExitStack()
+      startup_file_stack.close()
+      startup_file_stack = ExitStack()
       log.warning(
         "Claude MCP connection injection skipped chat_id=%s",
         chat_id,
         exc_info=True,
       )
     try:
+      options_kwargs["system_prompt"] = {
+        "type": "file",
+        "path": startup_file_stack.enter_context(
+          _system_prompt_file(options_kwargs["system_prompt"])
+        ),
+      }
       options = ClaudeAgentOptions(**options_kwargs)
       client = ClaudeSDKClient(options)
     except Exception:
-      connector_config_stack.close()
+      startup_file_stack.close()
       raise
 
     active_client = ActiveClaudeClient(
@@ -1749,7 +1777,7 @@ async def run_claude_sdk_turn(
         try:
           await client.disconnect()
         finally:
-          connector_config_stack.close()
+          startup_file_stack.close()
           try:
             # The SDK closes its direct PID; also reap this run's descendants.
             await active_client.terminate_owned_processes()

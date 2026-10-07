@@ -46,7 +46,9 @@ from app.database import (
   reset_database_request_label,
   set_database_request_label,
 )
-from app.schema_migrations import mapped_schema_gaps, run_migrations
+from app.schema_migrations import (
+  ensure_transcript_triggers, mapped_schema_gaps, run_migrations,
+)
 from app.http_caching import strip_range
 from app.frontend_assets import (
   baked_frontend_dir,
@@ -233,6 +235,8 @@ def _init_db():
     try:
       Base.metadata.create_all(bind=engine)
       run_migrations(engine)
+      # The previous release's change detection depends on these triggers.
+      ensure_transcript_triggers(engine)
       gaps = mapped_schema_gaps(engine)
       if gaps:
         # A mapped column with no migration fails at first query, not at
