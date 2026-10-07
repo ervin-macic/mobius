@@ -51,6 +51,10 @@ import {
   openFolder as finderOpenFolder,
   parentPath,
 } from '../../lib/projectFinderNav.js'
+import {
+  PROJECT_CHANGES_ACTIVE_MS,
+  nextProjectChangesDelay,
+} from '../../lib/projectChangeCadence.js'
 import ProjectPdfPreview from './ProjectPdfPreview.jsx'
 import ImageLightbox from '../ChatView/markdown/ImageLightbox.jsx'
 import ProjectPreviewFrame from './ProjectPreviewFrame.jsx'
@@ -483,15 +487,16 @@ export default function ProjectFinder({
   // The durable cursor repairs missed owner events and gives invited editors
   // the same near-live file refresh without granting them the shell event
   // stream. Clean files update automatically; dirty drafts are never replaced.
+  // It polls quickly only while changes keep arriving (projectChangeCadence).
   useEffect(() => {
     if (!source.liveSync || !source.changes) return undefined
     let active = true
     let cursor = null
     let controller = null
     let timer = null
-    let delay = 2_500
+    let delay = PROJECT_CHANGES_ACTIVE_MS
     const handleChanges = async (changes, truncated = false) => {
-      if (!active || (!truncated && (!changes || changes.length === 0))) return
+      if (!active || (!truncated && (!changes || changes.length === 0))) return false
       await source.invalidate(queryClient)
       const selectedNow = liveFileRef.current?.selected
       if (
@@ -511,6 +516,7 @@ export default function ProjectFinder({
           await refreshSelectedFromRemote({ change: selectedChange })
         } catch { /* the completion-scheduled poll retries */ }
       }
+      return true
     }
     const schedule = (wait = delay) => {
       if (!active) return
@@ -531,13 +537,13 @@ export default function ProjectFinder({
         cursor = Number(payload.cursor || cursor || 0)
         // Reconcile once after the baseline arrives. This closes the gap where
         // a save lands between the first file read and the first cursor read.
-        await handleChanges(
+        const changed = await handleChanges(
           payload.changes || [],
           !!payload.truncated || establishingBaseline,
         )
-        delay = 2_500
+        delay = nextProjectChangesDelay(delay, changed ? 'changed' : 'unchanged')
       } catch (cause) {
-        if (cause?.name !== 'AbortError') delay = Math.min(delay * 2, 30_000)
+        if (cause?.name !== 'AbortError') delay = nextProjectChangesDelay(delay, 'failed')
       } finally {
         controller = null
         if (!document.hidden) schedule()
@@ -547,6 +553,10 @@ export default function ProjectFinder({
       const detail = event?.detail
       if (String(detail?.projectId ?? '') !== String(projectId)) return
       void handleChanges(detail?.change ? [detail.change] : [], false)
+      // Pushed edits usually come in bursts that end with an unpublished
+      // agent-run completion, so resume the active cadence for the cursor.
+      delay = nextProjectChangesDelay(delay, 'changed')
+      if (!document.hidden && !controller) schedule()
     }
     const onVisibility = () => {
       if (document.hidden) {
