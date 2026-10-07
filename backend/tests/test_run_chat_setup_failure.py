@@ -81,6 +81,7 @@ async def test_setup_exception_leaves_a_readable_error_in_the_transcript(chat, m
   recovered = writer.submitted[0]
   assert isinstance(recovered, chat_mod.RecoverWedgedRun)
   assert recovered.run_token == "tok-1"
+  assert recovered.terminal_status == "failed"
   assert recovered.parked_until is None
   block = recovered.interruption_block
   assert "AttributeError" in block["message"]
@@ -90,6 +91,73 @@ async def test_setup_exception_leaves_a_readable_error_in_the_transcript(chat, m
   live = next(e for e in events if e.get("type") == "error")
   assert live["message"] == block["message"]
   assert finished == []
+
+
+@pytest.mark.asyncio
+async def test_failed_helper_setup_wakes_parent_with_settled_result(db, monkeypatch):
+  """The owning setup path, not a standalone writer command, delivers the
+  failed child's durable result to its waiting parent."""
+  from app import chat_start, delegations, models
+  from app.chat_writer import get_writer
+  from tests.goal_fixtures import goal_run
+  from tests.test_delegations import _seed_delegation
+
+  parent_id, child_id, delegation_id = _seed_delegation(
+    db, suffix="setup-failed-delivery", child_status="running",
+  )
+  root_id = db.get(models.Delegation, delegation_id).parent_root_run_id
+  parent = db.get(models.Chat, parent_id)
+  parent.agent_settings_json = {"model": "claude-sonnet-4-6"}
+  db.add(goal_run(
+    db, id=root_id, root_run_id=root_id, chat_id=parent_id,
+    status="completed", provider="claude",
+  ))
+  db.commit()
+
+  async def admitted(_data_dir):
+    pass
+
+  async def broken_impl(*_args, **_kwargs):
+    raise RuntimeError("private setup detail")
+
+  starts = []
+
+  async def record_start(**kwargs):
+    starts.append(kwargs)
+    return True
+
+  monkeypatch.setattr(chat_mod, "require_agent_turn_admission", admitted)
+  monkeypatch.setattr(chat_mod, "_run_chat_impl", broken_impl)
+  monkeypatch.setattr(
+    chat_start, "start_programmatic_activity_continuation", record_start,
+  )
+  # Deliberately keep the real writer, real SQLite row and real wake hook.
+  assert get_writer() is not None
+  await chat_mod.run_chat(
+    [], chat_id=child_id, session_id=None, provider_id="claude",
+    run_gen=chat_mod.current_run_generation(child_id),
+    run_token="child-run-setup-failed-delivery",
+  )
+
+  db.expire_all()
+  child_run = db.get(models.ChatRun, "child-run-setup-failed-delivery")
+  assert child_run.status == "failed"
+  assert starts == [{
+    "chat_id": parent_id,
+    "root_run_id": root_id,
+    "run_token": delegations._activity_continuation_run_id(
+      db, db.get(models.Delegation, delegation_id),
+    ),
+    "source_work_id": root_id,
+    "activity_id": delegation_id,
+    "_transition_lock_held": True,
+  }]
+  result = delegations.build_delegation_result_context(
+    db, parent_id, source_work_id=root_id,
+  )
+  assert result.delegation_ids == (delegation_id,)
+  assert "RuntimeError" in result.text
+  assert "private setup detail" not in result.text
 
 
 @pytest.mark.asyncio

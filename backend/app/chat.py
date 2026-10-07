@@ -716,7 +716,8 @@ async def _recover_wedged_run_strict(
   message: str = "This response could not be saved. You can resume the turn.",
   kind: str | None = None,
   resumable: bool = True,
-) -> None:
+  terminal_status: str = "interrupted",
+) -> bool:
   """Atomically leave a durable interruption marker and close a wedged run.
 
   Callers pass ``message`` (and optionally ``kind``/``resumable``) so the same
@@ -730,9 +731,10 @@ async def _recover_wedged_run_strict(
       chat_id=chat_id,
       run_token=run_token,
       interruption_block=_pause_note(message, kind=kind, resumable=resumable),
+      terminal_status=terminal_status,
     )
   )
-  await _await_ack(ack)
+  return bool(await _await_ack(ack))
 
 
 @dataclass(frozen=True)
@@ -4668,6 +4670,7 @@ async def run_chat(
   # reconciliation rather than silently wiping it — the safe default.
   disposition = chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
   runtime_settled = False
+  setup_failure_settled = False
   try:
     await require_agent_turn_admission(
       get_settings().data_dir,
@@ -4771,7 +4774,10 @@ async def run_chat(
       )
       if chat_id:
         try:
-          await _recover_wedged_run_strict(chat_id, run_token or "", message=message)
+          setup_failure_settled = await _recover_wedged_run_strict(
+            chat_id, run_token or "", message=message,
+            terminal_status="failed",
+          )
         except Exception:
           _get_logger().warning(
             "setup-failure error block did not persist chat_id=%s; "
@@ -4905,7 +4911,10 @@ async def run_chat(
       )
     # Parent progress must not wait on optional summary generation.
     try:
-      if chat_id and disposition in _DELEGATION_SETTLED_DISPOSITIONS:
+      if chat_id and (
+        disposition in _DELEGATION_SETTLED_DISPOSITIONS
+        or setup_failure_settled
+      ):
         from app.delegations import wake_parent_after_child_settled
         await wake_parent_after_child_settled(chat_id)
     except Exception:
