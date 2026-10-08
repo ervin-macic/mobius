@@ -286,6 +286,26 @@ def test_review_only_all_clear_survives_a_moved_base_and_still_posts_once(setup,
   assert posts == [SHA]
 
 
+def test_model_drift_flags_unfinished_runs_but_not_completed_ones(setup):
+  db, row, _ = setup
+  row.mode = "review"
+  row.options_json = {"provider": "codex", "model": "gpt-5", "reasoning_effort": "xhigh"}
+  chat = db.get(models.Chat, row.chat_id)
+  chat.provider = "codex"
+  chat.agent_settings_json = {"model": "gpt-5", "effort": "xhigh"}
+  db.commit()
+  assert routes._run_view(db, row)["state"] != "complete"
+  chat.agent_settings_json = {"model": "gpt-5", "effort": "low"}
+  db.commit()
+  assert "model choice" in routes._run_view(db, row)["summary"]
+  chat.agent_settings_json = {"model": "gpt-5", "effort": "xhigh"}
+  db.commit()
+  assert report(setup)["run"]["state"] == "complete"
+  chat.agent_settings_json = {"model": "gpt-5", "effort": "low"}
+  db.commit()
+  assert routes._run_view(db, row)["state"] == "complete"
+
+
 @pytest.mark.parametrize("mode", ["review", "review_merge"])
 def test_non_takeover_modes_deny_public_repair(setup, monkeypatch, mode):
   db, row, principal = setup

@@ -517,7 +517,9 @@ def _run_view(db, row, *, context_app_id=None):
   value["stop_semantics"] = "revokes_future_actions; an already-admitted public action may finish"
   frozen = row.options_json or {}
   actual = coerce_agent_settings(chat.agent_settings_json) if chat else {}
-  if frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
+  # A finished run stays finished; drift only matters for remaining work,
+  # which _parent already refuses under a different model choice.
+  if value["state"] != "complete" and frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
     value.update(state="needs_you", summary="The owning chat model choice no longer matches this frozen workflow.")
   last = db.query(models.ChatRun).filter_by(chat_id=row.chat_id).order_by(
     models.ChatRun.started_at.desc()).first()
