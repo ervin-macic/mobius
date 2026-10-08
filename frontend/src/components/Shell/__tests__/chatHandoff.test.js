@@ -152,7 +152,7 @@ test('activation presents a confirmed running transcript while stream catch-up r
     /runtime\.requested_anchor_found === false[\s\S]*if \(runtimeAnchorMatch\)[\s\S]*CHAT_READING_ANCHOR_NOT_FOUND[\s\S]*retireSavedReadingPosition\(chatId\)[\s\S]*anchorRetired = true/,
     'only an authoritative absent row retires the saved coordinate')
   assert.match(initialLoad,
-    /if \(activationCacheEntryState !== 'missing' && !anchorRetired\) \{[\s\S]*applyMessagesToView\(refreshed\.messages, refreshed\.offset\)[\s\S]*settleRuntime\(runtime, refreshed\.messages\)[\s\S]*return[\s\S]*const renderFrames = coldTranscriptRenderFrames/,
+    /if \(activationCacheEntryState !== 'missing' && !anchorRetired\) \{[\s\S]*applyMessagesToView\(refreshed\.messages, refreshed\.offset\)[\s\S]*settleRuntime\(runtime, refreshed\.messages, msgs\)[\s\S]*return[\s\S]*const renderFrames = coldTranscriptRenderFrames/,
     'a complete warm window, including nested-coordinate validation, must settle atomically before the cold prefix scheduler')
   assert.match(chatView,
     /cacheIsSafeFallback[\s\S]*CHAT_READING_ANCHOR_NOT_FOUND[\s\S]*applyMessagesToView\(\[\], 0\)[\s\S]*setLoadError\(!cacheIsSafeFallback && retry == null\)/,
