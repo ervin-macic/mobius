@@ -100,7 +100,7 @@ test('Firefox on Windows exposes current web-app instructions', () => {
   assert.equal(platform.windows, true)
   assert.equal(platform.installPossible, true)
   assert.equal(copy.unsupported, undefined)
-  assert.match(copy.body, /web-app button/)
+  assert.match(copy.body, /Add tab to taskbar/)
 })
 
 test('Firefox on Linux offers an honest cross-browser fallback', () => {

@@ -189,7 +189,7 @@ export function installCopyForPlatform(
     return {
       title: `Install ${productName}`,
       summary: 'Pin it to your Windows taskbar.',
-      body: `Click the web-app button in the Firefox address bar. ${productName} will open in its own window and appear in your taskbar and Start menu. Firefox 143+ is required (150+ for Microsoft Store installs).`,
+      body: `Click the Add tab to taskbar icon (a window with a down arrow) at the right end of the Firefox address bar. ${productName} will open in its own window and appear in your taskbar and Start menu. Firefox 143+ is required (150+ for Microsoft Store installs).`,
       ctaLabel: 'Show me',
     }
   }
