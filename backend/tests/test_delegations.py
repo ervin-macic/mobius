@@ -3439,13 +3439,15 @@ def test_delegation_capabilities_checks_provider_auth_off_the_event_loop(
     loop_threads.append(threading.get_ident())
     return {}
 
-  def check_auth(_data_dir):
+  def check_auth(_self, _data_dir):
     auth_threads.append(threading.get_ident())
     return None
 
   monkeypatch.setattr("app.routes.delegations.providers.list_models", fake_models)
-  for provider_id in list(providers.PROVIDERS):
-    monkeypatch.setattr(providers.PROVIDERS[provider_id], "check_auth", check_auth)
+  # Patch the classes: undoing an instance patch leaves the bound original in
+  # the instance dict, which would shadow later class-level patches.
+  for provider in providers.PROVIDERS.values():
+    monkeypatch.setattr(type(provider), "check_auth", check_auth)
   response = client.get("/api/delegations/capabilities", headers=auth)
   assert response.status_code == 200, response.text
   assert auth_threads and loop_threads

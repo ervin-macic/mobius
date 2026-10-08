@@ -2334,11 +2334,15 @@ async def test_usage_snapshot_checks_provider_auth_off_the_event_loop(monkeypatc
   loop_thread = threading.get_ident()
   seen = []
 
-  def check_auth(_data_dir):
+  def check_auth(_self, _data_dir):
     seen.append(threading.get_ident())
     return "not connected"
 
-  monkeypatch.setattr(provider_usage.providers.PROVIDERS["mobius"], "check_auth", check_auth)
+  # Class level: undoing an instance patch would leave the original bound on
+  # the shared provider instance, shadowing later class-level patches.
+  monkeypatch.setattr(
+    type(provider_usage.providers.PROVIDERS["mobius"]), "check_auth", check_auth,
+  )
   snapshot = await provider_usage._provider_snapshot("mobius", str(tmp_path))
   assert snapshot["state"] == "disconnected"
   assert seen and loop_thread not in seen
