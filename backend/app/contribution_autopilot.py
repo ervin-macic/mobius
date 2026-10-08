@@ -13,8 +13,10 @@ The lifecycle, per (app_id, record_id):
   /respond  ─▶  claim (state=responding, fresh run_id, 45-min lease) ─▶ spawn round
   agent  ─▶  /update (validated push) / /reply ─▶ /complete ─▶ idle, round logged
   crash   ─▶  lease expires ─▶ next retry marks it stale and reclaims it
-  2 consecutive stale/failed rounds ─▶ escalate (there is no round budget:
-  follow-up continues while rounds keep completing)
+  2 consecutive stale/failed rounds ─▶ escalate
+  RUNAWAY_ROUND_LIMIT completed rounds without an owner hand-back ─▶ escalate
+  (a runaway guard, not a review budget: it stops loops whose rounds complete
+  but never converge, e.g. an unfixable check or a bot commenting per push)
   escalate ─▶ blocked + human_required warning, claim revoked but grant retained
   fresh reviewed repair + cleared warning ─▶ recovery returns the grant to idle
   merged / closed ─▶ close_out, autopilot ends
@@ -54,6 +56,13 @@ log = logging.getLogger("mobius.contribution_autopilot")
 LEASE_SECONDS = 45 * 60
 # Two consecutive non-productive rounds (stale lease or failed spawn) escalate.
 FAILURE_ESCALATION_THRESHOLD = 2
+# Runaway guard, not a review budget. Settled rounds reset the failure counter,
+# so a loop whose rounds complete but never converge (a check the agent cannot
+# fix, a bot that comments on every push) would otherwise push and reply on the
+# PR indefinitely. ``rounds_used`` counts rounds since the owner last took
+# control (grant re-send, resume, reviewed recovery all reset it), so this
+# hands back after this many unattended rounds.
+RUNAWAY_ROUND_LIMIT = 20
 # Cap the mirrored/audit round log so a record can't grow without bound.
 MAX_ROUND_LOG = 30
 MAX_IGNORED_EVENT_URLS = 20
@@ -318,7 +327,8 @@ def claim_for_round(
     - ``"blocked"``: an escalation still awaits a reviewed resolution.
     - ``"duplicate"``: this attention was already handled or is in flight.
     - ``"busy"``: a live (non-expired) round holds the claim.
-    - ``"escalate"`` (+ ``reason``): repeated failed rounds — caller escalates.
+    - ``"escalate"`` (+ ``reason``): repeated failed rounds (``stale_rounds``)
+      or the runaway guard (``round_ceiling``) — caller escalates.
 
   A crashed round (expired lease) is reclaimed here: its stale round is logged
   and the failure counter advanced before the fresh claim is taken.
@@ -356,6 +366,8 @@ def claim_for_round(
       # request arrived. Preserve the same escalation verdict as inline reclaim
       # instead of granting an unbounded sequence of crash/retry rounds.
       return {"status": "escalate", "reason": "stale_rounds"}
+    if int(row.rounds_used or 0) >= RUNAWAY_ROUND_LIMIT:
+      return {"status": "escalate", "reason": "round_ceiling"}
 
     now = now_naive_utc()
     run_id = uuid.uuid4().hex
@@ -380,6 +392,7 @@ def claim_for_round(
         models.ContributionAutopilot.state == "idle",
         cursor_match,
         key_match,
+        models.ContributionAutopilot.rounds_used < RUNAWAY_ROUND_LIMIT,
       )
       .values(
         state="responding",
@@ -702,6 +715,8 @@ def mirror_block(row: models.ContributionAutopilot) -> dict:
     "granted_at": row.granted_at.isoformat() if row.granted_at else None,
     "state": row.state,
     "rounds_used": int(row.rounds_used or 0),
+    # The runaway guard, reported under the field name the app already reads.
+    "max_rounds": RUNAWAY_ROUND_LIMIT,
     "last_round": last,
     "rounds": rounds,
     "ignored_event_urls": list(row.ignored_event_urls_json or []),

@@ -1058,6 +1058,44 @@ def test_stale_lease_then_second_failure_escalates(
     db.close()
 
 
+def test_runaway_round_ceiling_escalates_with_its_own_message(
+  client, owner_token, monkeypatch,
+):
+  """Rounds that keep completing without the PR settling hand back once the
+  runaway guard is reached, and the owner is told why."""
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  headers = {"Authorization": f"Bearer {app_token}"}
+  record_id = "rec-ceiling"
+  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  (repo / ".git").mkdir(parents=True)
+  rec = _record(record_id, repo)
+  rec["status"] = "open"
+  _write_contribution(app_id, record_id, rec, _DIFF1)
+  monkeypatch.setattr(autopilot, "spawn_round_turn", _fake_spawn)
+  monkeypatch.setattr("app.routes.github.shutil.which", lambda name: f"/bin/{name}")
+
+  db = SessionLocal()
+  try:
+    autopilot.stamp_grant(db, app_id, record_id, head_sha=_HEAD1)
+    row = autopilot.get_row(db, app_id, record_id)
+    row.rounds_used = autopilot.RUNAWAY_ROUND_LIMIT
+    db.commit()
+  finally:
+    db.close()
+
+  r = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/respond",
+    json={"attention": {"key": "k1", "event_at": "2026-07-10T00:00:00Z"}},
+    headers=headers,
+  )
+  assert r.status_code == 200
+  assert r.json() == {"status": "escalated", "reason": "round_ceiling"}
+  updated = _read(app_id, record_id)
+  assert updated["attention"]["type"] == "human_required"
+  assert "without the PR settling" in updated["attention"]["message"]
+
+
 @pytest.fixture(autouse=True)
 def _synthetic_repos_answer_the_canonical_diff(monkeypatch):
   """Send hashes the byte-exact diff; fake repos still answer through ``_git``.
