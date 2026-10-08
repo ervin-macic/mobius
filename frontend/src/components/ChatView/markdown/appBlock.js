@@ -51,6 +51,22 @@ export function inlineBlockState(message, sessionId, keys) {
   return { actions, notice: shortText(message.notice, 500) }
 }
 
+/** A transcript is not a workspace navigation owner or a second chat-control
+ *  authority, so an embedded view may only open a conversation or an app, and
+ *  only while the reader can see it: a hidden session frame never navigates. */
+export function transcriptHostRequest(request, { visible, navigate }) {
+  if (!visible) {
+    throw new Error('Open the app to continue. A hidden transcript view cannot navigate.')
+  }
+  if (request?.type === 'moebius:open-chat' && request.chatId) {
+    navigate(`/shell/?${new URLSearchParams({ chat: request.chatId })}`)
+  } else if (request?.type === 'moebius:open-app' && request.appId) {
+    navigate(`/shell/?${new URLSearchParams({ app: request.appId, ...(request.intent ? { intent: request.intent } : {}) })}`)
+  } else {
+    throw new Error('Open the app to use workspace controls. This transcript view can only open conversations and apps.')
+  }
+}
+
 /* A pull-request snapshot renders like a GitHub PR row. Anything malformed is
    dropped rather than guessed, so the block falls back to its plain facts. */
 function pullSnapshot(value) {

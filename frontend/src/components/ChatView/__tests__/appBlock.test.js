@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { appBlockFromToken, inlineBlockState } from '../markdown/appBlock.js'
+import { appBlockFromToken, inlineBlockState, transcriptHostRequest } from '../markdown/appBlock.js'
 
 const token = value => ({ type:'code', lang:'mobius-app', text:JSON.stringify(value) })
 test('app blocks carry a destination and snapshot, not authority', () => {
@@ -121,4 +121,17 @@ test('the confirmation summary and busy label are bounded plain app text', () =>
   const [bare] = inlineBlockState({ type: 'moebius:app-block-state', sessionId: 's', actions: [
     { key: 'x:1', confirming: true, summary: { html: '<b>x</b>' } }] }, 's', new Set(['x:1'])).actions
   assert.equal(bare.summary, '')
+})
+
+test('only a visible transcript view may navigate, and only to a chat or an app', () => {
+  const seen = []
+  const navigate = target => seen.push(target)
+  const open = { type: 'moebius:open-chat', chatId: 'c1' }
+  assert.throws(() => transcriptHostRequest(open, { visible: false, navigate }), /hidden transcript view cannot navigate/)
+  assert.throws(() => transcriptHostRequest({ type: 'moebius:open-app', appId: 3 }, { visible: false, navigate }))
+  assert.deepEqual(seen, [])
+  transcriptHostRequest(open, { visible: true, navigate })
+  transcriptHostRequest({ type: 'moebius:open-app', appId: 3, intent: 'x:1' }, { visible: true, navigate })
+  assert.deepEqual(seen, ['/shell/?chat=c1', '/shell/?app=3&intent=x%3A1'])
+  assert.throws(() => transcriptHostRequest({ type: 'moebius:new-chat' }, { visible: true, navigate }), /only open conversations and apps/)
 })

@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Branch, ChevronDown, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { appQueries } from '../../../hooks/queries.js'
 import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
-import { inlineBlockState } from './appBlock.js'
+import { inlineBlockState, transcriptHostRequest } from './appBlock.js'
 import useAppBlockCapability from '../hooks/useAppBlockCapability.js'
 import './AppBlock.css'
 
@@ -149,17 +149,12 @@ export default function AppBlock({ block, onInternalNav }) {
     if (onInternalNav) onInternalNav(url)
     else window.location.assign(url.href)
   }, [onInternalNav])
-  // A transcript is not a workspace navigation owner or a second chat-control
-  // authority, so the embedded view may only open a conversation or an app.
-  const hostRequest = useCallback((_, request) => {
-    if (request.type === 'moebius:open-chat' && request.chatId) {
-      navigate(`/shell/?${new URLSearchParams({ chat: request.chatId })}`)
-    } else if (request.type === 'moebius:open-app' && request.appId) {
-      navigate(`/shell/?${new URLSearchParams({ app: request.appId, ...(request.intent ? { intent: request.intent } : {}) })}`)
-    } else {
-      throw new Error('Open the app to use workspace controls. This transcript view can only open conversations and apps.')
-    }
-  }, [navigate])
+  // Only the visible embedded view may navigate; hidden session frames mount
+  // without a reader gesture.
+  const visibleRef = useRef(false)
+  visibleRef.current = legacyMode === 'view'
+  const hostRequest = useCallback((_, request) =>
+    transcriptHostRequest(request, { visible: visibleRef.current, navigate }), [navigate])
   const openHref = target => event => {
     if (!onInternalNav || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
     event.preventDefault(); navigate(target)
