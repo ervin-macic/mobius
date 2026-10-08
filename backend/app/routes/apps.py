@@ -1378,7 +1378,6 @@ async def update_check(
   local_version = app.version
   target_app_id = app.id
   installed_manifest_url = app.manifest_url
-  installed_package_id = app.package_id
   source_dir = app.source_dir
   installed_source_revision = app.upstream_commit
   installed_contract = app.capability_contract
@@ -1471,9 +1470,7 @@ async def update_check(
       candidate = await asyncio.to_thread(
         install.fetch_git_package_summary, repo, fetch_manifest_url,
       )
-      require_bound_manifest(
-        candidate.manifest, bound_manifest_id, installed_package_id,
-      )
+      require_bound_manifest(candidate.manifest, bound_manifest_id)
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,
       )
@@ -1588,7 +1585,6 @@ async def update_candidate_preview(
 
   app = live_app_or_404(db, app_id)
   installed_manifest_url = app.manifest_url
-  installed_package_id = app.package_id
   source_dir = app.source_dir
   upstream_commit = app.upstream_commit
   installed_contract = app.capability_contract
@@ -1614,9 +1610,7 @@ async def update_candidate_preview(
         strict=True,
       )
       try:
-        require_bound_manifest(
-          candidate.manifest, bound_manifest_id, installed_package_id,
-        )
+        require_bound_manifest(candidate.manifest, bound_manifest_id)
       except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
       if manifest_url is not None and not _update_candidate_matches_installed(

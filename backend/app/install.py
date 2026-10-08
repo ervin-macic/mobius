@@ -74,7 +74,6 @@ from app.manifest_identity import (
   canonical_manifest_identity_key as _canonical_identity_key,
   requested_manifest_source,
   require_bound_manifest as _require_bound_manifest,
-  stored_manifest_fetch_url,
 )
 from app.manifest_contract import (
   EXECUTABLE_MANIFEST_FIELDS,
@@ -2369,7 +2368,6 @@ async def _fetch_and_validate_manifest(
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
-  bound_package_id: str | None = None,
 ) -> tuple[dict, str]:
   """Load one manifest and return it with its normalized asset base.
 
@@ -2402,7 +2400,7 @@ async def _fetch_and_validate_manifest(
 
   _validate_manifest(manifest)
   try:
-    _require_bound_manifest(manifest, bound_manifest_id, bound_package_id)
+    _require_bound_manifest(manifest, bound_manifest_id)
   except ValueError as exc:
     raise HTTPException(409, str(exc)) from exc
   return manifest, _normalize_raw_base(raw_base)
@@ -2872,13 +2870,8 @@ async def _fetch_install_candidate(
   expected_app_id: int | None,
   expected_upstream_commit: str | None,
   expected_candidate_digest: str | None,
-  bound_package_id: str | None = None,
 ) -> InstallCandidate:
-  """Fetch every install input once and enforce all review/replay guards.
-
-  `bound_package_id` is the updated row's own `package_id`; fresh installs
-  leave it unset so a stored address still binds by manifest id alone.
-  """
+  """Fetch every install input once and enforce all review/replay guards."""
   async with httpx.AsyncClient(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
@@ -2888,7 +2881,6 @@ async def _fetch_install_candidate(
       manifest_url=manifest_url,
       manifest=manifest,
       raw_base=raw_base,
-      bound_package_id=bound_package_id,
     )
     source_url = (
       requested_manifest_source(manifest_url)[0]
@@ -3089,12 +3081,9 @@ async def _authorize_source_handoff(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
   ) as cli:
-    # The old row's own address is fetched without the stored id binding:
-    # trust here comes from `package_id` + `moved_to`, and a `package_id` app
-    # may have changed its manifest id without `previous_id`.
     old_manifest, _ = await _fetch_and_validate_manifest(
       cli,
-      manifest_url=stored_manifest_fetch_url(existing.manifest_url),
+      manifest_url=existing.manifest_url,
       manifest=None,
       raw_base=None,
     )
@@ -4138,7 +4127,6 @@ async def install_from_manifest(
         expected_app_id=expected_app_id,
         expected_upstream_commit=expected_upstream_commit,
         expected_candidate_digest=expected_candidate_digest,
-        bound_package_id=reviewed_app.package_id,
       )
       git_candidate = None
     else:
@@ -4167,9 +4155,7 @@ async def install_from_manifest(
         ) from exc
       candidate = git_candidate.candidate
       try:
-        _require_bound_manifest(
-          candidate.manifest, bound_manifest_id, reviewed_app.package_id,
-        )
+        _require_bound_manifest(candidate.manifest, bound_manifest_id)
       except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     if git_candidate is not None and manifest is not None and manifest != candidate.manifest:
@@ -4214,12 +4200,6 @@ async def install_from_manifest(
         },
       )
   else:
-    # Only a replay of a known row may follow that row's package_id across
-    # a manifest id change; fresh installs bind by id alone.
-    expected_app = (
-      db.get(models.App, expected_app_id) if expected_app_id is not None
-      else None
-    )
     candidate = await _fetch_install_candidate(
       manifest_url=manifest_url,
       manifest=manifest,
@@ -4229,7 +4209,6 @@ async def install_from_manifest(
       expected_app_id=expected_app_id,
       expected_upstream_commit=expected_upstream_commit,
       expected_candidate_digest=expected_candidate_digest,
-      bound_package_id=expected_app.package_id if expected_app else None,
     )
 
   if manifest_url is not None:
