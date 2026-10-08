@@ -55,8 +55,6 @@
 .md-app-block__cancel:hover { background:color-mix(in srgb, var(--text) 8%, var(--surface)); }
 .md-app-block__cancel:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .md-app-block__cancel:disabled { opacity:.55; cursor:not-allowed; }
-.md-app-block__controls.is-confirming { flex-wrap:wrap; flex-basis:100%; }
-.md-app-block__confirm { flex-basis:100%; color:var(--text); font-size:14px; overflow-wrap:anywhere; }
 .md-app-block__note,.md-app-block__notice { margin:0; padding:4px 16px 12px; color:var(--muted); font-size:14px; overflow-wrap:anywhere; }
 .md-app-block__note.is-danger { color:var(--danger, #f85149); }
 .md-app-block__note.is-attention { color:var(--warning, #d29922); }

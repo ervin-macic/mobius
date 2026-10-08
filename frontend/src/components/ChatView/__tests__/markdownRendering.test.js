@@ -4,7 +4,6 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { Marked } from 'marked'
 import { createServer } from 'vite'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { mathTokens } from '../markdown/mathTokens.js'
 
 const vite = await createServer({
@@ -21,9 +20,6 @@ const { default: InlineContent } = await vite.ssrLoadModule(
 )
 const { BlockToken } = await vite.ssrLoadModule(
   '/src/components/ChatView/markdown/blocks.jsx',
-)
-const { StandardMarkdown, ProgressiveMarkdown } = await vite.ssrLoadModule(
-  '/src/components/ChatView/markdown/BlockRenderer.jsx',
 )
 
 after(() => vite.close())
@@ -61,29 +57,4 @@ test('escaped currency renders its dollar sign while real math stays math', () =
   assert.match(markup, /Revenue reached \$100M while/)
   assert.doesNotMatch(markup, /\\\$100M/)
   assert.match(markup, /md-math-inline/)
-})
-
-test('app blocks render only where the caller opts in (assistant replies)', () => {
-  const priorWindow = globalThis.window
-  globalThis.window = { location: new URL('https://mobius.test/shell') }
-  try {
-    const fence = '```mobius-app\n' + JSON.stringify({ app: 'contribute', intent: 'review:a', title: 'Fix typo',
-      action: { label: 'Contribute', intent: 'chat-send:a' }, pull: { repo: 'owner/repo', state: 'proposed' } }) + '\n```'
-    const render = (Component, props) => renderToStaticMarkup(React.createElement(QueryClientProvider,
-      { client: new QueryClient() }, React.createElement(Component, { text: fence, ...props })))
-    for (const Component of [StandardMarkdown, ProgressiveMarkdown]) {
-      const plain = render(Component, {})
-      assert.match(plain, /<pre[^]*&quot;app&quot;:&quot;contribute&quot;/)
-      assert.doesNotMatch(plain, /md-app-block/)
-      const owned = render(Component, { allowAppBlocks: true })
-      assert.match(owned, /md-app-block--pull/)
-      assert.doesNotMatch(owned, /<pre/)
-    }
-    // Nested containers inherit the caller's choice.
-    const quoted = '> ' + fence.split('\n').join('\n> ')
-    assert.doesNotMatch(render(StandardMarkdown, { text: quoted }), /md-app-block/)
-    assert.match(render(StandardMarkdown, { text: quoted, allowAppBlocks: true }), /md-app-block/)
-  } finally {
-    globalThis.window = priorWindow
-  }
 })

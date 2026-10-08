@@ -635,16 +635,6 @@
     //   7. parent posts {type:'moebius:frame-interactivity', interactive}
     //      whenever a shell modal (currently the navigation drawer) suspends or
     //      restores direct input without unpainting/reloading the app.
-    //   7b. transcript block session (only for a module exporting
-    //      `appBlockSessions = true`): parent posts
-    //      {type:'moebius:app-block-init', sessionId, actions} and
-    //      {type:'moebius:app-block-action', sessionId, key, event, nonce}
-    //      (event: activate | confirm | cancel). The app receives them through
-    //      props.blockSession.subscribe(cb) and answers with
-    //      props.blockSession.setState({actions, notice}), which posts
-    //      {type:'moebius:app-block-state', sessionId, ...}. Messages for any
-    //      other session, or for a module without the export, never reach app
-    //      listeners.
     //   8. parent may post {type:'moebius:app-intent', intent, nonce}; after
     //      app message handlers and their resulting React commits can run, the
     //      frame answers {type:'moebius:app-intent-applied', appId, nonce}.
@@ -1100,43 +1090,6 @@
     document.addEventListener('pointerdown', notifyParentFocus, { capture: true, passive: true });
     document.addEventListener('wheel', rememberGestureScrollers, { capture: true, passive: true });
 
-    // The app's handle on a transcript block session: the host's passive
-    // context plus a subscription to its events and a way to report state.
-    const blockSessionListeners = new Set();
-    function blockSessionApi(session) {
-      if (!session || typeof session.sessionId !== 'string') return null;
-      return Object.freeze({
-        sessionId: session.sessionId,
-        actions: Array.isArray(session.actions) ? session.actions : [],
-        subscribe(cb) {
-          if (typeof cb !== 'function') return function () {};
-          blockSessionListeners.add(cb);
-          return function () { blockSessionListeners.delete(cb); };
-        },
-        setState(state) {
-          window.parent.postMessage(
-            Object.assign({}, state, { type: 'moebius:app-block-state', sessionId: session.sessionId }),
-            window.location.origin
-          );
-        },
-      });
-    }
-
-    // Returns true when the message was a block-session message (handled).
-    function deliverBlockSessionMessage(event, msg) {
-      if (msg.type !== 'moebius:app-block-init' && msg.type !== 'moebius:app-block-action') return false;
-      if (!supportsAppBlocks || !currentBlockSession || msg.sessionId !== currentBlockSession.sessionId) {
-        // Registered before the module loads, so this keeps the message from
-        // every app listener.
-        event.stopImmediatePropagation();
-        return true;
-      }
-      blockSessionListeners.forEach(function (cb) {
-        try { cb(msg); } catch (err) { console.error(err); }
-      });
-      return true;
-    }
-
     function renderMountedComponent() {
       if (!mountedRoot || !mountedComponent || !currentToken) return;
       mountedRoot.render(
@@ -1571,7 +1524,6 @@
         } catch (e) {}
         return;
       }
-      if (deliverBlockSessionMessage(e, msg)) return;
       if (msg.type === 'moebius:app-intent') {
         acknowledgeAppIntent(msg.nonce);
         // Returning from this runtime listener does not stop the message event:
@@ -1601,7 +1553,7 @@
         acceptToken(msg.token);
         if (initialized) return;
         initialized = true;
-        currentBlockSession = blockSessionApi(msg.blockSession);
+        currentBlockSession = msg.blockSession || null;
         if (typeof window.__mobiusHydrateLocalStorage === 'function') {
           window.__mobiusHydrateLocalStorage(msg.storage);
         }

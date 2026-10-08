@@ -141,7 +141,7 @@ export function Table({ token, onInternalNav, mediaDimensions }) {
   )
 }
 
-export function BlockQuote({ token, onInternalNav, mediaDimensions, allowAppBlocks = false }) {
+export function BlockQuote({ token, onInternalNav, mediaDimensions }) {
   return (
     <blockquote className="md-blockquote">
       {token.tokens?.map((child, i) => (
@@ -150,14 +150,13 @@ export function BlockQuote({ token, onInternalNav, mediaDimensions, allowAppBloc
           token={child}
           onInternalNav={onInternalNav}
           mediaDimensions={mediaDimensions}
-          allowAppBlocks={allowAppBlocks}
         />
       ))}
     </blockquote>
   )
 }
 
-export function ListBlock({ token, onInternalNav, mediaDimensions, allowAppBlocks = false }) {
+export function ListBlock({ token, onInternalNav, mediaDimensions }) {
   const Tag = token.ordered ? 'ol' : 'ul'
   return (
     <Tag className="md-list" start={token.ordered ? token.start : undefined}>
@@ -180,7 +179,6 @@ export function ListBlock({ token, onInternalNav, mediaDimensions, allowAppBlock
                 token={child}
                 onInternalNav={onInternalNav}
                 mediaDimensions={mediaDimensions}
-                allowAppBlocks={allowAppBlocks}
               />
             )
           })}
@@ -221,7 +219,7 @@ export function HorizontalRule() {
  * Renders a single block-level token.
  * Used by BlockQuote and other nesting containers.
  */
-export function BlockToken({ token, onInternalNav, mediaDimensions, allowAppBlocks = false }) {
+export function BlockToken({ token, onInternalNav, mediaDimensions }) {
   switch (token.type) {
     case 'paragraph': return (
       <Paragraph
@@ -238,9 +236,7 @@ export function BlockToken({ token, onInternalNav, mediaDimensions, allowAppBloc
       />
     )
     case 'code': {
-      // Only the owner's assistant replies may render app blocks; peer notes,
-      // documents and other markdown keep the fence as plain code.
-      const block = allowAppBlocks ? appBlockFromToken(token) : null
+      const block = appBlockFromToken(token)
       return block ? <AppBlock block={block} onInternalNav={onInternalNav} /> : <CodeBlock token={token} />
     }
     case 'table': return (
@@ -255,7 +251,6 @@ export function BlockToken({ token, onInternalNav, mediaDimensions, allowAppBloc
         token={token}
         onInternalNav={onInternalNav}
         mediaDimensions={mediaDimensions}
-        allowAppBlocks={allowAppBlocks}
       />
     )
     case 'list': return (
@@ -263,7 +258,6 @@ export function BlockToken({ token, onInternalNav, mediaDimensions, allowAppBloc
         token={token}
         onInternalNav={onInternalNav}
         mediaDimensions={mediaDimensions}
-        allowAppBlocks={allowAppBlocks}
       />
     )
     case 'hr': return <HorizontalRule />
@@ -281,5 +275,4 @@ export const MemoBlock = memo(BlockToken, (prev, next) => {
   return prev.token.raw === next.token.raw
     && prev.onInternalNav === next.onInternalNav
     && prev.mediaDimensions === next.mediaDimensions
-    && prev.allowAppBlocks === next.allowAppBlocks
 })

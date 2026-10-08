@@ -39,9 +39,6 @@ export function inlineBlockState(message, sessionId, keys) {
     actions.push({ key: raw.key, label: shortText(raw.label, 40),
       disabled: raw.disabled === true, busy: raw.busy === true, confirming: raw.confirming === true,
       hidden: raw.hidden === true, note: shortText(raw.note, 500),
-      // What the app itself says the confirmation will do. Without it the host
-      // offers no Confirm: the block's own text is model-authored, not the app's.
-      summary: shortText(raw.summary, 500), busyLabel: shortText(raw.busyLabel, 40),
       tone: SESSION_TONES.has(raw.tone) ? raw.tone : 'neutral',
       status: shortText(raw.status, 40),
       statusTone: SESSION_TONES.has(raw.statusTone) ? raw.statusTone : 'neutral', links,
@@ -49,22 +46,6 @@ export function inlineBlockState(message, sessionId, keys) {
       ...(Array.isArray(raw.badges) ? { badges: pullBadges(raw.badges) } : {}) })
   }
   return { actions, notice: shortText(message.notice, 500) }
-}
-
-/** A transcript is not a workspace navigation owner or a second chat-control
- *  authority, so an embedded view may only open a conversation or an app, and
- *  only while the reader can see it: a hidden session frame never navigates. */
-export function transcriptHostRequest(request, { visible, navigate }) {
-  if (!visible) {
-    throw new Error('Open the app to continue. A hidden transcript view cannot navigate.')
-  }
-  if (request?.type === 'moebius:open-chat' && request.chatId) {
-    navigate(`/shell/?${new URLSearchParams({ chat: request.chatId })}`)
-  } else if (request?.type === 'moebius:open-app' && request.appId) {
-    navigate(`/shell/?${new URLSearchParams({ app: request.appId, ...(request.intent ? { intent: request.intent } : {}) })}`)
-  } else {
-    throw new Error('Open the app to use workspace controls. This transcript view can only open conversations and apps.')
-  }
 }
 
 /* A pull-request snapshot renders like a GitHub PR row. Anything malformed is
