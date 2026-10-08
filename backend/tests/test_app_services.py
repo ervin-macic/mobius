@@ -1,6 +1,7 @@
 """Accepted app services own policy; the platform owns their hard boundary."""
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -317,6 +318,35 @@ async def test_preload_and_tool_lane_receive_the_reviewed_output_budget(db, auth
     app, owner, {"actor": {}, "public": False}, lane="tools",
   )
   assert (status, body, seen) == (200, {"ok": True}, [12 * 1024 * 1024])
+
+
+@pytest.mark.asyncio
+async def test_dense_tool_request_serialization_uses_bounded_buffer(db, auth, monkeypatch):
+  import tracemalloc
+  from app import service_preload
+
+  app = _service_app(db, max_bytes=60 * 1024 * 1024)
+  owner = db.query(models.Owner).first()
+  envelope = {"actor": {}, "body": [0] * 200_000, "caption": "café"}
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: object())
+
+  async def run(_host, _environment, request, **kwargs):
+    # Input allocation is excluded; serialization must not retain one object
+    # per JSON token. Leave headroom for encoding and normal invocation setup.
+    _current, peak = tracemalloc.get_traced_memory()
+    assert peak < len(request) * 8
+    assert json.loads(request) == envelope
+    return b'{"body": {"ok": true}}', b"", 0
+
+  monkeypatch.setattr(service_preload, "run", run)
+  tracemalloc.start()
+  try:
+    status, body, _headers, _media = await app_services.invoke_service(
+      app, owner, envelope, lane="tools",
+    )
+  finally:
+    tracemalloc.stop()
+  assert (status, body) == (200, {"ok": True})
 
 
 @pytest.mark.asyncio

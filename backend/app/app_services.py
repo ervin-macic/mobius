@@ -15,6 +15,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import io
 import json
 import logging
 import os
@@ -339,7 +340,7 @@ async def invoke_service(
   try:
     # Tool calls bypass HTTP body admission. Bound their serialization too,
     # rather than building an arbitrarily large complete request first.
-    parts = []
+    buffer = io.BytesIO()
     size = 0
     for part in json.JSONEncoder(
       ensure_ascii=False, separators=(",", ":"), allow_nan=False,
@@ -348,8 +349,8 @@ async def invoke_service(
       size += len(encoded)
       if size > max_bytes:
         raise HTTPException(413, "App service request is too large.")
-      parts.append(encoded)
-    request_bytes = b"".join(parts)
+      buffer.write(encoded)
+    request_bytes = buffer.getvalue()
   except (TypeError, ValueError, RecursionError) as exc:
     raise HTTPException(400, "App service request contains invalid JSON data.") from exc
 

@@ -924,6 +924,8 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
       item not in before for item in after
     )
   if path in {"service.max_request_bytes", "service.max_response_bytes"}:
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a transfer allowance.
     # Service transfer is a reviewed ceiling, not an unordered declaration.
     # A legacy accepted service without these fields had the 8 MiB default.
     old = SERVICE_REQUEST_MAX_BYTES if before is None else before

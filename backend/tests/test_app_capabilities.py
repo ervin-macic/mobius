@@ -227,6 +227,20 @@ def test_service_transfer_ceiling_is_reviewed_and_defaults_closed():
       validate_manifest_contract(dict(base, service={"entry": "service.py", "max_bytes": value}))
 
 
+def test_service_revocation_never_restores_an_absent_transfer_ceiling():
+  manifest = _manifest(source_files=["service.py"],
+                       service={"entry": "service.py", "max_bytes": 1024})
+  capped, _ = contract_and_digest(manifest)
+  revoked = {key: value for key, value in capped.items() if key != "service"}
+  assert diff_contracts(capped, revoked)["widens"] is False
+
+  # Removing only the explicit ceiling keeps the service granted and restores
+  # its larger default; unlike revocation, that does require owner review.
+  legacy = dict(capped, service={key: value for key, value in capped["service"].items()
+                               if key not in {"max_request_bytes", "max_response_bytes"}})
+  assert diff_contracts(capped, legacy)["widens"] is True
+
+
 def test_agent_activities_bind_only_declared_source_commands():
   manifest = _manifest(
     source_files=["memory-core.md", "lookup.py"],
