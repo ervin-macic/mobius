@@ -1637,6 +1637,138 @@ def test_unknown_target_health_at_deadline_preserves_boot_and_receipt(
   assert host.read_transaction()["phase"] == "replacement_started"
 
 
+@pytest.mark.parametrize("path", ["run", "recover"])
+@pytest.mark.parametrize("target_health", ["starting", "running"])
+@pytest.mark.parametrize("unknown_observation", [False, True])
+def test_readiness_budget_preserves_single_rollback_policy(
+  tmp_path, monkeypatch, path, target_health, unknown_observation,
+):
+  # Exercise run/recover -> wait_healthy -> container_health and the real
+  # rollback/journal/ledger-command/settlement paths. The fixture supplies a
+  # consumed-boot proof; Docker transport, logs, disk preflight and time are fake.
+  config, inbox = _worker_paths(tmp_path, monkeypatch)
+  expected, nonce = "a" * 40, "2" * 32
+  previous, target = "sha256:previous", "sha256:target"
+  clock = [0.0]
+  current = [previous if path == "run" else target]
+  previous_health = ["starting"]
+  target_probes, boots, ledger_calls, deadlines = [], [], [], []
+  monkeypatch.setattr(host.time, "monotonic", lambda: clock[0])
+  monkeypatch.setattr(host.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+  monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
+  monkeypatch.setattr(host, "_bounded_docker_logs", lambda _cid: (b"", b"", False, False))
+
+  def command(args, **kwargs):
+    output = ""
+    if args[1] == "compose":
+      if "ps" in args:
+        output = "b" * 64 if current[0] == previous else "c" * 64
+        if "-a" in args:
+          deadlines.append((clock[0], kwargs["timeout"]))
+      elif "up" in args:
+        image = kwargs["env"]["MOBIUS_IMAGE"]
+        journal = host.read_transaction()
+        assert journal["phase"] == ("replacement_started" if image == host.TARGET_TAG else "rollback_started")
+        assert image in {host.TARGET_TAG, previous}
+        boots.append((clock[0], image, journal["operation_id"]))
+        current[0] = target if image == host.TARGET_TAG else previous
+      else:
+        pytest.fail(f"unexpected Compose command: {args}")
+    elif args[1:3] == ["image", "inspect"]:
+      template = args[-2]
+      output = (expected if "revision" in template else
+                host.IMAGE_SOURCE if "source" in template else
+                "amd64" if "Architecture" in template else target)
+    elif args[1:3] == ["container", "inspect"]:
+      if args[-2] == "{{.Image}}":
+        output = current[0]
+      else:
+        health = previous_health[0]
+        if current[0] == target:
+          target_probes.append(clock[0])
+          if unknown_observation and len(target_probes) > 1:
+            raise subprocess.CalledProcessError(1, args)
+          health = target_health
+        # "running" has no Docker healthcheck, "starting" has one.
+        output = f"{current[0]} running" + (f" {health}" if health != "running" else "")
+    elif args[1] == "exec":
+      action, operation = args[-2:]
+      assert operation == host.read_transaction()["operation_id"]
+      if action == "rearm-cutover":
+        assert host.read_transaction()["phase"] == "rollback_started"
+      ledger_calls.append((action, operation))
+    elif args[1] not in {"pull", "tag", "image", "ps"}:
+      pytest.fail(f"unexpected Docker command: {args}")
+    return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+  monkeypatch.setattr(host, "docker_command", command)
+  if path == "run":
+    (inbox / "request.json").write_text(json.dumps({
+      "version": 2, "expected_sha": expected, "nonce": nonce,
+    }))
+    assert host.run() == 1
+    assert not (inbox / "request.json").exists()
+  else:
+    transaction = host.transaction_record("1" * 32, expected, nonce, previous, target)
+    transaction["phase"] = "replacement_started"
+    host.write_transaction(transaction)
+    host.recover(config, transaction)
+
+  journal = host.read_transaction()
+  operation = journal["operation_id"]
+  status = host.read_json(host.STATUS)
+  assert status["state"] == "needs_recovery"
+  assert status["request_nonce"] == nonce and status["expected_sha"] == expected
+  assert all(0 < timeout <= 10 for _at, timeout in deadlines)
+  # The final pair of Docker queries must fit the remaining readiness budget.
+  assert (177.0, 1.5) in deadlines
+  wait_probes = target_probes[:60] if path == "run" else target_probes[1:61]
+  assert wait_probes == [float(t) for t in range(0, 180, 3)]
+  rollback_boots = [boot for boot in boots if boot[1] == previous]
+  if unknown_observation:
+    assert clock[0] == 180
+    assert journal["phase"] == "replacement_started"
+    assert not rollback_boots
+    assert not any(action in {"rearm-cutover", "finalize-cutover"} for action, _op in ledger_calls)
+    before = list(boots), list(ledger_calls)
+    assert host.reconcile() == 0
+    assert host.reconcile() == 0
+    assert (boots, ledger_calls) == before
+    assert host.read_json(host.STATUS)["state"] == "needs_recovery"
+    assert host.read_transaction()["phase"] == "replacement_started"
+    return
+
+  assert clock[0] == 180 + host.ROLLBACK_HEALTH_SECONDS
+  assert rollback_boots == [(180.0, previous, operation)]
+  assert journal["phase"] == "rollback_started"
+  assert journal["failure_code"] == "readiness_budget_exhausted"
+  subject = "the new container" if path == "run" else "the interrupted replacement"
+  detail = f"{subject} was not serviceable within the readiness budget"
+  assert journal["failure_detail"] == detail
+  assert [(action, op) for action, op in ledger_calls if action == "rearm-cutover"] == [("rearm-cutover", operation)]
+  # Reconciliation may observe the same slow rollback, but cannot boot it again.
+  before = list(boots), list(ledger_calls)
+  assert host.reconcile() == 0
+  assert clock[0] == 180 + 2 * host.ROLLBACK_HEALTH_SECONDS
+  assert (boots, ledger_calls) == before
+  assert host.read_transaction()["failure_code"] == "readiness_budget_exhausted"
+  previous_health[0] = "healthy"
+  assert host.reconcile() == 0
+  status = host.read_json(host.STATUS)
+  assert status["state"] == "rolled_back"
+  assert status["code"] == status["failure_code"] == "readiness_budget_exhausted"
+  assert status["failure_detail"] == detail
+  assert status["message"] == f"The previous container was restored: {detail}"
+  assert status["operation_id"] == operation and status["request_nonce"] == nonce
+  assert host.read_json(config["control_dir"] / "status.json") == status
+  assert host.read_transaction() is None
+  assert ledger_calls[-1] == ("finalize-cutover", operation)
+  before = list(boots), list(ledger_calls)
+  assert host.reconcile() == 0
+  assert host.reconcile() == 0
+  assert (boots, ledger_calls) == before
+
+
 def test_installer_stops_before_publishing_units_when_seeding_refuses(tmp_path):
   source = INSTALLER.read_text()
   start = source.index("MOBIUS_REBUILD_LOCK_HELD=1")

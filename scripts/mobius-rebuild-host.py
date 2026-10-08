@@ -51,7 +51,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 8
+WORKER_REVISION = 9
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -359,6 +359,7 @@ def container_health(config_value: dict, timeout: float = 10) -> tuple[str, str,
 
 
 def wait_healthy(config_value: dict, timeout: int = 180) -> bool:
+    """False means not serviceable within budget, not proof of a crashed boot."""
     deadline = time.monotonic() + timeout
     probe_failed = False
     while time.monotonic() < deadline:
@@ -1058,7 +1059,8 @@ def run() -> int:
             if not wait_healthy(config_value):
                 result = rollback(
                     config_value, operation, expected,
-                    "health_check_failed", "the new container was unhealthy",
+                    "readiness_budget_exhausted",
+                    "the new container was not serviceable within the readiness budget",
                     previous,
                 )
                 try:
@@ -1332,6 +1334,12 @@ def recover(config_value: dict, transaction: dict) -> None:
             if health in {"starting", "unhealthy", "running"}:
                 if wait_healthy(config_value):
                     cid, current, health = container_health(config_value)
+                else:
+                    rollback(config_value, operation, expected,
+                             "readiness_budget_exhausted",
+                             "the interrupted replacement was not serviceable within the readiness budget",
+                             previous)
+                    return
             if health == "healthy" and current == transaction["target_image"]:
                 try:
                     verify_served_generation(cid, expected)
