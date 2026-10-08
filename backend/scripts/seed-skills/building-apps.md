@@ -393,8 +393,6 @@ const { entries, complete, source } = await window.mobius.storage.listWithStatus
 const { entries: records, complete: recordsComplete } =
   await window.mobius.storage.listWithStatus('items/', { includeContent: true })
 window.mobius.online                        // boolean
-window.mobius.visible                       // boolean
-window.mobius.onVisibilityChange(cb)         // unsubscribe fn
 await window.mobius.storage.pendingCount()  // unsynced writes — for sync logic only, never rendered as UI
 ```
 

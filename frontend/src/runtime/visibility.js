@@ -15,10 +15,8 @@
 // outside AppCanvas keeps document semantics.
 
 export function makeVisibility({ win, doc } = {}) {
-  // The frame bootstrap retains verdicts sent before this bundle evaluates.
-  let frameVisible = typeof win?.__mobiusFrameVisible === 'boolean'
-    ? win.__mobiusFrameVisible : true
-  let visible = frameVisible && !doc?.hidden
+  let frameVisible = true
+  let visible = !doc?.hidden
   const listeners = new Set()
 
   function recompute() {

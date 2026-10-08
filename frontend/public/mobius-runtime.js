@@ -4432,8 +4432,8 @@ function makeProjects() {
 //#endregion
 //#region src/runtime/visibility.js
 function makeVisibility({ win, doc } = {}) {
-	let frameVisible = typeof win?.__mobiusFrameVisible === "boolean" ? win.__mobiusFrameVisible : true;
-	let visible = frameVisible && !doc?.hidden;
+	let frameVisible = true;
+	let visible = !doc?.hidden;
 	const listeners = /* @__PURE__ */ new Set();
 	function recompute() {
 		const next = frameVisible && !doc?.hidden;

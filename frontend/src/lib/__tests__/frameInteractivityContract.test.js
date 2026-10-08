@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs'
 import { runInNewContext } from 'node:vm'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { makeVisibility } from '../../runtime/visibility.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const src = resolve(here, '../..')
@@ -197,63 +196,4 @@ test('the app frame relays a child frame\'s shell action only while that frame h
   frameDoc.focus(frameDoc.iframeOf(frameDoc.child))
   frameDoc.message(frameDoc.child, action)
   assert.deepEqual(frameDoc.shellPosts.at(-1).message, action, 'relayed from the focused child frame')
-})
-
-const frameHtml = frame
-
-function bootVisibilityFrame() {
-  // Execute the real bootstrap listener, without fetching or mounting an app.
-  const source = frameHtml.match(/window\.addEventListener\('message', \(e\) => \{\s*if \(e\.source !== window\.parent \|\| e\.origin !== window\.location\.origin\) return;[\s\S]*?\n    \}\);/)?.[0]
-  assert.ok(source, 'frame bootstrap message listener exists')
-  const listeners = []
-  const parent = {}
-  const win = {
-    parent,
-    addEventListener(type, cb) { if (type === 'message') listeners.push(cb) },
-    dispatchMessage(event) { for (const cb of listeners) cb(event) },
-  }
-  const frame = { win, parent, doc: { hidden: false, addEventListener() {} } }
-  frame.win.location = { origin: 'https://mobius.test' }
-  let loading = false
-  runInNewContext(source, {
-    window: frame.win,
-    initialized: false,
-    currentCapabilityContract: null,
-    acceptToken() {},
-    applyTheme() {},
-    loadModule() { loading = true },
-  })
-  return {
-    ...frame,
-    get loading() { return loading },
-    deliver(data, source = frame.parent, origin = frame.win.location.origin) {
-      // Use a real message event shape, including the bootstrap origin guard.
-      frame.win.dispatchMessage({ data, source, origin })
-    },
-  }
-}
-
-test('frame bootstrap retains an early hide while the app module is loading', () => {
-  const frame = bootVisibilityFrame()
-  frame.deliver({ type: 'moebius:frame-init', token: 'synthetic-test-token' })
-  assert.equal(frame.loading, true)
-  frame.deliver({ type: 'moebius:frame-visibility', visible: false })
-  const visibility = makeVisibility(frame)
-  const seen = []
-  visibility.onVisibilityChange(v => seen.push(v))
-  assert.equal(visibility.visible, false)
-  assert.deepEqual(seen, [false])
-  frame.deliver({ type: 'moebius:frame-visibility', visible: true })
-  assert.deepEqual(seen, [false, true])
-})
-
-test('frame bootstrap retains the latest valid parent verdict only', () => {
-  const frame = bootVisibilityFrame()
-  frame.deliver({ type: 'moebius:frame-visibility', visible: false })
-  frame.deliver({ type: 'moebius:frame-visibility', visible: true }, {})
-  frame.deliver({ type: 'moebius:frame-visibility', visible: true }, frame.parent, 'https://other.test')
-  frame.deliver({ type: 'moebius:frame-visibility', visible: 'true' })
-  assert.equal(makeVisibility(frame).visible, false)
-  frame.deliver({ type: 'moebius:frame-visibility', visible: true })
-  assert.equal(makeVisibility(frame).visible, true)
 })

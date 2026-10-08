@@ -77,26 +77,3 @@ test('an unsubscribed visibility listener stops receiving changes', () => {
   assert.deepEqual(seen, [false])
   assert.equal(visibility.visible, true)
 })
-
-test('a verdict retained before runtime startup seeds the first callback', () => {
-  const frame = fakeFrame()
-  frame.win.__mobiusFrameVisible = false
-  const visibility = makeVisibility(frame)
-  const seen = []
-  visibility.onVisibilityChange(v => seen.push(v))
-  assert.equal(visibility.visible, false)
-  assert.deepEqual(seen, [false])
-  frame.post({ type: 'moebius:frame-visibility', visible: true })
-  assert.deepEqual(seen, [false, true])
-})
-
-test('only boolean retained verdicts override the foreground default', () => {
-  for (const verdict of [undefined, null, 'false', 0, true]) {
-    const frame = fakeFrame()
-    frame.win.__mobiusFrameVisible = verdict
-    assert.equal(makeVisibility(frame).visible, true)
-  }
-  const hidden = fakeFrame({ hidden: true })
-  hidden.win.__mobiusFrameVisible = true
-  assert.equal(makeVisibility(hidden).visible, false)
-})
