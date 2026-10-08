@@ -170,3 +170,53 @@ def test_tracing_setup_failure_never_blocks_server_boot(tracing_config, monkeypa
   assert tracing._tracer is None
   with tracing.span("anything") as handle:
     assert handle is None
+
+
+
+@pytest.mark.parametrize("failing_step", ["httpx", "fastapi"])
+def test_late_tracing_setup_failure_unwinds_every_earlier_step(
+  tracing_config, monkeypatch, failing_step,
+):
+  """A failure in a late setup step must leave tracing fully off: no request
+  or SQL spans reach the exporter, the propagator is restored, and the server
+  can keep assembling its app."""
+  otel_sdk = _otel_sdk()
+  from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+  from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+  from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+  from opentelemetry.propagate import get_global_textmap
+  from starlette.middleware.gzip import GZipMiddleware
+
+  monkeypatch.setattr(tracing, "_tracer", None)
+
+  def drifted(*_args, **_kwargs):
+    raise TypeError(f"{failing_step} instrumentation drifted")
+
+  if failing_step == "httpx":
+    monkeypatch.setattr(HTTPXClientInstrumentor, "instrument", drifted)
+  else:
+    monkeypatch.setattr(FastAPIInstrumentor, "instrument_app", drifted)
+  original_textmap = get_global_textmap()
+  exporter = otel_sdk.InMemorySpanExporter()
+  app = FastAPI()
+  engine = create_engine("sqlite://")
+
+  @app.get("/api/things/{thing_id}")
+  def read_thing(thing_id: int):
+    with engine.connect() as conn:
+      conn.execute(text("SELECT 1"))
+    return {"id": thing_id}
+
+  try:
+    assert tracing.configure(app, engine, exporter=exporter) is False
+    assert tracing._tracer is None
+    assert get_global_textmap() is original_textmap
+    assert not SQLAlchemyInstrumentor().is_instrumented_by_opentelemetry
+    assert not HTTPXClientInstrumentor().is_instrumented_by_opentelemetry
+    # main.py adds its middleware after configure(); that must still work.
+    app.add_middleware(GZipMiddleware)
+    assert TestClient(app).get("/api/things/7").status_code == 200
+  finally:
+    HTTPXClientInstrumentor().uninstrument()
+    SQLAlchemyInstrumentor().uninstrument()
+  assert exporter.get_finished_spans() == ()

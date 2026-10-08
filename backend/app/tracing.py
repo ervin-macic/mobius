@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
@@ -156,7 +156,7 @@ def configure(app, engine, *, exporter=None) -> bool:
   try:
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.context import Context
-    from opentelemetry.propagate import set_global_textmap
+    from opentelemetry.propagate import get_global_textmap, set_global_textmap
     from opentelemetry.propagators.textmap import TextMapPropagator
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -199,24 +199,34 @@ def configure(app, engine, *, exporter=None) -> bool:
       return self._inner.force_flush(timeout_millis)
 
   try:
-    provider = TracerProvider(resource=Resource.create({"service.name": "mobius"}))
-    if exporter is None:
-      provider.add_span_processor(BatchSpanProcessor(_ScrubbingExporter(
-        OTLPSpanExporter(endpoint=f"{config['endpoint']}/v1/traces"),
-      )))
-    else:
-      provider.add_span_processor(SimpleSpanProcessor(_ScrubbingExporter(exporter)))
-    # Spans stay inside this instance: never add a traceparent header to
-    # outgoing requests (proxy fetches reach arbitrary third parties).
-    set_global_textmap(_LocalOnlyPropagation())
+    # All or nothing: a failed step unwinds every step before it, so a
+    # half-configured setup never exports spans or keeps the propagator.
+    with ExitStack() as rollback:
+      provider = TracerProvider(resource=Resource.create({"service.name": "mobius"}))
+      rollback.callback(provider.shutdown)
+      if exporter is None:
+        provider.add_span_processor(BatchSpanProcessor(_ScrubbingExporter(
+          OTLPSpanExporter(endpoint=f"{config['endpoint']}/v1/traces"),
+        )))
+      else:
+        provider.add_span_processor(SimpleSpanProcessor(_ScrubbingExporter(exporter)))
+      # Spans stay inside this instance: never add a traceparent header to
+      # outgoing requests (proxy fetches reach arbitrary third parties).
+      rollback.callback(set_global_textmap, get_global_textmap())
+      set_global_textmap(_LocalOnlyPropagation())
+      SQLAlchemyInstrumentor().instrument(engine=engine, tracer_provider=provider)
+      rollback.callback(SQLAlchemyInstrumentor().uninstrument)
+      HTTPXClientInstrumentor().instrument(tracer_provider=provider)
+      rollback.callback(HTTPXClientInstrumentor().uninstrument)
 
-    # ASGI send/receive spans are one per streamed chunk; on a live chat stream
-    # they bury the request span under thousands of children.
-    FastAPIInstrumentor.instrument_app(
-      app, tracer_provider=provider, exclude_spans=["send", "receive"],
-    )
-    SQLAlchemyInstrumentor().instrument(engine=engine, tracer_provider=provider)
-    HTTPXClientInstrumentor().instrument(tracer_provider=provider)
+      # Last, because it cannot be undone safely: uninstrument_app builds the
+      # middleware stack, after which main.py could no longer add middleware.
+      # ASGI send/receive spans are one per streamed chunk; on a live chat
+      # stream they bury the request span under thousands of children.
+      FastAPIInstrumentor.instrument_app(
+        app, tracer_provider=provider, exclude_spans=["send", "receive"],
+      )
+      rollback.pop_all()
   except Exception:
     # Optional diagnostics must never stop the server from booting, e.g. when
     # a locally installed OpenTelemetry drifts from the platform's FastAPI.
