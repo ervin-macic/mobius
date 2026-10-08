@@ -368,14 +368,17 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
     if body.state == "all_clear":
-      try:
-        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-      except HTTPException as exc:
-        if row.mode == "review_merge":
-          raise
-        reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
-          "head_sha": target["head_sha"], "summary": str(exc.detail)})
-        return {"run": _run_view(db, row)}
+      # A read-only review stays valid when the base later moves; only the
+      # merging modes need the reviewed base to still be current.
+      if row.mode != "review":
+        try:
+          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+        except HTTPException as exc:
+          if row.mode == "review_merge":
+            raise
+          reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
+            "head_sha": target["head_sha"], "summary": str(exc.detail)})
+          return {"run": _run_view(db, row)}
       _parent(db, row, principal)
       if row.mode == "review_fix_merge":
         reviews.require_independent_clear(row, target, body)
@@ -973,7 +976,7 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
           entry = reviews.queue_entry(checks, target)
           outcome = ({**previous, "state": "queued", "queue_entry_id": entry["id"]} if entry else
             {**previous, "state": "merge_unknown", "summary": "The exact earlier merge/queue attempt remains unclear. It was not repeated."})
-        elif previous.get("state") == "all_clear":
+        elif previous.get("state") == "all_clear" and row.mode != "review":
           await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
           continue
         else:

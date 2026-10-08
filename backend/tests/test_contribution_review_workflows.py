@@ -268,15 +268,22 @@ def test_legacy_no_snapshot_retry_does_not_uncap_or_resume_stopped_work(setup, m
   assert "new defaults as old consent" in result["brief"]
 
 
-def test_review_only_all_clear_replay_rechecks_current_base(setup, monkeypatch):
-  db, row, _ = setup
+def test_review_only_all_clear_survives_a_moved_base_and_still_posts_once(setup, monkeypatch):
+  db, row, principal = setup
   row.mode = "review"
+  row.options_json = {"post_review": True}
   db.commit()
-  assert report(setup)["run"]["state"] == "complete"
   monkeypatch.setattr(domain, "assert_current_base", lambda *a: (_ for _ in ()).throw(HTTPException(409, "The target base drifted")))
-  value = report(setup)["run"]
-  assert value["state"] == "needs_you"
-  assert "drifted" in value["items"][0]["summary"]
+  posts = []
+  monkeypatch.setattr(domain, "post_review", lambda *a: posts.append(a[2]["head_sha"]) or {"id": 3, "url": "u"})
+  value = report(setup, reviewed_base_sha=BASE)["run"]
+  assert value["state"] == "complete"
+  assert value["items"][0]["reviewed_base_sha"] == BASE
+  assert value["items"][0]["public_review"]["state"] == "posted"
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
+  assert observed["state"] == "complete"
+  report(setup, reviewed_base_sha=BASE)
+  assert posts == [SHA]
 
 
 @pytest.mark.parametrize("mode", ["review", "review_merge"])
