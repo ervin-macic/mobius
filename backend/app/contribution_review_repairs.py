@@ -38,12 +38,11 @@ def _fail(message: str, status: int = 409) -> None:
   raise HTTPException(status, message)
 
 
-class PushNotAttempted(Exception):
+class PushNotAttempted(HTTPException):
   """A repair push was refused before any public Git I/O started."""
 
   def __init__(self, detail: str):
-    super().__init__(detail)
-    self.detail = detail
+    super().__init__(409, detail)
 
 
 def not_attempted(exc: BaseException) -> PushNotAttempted:
