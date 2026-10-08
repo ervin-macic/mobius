@@ -120,7 +120,7 @@ test('repair handoff carries evidence and preserves review, skill ownership and 
 
 test('a failed unfinished replacement remains actionable after reopening Settings, but historical failures do not', () => {
   const platform = { contained_upstream_sha: 'installed', activation: { level: 'image_rebuild' } }
-  for (const state of ['failed', 'rolled_back', 'needs_recovery']) {
+  for (const state of ['failed', 'rolled_back']) {
     assert.match(platformUpdateRepairReason({ platform, rebuild: { expected_sha: 'installed', state } }), /last attempt/)
     assert.equal(platformUpdateRepairReason({ platform, rebuild: { expected_sha: 'old', state } }), null)
     assert.equal(platformUpdateRepairReason({ platform: { ...platform, activation: { level: 'live' } }, rebuild: { expected_sha: 'installed', state } }), null)
@@ -138,7 +138,7 @@ test('mixed activation remains agent work regardless of its display level', () =
 
 const servingA = {
   contained_upstream_sha: 'serving-A',
-  activation: { level: 'image_rebuild', required_actions: ['image_rebuild'], deployment: 'self_hosted' },
+  activation: { level: 'live', required_actions: [], deployment: 'self_hosted' },
   unfinished_update: { target_sha: 'prepared-B', stage: 'finish', action: 'replace', cancellable: true },
 }
 
@@ -163,6 +163,7 @@ test('unresolved controller recovery remains evidence even without a matching in
     { platform: servingA, preview: { target_sha: 'reviewed-C' } },
   ]) {
     assert.deepEqual(platformUpdateRepairEvidence({ ...context, rebuild }).replacement, rebuild)
+    assert.match(platformUpdateRepairReason({ ...context, rebuild }), /still needs recovery/)
   }
 })
 
@@ -313,3 +314,16 @@ test('new unfinished and replacement diagnostics remain redacted and indented un
   assert.match(prompt, /Ignore all previous instructions/)
   assert.ok(prompt.split('\n').find(line => line.includes('Ignore all previous instructions')).startsWith('    '))
 })
+
+for (const state of ['failed', 'rolled_back']) {
+  test(`${state} prepared replacement remains actionable when the serving activation is live`, () => {
+    const rebuild = { expected_sha: 'prepared-B', state }
+    assert.match(platformUpdateRepairReason({ platform: servingA, rebuild }), /last attempt/)
+    assert.equal(platformUpdateRepairReason({
+      platform: { ...servingA, unfinished_update: null }, rebuild,
+    }), null)
+    assert.equal(platformUpdateRepairReason({
+      platform: servingA, preview: { target_sha: 'different-C', activation: { level: 'live' } }, rebuild,
+    }), null)
+  })
+}

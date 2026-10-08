@@ -14,6 +14,9 @@ function repairTarget({ preview, platform }) {
 
 export function platformUpdateRepairReason({ preview, platform, rebuild, error = '', errorCode = '' } = {}) {
   if (REVIEW_AGAIN.has(errorCode)) return null
+  if (rebuild?.state === 'needs_recovery') {
+    return 'The previous replacement still needs recovery before another update can start.'
+  }
   if (errorCode === 'update_applied_rebuild_pending') {
     return 'The update was applied, but Möbius needs help finishing the container replacement.'
   }
@@ -25,8 +28,10 @@ export function platformUpdateRepairReason({ preview, platform, rebuild, error =
     return 'Möbius needs to check your deployment settings before this update can finish.'
   }
   const target = repairTarget({ preview, platform })
-  if (level === 'image_rebuild' && target && rebuild?.expected_sha === target
-    && ['failed', 'rolled_back', 'needs_recovery'].includes(rebuild.state)) {
+  const unfinishedTarget = platform?.unfinished_update?.target_sha
+  if (target && rebuild?.expected_sha === target
+    && (level === 'image_rebuild' || unfinishedTarget === target)
+    && ['failed', 'rolled_back'].includes(rebuild.state)) {
     return 'The last attempt to finish this update needs attention.'
   }
   if (error || platform?.state === 'rolled_back') {
