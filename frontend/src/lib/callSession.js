@@ -1,36 +1,43 @@
 /**
  * Shell side of `media.call` v1: live audio and video calls for opaque apps.
  *
- * The trusted shell owns every media object: the microphone and camera, each
- * RTCPeerConnection, Web Audio playback, and the painted video tiles. The app
- * frame relays this provider's opaque `signal` payloads between participants
- * over its own channels and steers per-peer volume and tile rectangles. No
- * MediaStream, track, connection, or DOM handle crosses the capability
- * channel: every ready, event, and result value is plain JSON.
+ * The trusted shell owns every media object: the microphone and camera, a
+ * shared screen, each RTCPeerConnection, Web Audio playback, and the painted
+ * video tiles. The app frame relays this provider's opaque `signal` payloads
+ * between participants over its own channels and steers per-peer volume and
+ * tile rectangles. No MediaStream, track, connection, or DOM handle crosses the
+ * capability channel: every ready, event, and result value is plain JSON.
  *
  * Peers use the standard "perfect negotiation" pattern, so either side may
  * start and offer glare resolves through the app-chosen `polite` flag. A
- * negotiated data channel (id 0) carries only each side's own `{audio, video}`
- * send state, so a remote camera turned off hides its tile and reveals the
- * app's placeholder instead of painting black frames. Every app-supplied value
- * is checked by callRequest.js first.
+ * negotiated data channel (id 0) carries only each side's own
+ * `{audio, video, screen, screenStream}` send state, so a remote camera turned
+ * off hides its tile and reveals the app's placeholder instead of painting
+ * black frames, and a remote video track is known to be a shared screen when
+ * it arrives in the announced `screenStream`. Every app-supplied value is
+ * checked by callRequest.js first.
  */
 
 import {
   assertFields, callError, clamp, finiteNumber, invalid, isPlainObject, readCallRequest,
-  readPeer, readSignalData, readTiles, requirePeer, SELF,
+  readPeer, readScreenControl, readSignalData, readTiles, requirePeer, SELF,
 } from './callRequest.js'
 
 export const MEDIA_CALL = 'media.call'
 
 const MAX_GAINS = 64
 const MAX_PENDING_CONTROLS = 256
-const MAX_STATE_MESSAGE_CHARS = 128
+const MAX_STATE_MESSAGE_CHARS = 256
+// An SDP msid stream id is at most 64 characters (RFC 8830).
+const MAX_STREAM_ID_CHARS = 64
+// Stream ids of a peer's earlier shares, remembered so a stopped screen never
+// returns looking like a camera.
+const MAX_SCREEN_IDS = 16
 const LEVEL_INTERVAL_MS = 200
 const GAIN_TIME_CONSTANT_S = 0.05
 const STATE_CHANNEL_ID = 0
 
-const CONTROLS = new Set(['connect', 'signal', 'disconnect', 'volume', 'tiles', 'local'])
+const CONTROLS = new Set(['connect', 'signal', 'disconnect', 'volume', 'tiles', 'local', 'screen'])
 const PEER_STATES = {
   new: 'connecting',
   checking: 'connecting',
@@ -97,6 +104,34 @@ function mediaConstraints(audio, video) {
         }
       : false,
   }
+}
+
+// Screens favour legible detail over motion: a modest frame rate, capped at
+// 1080p so a large display does not flood every connection of the mesh.
+function displayConstraints() {
+  return {
+    video: { frameRate: { ideal: 15, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
+    audio: false,
+  }
+}
+
+function screenFailure(error) {
+  if (error?.name === 'InvalidStateError') {
+    // The browser opens its picker only for a recent click or key press.
+    return callError(
+      'denied',
+      'Screen sharing must start from a click or key press in the app. Try again.',
+      'NotAllowedError',
+    )
+  }
+  if (deniedMedia(error)) {
+    return callError(
+      'denied',
+      'Screen sharing was cancelled or blocked. Try again and choose what to share in the browser\'s picker.',
+      'NotAllowedError',
+    )
+  }
+  return callError('unavailable', 'No screen could be shared from this device.', 'NotFoundError')
 }
 
 function liveEnabled(track) {
@@ -198,6 +233,11 @@ function startCall(request, channel, environment) {
   let localVideo = null
   let selfVideo = null
   let selfMeter = null
+  // A shared screen travels in its own MediaStream, so the far side can tell
+  // it from the camera by the stream id this side announces.
+  let screenTrack = null
+  let screenStream = null
+  let screenRequest = null
   let levelTimer = null
   let startedAt = null
   let tiles = []
@@ -328,6 +368,25 @@ function startCall(request, channel, environment) {
     if (measured) channel.event('levels', { self, peers: remote })
   }
 
+  // A remote video track is the peer's shared screen when it arrived in the
+  // stream that peer announced for sharing; any other is its camera. Tracks of
+  // earlier shares are dropped, so a stopped screen never becomes the camera.
+  function cameraOf(peer) {
+    for (const entry of peer.videos.values()) {
+      if (!peer.screenIds.has(entry.streamId)) return entry
+    }
+    return null
+  }
+
+  function screenOf(peer) {
+    const id = peer.remote.screenStream
+    if (!id) return null
+    for (const entry of peer.videos.values()) {
+      if (entry.streamId === id) return entry
+    }
+    return null
+  }
+
   function snapshot(peer) {
     const { pc } = peer
     const state = PEER_STATES[pc.connectionState ?? pc.iceConnectionState] || 'connecting'
@@ -336,13 +395,14 @@ function startCall(request, channel, environment) {
       peer: peer.id,
       state,
       audio: flowing && peer.remote.audio && receiving(peer.audio?.track),
-      video: flowing && peer.remote.video && receiving(peer.video?.track),
+      video: flowing && peer.remote.video && receiving(cameraOf(peer)?.track),
+      screen: flowing && peer.remote.screen && receiving(screenOf(peer)?.track),
     }
   }
 
   function emitPeer(peer) {
     const value = snapshot(peer)
-    const key = `${value.state}|${value.audio}|${value.video}`
+    const key = `${value.state}|${value.audio}|${value.video}|${value.screen}`
     if (peer.reported === key) return false
     peer.reported = key
     channel.event('peer', value)
@@ -353,19 +413,29 @@ function startCall(request, channel, environment) {
     if (current(peer) && emitPeer(peer)) repaint()
   }
 
-  function selfStream() {
+  function screenLive() {
+    return Boolean(screenTrack) && screenTrack.readyState !== 'ended'
+  }
+
+  function selfStream(source) {
+    if (source === 'screen') return screenLive() ? screenStream : null
     return liveEnabled(localVideo) ? selfVideo : null
   }
 
-  function peerStream(peer) {
-    return peer && snapshot(peer).video ? peer.video.stream : null
+  function peerStream(peer, source) {
+    if (!peer) return null
+    const value = snapshot(peer)
+    if (source === 'screen') return value.screen ? screenOf(peer).stream : null
+    return value.video ? cameraOf(peer).stream : null
   }
 
   function repaint() {
     if (phase !== 'live') return
     const painted = []
     for (const tile of tiles) {
-      const stream = tile.peer === SELF ? selfStream() : peerStream(peers.get(tile.peer))
+      const stream = tile.peer === SELF
+        ? selfStream(tile.source)
+        : peerStream(peers.get(tile.peer), tile.source)
       // A tile without live video paints nothing; the app's own placeholder
       // underneath stays visible.
       if (stream) painted.push({ ...tile, stream })
@@ -379,12 +449,22 @@ function startCall(request, channel, environment) {
   }
 
   function localState() {
-    return { audio: liveEnabled(localAudio), video: liveEnabled(localVideo) }
+    return {
+      audio: liveEnabled(localAudio),
+      video: liveEnabled(localVideo),
+      screen: screenLive(),
+    }
   }
 
   function announceTo(peer) {
     if (!current(peer) || peer.channel?.readyState !== 'open') return
-    try { peer.channel.send(JSON.stringify(localState())) } catch { /* closing */ }
+    const state = localState()
+    // The far side needs the screen's stream id to tell it from the camera;
+    // the app only ever sees the booleans.
+    state.screenStream = state.screen && typeof screenStream.id === 'string'
+      ? screenStream.id
+      : null
+    try { peer.channel.send(JSON.stringify(state)) } catch { /* closing */ }
   }
 
   function localChanged() {
@@ -394,6 +474,11 @@ function startCall(request, channel, environment) {
     repaint()
   }
 
+  function releaseVideo(peer, track) {
+    releaseTrackHandlers(track)
+    peer.videos.delete(track)
+  }
+
   function receiveState(peer, data) {
     if (!current(peer) || typeof data !== 'string' || data.length > MAX_STATE_MESSAGE_CHARS) return
     let state
@@ -401,8 +486,35 @@ function startCall(request, channel, environment) {
     if (!isPlainObject(state) || typeof state.audio !== 'boolean' || typeof state.video !== 'boolean') {
       return
     }
-    peer.remote = { audio: state.audio, video: state.video }
-    refreshPeer(peer)
+    const screenId = state.screen === true
+      && typeof state.screenStream === 'string'
+      && state.screenStream.length >= 1
+      && state.screenStream.length <= MAX_STREAM_ID_CHARS
+      ? state.screenStream
+      : null
+    peer.remote = {
+      audio: state.audio,
+      video: state.video,
+      screen: screenId !== null,
+      screenStream: screenId,
+    }
+    if (screenId) {
+      peer.screenIds.delete(screenId)
+      peer.screenIds.add(screenId)
+      for (const old of peer.screenIds) {
+        if (peer.screenIds.size <= MAX_SCREEN_IDS) break
+        peer.screenIds.delete(old)
+      }
+    }
+    // A stopped or replaced share's track is never shown again.
+    for (const entry of [...peer.videos.values()]) {
+      if (entry.streamId !== screenId && peer.screenIds.has(entry.streamId)) {
+        releaseVideo(peer, entry.track)
+      }
+    }
+    emitPeer(peer)
+    // A restarted share keeps the same booleans but paints a new stream.
+    repaint()
   }
 
   function setGain(node, value, { immediate = false } = {}) {
@@ -455,15 +567,20 @@ function startCall(request, channel, environment) {
     resumeAudio()
   }
 
-  function receiveTrack(peer, track) {
+  function receiveTrack(peer, track, streamId) {
     if (!current(peer) || !track) return
     if (track.kind === 'audio') {
       if (peer.audio?.track !== track) attachRemoteAudio(peer, track)
     } else if (track.kind === 'video') {
-      if (peer.video?.track !== track) {
-        releaseTrackHandlers(peer.video?.track)
-        peer.video = { track, stream: new MediaStreamCtor([track]) }
+      const id = typeof streamId === 'string' ? streamId : null
+      // A late track from a share the peer has already stopped stays hidden.
+      if (peer.screenIds.has(id) && id !== peer.remote.screenStream) {
+        releaseVideo(peer, track)
+        return
       }
+      const known = peer.videos.get(track)
+      if (known) known.streamId = id
+      else peer.videos.set(track, { track, streamId: id, stream: new MediaStreamCtor([track]) })
     } else {
       return
     }
@@ -516,9 +633,13 @@ function startCall(request, channel, environment) {
       ignoreOffer: false,
       settingRemoteAnswer: false,
       // Until the remote announces otherwise, trust live, unmuted tracks.
-      remote: { audio: true, video: true },
+      remote: { audio: true, video: true, screen: false, screenStream: null },
       audio: null,
-      video: null,
+      // Remote video track -> { track, streamId, stream }, in arrival order.
+      videos: new Map(),
+      // Stream ids this peer has announced for sharing, oldest first.
+      screenIds: new Set(),
+      screenSender: null,
       channel: null,
       reported: '',
     }
@@ -529,7 +650,7 @@ function startCall(request, channel, environment) {
         channel.event('signal', { peer: id, data: candidateSignal(event?.candidate) })
       }
     }
-    pc.ontrack = (event) => receiveTrack(peer, event?.track)
+    pc.ontrack = (event) => receiveTrack(peer, event?.track, event?.streams?.[0]?.id)
     pc.onconnectionstatechange = () => refreshPeer(peer)
     pc.oniceconnectionstatechange = () => {
       if (!current(peer)) return
@@ -543,11 +664,15 @@ function startCall(request, channel, environment) {
         negotiated: true,
         id: STATE_CHANNEL_ID,
       })
-      stateChannel.onopen = () => announceTo(peer)
+      stateChannel.onopen = () => {
+        announceTo(peer)
+        attachScreen(peer)
+      }
       stateChannel.onmessage = (event) => receiveState(peer, event?.data)
       peer.channel = stateChannel
     } catch {
-      // Without the state channel, remote media falls back to track liveness.
+      // Without the state channel, remote media falls back to track liveness
+      // and no screen is sent, since the far side could not identify it.
     }
     // A side without a local kind adds no transceiver for it: JSEP never reuses
     // an addTransceiver() receiver for a remote offer, so the sending side's
@@ -574,8 +699,8 @@ function startCall(request, channel, environment) {
       try { peer.channel.close() } catch { /* already closed */ }
     }
     releaseRemoteAudio(peer)
-    releaseTrackHandlers(peer.video?.track)
-    peer.video = null
+    for (const track of [...peer.videos.keys()]) releaseVideo(peer, track)
+    peer.screenSender = null
     try { pc.close() } catch { /* already closed */ }
   }
 
@@ -653,7 +778,7 @@ function startCall(request, channel, environment) {
     if (!peer) return
     peers.delete(id)
     closePeer(peer)
-    channel.event('peer', { peer: id, state: 'closed', audio: false, video: false })
+    channel.event('peer', { peer: id, state: 'closed', audio: false, video: false, screen: false })
     repaint()
   }
 
@@ -687,7 +812,8 @@ function startCall(request, channel, environment) {
   }
 
   function setTiles(value) {
-    tiles = readTiles(value, request.maxPeers + 1)
+    // Room for every participant's camera and shared screen, self included.
+    tiles = readTiles(value, 2 * (request.maxPeers + 1))
     repaint()
   }
 
@@ -704,6 +830,113 @@ function startCall(request, channel, environment) {
     localChanged()
   }
 
+  // The screen joins a connection only once its state channel is open, so the
+  // announcement naming the screen's stream always leaves before the
+  // renegotiation that delivers the track, and even a late joiner never sees a
+  // screen arrive looking like a camera.
+  function attachScreen(peer) {
+    if (!current(peer) || !screenLive() || peer.screenSender) return
+    if (peer.channel?.readyState !== 'open') return
+    try {
+      peer.screenSender = peer.pc.addTrack(screenTrack, screenStream)
+    } catch {
+      // This connection simply receives no screen.
+    }
+  }
+
+  function detachScreen(peer) {
+    const sender = peer.screenSender
+    if (!sender) return
+    peer.screenSender = null
+    // Removing the sender renegotiates, and the far side's track goes quiet.
+    try { peer.pc.removeTrack(sender) } catch { /* the connection is closing */ }
+  }
+
+  function beginScreen(stream) {
+    const track = stream?.getVideoTracks?.()[0] || null
+    let wrapped = null
+    if (track && track.readyState !== 'ended') {
+      try { wrapped = new MediaStreamCtor([track]) } catch { /* reported below */ }
+    }
+    if (!wrapped) {
+      // Never leave a capture running that the call does not own.
+      stopStream(stream)
+      report(null, screenFailure(null))
+      return
+    }
+    // Only the screen itself is kept from what the picker returned.
+    for (const other of stream.getTracks?.() || []) {
+      if (other === track) continue
+      try { other.stop() } catch { /* already stopped */ }
+    }
+    try {
+      // Keep text and edges legible when bandwidth is short.
+      if ('contentHint' in track) track.contentHint = 'detail'
+    } catch { /* the browser keeps its default */ }
+    screenTrack = track
+    screenStream = wrapped
+    // The browser's own "Stop sharing" control ends the track.
+    track.onended = stopScreen
+    localChanged()
+    for (const peer of peers.values()) attachScreen(peer)
+  }
+
+  function stopScreen() {
+    // A picker that is still open settles into a stopped track.
+    screenRequest = null
+    if (!screenTrack) return
+    const track = screenTrack
+    screenTrack = null
+    screenStream = null
+    track.onended = null
+    try { track.stop() } catch { /* already stopped */ }
+    for (const peer of peers.values()) detachScreen(peer)
+    localChanged()
+  }
+
+  function shareScreen(value) {
+    if (!readScreenControl(value)) {
+      stopScreen()
+      return
+    }
+    if (!request.screenShare) {
+      throw callError(
+        'denied',
+        'This app is not allowed to share your screen. Its installed access does not include screen sharing.',
+        'NotAllowedError',
+      )
+    }
+    // One screen per call: asking again while sharing or choosing is a no-op.
+    if (screenTrack || screenRequest) return
+    if (typeof mediaDevices?.getDisplayMedia !== 'function') {
+      throw callError('unavailable', 'Screen sharing is unavailable in this browser.', 'NotSupportedError')
+    }
+    const attempt = {}
+    screenRequest = attempt
+    let picked
+    try {
+      // The first browser call after the app's control arrives: the click in
+      // the app frame that sent it also activated this shell, and the browser
+      // opens its picker only while that activation lasts.
+      picked = mediaDevices.getDisplayMedia(displayConstraints())
+    } catch (error) {
+      picked = Promise.reject(error)
+    }
+    Promise.resolve(picked).then((stream) => {
+      if (screenRequest !== attempt || phase !== 'live') {
+        // Withdrawn, or the call ended, while the picker was open.
+        stopStream(stream)
+        return
+      }
+      screenRequest = null
+      beginScreen(stream)
+    }, (error) => {
+      if (screenRequest !== attempt) return
+      screenRequest = null
+      report(null, screenFailure(error))
+    })
+  }
+
   function apply(action, value) {
     try {
       if (action === 'connect') connect(value)
@@ -712,6 +945,7 @@ function startCall(request, channel, environment) {
       else if (action === 'volume') setVolumes(value)
       else if (action === 'tiles') setTiles(value)
       else if (action === 'local') setLocal(value)
+      else if (action === 'screen') shareScreen(value)
     } catch (error) {
       // Per-peer and payload problems never end the call.
       report(isPlainObject(value) ? readPeer(value.peer) : null, error)
@@ -741,6 +975,12 @@ function startCall(request, channel, environment) {
     localAudio = null
     localVideo = null
     selfVideo = null
+    // Closing each connection removed the screen's senders; a picker still
+    // open settles into a stopped track.
+    screenRequest = null
+    stopStream(screenStream)
+    screenTrack = null
+    screenStream = null
     audioContext.onstatechange = null
     try {
       Promise.resolve(audioContext.close?.()).catch(() => {})
@@ -797,7 +1037,8 @@ function startCall(request, channel, environment) {
 }
 
 /**
- * `media.call` v1 provider. `createSurface()` returns the host tile painter
+ * `media.call` v1 provider. `mediaDevices` supplies both `getUserMedia` and
+ * `getDisplayMedia`. `createSurface()` returns the host tile painter
  * (`{ paint(tiles), destroy() }`) for the frame that owns the session.
  */
 export function createCallProvider({

@@ -731,8 +731,12 @@ For live voice or video between people the app connects (a call, or proximity
 chat in a shared space), declare `media.call`. The shell owns the devices, peer
 connections, playback, and painted video tiles; the app relays each `signal`
 event's payload to that participant unchanged, passes payloads it receives to
-`control('signal', ...)`, and steers `volume` and `tiles`. The `media.call`
-section of the platform `CAPABILITIES.md` has the complete contract.
+`control('signal', ...)`, and steers `volume` and `tiles`. To let someone
+present their screen, also declare `"limits": {"screen_share": 1}` and send
+`control('screen', {share: true})` from a click: the browser's own picker
+chooses what is shared, the app never sees the pixels, and others show it with
+a `source: 'screen'` tile. The `media.call` section of the platform
+`CAPABILITIES.md` has the complete contract.
 
 ## Local zoom surfaces
 

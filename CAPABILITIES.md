@@ -460,8 +460,8 @@ recorder. Finish before readiness fails rather than manufacturing an empty or
 invalid video. Finish after readiness returns the useful partial recording.
 A `media.call` v1 session ends with an `aborted` error when its app is hidden,
 its frame is torn down, or it is cancelled; each path closes every peer
-connection, stops every device, removes every painted tile, and closes the
-call's audio context.
+connection, stops every device and any shared screen, removes every painted
+tile, and closes the call's audio context.
 
 ## Stable error codes
 
@@ -574,18 +574,18 @@ large package in memory.
 
 `media.call` gives an app live audio and video between the people it connects
 without the app ever receiving a `MediaStream`, track, peer connection, or DOM
-handle. The trusted shell owns the microphone and camera, every
-`RTCPeerConnection`, audio playback, and the painted video. The app relays the
-shell's signalling payloads between participants over its own channels and
-steers per-peer volume and where video appears.
+handle. The trusted shell owns the microphone and camera, a shared screen,
+every `RTCPeerConnection`, audio playback, and the painted video. The app
+relays the shell's signalling payloads between participants over its own
+channels and steers per-peer volume and where video appears.
 
 ```json
 {
   "capabilities": {
     "media.call": {
       "version": 1,
-      "reason": "Talk with players standing near you.",
-      "limits": { "max_peers": 12 }
+      "reason": "Talk with players near you, and present from the stage.",
+      "limits": { "max_peers": 12, "screen_share": 1 }
     }
   }
 }
@@ -593,6 +593,9 @@ steers per-peer volume and where video appears.
 
 `max_peers` (default 8, reviewed range 1–32) bounds simultaneous connections.
 v1 is a full mesh, so each participant sends its media once per connected peer.
+`screen_share` (default 0, reviewed range 0–1) must be 1 before the app may ask
+to share the owner's screen; raising it is an access increase, so update review
+asks again.
 
 ```js
 const call = caps.open('media.call', {
@@ -628,11 +631,11 @@ browser's autoplay policy has not let the shell start audio yet; send
 | Event | Value |
 |---|---|
 | `signal` | `{peer, data}`: opaque JSON the app must deliver unchanged to that peer's session |
-| `peer` | `{peer, state, audio, video}`: `connecting`, `connected`, `disconnected`, `failed`, or `closed`, and whether remote audio/video is being received |
+| `peer` | `{peer, state, audio, video, screen}`: `connecting`, `connected`, `disconnected`, `failed`, or `closed`, and whether remote audio, camera video, and a shared screen are being received |
 | `levels` | `{self, peers: {[peer]: level}}`: smoothed 0–1 speaking levels about five times a second |
-| `local` | `{audio, video}`: local send state after a `local` control or a device ending |
+| `local` | `{audio, video, screen}`: local send state after a `local` or `screen` control, a device ending, or the browser's own stop-sharing control |
 | `playback` | `{state}`: shell audio output started (`running`) or was suspended |
-| `error` | `{peer, code, message}`: a non-fatal problem such as `limit_exceeded` or `invalid_request`; `peer` is `null` when it concerns no single peer |
+| `error` | `{peer, code, message}`: a non-fatal problem such as `limit_exceeded`, `invalid_request`, or a screen share that was `denied` or `unavailable`; `peer` is `null` when it concerns no single peer |
 
 | Control | Value |
 |---|---|
@@ -640,8 +643,9 @@ browser's autoplay policy has not let the shell start audio yet; send
 | `signal` | `{peer, data}` received from that peer. An offer from an unknown peer opens a polite connection within `max_peers`; other payloads for unknown peers are stale and ignored. SDP ≤ 100 KB, candidate ≤ 2 KB |
 | `disconnect` | `{peer}`; idempotent |
 | `volume` | `{gains: {[peer]: 0..1}}`: partial, clamped; 0 is silent but connected. A gain set before a peer's audio arrives applies from its first sample |
-| `tiles` | `{tiles: [{peer, x, y, width, height, radius?, mirror?, opacity?}]}`: replaces every tile; `[]` hides all; at most `max_peers + 1` |
+| `tiles` | `{tiles: [{peer, source?, x, y, width, height, radius?, mirror?, opacity?}]}`: replaces every tile; `[]` hides all; `source` is `camera` (default) or `screen`; at most `2 × (max_peers + 1)`, room for every participant's camera and screen |
 | `local` | `{audio?, video?}`: mutes or unmutes local tracks without renegotiation |
+| `screen` | `{share}`: `true` asks the browser to share a screen, `false` stops sharing. One share per call; asking again while sharing or choosing is a no-op |
 | `audio-resume` | retries starting shell audio output |
 | `finish` | ends the call with `{durationMs}`; `cancel()` aborts |
 
@@ -651,19 +655,53 @@ local tile. One call may be open per app frame; another `open()` is `busy`.
 Tiles use the app frame's CSS pixels (an element's `getBoundingClientRect()`).
 The shell paints them as non-interactive video over the frame, clipped to it
 and moving with it; later tiles stack above earlier ones, and `self` shows the
-local camera, mirrored by default. A tile whose peer has no live video (not yet
-connected, camera off, or not sending) paints nothing, so the app's own avatar
-or placeholder underneath stays visible. Draw that placeholder in the app.
+local camera, mirrored by default. A `source: 'screen'` tile shows that
+participant's shared screen, letterboxed rather than cropped; `{peer: 'self',
+source: 'screen'}` previews your own share and is not mirrored. A tile whose
+peer has no live video of that source (not yet connected, camera off, not
+sharing, or not sending) paints nothing, so the app's own avatar or placeholder
+underneath stays visible. Draw that placeholder in the app.
+
+```js
+// From the app's own click or key handler, once `ready` has resolved.
+presentButton.onclick = () => call.control('screen', { share: true })
+call.on('local', ({ screen }) => showPresenting(screen))
+call.on('peer', ({ peer, screen }) => {
+  if (!screen) return
+  const { left, top, width, height } = projector.getBoundingClientRect()
+  call.control('tiles', {
+    tiles: [{ peer, source: 'screen', x: left, y: top, width, height }],
+  })
+})
+```
+
+Screen sharing needs a reviewed `screen_share: 1`; otherwise `share: true`
+produces a `denied` error event. The shell calls the browser's own screen
+capture, so the browser's picker always chooses which screen, window, or tab is
+shared, and the browser shows its sharing indicator and stop control. Browsers
+open that picker only shortly after a click or key press: the click inside the
+app frame also activates the shell, so send the control straight from the
+app's gesture handler. A cancelled or refused picker, or a request without a
+recent gesture, is `denied`; a browser without screen capture, or nothing to
+share, is `unavailable`; neither ends the call. The shell sends the screen (at
+most 1080p and 30 frames per second, tuned for legible detail) in its own
+stream to every connected peer, and to each peer that connects later once that
+connection is up. Starting or stopping a share renegotiates every connection,
+so the app keeps relaying `signal` payloads for the whole call. A share ends
+with `share: false`, the browser's stop control, or the end of the call;
+receivers then see `screen: false` and its tiles clear. The app never receives
+the pixels.
 
 Streams, tracks, connections, and elements stay in the shell; every value the
 app sees is JSON, and tile geometry is validated numbers, so the app cannot
 style, read, or capture the video. Remote audio plays through shell-owned Web
 Audio gain nodes. A shell-to-shell data channel carries only each side's
-`{audio, video}` send state, which is how a remote camera turned off clears its
-tile. The app chooses whom to connect and which STUN/TURN servers to use, and
-its signalling payloads include network candidates (local and public
-addresses), as for any WebRTC app, so its reviewed `reason` should say who it
-connects the owner with.
+`{audio, video, screen, screenStream}` send state, which is how a remote camera
+turned off clears its tile and how a shared screen is told from a camera: a
+remote video track in the announced `screenStream` is the screen. The app
+chooses whom to connect and which STUN/TURN servers to use, and its signalling
+payloads include network candidates (local and public addresses), as for any
+WebRTC app, so its reviewed `reason` should say who it connects the owner with.
 
 ## Adding a capability
 

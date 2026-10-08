@@ -377,10 +377,15 @@ def test_camera_capture_limits_are_validated_and_bound_into_the_digest():
       }))
 
 
-def _media_call(max_peers=None, reason="Talk with nearby players."):
+def _media_call(max_peers=None, reason="Talk with nearby players.", screen_share=None):
   declaration = {"version": 1, "reason": reason}
+  limits = {}
   if max_peers is not None:
-    declaration["limits"] = {"max_peers": max_peers}
+    limits["max_peers"] = max_peers
+  if screen_share is not None:
+    limits["screen_share"] = screen_share
+  if limits:
+    declaration["limits"] = limits
   return {"media.call": declaration}
 
 
@@ -401,13 +406,13 @@ def test_media_call_is_a_reviewed_active_frame_session_bounded_by_peers():
       "risk": "device",
       "lifecycle": "active_frame",
       "reason": "Talk with nearby players.",
-      "limits": {"max_peers": 12},
+      "limits": {"max_peers": 12, "screen_share": 0},
     },
   }
   defaulted = normalize_runtime_capabilities(_manifest(capabilities={
     "media.call": {"version": 1},
   }))
-  assert defaulted["media.call"]["limits"] == {"max_peers": 8}
+  assert defaulted["media.call"]["limits"] == {"max_peers": 8, "screen_share": 0}
   assert defaulted["media.call"]["reason"] is None
 
 
@@ -416,6 +421,10 @@ def test_media_call_is_a_reviewed_active_frame_session_bounded_by_peers():
   ({"max_peers": 33}, "must be between 1 and 32"),
   ({"max_peers": True}, "must be a number"),
   ({"max_peers": "12"}, "must be a number"),
+  ({"screen_share": 2}, "`screen_share` must be between 0 and 1"),
+  ({"screen_share": -1}, "`screen_share` must be between 0 and 1"),
+  ({"screen_share": True}, "`screen_share` must be a number"),
+  ({"screen_share": "1"}, "`screen_share` must be a number"),
   ({"max_duration_ms": 1000}, "unknown limits: max_duration_ms"),
 ])
 def test_media_call_rejects_out_of_range_and_unknown_limits(limits, message):
@@ -450,6 +459,62 @@ def test_media_call_peer_ceiling_is_bound_into_digest_and_update_review():
   assert diff_contracts(contract, without)["widens"] is False
 
 
+def test_media_call_screen_share_is_opt_in_and_raising_it_needs_review():
+  silent, silent_digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8)),
+  )
+  explicit_off, explicit_off_digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8, screen_share=0)),
+  )
+  sharing, sharing_digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8, screen_share=1)),
+  )
+
+  # Omitting the limit is the closed default, not a different contract.
+  assert silent == explicit_off
+  assert silent_digest == explicit_off_digest
+  assert silent["runtime"]["media.call"]["limits"]["screen_share"] == 0
+  assert sharing["runtime"]["media.call"]["limits"] == {
+    "max_peers": 8, "screen_share": 1,
+  }
+  assert sharing_digest != silent_digest
+
+  raised = diff_contracts(silent, sharing)
+  assert raised["changed"] == ["runtime.media.call.limits.screen_share"]
+  assert raised["widens"] is True
+  lowered = diff_contracts(sharing, silent)
+  assert lowered["changed"] == ["runtime.media.call.limits.screen_share"]
+  assert lowered["widens"] is False
+  # Adding a call capability that may share the screen asks, too.
+  assert diff_contracts(_contract(), sharing)["widens"] is True
+
+
+def test_screen_share_granted_after_an_older_call_contract_needs_review():
+  # A call contract accepted before `screen_share` existed carries no value
+  # for it. Unlike a ceiling, its absence granted nothing.
+  older, _digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8)),
+  )
+  older["runtime"]["media.call"]["limits"].pop("screen_share")
+  silent, _digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8)),
+  )
+  sharing, _digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8, screen_share=1)),
+  )
+
+  granted = diff_contracts(older, sharing)
+  assert granted["added"] == ["runtime.media.call.limits.screen_share"]
+  assert granted["widens"] is True
+  defaulted = diff_contracts(older, silent)
+  assert defaulted["added"] == ["runtime.media.call.limits.screen_share"]
+  assert defaulted["widens"] is False
+  # A ceiling an older contract lacked is still a new limit, not new access.
+  uncapped = json.loads(json.dumps(silent))
+  uncapped["runtime"]["media.call"]["limits"].pop("max_peers")
+  assert diff_contracts(uncapped, silent)["widens"] is False
+
+
 def test_local_app_create_reviews_media_call_row(client, auth):
   app = create_local_app(
     client, auth,
@@ -463,7 +528,17 @@ def test_local_app_create_reviews_media_call_row(client, auth):
   assert row["risk"] == "device"
   assert row["lifecycle"] == "active_frame"
   assert row["reason"] == "Talk with nearby players."
-  assert row["limits"] == {"max_peers": 12}
+  assert row["limits"] == {"max_peers": 12, "screen_share": 0}
+
+  presenter = create_local_app(
+    client, auth,
+    name="Auditorium",
+    description="Present to the room",
+    capabilities=_media_call(max_peers=12, screen_share=1),
+  )
+  assert presenter["capability_contract"]["runtime"]["media.call"]["limits"] == {
+    "max_peers": 12, "screen_share": 1,
+  }
 
 
 def test_screen_control_is_reviewed_as_an_app_owned_background_session():

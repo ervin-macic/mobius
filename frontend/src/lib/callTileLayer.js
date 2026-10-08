@@ -7,7 +7,8 @@
  * resize with the frame and are clipped to it. Only validated numbers reach
  * style properties, and the app never receives these elements or the
  * MediaStreams they show. Updates mutate styles in place, so an app may move
- * tiles every animation frame without re-rendering the shell.
+ * tiles every animation frame without re-rendering the shell. A camera fills
+ * its tile; a shared screen is letterboxed so none of it is cropped away.
  */
 export function createCallTileLayer({ getContainer }) {
   let painted = new Map()
@@ -38,7 +39,6 @@ export function createCallTileLayer({ getContainer }) {
       display: 'block',
       width: '100%',
       height: '100%',
-      objectFit: 'cover',
       pointerEvents: 'none',
     })
     element.appendChild(video)
@@ -58,6 +58,7 @@ export function createCallTileLayer({ getContainer }) {
       zIndex: String(order + 1),
     })
     entry.video.style.transform = tile.mirror ? 'scaleX(-1)' : ''
+    entry.video.style.objectFit = tile.source === 'screen' ? 'contain' : 'cover'
     if (entry.stream !== tile.stream) {
       entry.stream = tile.stream
       entry.video.srcObject = tile.stream
@@ -74,9 +75,13 @@ export function createCallTileLayer({ getContainer }) {
       if (container) {
         const occurrences = new Map()
         tiles.forEach((tile, order) => {
-          const count = occurrences.get(tile.peer) || 0
-          occurrences.set(tile.peer, count + 1)
-          const key = `${tile.peer}\u0000${count}`
+          // A peer's camera and screen keep separate elements as either
+          // starts, stops, or moves.
+          const source = tile.source === 'screen' ? 'screen' : 'camera'
+          const identity = `${tile.peer}\u0000${source}`
+          const count = occurrences.get(identity) || 0
+          occurrences.set(identity, count + 1)
+          const key = `${identity}\u0000${count}`
           let entry = painted.get(key)
           if (entry && entry.element.parentNode !== container) entry = null
           entry ||= create(container)

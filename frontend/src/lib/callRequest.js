@@ -1,11 +1,13 @@
 /**
- * Input checks for `media.call` v1: the open request, signalling payloads, and
- * tile geometry an app may send. Everything the app passes is validated here
- * before it reaches a browser media API, and only plain copies holding known
- * fields leave these functions. The session itself lives in callSession.js.
+ * Input checks for `media.call` v1: the open request, signalling payloads, the
+ * screen control, and tile geometry an app may send. Everything the app passes
+ * is validated here before it reaches a browser media API, and only plain
+ * copies holding known fields leave these functions. The session itself lives
+ * in callSession.js.
  */
 
 export const SELF = 'self'
+const TILE_SOURCES = ['camera', 'screen']
 const PEER_ID = /^[A-Za-z0-9_.:~@-]{1,80}$/
 const ICE_URL = /^(?:stun|turns?):\S+$/
 const DEFAULT_MAX_PEERS = 8
@@ -123,7 +125,17 @@ export function readCallRequest(input, declaration) {
     maxPeers: Number.isFinite(reviewed) && reviewed >= 1
       ? Math.min(HARD_MAX_PEERS, reviewed)
       : DEFAULT_MAX_PEERS,
+    // Only a reviewed `screen_share: 1` lets the app ask to share the screen.
+    screenShare: Number(declaration?.limits?.screen_share) >= 1,
   }
+}
+
+export function readScreenControl(value) {
+  assertFields(value, ['share'], 'call screen control')
+  if (typeof value.share !== 'boolean') {
+    throw invalid('Call `screen` needs a boolean `share`.')
+  }
+  return value.share
 }
 
 function optionalCandidateField(value, field) {
@@ -185,11 +197,15 @@ function readTile(tile, index) {
   const label = `tiles[${index}]`
   assertFields(
     tile,
-    ['peer', 'x', 'y', 'width', 'height', 'radius', 'mirror', 'opacity'],
+    ['peer', 'source', 'x', 'y', 'width', 'height', 'radius', 'mirror', 'opacity'],
     label,
   )
   const peer = tile.peer === SELF ? SELF : readPeer(tile.peer)
   if (!peer) throw invalid(`${label}.peer must be \`self\` or a call peer id.`)
+  const source = tile.source ?? 'camera'
+  if (!TILE_SOURCES.includes(source)) {
+    throw invalid(`${label}.source must be \`camera\` or \`screen\`.`)
+  }
   if (![tile.x, tile.y, tile.width, tile.height].every(finiteNumber)) {
     throw invalid(`${label} needs finite x, y, width, and height numbers.`)
   }
@@ -206,12 +222,14 @@ function readTile(tile, index) {
   }
   return {
     peer,
+    source,
     x: clamp(tile.x, -MAX_TILE_COORDINATE, MAX_TILE_COORDINATE),
     y: clamp(tile.y, -MAX_TILE_COORDINATE, MAX_TILE_COORDINATE),
     width: Math.min(tile.width, MAX_TILE_COORDINATE),
     height: Math.min(tile.height, MAX_TILE_COORDINATE),
     radius: clamp(tile.radius ?? 0, 0, MAX_TILE_COORDINATE),
-    mirror: tile.mirror ?? peer === SELF,
+    // Only the self camera mirrors by default; a shared screen reads as-is.
+    mirror: tile.mirror ?? (peer === SELF && source === 'camera'),
     opacity: clamp(tile.opacity ?? 1, 0, 1),
   }
 }
