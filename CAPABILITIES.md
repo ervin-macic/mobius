@@ -148,8 +148,8 @@ The platform starts a fresh process from the exact accepted app revision for
 each request. It sends one JSON object on stdin and accepts one JSON response
 on stdout: `{ "status": 200, "body": ..., "headers": {...} }`. The platform
 owns authentication, immutable source selection, the short-lived app token,
-8 MiB request/response ceilings, timeout, concurrency, and response-header
-safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
+an 8 MiB default serialized request/response ceiling, timeout, concurrency,
+and response-header safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
 `ETag`, `Last-Modified`, and `Vary` pass, other headers are dropped, and an
 authenticated response may not opt into shared caching (`public`, `s-maxage`).
 Private and public requests use separate serialized lanes so a private
@@ -160,6 +160,13 @@ the same time can touch the same state, the app must
 provide its own file or database locking.
 The app owns its paths, policy, storage format, and domain behavior. This is a
 reviewed trusted process like an app job, not an operating-system sandbox.
+An app may request a larger per-direction ceiling with `service.max_bytes`
+(integer bytes, at most 60 MiB). This is a reviewed service grant, not an
+implicit upgrade for installed apps. The same limit covers the complete JSON
+request envelope and complete JSON response envelope (including base64 and
+metadata), before any binary response is decoded. Requests exceeding the
+accepted limit are rejected while streaming, before the whole body is buffered;
+the platform's independent 64 MiB HTTP request backstop remains in force.
 
 Starting a fresh interpreter costs most services far more than their work
 (roughly a second for a FastAPI entry). An entry can declare a top-level

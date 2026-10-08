@@ -206,7 +206,7 @@ print(json.dumps({
 
 def _service_app(
   db, *, access="self", slug="service-test", service_id=None, aliases=(),
-  service_bytes=SERVICE,
+  service_bytes=SERVICE, max_bytes=8 * 1024 * 1024,
 ):
   source = Path(get_settings().data_dir) / "apps" / slug
   source.mkdir(parents=True)
@@ -222,8 +222,8 @@ def _service_app(
         "entry": "service.py",
         "access": access,
         "protocol": "json-v1",
-        "max_request_bytes": 8 * 1024 * 1024,
-        "max_response_bytes": 8 * 1024 * 1024,
+        "max_request_bytes": max_bytes,
+        "max_response_bytes": max_bytes,
       },
     },
     service_id=service_id,
@@ -240,6 +240,96 @@ def _service_app(
   app.runtime_revision = revision
   db.commit()
   return app
+
+
+def test_service_request_body_uses_accepted_limit_before_buffering(client, auth, db, monkeypatch):
+  from app.routes import app_services as routes
+  app = _service_app(db, max_bytes=1024)
+  seen = []
+  original = routes.read_capped_body
+
+  async def tracked(request, limit, **kwargs):
+    seen.append(limit)
+    return await original(request, limit, **kwargs)
+
+  monkeypatch.setattr(routes, "read_capped_body", tracked)
+  denied = client.post(
+    f"/api/apps/{app.id}/service/echo", headers=auth,
+    content=b'"' + b'x' * 1024 + b'"',
+  )
+  assert denied.status_code == 413
+  assert seen == [1024]
+  allowed = client.post(f"/api/apps/{app.id}/service/echo", headers=auth, json={})
+  assert allowed.status_code == 201
+
+
+def test_service_default_eight_mib_still_rejects_oversize_body(client, auth, db):
+  app = _service_app(db)
+  denied = client.post(
+    f"/api/apps/{app.id}/service/echo", headers=auth,
+    content=b'"' + b'x' * (8 * 1024 * 1024) + b'"',
+  )
+  assert denied.status_code == 413
+
+
+def test_reviewed_service_accepts_request_above_default_eight_mib(client, auth, db):
+  service = b'''import json, sys
+request = json.load(sys.stdin)
+print(json.dumps({"body": {"length": len(request["body"]["payload"])}}))
+'''
+  app = _service_app(db, service_bytes=service, max_bytes=60 * 1024 * 1024)
+  response = client.post(
+    f"/api/apps/{app.id}/service/echo", headers=auth,
+    json={"payload": "x" * (8 * 1024 * 1024)},
+  )
+  assert response.status_code == 200
+  assert response.json() == {"length": 8 * 1024 * 1024}
+
+
+def test_binary_response_budget_includes_base64_envelope(client, auth, db):
+  service = b'''import base64, json, sys
+json.load(sys.stdin)
+print(json.dumps({"body_base64": base64.b64encode(b"x" * 1536).decode(), "media_type": "image/gif"}))
+'''
+  small = _service_app(db, slug="binary-small", service_bytes=service, max_bytes=2048)
+  large = _service_app(db, slug="binary-large", service_bytes=service, max_bytes=4096)
+  denied = client.get(f"/api/apps/{small.id}/service/echo", headers=auth)
+  allowed = client.get(f"/api/apps/{large.id}/service/echo", headers=auth)
+  assert denied.status_code == 503
+  assert allowed.status_code == 200
+  assert allowed.content == b"x" * 1536
+
+
+@pytest.mark.asyncio
+async def test_preload_and_tool_lane_receive_the_reviewed_output_budget(db, auth, monkeypatch):
+  from app import service_preload
+  app = _service_app(db, max_bytes=12 * 1024 * 1024)
+  owner = db.query(models.Owner).first()
+  seen = []
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: object())
+
+  async def run(_host, _environment, _request, **kwargs):
+    seen.append(kwargs["max_stdout"])
+    return b'{"body": {"ok": true}}', b"", 0
+
+  monkeypatch.setattr(service_preload, "run", run)
+  status, body, _headers, _media = await app_services.invoke_service(
+    app, owner, {"actor": {}, "public": False}, lane="tools",
+  )
+  assert (status, body, seen) == (200, {"ok": True}, [12 * 1024 * 1024])
+
+
+@pytest.mark.asyncio
+async def test_tool_lane_rejects_oversize_request_before_execution(db, auth, monkeypatch):
+  app = _service_app(db, max_bytes=1024)
+  owner = db.query(models.Owner).first()
+  monkeypatch.setattr(app_services, "service_entry", lambda *_: pytest.fail("service executed"))
+  with pytest.raises(HTTPException) as caught:
+    await app_services.invoke_service(
+      app, owner, {"actor": {}, "body": {"arguments": {"payload": "x" * 1024}}},
+      lane="tools",
+    )
+  assert caught.value.status_code == 413
 
 
 def test_authenticated_service_receives_one_bounded_json_envelope(

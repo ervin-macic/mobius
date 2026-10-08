@@ -30,7 +30,7 @@ from app import app_python_env, auth, models, service_preload
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
-from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES
+from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES, SERVICE_TRANSFER_MAX_BYTES
 
 
 log = logging.getLogger(__name__)
@@ -80,7 +80,21 @@ def service_contract(app, *, access: str) -> dict:
   entry = service.get("entry")
   if not isinstance(entry, str) or not entry.endswith(".py"):
     raise HTTPException(503, "Accepted app service declaration is invalid.")
+  service_max_bytes(service)
   return service
+
+
+def service_max_bytes(service: dict) -> int:
+  """The one reviewed serialized request/response ceiling, including old grants."""
+  request_limit = service.get("max_request_bytes", SERVICE_REQUEST_MAX_BYTES)
+  response_limit = service.get("max_response_bytes", SERVICE_REQUEST_MAX_BYTES)
+  if (
+    type(request_limit) is not int or type(response_limit) is not int
+    or request_limit != response_limit
+    or not 1 <= request_limit <= SERVICE_TRANSFER_MAX_BYTES
+  ):
+    raise HTTPException(503, "Accepted app service transfer limit is invalid.")
+  return request_limit
 
 
 def request_actor(db, principal, caller=None) -> dict:
@@ -220,7 +234,7 @@ def _response_headers(value, *, public: bool) -> dict[str, str]:
 
 async def _run_spawned(
   python: str, entry: Path, environment: dict[str, str], request_bytes: bytes,
-  timeout_seconds: float,
+  timeout_seconds: float, max_stdout: int = MAX_RESPONSE_BYTES,
 ) -> tuple[bytes, bytes, int]:
   """Run one request in a fresh interpreter; return (stdout, stderr, exit code)."""
   try:
@@ -261,7 +275,7 @@ async def _run_spawned(
   assert process.stdin is not None
   assert process.stdout is not None
   assert process.stderr is not None
-  stdout_task = asyncio.create_task(_read_bounded(process.stdout, MAX_RESPONSE_BYTES))
+  stdout_task = asyncio.create_task(_read_bounded(process.stdout, max_stdout))
   stderr_task = asyncio.create_task(_read_bounded(process.stderr, MAX_ERROR_BYTES))
   write_task = asyncio.create_task(_write_request(process.stdin, request_bytes))
   try:
@@ -321,15 +335,23 @@ async def invoke_service(
 ) -> tuple[int, object, dict[str, str], str | None]:
   public = request_envelope.get("public") is True
   service = service_contract(app, access="public" if public else "self")
+  max_bytes = service_max_bytes(service)
   try:
-    request_bytes = json.dumps(
-      request_envelope, ensure_ascii=False, separators=(",", ":"),
-      allow_nan=False,
-    ).encode("utf-8")
+    # Tool calls bypass HTTP body admission. Bound their serialization too,
+    # rather than building an arbitrarily large complete request first.
+    parts = []
+    size = 0
+    for part in json.JSONEncoder(
+      ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).iterencode(request_envelope):
+      encoded = part.encode("utf-8")
+      size += len(encoded)
+      if size > max_bytes:
+        raise HTTPException(413, "App service request is too large.")
+      parts.append(encoded)
+    request_bytes = b"".join(parts)
   except (TypeError, ValueError, RecursionError) as exc:
     raise HTTPException(400, "App service request contains invalid JSON data.") from exc
-  if len(request_bytes) > MAX_REQUEST_BYTES:
-    raise HTTPException(413, "App service request is too large.")
 
   # A service owns its persistence semantics. Serialize one app's private
   # requests so simple file-backed services do not need a platform-specific
@@ -380,7 +402,7 @@ async def invoke_service(
         try:
           outcome = await service_preload.run(
             host, environment, request_bytes, timeout_seconds=timeout_seconds,
-            max_stdout=MAX_RESPONSE_BYTES, max_stderr=MAX_ERROR_BYTES,
+            max_stdout=max_bytes, max_stderr=MAX_ERROR_BYTES,
           )
         except service_preload.PreloadUnavailable:
           pass
@@ -390,7 +412,7 @@ async def invoke_service(
           raise HTTPException(502, "App service failed before accepting its request.") from exc
       if outcome is None:
         outcome = await _run_spawned(
-          python, entry, environment, request_bytes, timeout_seconds,
+          python, entry, environment, request_bytes, timeout_seconds, max_bytes,
         )
       stdout, stderr, returncode = outcome
       if returncode != 0:
@@ -439,7 +461,7 @@ async def invoke_service(
       body = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error) as exc:
       raise HTTPException(502, "App service returned invalid binary data.") from exc
-    if len(body) > MAX_RESPONSE_BYTES:
+    if len(body) > max_bytes:
       raise HTTPException(502, "App service returned too much binary data.")
     return status, body, headers, media_type
   if media_type is not None:

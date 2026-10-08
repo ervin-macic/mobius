@@ -75,7 +75,7 @@ def _service_app(db: Session, service_id: str) -> models.App | None:
   )
 
 
-async def _envelope(request: Request, path: str, *, public: bool, actor: dict) -> dict:
+async def _envelope(request: Request, path: str, *, public: bool, actor: dict, max_bytes: int) -> dict:
   # `tools/` belongs to the platform's agent-tool lane (app_tools.call_app_tool),
   # whose `call` a service trusts as the moment an agent called it. An HTTP
   # caller never reaches it, so a frame cannot forge a tool call.
@@ -87,7 +87,7 @@ async def _envelope(request: Request, path: str, *, public: bool, actor: dict) -
     raise HTTPException(404, "App service path not found.")
   raw = await read_capped_body(
     request,
-    app_services.MAX_REQUEST_BYTES,
+    max_bytes,
     too_large="App service request is too large.",
   )
   body = None
@@ -129,9 +129,10 @@ async def authenticated_app_service(
   app = live_app_or_404(db, app_id)
   if principal.app_id is not None and principal.app_id != app.id:
     raise HTTPException(403, "An app can invoke only its own service.")
-  app_services.service_contract(app, access="self")
+  service = app_services.service_contract(app, access="self")
   envelope = await _envelope(
     request, path, public=False,
+    max_bytes=app_services.service_max_bytes(service),
     actor=app_services.request_actor(
       db, principal, app if principal.app_id is not None else None,
     ),
@@ -166,9 +167,10 @@ async def shared_app_service(
   if principal.app_id is not None and caller is None:
     raise HTTPException(403, "Calling app is unavailable.")
   required = "self" if principal.app_id in {None, target.id} else "apps"
-  app_services.service_contract(target, access=required)
+  service = app_services.service_contract(target, access=required)
   envelope = await _envelope(
     request, path, public=False,
+    max_bytes=app_services.service_max_bytes(service),
     actor=app_services.request_actor(db, principal, caller),
   )
   db.expunge(target)
@@ -194,11 +196,14 @@ async def public_app_service(
   app = _service_app(db, slug)
   if app is None:
     raise HTTPException(404, "Public app service not found.")
-  app_services.service_contract(app, access="public")
+  service = app_services.service_contract(app, access="public")
   owner = db.query(models.Owner).first()
   if owner is None:
     raise HTTPException(503, "Owner setup is incomplete.")
-  envelope = await _envelope(request, path, public=True, actor={"scope": "public"})
+  envelope = await _envelope(
+    request, path, public=True, actor={"scope": "public"},
+    max_bytes=app_services.service_max_bytes(service),
+  )
   db.expunge(app)
   db.expunge(owner)
   db.close()
