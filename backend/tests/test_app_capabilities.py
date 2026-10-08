@@ -377,6 +377,95 @@ def test_camera_capture_limits_are_validated_and_bound_into_the_digest():
       }))
 
 
+def _media_call(max_peers=None, reason="Talk with nearby players."):
+  declaration = {"version": 1, "reason": reason}
+  if max_peers is not None:
+    declaration["limits"] = {"max_peers": max_peers}
+  return {"media.call": declaration}
+
+
+def test_media_call_is_a_reviewed_active_frame_session_bounded_by_peers():
+  runtime = normalize_runtime_capabilities(
+    _manifest(capabilities=_media_call(max_peers=12)),
+  )
+
+  assert runtime == {
+    "media.call": {
+      "version": 1,
+      "kind": "session",
+      "title": "Join live calls",
+      "description": (
+        "Use the microphone and camera for live audio and video with people "
+        "this app connects you to, while this app is visible."
+      ),
+      "risk": "device",
+      "lifecycle": "active_frame",
+      "reason": "Talk with nearby players.",
+      "limits": {"max_peers": 12},
+    },
+  }
+  defaulted = normalize_runtime_capabilities(_manifest(capabilities={
+    "media.call": {"version": 1},
+  }))
+  assert defaulted["media.call"]["limits"] == {"max_peers": 8}
+  assert defaulted["media.call"]["reason"] is None
+
+
+@pytest.mark.parametrize(("limits", "message"), [
+  ({"max_peers": 0}, "must be between 1 and 32"),
+  ({"max_peers": 33}, "must be between 1 and 32"),
+  ({"max_peers": True}, "must be a number"),
+  ({"max_peers": "12"}, "must be a number"),
+  ({"max_duration_ms": 1000}, "unknown limits: max_duration_ms"),
+])
+def test_media_call_rejects_out_of_range_and_unknown_limits(limits, message):
+  with pytest.raises(ValueError, match=message):
+    normalize_runtime_capabilities(_manifest(capabilities={
+      "media.call": {"version": 1, "limits": limits},
+    }))
+  with pytest.raises(ValueError, match="requires version 1"):
+    normalize_runtime_capabilities(_manifest(capabilities={
+      "media.call": {"version": 2},
+    }))
+
+
+def test_media_call_peer_ceiling_is_bound_into_digest_and_update_review():
+  contract, digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=8)),
+  )
+  raised, raised_digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=12)),
+  )
+  lowered, _lowered_digest = contract_and_digest(
+    _manifest(capabilities=_media_call(max_peers=4)),
+  )
+  without, _without_digest = contract_and_digest(_manifest())
+
+  assert digest != raised_digest
+  assert diff_contracts(contract, raised)["widens"] is True
+  assert diff_contracts(contract, lowered)["widens"] is False
+  added = diff_contracts(without, contract)
+  assert added["widens"] is True
+  assert "runtime.media.call.limits.max_peers" in added["added"]
+  assert diff_contracts(contract, without)["widens"] is False
+
+
+def test_local_app_create_reviews_media_call_row(client, auth):
+  app = create_local_app(
+    client, auth,
+    name="Town Square",
+    description="Talk with nearby players",
+    capabilities=_media_call(max_peers=12),
+  )
+
+  row = app["capability_contract"]["runtime"]["media.call"]
+  assert row["title"] == "Join live calls"
+  assert row["risk"] == "device"
+  assert row["lifecycle"] == "active_frame"
+  assert row["reason"] == "Talk with nearby players."
+  assert row["limits"] == {"max_peers": 12}
+
+
 def test_screen_control_is_reviewed_as_an_app_owned_background_session():
   runtime = normalize_runtime_capabilities(_manifest(capabilities={
     "workspace.screen-control": {

@@ -458,6 +458,10 @@ do not expose a way to dismiss that prompt programmatically; if it later grants
 access, the provider stops the newly returned tracks without starting a
 recorder. Finish before readiness fails rather than manufacturing an empty or
 invalid video. Finish after readiness returns the useful partial recording.
+A `media.call` v1 session ends with an `aborted` error when its app is hidden,
+its frame is torn down, or it is cancelled; each path closes every peer
+connection, stops every device, removes every painted tile, and closes the
+call's audio context.
 
 ## Stable error codes
 
@@ -484,7 +488,7 @@ expose shell tokens, paths, browser internals, or another app's activity.
 
 Add primitives only after a real app needs them. Likely families are:
 
-- `media.microphone.capture`, `media.camera.capture`
+- `media.microphone.capture`, `media.camera.capture`, `media.call`
 - `device.storage`, `device.asset-cache`
 - `files.open`, `files.save`
 - `clipboard.read`, `clipboard.write`
@@ -565,6 +569,101 @@ session API; the app remains responsible for presentation, interpretation, and
 licensing of the bytes. A `read` consumer sends `control('next')` after taking
 ownership of every `chunk` event, so neither message port accumulates a whole
 large package in memory.
+
+### Live audio and video calls
+
+`media.call` gives an app live audio and video between the people it connects
+without the app ever receiving a `MediaStream`, track, peer connection, or DOM
+handle. The trusted shell owns the microphone and camera, every
+`RTCPeerConnection`, audio playback, and the painted video. The app relays the
+shell's signalling payloads between participants over its own channels and
+steers per-peer volume and where video appears.
+
+```json
+{
+  "capabilities": {
+    "media.call": {
+      "version": 1,
+      "reason": "Talk with players standing near you.",
+      "limits": { "max_peers": 12 }
+    }
+  }
+}
+```
+
+`max_peers` (default 8, reviewed range 1–32) bounds simultaneous connections.
+v1 is a full mesh, so each participant sends its media once per connected peer.
+
+```js
+const call = caps.open('media.call', {
+  audio: true, // default true
+  video: true, // default false
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+})
+call.on('signal', ({ peer, data }) => sendToPlayer(peer, data)) // unchanged
+onPlayerMessage((from, data) => call.control('signal', { peer: from, data }))
+
+const ready = await call.ready
+// { audio, video, playback: 'running' | 'suspended', videoError?, audioError? }
+call.control('connect', { peer: 'p7', polite: myId < 'p7' })
+call.control('volume', { gains: { p7: 0.4 } })
+call.control('tiles', {
+  tiles: [{ peer: 'p7', x: 40, y: 60, width: 96, height: 72, radius: 12 }],
+})
+const { durationMs } = await call.finish()
+```
+
+Input accepts only `audio`, `video`, and `iceServers`: at most 4
+`{urls, username?, credential?}` entries with 1–4 `stun:`, `turn:`, or `turns:`
+URLs of at most 512 characters (TURN needs a username and credential, each at
+most 256). `audio: false, video: false` joins receive-only with no device
+prompt. `ready` reports which local devices are live. A missing, busy, or
+refused camera continues audio-only with `videoError: 'denied' |
+'unavailable'`; a missing or busy (not refused) microphone likewise continues
+camera-only with `audioError`. When nothing requested is available, `ready`
+rejects with `denied` or `unavailable`. `playback` is `suspended` when the
+browser's autoplay policy has not let the shell start audio yet; send
+`control('audio-resume')` from a later user gesture.
+
+| Event | Value |
+|---|---|
+| `signal` | `{peer, data}`: opaque JSON the app must deliver unchanged to that peer's session |
+| `peer` | `{peer, state, audio, video}`: `connecting`, `connected`, `disconnected`, `failed`, or `closed`, and whether remote audio/video is being received |
+| `levels` | `{self, peers: {[peer]: level}}`: smoothed 0–1 speaking levels about five times a second |
+| `local` | `{audio, video}`: local send state after a `local` control or a device ending |
+| `playback` | `{state}`: shell audio output started (`running`) or was suspended |
+| `error` | `{peer, code, message}`: a non-fatal problem such as `limit_exceeded` or `invalid_request`; `peer` is `null` when it concerns no single peer |
+
+| Control | Value |
+|---|---|
+| `connect` | `{peer, polite}`; idempotent. The two sides pass opposite `polite` values (compare ids); either may start, and offer glare resolves by perfect negotiation |
+| `signal` | `{peer, data}` received from that peer. An offer from an unknown peer opens a polite connection within `max_peers`; other payloads for unknown peers are stale and ignored. SDP ≤ 100 KB, candidate ≤ 2 KB |
+| `disconnect` | `{peer}`; idempotent |
+| `volume` | `{gains: {[peer]: 0..1}}`: partial, clamped; 0 is silent but connected. A gain set before a peer's audio arrives applies from its first sample |
+| `tiles` | `{tiles: [{peer, x, y, width, height, radius?, mirror?, opacity?}]}`: replaces every tile; `[]` hides all; at most `max_peers + 1` |
+| `local` | `{audio?, video?}`: mutes or unmutes local tracks without renegotiation |
+| `audio-resume` | retries starting shell audio output |
+| `finish` | ends the call with `{durationMs}`; `cancel()` aborts |
+
+Peer ids are 1–80 characters of `[A-Za-z0-9_.:~@-]`; `self` is reserved for the
+local tile. One call may be open per app frame; another `open()` is `busy`.
+
+Tiles use the app frame's CSS pixels (an element's `getBoundingClientRect()`).
+The shell paints them as non-interactive video over the frame, clipped to it
+and moving with it; later tiles stack above earlier ones, and `self` shows the
+local camera, mirrored by default. A tile whose peer has no live video (not yet
+connected, camera off, or not sending) paints nothing, so the app's own avatar
+or placeholder underneath stays visible. Draw that placeholder in the app.
+
+Streams, tracks, connections, and elements stay in the shell; every value the
+app sees is JSON, and tile geometry is validated numbers, so the app cannot
+style, read, or capture the video. Remote audio plays through shell-owned Web
+Audio gain nodes. A shell-to-shell data channel carries only each side's
+`{audio, video}` send state, which is how a remote camera turned off clears its
+tile. The app chooses whom to connect and which STUN/TURN servers to use, and
+its signalling payloads include network candidates (local and public
+addresses), as for any WebRTC app, so its reviewed `reason` should say who it
+connects the owner with.
 
 ## Adding a capability
 
