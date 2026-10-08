@@ -9,7 +9,6 @@ owner or an app-scoped token.
 
 import asyncio
 from collections.abc import Callable
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -21,7 +20,7 @@ from pydantic import BaseModel
 
 from app.deps import authorize_current_owner_or_app_detached, reject_cross_site
 from app.net_utils import validate_url_safe
-from app.pinned_http_clients import PinnedHostClientPool, PoolBusy
+from app.pinned_http_clients import PinnedHostClientPool
 
 router = APIRouter(prefix="/api/proxy", tags=["proxy"])
 
@@ -46,16 +45,9 @@ _FORWARDED_RESPONSE_HEADERS = (
   "x-ratelimit-used",
 )
 
-# The owner and every app share this pool's request slots, so neither waiting
-# for a slot nor holding one may be unbounded: one app pointing many requests
-# at a slow or drip-feeding upstream must not stall every other caller.
-_PROXY_SLOT_WAIT_SECS = 5
-_PROXY_REQUEST_DEADLINE_SECS = 60
-_PROXY_BUSY_RETRY_AFTER = "2"
-
 # The owner proxy reuses keep-alive connections per (Host, SNI); see
 # app.pinned_http_clients for why one global client would be unsafe.
-_proxy_clients = PinnedHostClientPool(acquire_timeout=_PROXY_SLOT_WAIT_SECS)
+_proxy_clients = PinnedHostClientPool()
 
 # Browser freshness the owner proxy will grant at most, whatever upstream says.
 _PROXY_MAX_BROWSER_AGE = 24 * 60 * 60
@@ -409,29 +401,6 @@ async def proxy_favicon(
   raise HTTPException(404, "Site icon unavailable.")
 
 
-@asynccontextmanager
-async def _proxy_client(host_header: str, sni_host: str):
-  """Lease a pooled client, failing fast with 503 when every slot is taken."""
-  try:
-    async with _proxy_clients.lease(host_header, sni_host) as client:
-      yield client
-  except PoolBusy:
-    # Only raised while acquiring the slot, before the body runs.
-    raise HTTPException(
-      503, "Proxy busy; retry shortly.",
-      headers={"Retry-After": _PROXY_BUSY_RETRY_AFTER},
-    ) from None
-
-
-async def _bounded_proxy_response(client, req, **kwargs) -> Response:
-  """One proxied exchange may hold its slot for a bounded total time."""
-  try:
-    async with asyncio.timeout(_PROXY_REQUEST_DEADLINE_SECS):
-      return await _capped_response(client, req, **kwargs)
-  except TimeoutError:
-    raise HTTPException(504, "Upstream response took too long.") from None
-
-
 @router.get("")
 async def proxy_get(
   url: str,
@@ -453,7 +422,7 @@ async def proxy_get(
   pinned_url, host_header, sni_host = await asyncio.to_thread(
     validate_url_safe, url,
   )
-  async with _proxy_client(host_header, sni_host) as client:
+  async with _proxy_clients.lease(host_header, sni_host) as client:
     req = client.build_request("GET", pinned_url)
     req.headers["host"] = host_header
     req.headers["user-agent"] = _PROXY_USER_AGENT
@@ -463,7 +432,7 @@ async def proxy_get(
     # httpcore/anyio require text here. Bytes reach idna2008_resolve(), which
     # calls .encode() itself and turns every real HTTPS proxy request into 502.
     req.extensions["sni_hostname"] = sni_host
-    return await _bounded_proxy_response(
+    return await _capped_response(
       client, req, cache_headers=private_browser_cache_headers,
     )
 
@@ -479,7 +448,7 @@ async def proxy_post(
   pinned_url, host_header, sni_host = await asyncio.to_thread(
     validate_url_safe, body.url,
   )
-  async with _proxy_client(host_header, sni_host) as client:
+  async with _proxy_clients.lease(host_header, sni_host) as client:
     req = client.build_request(
       "POST", pinned_url,
       content=body.body.encode(),
@@ -488,4 +457,4 @@ async def proxy_post(
     req.headers["host"] = host_header
     req.headers["user-agent"] = _PROXY_USER_AGENT
     req.extensions["sni_hostname"] = sni_host
-    return await _bounded_proxy_response(client, req)
+    return await _capped_response(client, req)
