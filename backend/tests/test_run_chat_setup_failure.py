@@ -35,9 +35,18 @@ class _Writer:
 
 
 async def _run_broken_setup(chat, monkeypatch, writer, *, error=None):
+  async def admitted(_data_dir):
+    pass
+
+  setup_started = False
+
   async def broken_impl(*_args, **_kwargs):
+    nonlocal setup_started
+    setup_started = True
     raise error or AttributeError("'Chat' object has no attribute 'messages'")
 
+  # Exercise setup recovery, not the host's storage/memory admission policy.
+  monkeypatch.setattr(chat_mod, "require_agent_turn_admission", admitted)
   monkeypatch.setattr(chat_mod, "_run_chat_impl", broken_impl)
   monkeypatch.setattr(chat_mod, "get_writer", lambda: writer)
   finished = []
@@ -63,6 +72,7 @@ async def _run_broken_setup(chat, monkeypatch, writer, *, error=None):
     )
   finally:
     remove_broadcast(chat.id)
+  assert setup_started, "injected setup failure must be reached"
   return events, finished
 
 
@@ -117,7 +127,11 @@ async def test_failed_helper_setup_wakes_parent_with_settled_result(db, monkeypa
   async def admitted(_data_dir):
     pass
 
+  setup_started = False
+
   async def broken_impl(*_args, **_kwargs):
+    nonlocal setup_started
+    setup_started = True
     raise RuntimeError("private setup detail")
 
   starts = []
@@ -138,6 +152,7 @@ async def test_failed_helper_setup_wakes_parent_with_settled_result(db, monkeypa
     run_gen=chat_mod.current_run_generation(child_id),
     run_token="child-run-setup-failed-delivery",
   )
+  assert setup_started, "injected helper setup failure must be reached"
 
   db.expire_all()
   child_run = db.get(models.ChatRun, "child-run-setup-failed-delivery")
