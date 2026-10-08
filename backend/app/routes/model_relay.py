@@ -33,13 +33,6 @@ router = APIRouter(prefix="/api/model-relay", include_in_schema=False)
 _PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "forwarded", "x-real-ip")
 _TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
 _http_client: httpx.AsyncClient | None = None
-# Upstream response headers the engines act on: server-directed retry and
-# rate-limit state, and request ids for support. Everything else (cookies,
-# hop-by-hop headers, content-encoding/length of the re-chunked body) stays.
-_RESPONSE_HEADERS = frozenset((
-  "retry-after", "retry-after-ms", "x-should-retry", "request-id", "x-request-id",
-))
-_RESPONSE_HEADER_PREFIXES = ("anthropic-ratelimit-", "x-ratelimit-")
 
 
 def _client() -> httpx.AsyncClient:
@@ -170,15 +163,6 @@ _PROTOCOLS: dict[str, _Protocol] = {
 }
 
 
-def _forwarded_response_headers(upstream: httpx.Response) -> dict[str, str]:
-  headers = {"content-type": upstream.headers.get("content-type", "application/json")}
-  for name, value in upstream.headers.items():
-    name = name.lower()
-    if name in _RESPONSE_HEADERS or name.startswith(_RESPONSE_HEADER_PREFIXES):
-      headers[name] = value
-  return headers
-
-
 def _is_direct_loopback(request: Request) -> bool:
   if any(request.headers.get(name) for name in _PROXY_HEADERS):
     return False
@@ -269,5 +253,5 @@ async def _relay(provider_id: str, request: Request, protocol_name: str):
   return StreamingResponse(
     body_chunks(),
     status_code=upstream.status_code,
-    headers=_forwarded_response_headers(upstream),
+    headers={"content-type": upstream.headers.get("content-type", "application/json")},
   )

@@ -140,49 +140,6 @@ def test_relay_checks_token_then_forwards_normalized_body_with_real_key(
     providers.invalidate_model_cache()
 
 
-
-def test_relay_forwards_retry_and_rate_limit_headers_only(client, db, monkeypatch):
-  app = models.App(
-    name="Messages Connect", slug="messages-connect-429", description="",
-    source_dir="/tmp/messages-connect-429", capability_contract=contract_from_manifest(_manifest()),
-  )
-  db.add(app)
-  db.commit()
-  provider_id = f"app-{app.id}"
-  data_dir = get_settings().data_dir
-  _write_secret(Path(data_dir) / "app-secrets" / str(app.id) / "api_key", REAL_KEY)
-
-  def upstream(_req: httpx.Request) -> httpx.Response:
-    return httpx.Response(429, headers={
-      "content-type": "application/json",
-      "retry-after": "7", "retry-after-ms": "7000", "x-should-retry": "true",
-      "request-id": "req_123", "anthropic-ratelimit-requests-remaining": "0",
-      "x-ratelimit-reset-requests": "7s", "set-cookie": "upstream=1",
-      "connection": "close",
-    }, content=b'{"type":"error"}')
-
-  monkeypatch.setattr(model_relay, "_is_direct_loopback", lambda _request: True)
-  monkeypatch.setattr(model_relay, "_http_client", httpx.AsyncClient(transport=httpx.MockTransport(upstream)))
-  try:
-    providers.sync_app_model_providers(data_dir, force=True)
-    relayed = client.post(
-      f"/api/model-relay/{provider_id}/v1/messages",
-      json={"model": "example/flash", "messages": [{"role": "user", "content": "hi"}]},
-      headers={"x-api-key": providers.model_relay_token(provider_id)},
-    )
-  finally:
-    providers.invalidate_model_cache()
-
-  assert relayed.status_code == 429
-  assert relayed.headers["retry-after"] == "7"
-  assert relayed.headers["retry-after-ms"] == "7000"
-  assert relayed.headers["x-should-retry"] == "true"
-  assert relayed.headers["request-id"] == "req_123"
-  assert relayed.headers["anthropic-ratelimit-requests-remaining"] == "0"
-  assert relayed.headers["x-ratelimit-reset-requests"] == "7s"
-  assert "set-cookie" not in relayed.headers
-
-
 @pytest.mark.asyncio
 async def test_claude_runner_accepts_a_messages_providers_own_model(monkeypatch):
   from app import claude_sdk_runner
