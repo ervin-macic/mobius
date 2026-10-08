@@ -404,53 +404,17 @@ def test_sweep_reclamation_survives_its_own_session():
     reader.close()
 
 
-def test_follow_up_has_no_five_round_budget(db):
-  """Productive review continues well past the old five-round stop."""
+def test_follow_up_has_no_round_budget(db):
+  """Completed rounds never exhaust a budget; only failed rounds escalate."""
   autopilot.stamp_grant(db, 1, "rec", head_sha="abc")
   row = autopilot.get_row(db, 1, "rec")
-  row.rounds_used = autopilot.RUNAWAY_ROUND_LIMIT - 1
+  row.rounds_used = 50
   db.commit()
   v = autopilot.claim_for_round(
     db, 1, "rec", attention_key="k", event_at="2026-08-01T00:00:00Z",
   )
   assert v["status"] == "granted"
-  assert autopilot.mirror_block(
-    autopilot.get_row(db, 1, "rec")
-  )["max_rounds"] == autopilot.RUNAWAY_ROUND_LIMIT
-
-
-def test_recurring_settled_rounds_eventually_escalate(db):
-  """A check the agent can't fix: every round pushes, CI fails again, and a
-  fresh checks_failed attention arrives. Settled rounds reset the failure
-  counter, so only the runaway guard hands the PR back to the owner."""
-  autopilot.stamp_grant(db, 1, "rec", head_sha="sha0")
-  limit = autopilot.RUNAWAY_ROUND_LIMIT
-  for i in range(limit):
-    v = autopilot.claim_for_round(
-      db, 1, "rec", attention_key=f"checks_failed:sha{i}",
-      event_at=f"2026-08-01T00:{i:02d}:00Z",
-    )
-    assert v["status"] == "granted", i
-    assert autopilot.record_action(
-      db, 1, "rec", run_id=v["run_id"], action="pushed", head_sha=f"sha{i + 1}",
-    )
-    assert autopilot.complete_round(
-      db, 1, "rec", run_id=v["run_id"], outcome="pushed", summary="retry",
-    )["escalate"] is False
-  row = autopilot.get_row(db, 1, "rec")
-  assert row.rounds_used == limit and row.consecutive_failures == 0
-  v = autopilot.claim_for_round(
-    db, 1, "rec", attention_key=f"checks_failed:sha{limit}",
-    event_at="2026-08-01T01:00:00Z",
-  )
-  assert v == {"status": "escalate", "reason": "round_ceiling"}
-  assert autopilot.get_row(db, 1, "rec").state == "idle"
-  # Owner resume restores follow-up with a fresh allowance.
-  autopilot.set_enabled(db, 1, "rec", True)
-  assert autopilot.claim_for_round(
-    db, 1, "rec", attention_key=f"checks_failed:sha{limit}",
-    event_at="2026-08-01T01:00:00Z",
-  )["status"] == "granted"
+  assert "max_rounds" not in autopilot.mirror_block(autopilot.get_row(db, 1, "rec"))
 
 
 def test_resume_resets_counters_and_close_out(db):

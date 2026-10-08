@@ -5910,12 +5910,7 @@ async def autopilot_respond(
   if status == "escalate":
     await _autopilot_escalate_and_notify(
       db, app_id, record_id, owner_id,
-      (
-        f"Autopilot completed {autopilot.RUNAWAY_ROUND_LIMIT} follow-up rounds "
-        "without the PR settling and needs your review before continuing."
-      )
-      if verdict.get("reason") == "round_ceiling"
-      else "Autopilot's follow-up rounds keep failing to complete.",
+      "Autopilot's follow-up rounds keep failing to complete.",
     )
     await autopilot.mirror_to_ledger(app_id, record_id)
     return {"status": "escalated", "reason": verdict.get("reason")}
