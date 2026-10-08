@@ -1466,6 +1466,11 @@
         acceptModuleResult(msg);
         return;
       }
+      if (msg.type === 'moebius:frame-visibility') {
+        // AppCanvas sends this before the fetched app runtime evaluates.
+        if (typeof msg.visible === 'boolean') window.__mobiusFrameVisible = msg.visible;
+        return;
+      }
       if (msg.type === 'moebius:frame-theme') {
         applyTheme(msg.themeCss, msg.bg);
         return;
