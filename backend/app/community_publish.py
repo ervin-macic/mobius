@@ -33,8 +33,30 @@ _OID = re.compile(r"^[0-9a-f]{40,64}$")
 # brackets, tildes and non-ASCII letters. Refuse only names that cannot be
 # shown or handled faithfully: control, format, and separator characters
 # plus blank-lookalike fillers disguise a name. ASCII spaces remain allowed.
-_UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Zl", "Zp", "Zs"}
+# Control, format, separator, surrogate, private-use and unassigned code
+# points can hide or disguise a published name.
+_UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp", "Zs"}
 _BLANK_PATH_CHARACTERS = {"\u115f", "\u1160", "\u3164", "\uffa0", "\u2800"}
+# Unicode Default_Ignorable_Code_Point ranges: characters that render as
+# nothing, whatever their general category (for example U+034F is Mn).
+_DEFAULT_IGNORABLE_RANGES = (
+  (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+  (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
+  (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+  (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+  (0xE0000, 0xE0FFF),
+)
+
+
+def _is_unsafe_path_character(char: str) -> bool:
+  if char == " ":
+    return False
+  point = ord(char)
+  return (
+    unicodedata.category(char) in _UNSAFE_PATH_CATEGORIES
+    or char in _BLANK_PATH_CHARACTERS
+    or any(low <= point <= high for low, high in _DEFAULT_IGNORABLE_RANGES)
+  )
 # Path segments refused anywhere in a published tree, each with the reason the
 # author sees. Private folder names remain a guard beyond the content scan.
 _UNPUBLISHED_SEGMENTS = {
@@ -315,17 +337,14 @@ def _validate_path(path: str) -> None:
     or len(path.encode("utf-8")) > MAX_PATH_BYTES
     or str(pure) != path
     or any(part in {"", ".", ".."} for part in parts)
-    or any(
-      char != " " and (
-        unicodedata.category(char) in _UNSAFE_PATH_CATEGORIES
-        or char in _BLANK_PATH_CHARACTERS
-      ) for char in path
-    )
+    or any(part != part.strip() for part in parts)
+    or any(_is_unsafe_path_character(char) for char in path)
   ):
     raise CommunityPublicationError(
       f"The path {path!r} cannot be published. Use a relative path of at most "
       f"{MAX_PATH_BYTES} bytes with '/' separators (no backslashes), no '.' "
-      "or '..' segments, and no control, text-direction or blank-lookalike characters.",
+      "or '..' segments, no leading or trailing spaces in a name, and no "
+      "control, text-direction, invisible or blank-lookalike characters.",
       "invalid_path",
     )
   folded = [part.casefold() for part in parts]

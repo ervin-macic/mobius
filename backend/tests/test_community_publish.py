@@ -486,6 +486,7 @@ def test_content_scan_catches_ascii_credentials_in_invalid_utf8(tmp_path, folder
   "\u2028", "\u2029", "\u200e", "\u200f", "\u061c", "\u200b", "\u200c",
   "\u200d", "\u2060", "\u180e", "\u2062", "\ufeff",
   "\u00a0", "\u3000", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800",
+  "\u034f", "\ufe0f", "\u17b4", "\u0378", "\ue000", "\U000e0001",
 ])
 def test_snapshot_refuses_invisible_filename_characters(tmp_path, character):
   repo, app, _ = _app_repo(tmp_path)
@@ -495,6 +496,46 @@ def test_snapshot_refuses_invisible_filename_characters(tmp_path, character):
     build_public_snapshot(app)
 
   assert raised.value.code == "invalid_path"
+
+
+@pytest.mark.parametrize("path", [
+  "\u034f/a.js", "a/\ufe0f", "\u17b4.js", " /a.js", "a /b.js", "a/ b.js",
+  "a/b.js ", " ",
+])
+def test_snapshot_refuses_invisible_or_padded_segments(tmp_path, path):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {path: b"export {}"})
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "invalid_path"
+
+
+def test_snapshot_refuses_name_that_differs_by_an_invisible_joiner(tmp_path):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {
+    "index.jsx": b"export {}",
+    "index\u034f.jsx": b"export {}",
+  })
+
+  with pytest.raises(CommunityPublicationError) as raised:
+    build_public_snapshot(app)
+
+  assert raised.value.code == "invalid_path"
+
+
+def test_snapshot_allows_inner_spaces_and_visible_unicode(tmp_path):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {
+    "my notes/read me.md": b"hello",
+    "caf\u00e9/\u65e5\u672c.txt": b"hello",
+  })
+
+  _, files = build_public_snapshot(app)
+  paths = {item["path"] for item in files}
+  assert "my notes/read me.md" in paths
+  assert "caf\u00e9/\u65e5\u672c.txt" in paths
 
 
 def test_snapshot_allows_slack_placeholder(tmp_path):
