@@ -74,6 +74,7 @@ from app.manifest_identity import (
   canonical_manifest_identity_key as _canonical_identity_key,
   requested_manifest_source,
   require_bound_manifest as _require_bound_manifest,
+  stored_manifest_fetch_url,
 )
 from app.manifest_contract import (
   EXECUTABLE_MANIFEST_FIELDS,
@@ -3081,9 +3082,12 @@ async def _authorize_source_handoff(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
   ) as cli:
+    # The old row's own address is fetched without the stored id binding:
+    # trust here comes from `package_id` + `moved_to`, and a `package_id` app
+    # may have changed its manifest id without `previous_id`.
     old_manifest, _ = await _fetch_and_validate_manifest(
       cli,
-      manifest_url=existing.manifest_url,
+      manifest_url=stored_manifest_fetch_url(existing.manifest_url),
       manifest=None,
       raw_base=None,
     )

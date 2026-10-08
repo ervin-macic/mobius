@@ -5504,6 +5504,60 @@ def test_package_identity_accepts_a_different_repository_named_by_old_source(
   assert moved.json()["manifest_url"].startswith(new_base.rstrip("/"))
 
 
+def test_package_identity_handoff_accepts_old_source_whose_id_changed(
+  client, auth, bypass_url_validation,
+):
+  """The old source may rename its manifest id under the same package_id."""
+  old_base = "https://raw.githubusercontent.com/alice/app-kanban/main/"
+  new_base = "https://raw.githubusercontent.com/acme/app-kanban/main/"
+  package_id = "urn:uuid:9e136d55-9631-585a-aa75-a745a5dc8f2e"
+  old = _simple_manifest("kanban")
+  old["package_id"] = package_id
+  old_api = json.dumps({"id": 100, "full_name": "alice/app-kanban"}).encode()
+  new_api = json.dumps({"id": 200, "full_name": "acme/app-kanban"}).encode()
+  first_responses = {
+    old_base + "mobius.json": (200, json.dumps(old).encode()),
+    old_base + "index.jsx": (200, JSX.encode()),
+    "https://api.github.com/repos/alice/app-kanban": (200, old_api),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client(first_responses),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    installed = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": old_base + "mobius.json"},
+    )
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+
+  renamed_old = _simple_manifest("kanban-board")
+  renamed_old.update({
+    "package_id": package_id,
+    "moved_to": {"manifest_url": new_base + "mobius.json"},
+  })
+  new = _simple_manifest("kanban-board", version="2.0.0")
+  new["package_id"] = package_id
+  moved_responses = {
+    new_base + "mobius.json": (200, json.dumps(new).encode()),
+    new_base + "index.jsx": (200, JSX.encode()),
+    old_base + "mobius.json": (200, json.dumps(renamed_old).encode()),
+    "https://api.github.com/repos/acme/app-kanban": (200, new_api),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client(moved_responses),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    moved = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": new_base + "mobius.json"},
+    )
+
+  assert moved.status_code == 201, moved.text
+  assert moved.json()["id"] == app_id
+  assert moved.json()["package_id"] == package_id
+
+
 def test_rename_adopts_predecessor_across_same_owner_repository_move(
   client, auth, bypass_url_validation,
 ):
@@ -8444,6 +8498,36 @@ def test_update_discovery_preserves_stored_address_binding(
     assert "another-app" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+def test_update_discovery_fallback_follows_package_id_across_id_change(
+  client, auth, tmp_path, bypass_url_validation, route,
+):
+  """A package_id app keeps update discovery after renaming its manifest id."""
+  manifest = {
+    "id": "pkg-update", "name": "Package update", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+    "package_id": "urn:uuid:3b7f0f8e-2d1c-5a7e-9a4b-0c6d2e1f8a90",
+  }
+  base = "https://pkg-update.test/repo/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  renamed = {**manifest, "id": "pkg-update-renamed", "version": "2.0.0"}
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(renamed)})
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(f"/api/apps/{app_id}/{route}", headers=auth)
+  assert response.status_code == 200, response.text
+  if route == "update-check":
+    assert response.json()["update_available"] is True
+  else:
+    assert response.json()["upstream_commit"]
+
+
 @pytest.mark.parametrize("manifest_id,previous_id,allowed", [
   ("current", None, True), ("renamed", "current", True), ("other", None, False),
 ])
@@ -8458,3 +8542,14 @@ def test_stored_address_binding_accepts_only_the_package_or_its_predecessor(
   else:
     with pytest.raises(ValueError, match="no longer"):
       require_bound_manifest(manifest, "current")
+
+
+def test_stored_address_binding_accepts_the_rows_package_id():
+  from app.manifest_identity import require_bound_manifest
+
+  manifest = {"id": "renamed", "package_id": "urn:uuid:p"}
+  require_bound_manifest(manifest, "current", "urn:uuid:p")
+  with pytest.raises(ValueError, match="no longer"):
+    require_bound_manifest(manifest, "current", "urn:uuid:other")
+  with pytest.raises(ValueError, match="no longer"):
+    require_bound_manifest(manifest, "current")
