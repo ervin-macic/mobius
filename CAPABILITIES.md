@@ -620,7 +620,8 @@ Input accepts only `audio`, `video`, and `iceServers`: at most 4
 `{urls, username?, credential?}` entries with 1–4 `stun:`, `turn:`, or `turns:`
 URLs of at most 512 characters (TURN needs a username and credential, each at
 most 256). `audio: false, video: false` joins receive-only with no device
-prompt. `ready` reports which local devices are live. A missing, busy, or
+prompt; turning the microphone or camera on later with `local` asks for that
+device then. `ready` reports which local devices are live. A missing, busy, or
 refused camera continues audio-only with `videoError: 'denied' |
 'unavailable'`; a missing or busy (not refused) microphone likewise continues
 camera-only with `audioError`. When nothing requested is available, `ready`
@@ -635,7 +636,7 @@ browser's autoplay policy has not let the shell start audio yet; send
 | `levels` | `{self, peers: {[peer]: level}}`: smoothed 0–1 speaking levels about five times a second |
 | `local` | `{audio, video, screen}`: local send state after a `local` or `screen` control, a device ending, or the browser's own stop-sharing control |
 | `playback` | `{state}`: shell audio output started (`running`) or was suspended |
-| `error` | `{peer, code, message}`: a non-fatal problem such as `limit_exceeded`, `invalid_request`, or a screen share that was `denied` or `unavailable`; `peer` is `null` when it concerns no single peer |
+| `error` | `{peer, code, message}`: a non-fatal problem such as `limit_exceeded`, `invalid_request`, or a screen share or a later-requested device that was `denied` or `unavailable`; `peer` is `null` when it concerns no single peer |
 
 | Control | Value |
 |---|---|
@@ -644,7 +645,7 @@ browser's autoplay policy has not let the shell start audio yet; send
 | `disconnect` | `{peer}`; idempotent |
 | `volume` | `{gains: {[peer]: 0..1}}`: partial, clamped; 0 is silent but connected. A gain set before a peer's audio arrives applies from its first sample |
 | `tiles` | `{tiles: [{peer, source?, x, y, width, height, radius?, mirror?, opacity?}]}`: replaces every tile; `[]` hides all; `source` is `camera` (default) or `screen`; at most `2 × (max_peers + 1)`, room for every participant's camera and screen |
-| `local` | `{audio?, video?}`: mutes or unmutes local tracks without renegotiation |
+| `local` | `{audio?, video?}`: mutes or unmutes local tracks without renegotiation. Turning on a kind the call has no device for (it joined without it) asks the browser for that device once, then sends it to every connection, which renegotiates; a refusal is a non-fatal `denied` or `unavailable` error. One request at a time; turning the kind off before it arrives releases it |
 | `screen` | `{share}`: `true` asks the browser to share a screen, `false` stops sharing. One share per call; asking again while sharing or choosing is a no-op |
 | `audio-resume` | retries starting shell audio output |
 | `finish` | ends the call with `{durationMs}`; `cancel()` aborts |

@@ -1898,3 +1898,152 @@ test('ending or hiding the call stops a shared screen', async () => {
   assert.equal(host.activeCount(), 0)
   for (const entry of sent) assertPlainJson(entry.value ?? null, `${entry.type}.value`)
 })
+
+// Alice joined to listen, without a microphone or camera; Bob talks.
+async function listenerPair(aliceDevices = fakeDevices()) {
+  const rtc = fakeRtc()
+  const aliceEnv = environment({ rtc, devices: aliceDevices })
+  const bobEnv = environment({ rtc })
+  const alice = openCall(aliceEnv, { audio: false, video: false })
+  const bob = openCall(bobEnv, { audio: true, video: false })
+  await alice.ready
+  await bob.ready
+  relay(alice, 'alice', bob, 'bob')
+  relay(bob, 'bob', alice, 'alice')
+  alice.control('connect', { peer: 'bob', polite: false })
+  bob.control('connect', { peer: 'alice', polite: true })
+  await settle(80)
+  const [alicePc, bobPc] = rtc.instances
+  return { aliceEnv, bobEnv, alice, bob, alicePc, bobPc }
+}
+
+test('a call that joined without devices asks for one the first time the app turns it on', async () => {
+  const { aliceEnv, alice, bob, alicePc, bobPc } = await listenerPair()
+  assert.deepEqual(aliceEnv.devices.requests, [], 'joining asked for nothing')
+  assert.deepEqual(alicePc.senders, [])
+  const offers = alicePc.offers + bobPc.offers
+
+  alice.control('local', { audio: true })
+  await settle(80)
+
+  assert.equal(aliceEnv.devices.requests.length, 1)
+  assert.ok(aliceEnv.devices.requests[0].audio, 'the microphone is asked for')
+  assert.equal(aliceEnv.devices.requests[0].video, false, 'and nothing else')
+  const [mic] = aliceEnv.devices.granted[0].getAudioTracks()
+  assert.ok(alicePc.senders.some(({ track }) => track === mic), 'it joins the open connection')
+  assert.ok(alicePc.offers + bobPc.offers > offers, 'adding it renegotiated')
+  assert.deepEqual(alice.events('local').at(-1), { audio: true, video: false, screen: false })
+  assert.deepEqual(bob.events('peer').at(-1), {
+    peer: 'alice', state: 'connected', audio: true, video: false, screen: false,
+  })
+  mic.level = 0.5
+  aliceEnv.timers.fire()
+  assert.ok(alice.events('levels').at(-1).self > 0, 'the new microphone is metered')
+
+  // From now on it is the ordinary mute toggle.
+  alice.control('local', { audio: false })
+  alice.control('local', { audio: true })
+  assert.equal(aliceEnv.devices.requests.length, 1, 'a device the call has is never asked for again')
+  assert.equal(mic.enabled, true)
+
+  // The camera can follow later in the same way, and paints the self view.
+  alice.control('local', { video: true })
+  await settle(80)
+  assert.equal(aliceEnv.devices.requests.length, 2)
+  assert.equal(aliceEnv.devices.requests[1].audio, false)
+  assert.ok(aliceEnv.devices.requests[1].video)
+  const [camera] = aliceEnv.devices.granted[1].getVideoTracks()
+  assert.ok(alicePc.senders.some(({ track }) => track === camera))
+  alice.control('tiles', { tiles: [{ peer: 'self', x: 0, y: 0, width: 64, height: 48 }] })
+  assert.equal(paintedTiles(aliceEnv)[0].track, camera)
+  assert.deepEqual(bob.events('peer').at(-1), {
+    peer: 'alice', state: 'connected', audio: true, video: true, screen: false,
+  })
+
+  alice.control('finish')
+  await alice.result
+  assert.equal(mic.stops, 1, 'ending the call stops a device added later')
+  assert.equal(camera.stops, 1)
+  assert.deepEqual(alice.events('error'), [])
+  assert.deepEqual(bob.events('error'), [])
+  assertAppSawOnlyJson(alice)
+  assertAppSawOnlyJson(bob)
+})
+
+test('a device refused or missing after joining is reported without ending the call', async () => {
+  for (const [failure, code] of [['NotAllowedError', 'denied'], ['NotFoundError', 'unavailable']]) {
+    const devices = fakeDevices({ audio: failure })
+    const { alice, alicePc } = await listenerPair(devices)
+
+    alice.control('local', { audio: true })
+    await settle(20)
+    const [error] = alice.events('error')
+    assert.equal(error.code, code)
+    assert.equal(error.peer, null)
+    assert.deepEqual(alice.events('local').at(-1), { audio: false, video: false, screen: false })
+    assert.deepEqual(alicePc.senders, [])
+    assert.deepEqual(alice.events('failure'), [], 'the call carries on')
+
+    // A later turn-on asks again, for instance once the browser allows it.
+    delete devices.plan.audio
+    alice.control('local', { audio: true })
+    await settle(80)
+    assert.deepEqual(alice.events('local').at(-1), { audio: true, video: false, screen: false })
+    assert.equal(alicePc.senders.length, 1)
+    alice.control('finish')
+  }
+})
+
+test('a device that arrives after the call ended or was turned off again is released', async () => {
+  // The call ends while the browser asks.
+  {
+    const devices = deferredDevices()
+    const env = environment({ devices })
+    const session = openCall(env, { audio: false, video: false })
+    await session.ready
+    session.control('local', { audio: true })
+    session.control('local', { audio: true })
+    assert.equal(devices.calls.length, 1, 'asking again while asking is a no-op')
+    session.control('finish')
+    await session.result
+    const late = new FakeTrack('audio')
+    devices.calls[0].resolve(new FakeStream([late]))
+    await settle(4)
+    assert.equal(late.stops, 1)
+  }
+
+  // The app turns the microphone off, and on again, while the browser asks.
+  {
+    const devices = deferredDevices()
+    const env = environment({ devices })
+    const session = openCall(env, { audio: false, video: false })
+    await session.ready
+    session.control('connect', { peer: 'p1', polite: false })
+    await settle(6)
+    const pc = env.rtc.instances[0]
+
+    session.control('local', { audio: true })
+    session.control('local', { audio: false })
+    const unwanted = new FakeTrack('audio')
+    devices.calls[0].resolve(new FakeStream([unwanted]))
+    await settle(6)
+    assert.equal(unwanted.stops, 1, 'a microphone turned off while asking is not kept')
+    assert.deepEqual(pc.senders, [])
+    assert.deepEqual(session.events('error'), [])
+    assert.deepEqual(session.events('local').at(-1), { audio: false, video: false, screen: false })
+
+    session.control('local', { audio: true })
+    session.control('local', { audio: false })
+    session.control('local', { audio: true })
+    assert.equal(devices.calls.length, 2)
+    const wanted = new FakeTrack('audio')
+    devices.calls[1].resolve(new FakeStream([wanted]))
+    await settle(6)
+    assert.equal(wanted.stops, 0, 'the latest choice wins')
+    assert.ok(pc.senders.some(({ track }) => track === wanted))
+    assert.deepEqual(session.events('local').at(-1), { audio: true, video: false, screen: false })
+    session.control('finish')
+    await session.result
+    assert.equal(wanted.stops, 1)
+  }
+})

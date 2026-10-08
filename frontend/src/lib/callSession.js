@@ -238,6 +238,8 @@ function startCall(request, channel, environment) {
   let screenTrack = null
   let screenStream = null
   let screenRequest = null
+  // A microphone or camera asked for after the call joined without it.
+  let deviceRequest = null
   let levelTimer = null
   let startedAt = null
   let tiles = []
@@ -827,6 +829,97 @@ function startCall(request, channel, environment) {
     // Muting toggles the track, so no renegotiation and instant unmute.
     if (typeof value.audio === 'boolean' && localAudio) localAudio.enabled = value.audio
     if (typeof value.video === 'boolean' && localVideo) localVideo.enabled = value.video
+    // A kind the call joined without is asked for the first time the app
+    // turns it on, so a receive-only listener can still speak up later.
+    // While the browser asks, the latest on or off for a kind being asked
+    // for decides whether it is kept when it arrives.
+    for (const kind of ['audio', 'video']) {
+      if (deviceRequest?.asked[kind] && typeof value[kind] === 'boolean') deviceRequest[kind] = value[kind]
+    }
+    const audio = value.audio === true && !localAudio
+    const video = value.video === true && !localVideo
+    if (audio || video) requestDevices(audio, video)
+    localChanged()
+  }
+
+  function requestDevices(audio, video) {
+    // One request at a time: turning a kind on again while asking is a no-op.
+    if (deviceRequest) return
+    if (typeof mediaDevices?.getUserMedia !== 'function') {
+      report(null, callError(
+        'unavailable',
+        'Microphone and camera access is unavailable in this browser.',
+        'NotSupportedError',
+      ))
+      return
+    }
+    const attempt = { asked: { audio, video }, audio, video }
+    deviceRequest = attempt
+    let asked
+    try {
+      asked = mediaDevices.getUserMedia(mediaConstraints(audio, video))
+    } catch (error) {
+      asked = Promise.reject(error)
+    }
+    Promise.resolve(asked).then((stream) => {
+      if (deviceRequest !== attempt || phase !== 'live') {
+        // The call ended while the permission prompt was open.
+        stopStream(stream)
+        return
+      }
+      deviceRequest = null
+      addDevices(stream, attempt)
+    }, (error) => {
+      if (deviceRequest !== attempt) return
+      deviceRequest = null
+      // A refused or missing device leaves the call as it was.
+      report(null, mediaFailure([error]))
+    })
+  }
+
+  function addDevices(stream, wanted) {
+    let added = false
+    let withdrawn = false
+    for (const track of stream?.getTracks?.() || []) {
+      const missing = track.readyState !== 'ended'
+        && ((track.kind === 'audio' && !localAudio) || (track.kind === 'video' && !localVideo))
+      const keep = missing && wanted[track.kind] === true
+      if (missing && !keep) withdrawn = true
+      if (!keep) {
+        // Never keep a capture the call does not use, or one turned off again.
+        try { track.stop() } catch { /* already stopped */ }
+        continue
+      }
+      track.onended = localChanged
+      if (track.kind === 'audio') {
+        localAudio = track
+        try {
+          selfMeter = createMeter(audioContext, new MediaStreamCtor([track]))
+        } catch {
+          selfMeter = null // The call still works; only the self level stays 0.
+        }
+      } else {
+        localVideo = track
+        selfVideo = new MediaStreamCtor([track])
+      }
+      added = true
+    }
+    if (!added) {
+      // Everything granted was turned off again meanwhile: nothing to report.
+      if (!withdrawn) report(null, mediaFailure([]))
+      return
+    }
+    // One local stream holds every device track, so connections made later
+    // send them together and ending the call stops them all.
+    localStream = new MediaStreamCtor([localAudio, localVideo].filter(Boolean))
+    for (const peer of peers.values()) {
+      if (!current(peer)) continue
+      for (const track of stream.getTracks()) {
+        if (track !== localAudio && track !== localVideo) continue
+        // Adding a track renegotiates through perfect negotiation.
+        try { peer.pc.addTrack(track, localStream) } catch { /* this connection keeps receiving */ }
+      }
+    }
     localChanged()
   }
 
@@ -970,6 +1063,8 @@ function startCall(request, channel, environment) {
     }
     if (selfMeter) disconnectNodes(selfMeter.source, selfMeter.analyser)
     selfMeter = null
+    // A device that is granted after this is stopped when it arrives.
+    deviceRequest = null
     stopStream(localStream)
     localStream = null
     localAudio = null
