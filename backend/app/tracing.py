@@ -156,7 +156,7 @@ def configure(app, engine, *, exporter=None) -> bool:
   try:
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.context import Context
-    from opentelemetry.propagate import get_global_textmap, set_global_textmap
+    from opentelemetry.propagate import set_global_textmap
     from opentelemetry.propagators.textmap import TextMapPropagator
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -164,7 +164,7 @@ def configure(app, engine, *, exporter=None) -> bool:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import Event, ReadableSpan, TracerProvider
     from opentelemetry.sdk.trace.export import (
-      BatchSpanProcessor, SimpleSpanProcessor, SpanExporter, SpanExportResult,
+      BatchSpanProcessor, SimpleSpanProcessor, SpanExporter,
     )
   except ImportError as exc:
     _log.warning("tracing: OpenTelemetry install is incomplete (%s)", exc)
@@ -184,19 +184,12 @@ def configure(app, engine, *, exporter=None) -> bool:
       return set()
 
   class _ScrubbingExporter(SpanExporter):
-    """Scrub every span on its way out, whenever its attributes were set.
-
-    Nothing leaves until ``enabled`` is set, which ``configure`` does only
-    after every setup step has succeeded.
-    """
+    """Scrub every span on its way out, whenever its attributes were set."""
 
     def __init__(self, inner):
       self._inner = inner
-      self.enabled = False
 
     def export(self, spans):
-      if not self.enabled:
-        return SpanExportResult.SUCCESS
       return self._inner.export([_scrubbed(span, ReadableSpan, Event) for span in spans])
 
     def shutdown(self):
@@ -205,19 +198,14 @@ def configure(app, engine, *, exporter=None) -> bool:
     def force_flush(self, timeout_millis: int = 30000) -> bool:
       return self._inner.force_flush(timeout_millis)
 
-  previous_textmap = get_global_textmap()
-  provider = None
-  undo = []
   try:
     provider = TracerProvider(resource=Resource.create({"service.name": "mobius"}))
     if exporter is None:
-      gate = _ScrubbingExporter(
+      provider.add_span_processor(BatchSpanProcessor(_ScrubbingExporter(
         OTLPSpanExporter(endpoint=f"{config['endpoint']}/v1/traces"),
-      )
-      provider.add_span_processor(BatchSpanProcessor(gate))
+      )))
     else:
-      gate = _ScrubbingExporter(exporter)
-      provider.add_span_processor(SimpleSpanProcessor(gate))
+      provider.add_span_processor(SimpleSpanProcessor(_ScrubbingExporter(exporter)))
     # Spans stay inside this instance: never add a traceparent header to
     # outgoing requests (proxy fetches reach arbitrary third parties).
     set_global_textmap(_LocalOnlyPropagation())
@@ -227,32 +215,13 @@ def configure(app, engine, *, exporter=None) -> bool:
     FastAPIInstrumentor.instrument_app(
       app, tracer_provider=provider, exclude_spans=["send", "receive"],
     )
-    undo.append(lambda: FastAPIInstrumentor.uninstrument_app(app))
-    sqlalchemy_instrumentor = SQLAlchemyInstrumentor()
-    sqlalchemy_instrumentor.instrument(engine=engine, tracer_provider=provider)
-    undo.append(sqlalchemy_instrumentor.uninstrument)
-    httpx_instrumentor = HTTPXClientInstrumentor()
-    httpx_instrumentor.instrument(tracer_provider=provider)
-    undo.append(httpx_instrumentor.uninstrument)
+    SQLAlchemyInstrumentor().instrument(engine=engine, tracer_provider=provider)
+    HTTPXClientInstrumentor().instrument(tracer_provider=provider)
   except Exception:
     # Optional diagnostics must never stop the server from booting, e.g. when
     # a locally installed OpenTelemetry drifts from the platform's FastAPI.
-    # Setup is all-or-nothing: the exporter gate was never opened, so no span
-    # leaves, and every step that did succeed is undone.
     _log.exception("tracing: setup failed; tracing stays off")
-    for step in reversed(undo):
-      try:
-        step()
-      except Exception:
-        _log.warning("tracing: rollback step failed", exc_info=True)
-    set_global_textmap(previous_textmap)
-    if provider is not None:
-      try:
-        provider.shutdown()
-      except Exception:
-        _log.warning("tracing: provider shutdown failed", exc_info=True)
     return False
-  gate.enabled = True
   _tracer = provider.get_tracer("mobius")
   _log.info("tracing: exporting to %s", config["endpoint"])
   return True
