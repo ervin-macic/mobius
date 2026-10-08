@@ -125,6 +125,12 @@ export function PlatformUpdatesView({ update, onOpenChat, inertBoundaryRef }) {
             {busy ? (phase === 'checking' ? 'Checking…' : phase === 'restarting' ? 'Restarting…' : phase === 'cancelling' ? 'Cancelling…' : 'Updating…') : primary.label}
           </button>
         )}
+        {recoveryRequired && (
+          <button type="button" className="settings__btn settings__btn--sm settings__btn--outline"
+            disabled={busy} onClick={update.check}>
+            {phase === 'checking' ? 'Checking recovery status…' : 'Check recovery status'}
+          </button>
+        )}
         {platform?.unfinished_update?.cancellable && !busy && !recoveryRequired && (
           <button type="button" className="settings__btn settings__btn--sm settings__btn--outline" onClick={update.cancel}>Cancel update</button>
         )}

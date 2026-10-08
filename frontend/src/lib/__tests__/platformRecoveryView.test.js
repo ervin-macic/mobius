@@ -39,9 +39,22 @@ for (const state of ['finish', 'settling', 'conflict', 'restart']) {
     assert.match(html, /The replacement needs recovery before another update can start/)
     assert.match(html, /The previous replacement still needs recovery in your deployment/)
     assert.match(html, /<button[^>]*>Ask Möbius<\/button>/)
+    assert.match(html, /<button[^>]*>Check recovery status<\/button>/)
     assert.match(html, /<button class="settings__btn settings__btn--outline settings__btn--sm">Restart<\/button>/)
     assert.doesNotMatch(html, />(?:Finish update|Finish in chat|Review update|Cancel update|Keep this version|Withdraw request|Updating…|Checking…)</)
     assert.doesNotMatch(html, /The update is still running|Confirming the new container/)
     assert.doesNotMatch(html, /Your changes are ready|Restart to finish/)
   })
 }
+
+test('the recovery status control is disabled while checking', () => {
+  const html = renderToStaticMarkup(createElement(PlatformUpdatesView, {
+    update: {
+      platform: { state: 'ready', contained_upstream_sha: target },
+      rebuild: { state: 'needs_recovery', expected_sha: target },
+      phase: 'checking', busy: true, reconnecting: false,
+    },
+  }))
+  assert.match(html, /<button[^>]*disabled=""[^>]*>Checking recovery status…<\/button>/)
+  assert.doesNotMatch(html, />(?:Review update|Cancel update|Keep this version|Withdraw request|Updating…)</)
+})
