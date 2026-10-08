@@ -652,6 +652,39 @@ def _require_ready_attempt_resolved(previous):
     raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before any new public action.")
 
 
+async def _confirm_ready_attempt(row, target, cwd) -> str | None:
+  """Read-only check that an earlier readiness attempt is visibly complete.
+
+  Returns None when confirmed, otherwise why it is not. Never mutates GitHub.
+  """
+  try:
+    live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
+  except Exception:
+    return "The earlier readiness attempt is uncertain; it was not repeated."
+  if live.get("state") != "open" or live.get("draft") is not False:
+    return "The earlier readiness attempt is not confirmed; it was not repeated."
+  if not reviews.merge_permission(live_repo):
+    return "The earlier readiness attempt is visible, but write permission changed; no action was repeated."
+  try:
+    actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
+  except Exception:
+    return "The earlier readiness attempt is visible, but the GitHub actor could not be confirmed; no action was repeated."
+  if str(actor.get("id") or "") != row.github_actor_id:
+    return "The earlier readiness attempt is visible, but the GitHub actor changed; no action was repeated."
+  try:
+    await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+  except Exception:
+    return "The target base changed; exact readiness evidence cannot be confirmed."
+  return None
+
+
+def _escalate_unconfirmed_ready(db, row, item_key, previous, attempt):
+  # A leftover "attempting" receipt (crash or lost response) that cannot be
+  # confirmed must surface to the owner instead of silently blocking.
+  if attempt.get("state") == "attempting":
+    reviews.save_outcome(db, row, item_key, {**previous, "ready_attempt": {**attempt, "state": "unknown"}})
+
+
 class DraftReady(PullIdentity):
   reviewed_base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
   independent_receipt_id: str = Field(min_length=1, max_length=64)
@@ -679,25 +712,14 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
     attempt = previous.get("ready_attempt")
     if attempt:
       # The mutation is unrepeatable after admission, including lost responses.
-      try:
-        live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-      except Exception:
-        return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is uncertain; it was not repeated."}
-      if live.get("state") == "open" and live.get("draft") is False:
-        if not reviews.merge_permission(live_repo):
-          return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is visible, but write permission changed; no action was repeated."}
-        actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-        if str(actor.get("id") or "") != row.github_actor_id:
-          return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is visible, but the GitHub actor changed; no action was repeated."}
-        try:
-          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-        except HTTPException:
-          return {"run": _run_view(db, row), "blocked": "The target base changed; exact readiness evidence cannot be confirmed."}
-        if attempt.get("state") != "ready":
-          reviews.save_outcome(db, row, item_key, {**previous,
-            "ready_attempt": {**attempt, "state": "ready"}})
-        return {"run": _run_view(db, row)}
-      return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is not confirmed; it was not repeated."}
+      blocked = await _confirm_ready_attempt(row, target, cwd)
+      if blocked:
+        _escalate_unconfirmed_ready(db, row, item_key, previous, attempt)
+        return {"run": _run_view(db, row), "blocked": blocked}
+      if attempt.get("state") != "ready":
+        reviews.save_outcome(db, row, item_key, {**previous,
+          "ready_attempt": {**attempt, "state": "ready"}})
+      return {"run": _run_view(db, row)}
     if body.tests_passed is not True or set(body.scope) != SCOPE or not body.tests.strip():
       raise HTTPException(422, "Fresh full-rubric review and passing tests are required before draft readiness.")
     reviews.require_independent_clear(row, target, body)
@@ -732,6 +754,12 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
       reviews.arm_ready(db, row, target, receipt, principal)
       try:
         _parent(db, row, principal)
+      except Exception:
+        # Stop, uninstall or model drift before the mutation: nothing public
+        # happened, so drop the receipt and claim instead of recording unknown.
+        reviews.disarm_ready(db, row, target)
+        raise
+      try:
         await asyncio.to_thread(reviews.mark_ready, _gh, cwd, target)
         # The GraphQL response confirms the PR/head but not the target base.
         # A second live read keeps a post-mutation base drift uncertain.
@@ -1051,23 +1079,13 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
       ready_attempt = previous.get("ready_attempt")
       if ready_attempt and ready_attempt.get("state") != "ready":
         target = reviews.effective_target(row, original)
-        try:
-          live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-        except Exception:
-          live = None
-        if (live and reviews.merge_permission(live_repo) and live.get("state") == "open"
-            and live.get("draft") is False):
-          try:
-            await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-          except HTTPException:
-            pass
-          else:
-            actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-            if str(actor.get("id") or "") == row.github_actor_id:
-              _assert_app_current(db, row.app_id, row.app_nonce)
-              reviews.save_outcome(db, row, reviews.key(original), {**previous,
-                "ready_attempt": {**ready_attempt, "state": "ready"}})
-              previous = row.outcomes_json[reviews.key(original)]
+        if await _confirm_ready_attempt(row, target, cwd) is None:
+          _assert_app_current(db, row.app_id, row.app_nonce)
+          reviews.save_outcome(db, row, reviews.key(original), {**previous,
+            "ready_attempt": {**ready_attempt, "state": "ready"}})
+        else:
+          _escalate_unconfirmed_ready(db, row, reviews.key(original), previous, ready_attempt)
+        previous = row.outcomes_json[reviews.key(original)]
       attempts = list(previous.get("repair_attempts", []))
       pending = next((a for a in attempts if a.get("state") in {"pushing", "push_unknown"}), None)
       if pending:

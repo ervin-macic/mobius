@@ -309,9 +309,28 @@ def arm_merge(db, row, target, outcome, principal):
   return None
 
 
+def ready_work_key(target):
+  return f"github:{target['repo'].lower()}:pr:{target['number']}:{target['head_sha']}:ready"
+
+
+def disarm_ready(db, row, target):
+  """Undo arm_ready when the run is refused before the mutation was sent."""
+  db.rollback()
+  db.refresh(row)
+  item_key = key(target)
+  previous = (row.outcomes_json or {}).get(item_key, {})
+  if (previous.get("ready_attempt") or {}).get("state") == "attempting":
+    save_outcome(db, row, item_key, {k: v for k, v in previous.items() if k != "ready_attempt"})
+  try:
+    agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      work_key=ready_work_key(target), outcome="Draft readiness was not attempted.", release=True)
+  except ValueError:
+    db.rollback()
+
+
 def arm_ready(db, row, target, receipt, principal):
   """Fence one readiness mutation per exact PR/head across overlapping grants."""
-  work_key = f"github:{target['repo'].lower()}:pr:{target['number']}:{target['head_sha']}:ready"
+  work_key = ready_work_key(target)
   claim = agent_work_claims.claim_work(db, owner_id=row.owner_id,
     chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
     summary=f"Mark reviewed draft {key(target)} ready at {target['head_sha'][:12]}.")

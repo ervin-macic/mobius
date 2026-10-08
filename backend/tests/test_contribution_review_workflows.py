@@ -409,6 +409,81 @@ def test_second_draft_preflight_refuses_revoked_identity_or_rights(setup, monkey
   assert not row.outcomes_json[domain.key(ITEM)].get("ready_attempt")
 
 
+@pytest.mark.parametrize("case", ["stop", "app", "model"])
+def test_refusal_after_arming_readiness_is_not_attempted_and_can_retry(setup, monkeypatch, case):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = []
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: calls.append(1))
+  arm = domain.arm_ready
+  def arm_then_revoke(*args):
+    arm(*args)
+    if case == "stop":
+      db.get(models.ChatRun, principal.run_id).status = "stopped"
+    elif case == "app":
+      db.get(models.App, row.app_id).github_access = False
+    else:
+      db.get(models.Chat, row.chat_id).agent_settings_json = {"model": "gpt-5", "effort": "low"}
+    db.commit()
+  monkeypatch.setattr(domain, "arm_ready", arm_then_revoke)
+  with pytest.raises(HTTPException):
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  db.refresh(row)
+  assert calls == []
+  assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+  if case == "stop":
+    db.get(models.ChatRun, principal.run_id).status = "running"
+  elif case == "app":
+    db.get(models.App, row.app_id).github_access = True
+  else:
+    db.get(models.Chat, row.chat_id).agent_settings_json = {"model": "gpt-5", "effort": "xhigh"}
+  db.commit()
+  monkeypatch.setattr(domain, "arm_ready", arm)
+  confirmed = iter([(REPO, {**PULL, "draft": True}), (REPO, {**PULL, "draft": True}), (REPO, {**PULL, "draft": False})])
+  monkeypatch.setattr(domain, "current_pull", lambda *a: next(confirmed))
+  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert calls == [1]
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
+
+
+def test_leftover_attempting_readiness_escalates_to_needs_you_on_observe(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  prior = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
+    "ready_attempt": {"state": "attempting", "head_sha": SHA, "base_sha": BASE}})
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("never replayed"))
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
+  assert observed["state"] == "needs_you"
+  assert observed["items"][0]["state"] == "ready_unknown"
+  assert observed["items"][0]["ready_attempt"]["state"] == "unknown"
+
+
+def test_leftover_attempting_readiness_escalates_on_ready_retry(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  prior = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
+    "ready_attempt": {"state": "attempting", "head_sha": SHA, "base_sha": BASE}})
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("never replayed"))
+  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert result["blocked"]
+  assert result["run"]["state"] == "needs_you"
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
+
+
+def test_observe_actor_read_failure_leaves_readiness_unchanged(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  prior = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
+    "ready_attempt": {"state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": False}))
+  def broken(*a):
+    raise RuntimeError("gh unavailable")
+  monkeypatch.setattr(domain, "read", broken)
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
+  assert observed["items"][0]["ready_attempt"]["state"] == "unknown"
+
+
 @pytest.mark.parametrize("options", [None, {}, {"max_rounds": None}])
 def test_uncapped_preview_admission_and_retry_freeze_the_same_hash(setup, monkeypatch, options):
   db, _, principal = setup
