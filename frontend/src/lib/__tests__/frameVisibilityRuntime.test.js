@@ -77,3 +77,18 @@ test('an unsubscribed visibility listener stops receiving changes', () => {
   assert.deepEqual(seen, [false])
   assert.equal(visibility.visible, true)
 })
+
+test('a verdict seeded at init replaces the foreground default and notifies', () => {
+  const frame = fakeFrame()
+  const visibility = makeVisibility(frame)
+  const seen = []
+  visibility.onVisibilityChange((v) => seen.push(v))
+
+  visibility.setFrameVisible(undefined)
+  visibility.setFrameVisible('false')
+  assert.equal(visibility.visible, true)
+  visibility.setFrameVisible(false)
+  assert.equal(visibility.visible, false)
+  frame.post({ type: 'moebius:frame-visibility', visible: true })
+  assert.deepEqual(seen, [true, false, true])
+})

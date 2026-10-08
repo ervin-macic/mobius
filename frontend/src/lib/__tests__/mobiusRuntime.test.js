@@ -126,6 +126,57 @@ test('a probed reachability verdict outranks later raw browser events', async (t
   await new Promise(resolve => setTimeout(resolve, 0))
 })
 
+test('init seeds the frame verdict its host kept before the runtime listened', async (t) => {
+  const names = ['navigator', 'window', 'document', 'indexedDB']
+  const originals = names.map(name => Object.getOwnPropertyDescriptor(globalThis, name))
+  t.after(() => names.forEach((name, i) => {
+    if (originals[i]) Object.defineProperty(globalThis, name, originals[i])
+    else delete globalThis[name]
+  }))
+  const messageHandlers = []
+  const shellWindow = {}
+  const define = (name, value) => Object.defineProperty(globalThis, name, {
+    configurable: true, value,
+  })
+  define('navigator', { onLine: true })
+  define('window', {
+    location: { origin: 'https://mobius.test' },
+    parent: shellWindow,
+    addEventListener(type, callback) {
+      if (type === 'message') messageHandlers.push(callback)
+    },
+    removeEventListener() {},
+  })
+  define('document', {
+    hidden: false,
+    visibilityState: 'visible',
+    addEventListener() {},
+    removeEventListener() {},
+  })
+  define('indexedDB', new IDBFactory())
+
+  const runtime = await import(
+    `../../../public/mobius-runtime.js?frame-visibility=${Date.now()}`
+  )
+  // app-frame.html received AppCanvas's load-time hide before this module ran.
+  const api = runtime.init({ appId: 998, getToken: async () => null, frameVisible: false })
+  const seen = []
+  api.onVisibilityChange(v => seen.push(v))
+  assert.equal(api.visible, false)
+  for (const callback of messageHandlers) {
+    callback({
+      source: shellWindow,
+      data: { type: 'moebius:frame-visibility', visible: true },
+    })
+  }
+  assert.equal(api.visible, true)
+  assert.deepEqual(seen, [false, true])
+  await api.storage.pendingCount()
+  await api.storage._drain()
+  api.storage._destroy()
+  await new Promise(resolve => setTimeout(resolve, 0))
+})
+
 test('no pending op → fallback stands (the cached/server value)', () => {
   assert.deepEqual(overlayPending([], 'hi.json', SERVER), SERVER)
   assert.deepEqual(overlayPending([put('other.json', QUEUED)], 'hi.json', SERVER), SERVER)

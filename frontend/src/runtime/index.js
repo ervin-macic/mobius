@@ -192,7 +192,11 @@ export const runtimeFeatures = Object.freeze({
   projects: true,
 })
 
-export function init({ appId, appInstanceId = null, getToken, capabilityContract = null }) {
+export function init({
+  appId, appInstanceId = null, getToken, capabilityContract = null, frameVisible,
+}) {
+  // The frame host's latest verdict, which may predate this module's listener.
+  _visibility.setFrameVisible(frameVisible)
   const identityKey = `${String(appId)}:${appInstanceId || 'legacy'}`
   if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
     // Hosts may replace their token broker after a refresh. Keep one runtime and

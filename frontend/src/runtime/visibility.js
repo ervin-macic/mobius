@@ -10,9 +10,11 @@
 // Apps use it to pause polling, animation, and audio while out of sight.
 //
 // Only the hosting shell window may set the verdict (`event.source ===
-// window.parent`, matching immersive.js and navigation.js). Until the shell's
-// first verdict arrives the frame is assumed foreground, so an app mounted
-// outside AppCanvas keeps document semantics.
+// window.parent`, matching immersive.js and navigation.js). AppCanvas posts its
+// first verdict when the frame document loads, before this runtime evaluates,
+// so app-frame.html keeps the latest one and init() seeds it here via
+// `setFrameVisible`. Without any verdict the frame is assumed foreground, so an
+// app mounted outside AppCanvas keeps document semantics.
 
 export function makeVisibility({ win, doc } = {}) {
   let frameVisible = true
@@ -28,20 +30,25 @@ export function makeVisibility({ win, doc } = {}) {
     }
   }
 
+  function setFrameVisible(next) {
+    if (typeof next !== 'boolean') return
+    frameVisible = next
+    recompute()
+  }
+
   if (win && win.parent && win.parent !== win) {
     win.addEventListener('message', (e) => {
       if (e.source !== win.parent) return
       const msg = e.data
       if (!msg || msg.type !== 'moebius:frame-visibility') return
-      if (typeof msg.visible !== 'boolean') return
-      frameVisible = msg.visible
-      recompute()
+      setFrameVisible(msg.visible)
     })
   }
   doc?.addEventListener?.('visibilitychange', recompute)
 
   return {
     get visible() { return visible },
+    setFrameVisible,
     // cb(boolean) fires immediately with the current value and again whenever
     // it changes. Returns an unsubscribe function.
     onVisibilityChange(cb) {

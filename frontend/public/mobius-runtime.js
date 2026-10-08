@@ -4443,19 +4443,23 @@ function makeVisibility({ win, doc } = {}) {
 			cb(next);
 		} catch (e) {}
 	}
+	function setFrameVisible(next) {
+		if (typeof next !== "boolean") return;
+		frameVisible = next;
+		recompute();
+	}
 	if (win && win.parent && win.parent !== win) win.addEventListener("message", (e) => {
 		if (e.source !== win.parent) return;
 		const msg = e.data;
 		if (!msg || msg.type !== "moebius:frame-visibility") return;
-		if (typeof msg.visible !== "boolean") return;
-		frameVisible = msg.visible;
-		recompute();
+		setFrameVisible(msg.visible);
 	});
 	doc?.addEventListener?.("visibilitychange", recompute);
 	return {
 		get visible() {
 			return visible;
 		},
+		setFrameVisible,
 		onVisibilityChange(cb) {
 			if (typeof cb !== "function") return () => {};
 			listeners.add(cb);
@@ -4509,7 +4513,8 @@ const runtimeFeatures = Object.freeze({
 	idleDocument: true,
 	projects: true
 });
-function init({ appId, appInstanceId = null, getToken, capabilityContract = null }) {
+function init({ appId, appInstanceId = null, getToken, capabilityContract = null, frameVisible }) {
+	_visibility.setFrameVisible(frameVisible);
 	const identityKey = `${String(appId)}:${appInstanceId || "legacy"}`;
 	if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
 		_runtimeContext.tokenRef.current = getToken;
