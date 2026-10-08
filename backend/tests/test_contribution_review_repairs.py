@@ -170,7 +170,7 @@ def test_push_final_guard_runs_after_remote_io_before_public_write(repair, monke
   def guard():
     order.append("stop")
     raise HTTPException(409, "Stopped")
-  with pytest.raises(repairs.PushNotAttempted, match="Stopped"):
+  with pytest.raises(HTTPException):
     repairs.push_repair(None, repo, None, target, validation, before_push=guard)
   assert order == ["validate", "remote", "stop"]
 

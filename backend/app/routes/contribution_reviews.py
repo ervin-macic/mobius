@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app import agent_work_claims, chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
+from app import chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
 from app import contribution_review_presets as presets
 from app.chat_start import start_programmatic_chat_turn
 from app.chat_visibility import coerce_agent_settings
@@ -368,17 +368,14 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
     if body.state == "all_clear":
-      # A read-only review stays valid when the base later moves; only the
-      # merging modes need the reviewed base to still be current.
-      if row.mode != "review":
-        try:
-          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-        except HTTPException as exc:
-          if row.mode == "review_merge":
-            raise
-          reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
-            "head_sha": target["head_sha"], "summary": str(exc.detail)})
-          return {"run": _run_view(db, row)}
+      try:
+        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+      except HTTPException as exc:
+        if row.mode == "review_merge":
+          raise
+        reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
+          "head_sha": target["head_sha"], "summary": str(exc.detail)})
+        return {"run": _run_view(db, row)}
       _parent(db, row, principal)
       if row.mode == "review_fix_merge":
         reviews.require_independent_clear(row, target, body)
@@ -517,9 +514,7 @@ def _run_view(db, row, *, context_app_id=None):
   value["stop_semantics"] = "revokes_future_actions; an already-admitted public action may finish"
   frozen = row.options_json or {}
   actual = coerce_agent_settings(chat.agent_settings_json) if chat else {}
-  # A finished run stays finished; drift only matters for remaining work,
-  # which _parent already refuses under a different model choice.
-  if value["state"] != "complete" and frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
+  if frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
     value.update(state="needs_you", summary="The owning chat model choice no longer matches this frozen workflow.")
   last = db.query(models.ChatRun).filter_by(chat_id=row.chat_id).order_by(
     models.ChatRun.started_at.desc()).first()
@@ -757,35 +752,17 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
       attempts = list(previous["repair_attempts"])
       try:
         # Stop and nonce rechecked after claim acquisition commits too.
-        try:
-          _parent(db, row, principal)
-        except Exception as exc:
-          raise repairs.not_attempted(exc) from exc
+        _parent(db, row, principal)
         loop = asyncio.get_running_loop()
         async def final_push_guard():
           _parent(db, row, principal)
         def before_push():
-          try:
-            asyncio.run_coroutine_threadsafe(final_push_guard(), loop).result()
-          except Exception as exc:
-            raise repairs.not_attempted(exc) from exc
+          asyncio.run_coroutine_threadsafe(final_push_guard(), loop).result()
         # push_repair confirms the new head from the branch ref. Re-reading the
         # PR here would race GitHub's asynchronous PR head update.
         await asyncio.to_thread(repairs.push_repair, _gh, cwd, row, target, validation,
                                 before_push=before_push)
         _parent(db, row, principal)
-      except repairs.PushNotAttempted as exc:
-        # Nothing public happened: drop the armed receipt and release the
-        # exact-head claim so this or a fresh grant can repair it later.
-        reviews.save_outcome(db, row, reviews.key(target), {**previous,
-          "repair_attempts": attempts[:-1], "state": "needs_you",
-          "summary": f"No push was attempted: {exc.detail}"})
-        try:
-          agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
-            work_key=attempts[-1]["work_key"], outcome="Repair push was not attempted.", release=True)
-        except ValueError:
-          db.rollback()
-        return {"run": _run_view(db, row), "blocked": f"No push was attempted: {exc.detail}"}
       except Exception:
         attempts[-1] = {**attempts[-1], "state": "push_unknown"}
         reviews.save_outcome(db, row, reviews.key(target), {**previous,
@@ -978,7 +955,7 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
           entry = reviews.queue_entry(checks, target)
           outcome = ({**previous, "state": "queued", "queue_entry_id": entry["id"]} if entry else
             {**previous, "state": "merge_unknown", "summary": "The exact earlier merge/queue attempt remains unclear. It was not repeated."})
-        elif previous.get("state") == "all_clear" and row.mode != "review":
+        elif previous.get("state") == "all_clear":
           await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
           continue
         else:

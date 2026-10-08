@@ -268,42 +268,15 @@ def test_legacy_no_snapshot_retry_does_not_uncap_or_resume_stopped_work(setup, m
   assert "new defaults as old consent" in result["brief"]
 
 
-def test_review_only_all_clear_survives_a_moved_base_and_still_posts_once(setup, monkeypatch):
-  db, row, principal = setup
-  row.mode = "review"
-  row.options_json = {"post_review": True}
-  db.commit()
-  monkeypatch.setattr(domain, "assert_current_base", lambda *a: (_ for _ in ()).throw(HTTPException(409, "The target base drifted")))
-  posts = []
-  monkeypatch.setattr(domain, "post_review", lambda *a: posts.append(a[2]["head_sha"]) or {"id": 3, "url": "u"})
-  value = report(setup, reviewed_base_sha=BASE)["run"]
-  assert value["state"] == "complete"
-  assert value["items"][0]["reviewed_base_sha"] == BASE
-  assert value["items"][0]["public_review"]["state"] == "posted"
-  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
-  assert observed["state"] == "complete"
-  report(setup, reviewed_base_sha=BASE)
-  assert posts == [SHA]
-
-
-def test_model_drift_flags_unfinished_runs_but_not_completed_ones(setup):
+def test_review_only_all_clear_replay_rechecks_current_base(setup, monkeypatch):
   db, row, _ = setup
   row.mode = "review"
-  row.options_json = {"provider": "codex", "model": "gpt-5", "reasoning_effort": "xhigh"}
-  chat = db.get(models.Chat, row.chat_id)
-  chat.provider = "codex"
-  chat.agent_settings_json = {"model": "gpt-5", "effort": "xhigh"}
-  db.commit()
-  assert routes._run_view(db, row)["state"] != "complete"
-  chat.agent_settings_json = {"model": "gpt-5", "effort": "low"}
-  db.commit()
-  assert "model choice" in routes._run_view(db, row)["summary"]
-  chat.agent_settings_json = {"model": "gpt-5", "effort": "xhigh"}
   db.commit()
   assert report(setup)["run"]["state"] == "complete"
-  chat.agent_settings_json = {"model": "gpt-5", "effort": "low"}
-  db.commit()
-  assert routes._run_view(db, row)["state"] == "complete"
+  monkeypatch.setattr(domain, "assert_current_base", lambda *a: (_ for _ in ()).throw(HTTPException(409, "The target base drifted")))
+  value = report(setup)["run"]
+  assert value["state"] == "needs_you"
+  assert "drifted" in value["items"][0]["summary"]
 
 
 @pytest.mark.parametrize("mode", ["review", "review_merge"])
@@ -699,44 +672,7 @@ def test_stop_during_final_push_preflight_is_rechecked_before_public_io(setup, m
     pytest.fail("Public push must not happen after Stop")
   monkeypatch.setattr(repairs, "push_repair", preflight)
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
-  item = result["run"]["items"][0]
-  # Stop before public I/O is a definite no-push, not an ambiguous outcome.
-  assert item.get("repair_attempts", []) == []
-  assert "no push was attempted" in result["blocked"].lower()
-  claim = db.query(models.AgentWorkClaim).one()
-  db.refresh(claim)
-  assert claim.released_at is not None
-  with SessionLocal() as other:
-    other.get(models.ChatRun, principal.run_id).status = "running"
-    other.commit()
-  pushes = []
-  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: pushes.append(1))
-  result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
-  assert pushes == [1]
-  assert result["run"]["items"][0]["repair_attempts"][0]["state"] == "pushed"
-
-
-def test_refused_preflight_push_does_not_fence_a_fresh_grant(setup, monkeypatch):
-  db, row, principal = configure_repair(setup, monkeypatch)
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: {"checkout": "/fake/server-repair",
-    "initial_head_sha": SHA, "allowed_files": ["owned.py"], "head_repo": "example/project",
-    "head_repo_id": 1, "head_ref": "topic", "head_sha": NEW, "files": ["owned.py"], "diff_sha256": "d" * 64})
-  monkeypatch.setattr(repairs, "_branch_head", lambda *a: "f" * 40)
-  monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pytest.fail("no public push after a moved remote head"))
-  result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
-  assert "remote pr head moved" in result["blocked"].lower()
-  assert not any(a.get("state") == "push_unknown" for a in result["run"]["items"][0].get("repair_attempts", []))
-  second = models.ContributionReviewRun(id="second-repair", app_id=1, owner_id=row.owner_id,
-    request_id="second-repair-request", mode=row.mode, github_actor_id=row.github_actor_id,
-    app_nonce=row.app_nonce, options_json=dict(row.options_json), targets_json=list(row.targets_json),
-    outcomes_json={domain.key(ITEM): {"state": "repairing", "checkout": row.outcomes_json[domain.key(ITEM)]["checkout"]}},
-    chat_id=row.chat_id)
-  db.add(second)
-  db.commit()
-  pushes = []
-  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: pushes.append(1))
-  result = asyncio.run(routes.publish_repair(1, second.id, publish_body(), db, principal))
-  assert "blocked" not in result and pushes == [1]
+  assert result["run"]["items"][0]["repair_attempts"][0]["state"] == "push_unknown"
 
 
 def test_cross_grant_uncertain_push_fence_cannot_be_replayed(setup, monkeypatch):
