@@ -213,3 +213,47 @@ test('ordinary app mounts and apps without block support keep their existing pro
   assert.deepEqual(Object.keys(props).sort(), ['appId', 'token'])
   assert.equal(renderAppMount({ currentToken: null }), undefined)
 })
+
+const sessionStart = frame.indexOf('    const blockSessionListeners')
+const sessionSource = frame.slice(sessionStart, frame.indexOf('    function renderMountedComponent()', sessionStart))
+
+function frameBlockSession({ supportsAppBlocks, session = { sessionId: 's', actions: [{ key: 'run:1' }] } }) {
+  const posted = []
+  const context = {
+    supportsAppBlocks, currentBlockSession: null, console,
+    window: { location: { origin: 'null' }, parent: { postMessage: (message, origin) => posted.push({ message, origin }) } },
+  }
+  runInNewContext(`${sessionSource}\ncurrentBlockSession = blockSessionApi(${JSON.stringify(session)})
+    globalThis.deliver = deliverBlockSessionMessage; globalThis.api = currentBlockSession`, context)
+  const deliver = msg => {
+    const event = { stopped: false, stopImmediatePropagation() { this.stopped = true } }
+    return { handled: context.deliver(event, msg), stopped: event.stopped }
+  }
+  return { api: context.api, deliver, posted }
+}
+
+test('block-session messages reach the app only when its module exports appBlockSessions', () => {
+  const action = { type: 'moebius:app-block-action', sessionId: 's', key: 'run:1', event: 'activate', nonce: 'n' }
+  const off = frameBlockSession({ supportsAppBlocks: false })
+  const offSeen = []
+  off.api.subscribe(msg => offSeen.push(msg))
+  assert.deepEqual(off.deliver(action), { handled: true, stopped: true })
+  assert.deepEqual(offSeen, [])
+
+  const on = frameBlockSession({ supportsAppBlocks: true })
+  const seen = []
+  const unsubscribe = on.api.subscribe(msg => seen.push(msg))
+  assert.deepEqual(on.deliver(action), { handled: true, stopped: false })
+  assert.deepEqual(on.deliver({ ...action, sessionId: 'other' }), { handled: true, stopped: true })
+  assert.deepEqual(on.deliver({ type: 'moebius:app-intent', intent: 'x:1' }), { handled: false, stopped: false })
+  assert.deepEqual(seen, [action])
+  unsubscribe()
+  on.deliver(action)
+  assert.equal(seen.length, 1)
+
+  // State is always stamped with the live session, whatever the app passes.
+  on.api.setState({ actions: [{ key: 'run:1', busy: true }], type: 'forged', sessionId: 'other' })
+  assert.equal(on.posted[0].message.type, 'moebius:app-block-state')
+  assert.equal(on.posted[0].message.sessionId, 's')
+  assert.equal(on.posted[0].message.actions[0].busy, true)
+})
