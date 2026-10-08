@@ -180,14 +180,55 @@ def enqueue(gh, cwd, target):
   return entry
 
 
+# GitHub rejects a review body above 65,536 characters. Measure in UTF-16 code
+# units, which is never less than the code-point count, so the bound holds
+# whichever way GitHub counts.
+GITHUB_REVIEW_BODY_MAX = 65536
+
+
+def _body_units(text: str) -> int:
+  return len(text.encode("utf-16-le")) // 2
+
+
+def _clip_evidence(text: str, limit: int) -> str:
+  """Keep `text` whole if it fits, else its start plus an explicit omission marker."""
+  if _body_units(text) <= limit:
+    return text
+  def marker(omitted):
+    return f"\n\n… {omitted} characters omitted; the full evidence is in Möbius."
+  # Code points never exceed UTF-16 units, so shrink by the overflow until it fits.
+  keep = max(0, limit - _body_units(marker(len(text))))
+  while keep and (excess := _body_units(text[:keep] + marker(len(text) - keep)) - limit) > 0:
+    keep = max(0, keep - excess)
+  return text[:keep].rstrip() + marker(len(text) - keep)
+
+
 def review_comment_body(outcome: dict) -> str:
-  """The public text of an owner-requested review: verdict, findings, checks."""
+  """The public text of an owner-requested review: verdict, findings, checks.
+
+  Stored evidence is never cut. Only the posted copy is bounded to GitHub's
+  limit, and any omission is stated in the body, never silent. The verdict
+  header, the checks and the reviewed-head footer always survive.
+  """
   verdict = "All clear" if outcome.get("state") == "all_clear" else "Changes suggested"
-  parts = [f"**Möbius review: {verdict}**", "", (outcome.get("summary") or "").strip()]
-  if (outcome.get("tests") or "").strip():
-    parts += ["", f"**Checks:** {outcome['tests'].strip()}"]
-  parts += ["", f"_Reviewed at {str(outcome.get('head_sha') or '')[:12]}._"]
-  return "\n".join(parts)
+  header = f"**Möbius review: {verdict}**"
+  summary = (outcome.get("summary") or "").strip()
+  tests = (outcome.get("tests") or "").strip()
+  footer = f"_Reviewed at {str(outcome.get('head_sha') or '')[:12]}._"
+  def render(summary_text, tests_text):
+    parts = [header, "", summary_text]
+    if tests_text:
+      parts += ["", f"**Checks:** {tests_text}"]
+    return "\n".join(parts + ["", footer])
+  body = render(summary, tests)
+  if _body_units(body) <= GITHUB_REVIEW_BODY_MAX:
+    return body
+  available = GITHUB_REVIEW_BODY_MAX - _body_units(render("", ""))
+  if tests:
+    available -= _body_units("\n\n**Checks:** ")
+  # Checks keep at least a quarter of the room, the summary takes the rest.
+  tests_room = min(_body_units(tests), max(available - _body_units(summary), available // 4))
+  return render(_clip_evidence(summary, available - tests_room), _clip_evidence(tests, tests_room))
 
 
 def post_review(gh, cwd, target, body):
