@@ -675,3 +675,68 @@ def test_pooled_upstream_clients_never_carry_cookies_between_callers():
   finally:
     server.shutdown()
   assert seen == [("/login", None), ("/data", None)]
+
+
+def test_pool_slot_wait_is_bounded():
+  """A full pool fails a new lease fast instead of queueing it forever."""
+  from app.pinned_http_clients import PinnedHostClientPool, PoolBusy
+
+  async def scenario():
+    pool = PinnedHostClientPool(max_active=1, acquire_timeout=0.05)
+    try:
+      async with pool.lease("slow.example", "slow.example"):
+        with pytest.raises(PoolBusy):
+          await asyncio.wait_for(
+            pool.lease("other.example", "other.example").__aenter__(), 2,
+          )
+      # The held slot is released normally and the next lease succeeds.
+      async with pool.lease("other.example", "other.example") as client:
+        assert client is not None
+      assert pool.metrics()["active_requests"] == 0
+    finally:
+      await pool.close()
+
+  asyncio.run(scenario())
+
+
+def test_proxy_routes_answer_503_when_every_slot_is_taken(
+  client, owner_token, monkeypatch,
+):
+  from app.pinned_http_clients import PinnedHostClientPool
+
+  class FullPool(PinnedHostClientPool):
+    def __init__(self):
+      super().__init__(max_active=1, acquire_timeout=0.01)
+      self._capacity = asyncio.BoundedSemaphore(1)
+      # Model a slot held by another app's slow upstream for the whole test.
+      self._capacity._value = 0
+
+  # Each TestClient request runs on its own event loop, so each gets a fresh pool.
+  monkeypatch.setattr("app.routes.proxy._proxy_clients", FullPool())
+  monkeypatch.setattr(
+    "app.routes.proxy.validate_url_safe",
+    lambda url: ("https://93.184.216.34/x", "busy.example", "busy.example"),
+  )
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  got = client.get("/api/proxy", params={"url": "https://busy.example/x"}, headers=auth)
+  assert got.status_code == 503, got.text
+  assert got.headers["retry-after"] == "2"
+  monkeypatch.setattr("app.routes.proxy._proxy_clients", FullPool())
+  posted = client.post(
+    "/api/proxy", json={"url": "https://busy.example/x", "body": "{}"}, headers=auth,
+  )
+  assert posted.status_code == 503, posted.text
+
+
+def test_proxy_bounds_the_total_time_one_exchange_holds_a_slot(monkeypatch):
+  """A drip-feeding upstream cannot hold a shared slot past the deadline."""
+  from app.routes import proxy
+
+  async def drip(_client, _req, **_kwargs):
+    await asyncio.sleep(5)
+
+  monkeypatch.setattr(proxy, "_capped_response", drip)
+  monkeypatch.setattr(proxy, "_PROXY_REQUEST_DEADLINE_SECS", 0.05)
+  with pytest.raises(HTTPException) as exc:
+    asyncio.run(proxy._bounded_proxy_response(None, None))
+  assert exc.value.status_code == 504

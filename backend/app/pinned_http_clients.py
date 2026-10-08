@@ -31,6 +31,10 @@ def _refuse_all_cookies() -> http.cookiejar.CookieJar:
   )
 
 
+class PoolBusy(Exception):
+  """No request slot freed up within the pool's ``acquire_timeout``."""
+
+
 @dataclass
 class _PooledClient:
   client: httpx.AsyncClient
@@ -45,9 +49,16 @@ class PinnedHostClientPool:
   container network.
   """
 
-  def __init__(self, max_clients: int = 64, max_active: int = 64):
+  def __init__(
+    self, max_clients: int = 64, max_active: int = 64,
+    acquire_timeout: float | None = None,
+  ):
+    """``acquire_timeout`` bounds the wait for one of ``max_active`` request
+    slots; past it ``lease`` raises ``PoolBusy``. ``None`` waits indefinitely.
+    """
     self.max_clients = max_clients
     self.max_active = max_active
+    self.acquire_timeout = acquire_timeout
     self._lock = asyncio.Lock()
     self._capacity = asyncio.BoundedSemaphore(max_active)
     self._clients: OrderedDict[tuple[str, str], _PooledClient] = OrderedDict()
@@ -88,7 +99,14 @@ class PinnedHostClientPool:
 
   @asynccontextmanager
   async def lease(self, host_header: str, sni_host: str):
-    await self._capacity.acquire()
+    if self.acquire_timeout is None:
+      await self._capacity.acquire()
+    else:
+      try:
+        async with asyncio.timeout(self.acquire_timeout):
+          await self._capacity.acquire()
+      except TimeoutError:
+        raise PoolBusy() from None
     try:
       key = (host_header, sni_host)
       retired: list[httpx.AsyncClient] = []
