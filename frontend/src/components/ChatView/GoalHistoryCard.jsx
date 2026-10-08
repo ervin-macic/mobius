@@ -15,7 +15,6 @@ export default function GoalHistoryCard({ summary }) {
         <LifecycleOutcome tone={view.completed ? 'completed' : summary.status === 'cancelled' ? 'stopped' : 'attention'} />{view.kicker}
       </span>
       <strong className={`chat__goal-history-objective${view.hasPlan ? ' chat__goal-history-objective--preview' : ''}`}>{view.objective}</strong>
-      {!view.completed && view.reason && <span className="chat__goal-history-reason">{view.reason}</span>}
       {view.metadata && <span className="chat__goal-history-meta">{view.metadata}</span>}
     </span>
   </>

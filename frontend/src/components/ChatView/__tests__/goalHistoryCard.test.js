@@ -24,7 +24,6 @@ test('Goal history summarizes a terminal outcome and its plan', () => {
     ariaLabel: 'Completed goal: Ship the Goal experience',
     metadata: '3 of 3 steps complete · 2m 5s',
     hasPlan: true,
-    reason: '',
   })
 })
 
@@ -37,17 +36,16 @@ test('Goal history preserves neutral labels for legacy failed snapshots', () => 
     completed: false,
     kicker: 'Goal needs attention',
     ariaLabel: 'Goal needing attention: Needs repair',
-    reason: '',
     metadata: '',
     hasPlan: false,
   })
 })
 
-test('terminal Goal outcomes retain their honest result in history', () => {
+test('terminal Goal records retain outcome identity without repeating result prose', () => {
   const cancelled = goalHistoryViewModel({ objective: 'Ship', status: 'cancelled', result: { reason: 'Owner stopped it' } })
   assert.equal(cancelled.kicker, 'Goal cancelled')
-  assert.equal(cancelled.reason, 'Owner stopped it')
+  assert.equal(cancelled.reason, undefined)
   const impossible = goalHistoryViewModel({ objective: 'Ship', status: 'cannot_complete', result: 'Dependency unavailable' })
   assert.equal(impossible.kicker, 'Goal cannot complete')
-  assert.equal(impossible.reason, 'Dependency unavailable')
+  assert.equal(impossible.reason, undefined)
 })
