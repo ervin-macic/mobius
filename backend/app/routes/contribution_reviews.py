@@ -85,11 +85,16 @@ class StartReviews(BaseModel):
   chat_approval: ChatApproval | None = None
 
 
+# Evidence is prose, not a database blob: generous enough for any real review,
+# small enough that stored outcomes, run payloads and prompts stay bounded.
+EVIDENCE_MAX_CHARS = 200_000
+
+
 class ReviewOutcome(PullIdentity):
   state: Literal["all_clear", "needs_you"]
-  summary: str = Field(min_length=1)
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   scope: list[str] = Field(default_factory=list, max_length=6)
-  tests: str = ""
+  tests: str = Field(default="", max_length=EVIDENCE_MAX_CHARS)
   tests_passed: bool | None = None
   reviewed_base_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
   independent_receipt_id: str | None = Field(default=None, max_length=64)
@@ -632,12 +637,12 @@ async def independent_review(app_id: int | None, run_id: str, body: ReviewOutcom
 
 
 class RepairCheckout(PullIdentity):
-  findings: str = Field(min_length=1)
+  findings: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
 
 
 class RepairPublish(PullIdentity):
-  summary: str = Field(min_length=1)
-  tests: str = Field(min_length=1)
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
+  tests: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   tests_passed: bool
 
 
@@ -655,9 +660,9 @@ def _require_ready_attempt_resolved(previous):
 class DraftReady(PullIdentity):
   reviewed_base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
   independent_receipt_id: str = Field(min_length=1, max_length=64)
-  summary: str = Field(min_length=1)
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   scope: list[str] = Field(min_length=6, max_length=6)
-  tests: str = Field(min_length=1)
+  tests: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   tests_passed: bool
 
 

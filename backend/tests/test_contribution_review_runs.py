@@ -142,6 +142,29 @@ def test_owner_requested_public_review_posts_bounded_body_and_keeps_full_evidenc
   assert row.outcomes_json[domain.key(ITEM)]["summary"] == summary
 
 
+def test_review_evidence_models_accept_100000_and_reject_over_200000_characters():
+  from pydantic import ValidationError
+  accepted = "e" * 100000
+  over = "e" * (routes.EVIDENCE_MAX_CHARS + 1)
+  assert routes.ReviewOutcome(**ITEM, state="needs_you", summary=accepted, tests=accepted).tests == accepted
+  assert routes.RepairCheckout(**ITEM, findings=accepted).findings == accepted
+  assert routes.RepairPublish(**ITEM, summary=accepted, tests=accepted, tests_passed=True).summary == accepted
+  ready = dict(ITEM, reviewed_base_sha=BASE, independent_receipt_id="receipt",
+    scope=sorted(routes.SCOPE), tests_passed=True)
+  assert routes.DraftReady(**ready, summary=accepted, tests=accepted).tests == accepted
+  for build in (
+    lambda: routes.ReviewOutcome(**ITEM, state="needs_you", summary=over),
+    lambda: routes.ReviewOutcome(**ITEM, state="needs_you", summary="ok", tests=over),
+    lambda: routes.RepairCheckout(**ITEM, findings=over),
+    lambda: routes.RepairPublish(**ITEM, summary=over, tests="ok", tests_passed=True),
+    lambda: routes.RepairPublish(**ITEM, summary="ok", tests=over, tests_passed=True),
+    lambda: routes.DraftReady(**ready, summary=over, tests="ok"),
+    lambda: routes.DraftReady(**ready, summary="ok", tests=over),
+  ):
+    with pytest.raises(ValidationError, match="at most 200000 characters"):
+      build()
+
+
 def test_owner_requested_public_review_posts_full_long_evidence(setup, monkeypatch):
   _public_review_run(setup)
   posted = []
