@@ -112,3 +112,13 @@ test('live badges may replace a saved snapshot without granting an action or mar
   assert.deepEqual(state([{ label: 'Current', tone: 'neon' }, null]).badges, [{ label: 'Current', tone: 'neutral' }])
   assert.equal(state([]).confirming, false)
 })
+
+test('the confirmation summary and busy label are bounded plain app text', () => {
+  const [action] = inlineBlockState({ type: 'moebius:app-block-state', sessionId: 's', actions: [
+    { key: 'x:1', confirming: true, summary: 'S'.repeat(600), busyLabel: 'B'.repeat(80) }] }, 's', new Set(['x:1'])).actions
+  assert.equal(action.summary.length, 500)
+  assert.equal(action.busyLabel.length, 40)
+  const [bare] = inlineBlockState({ type: 'moebius:app-block-state', sessionId: 's', actions: [
+    { key: 'x:1', confirming: true, summary: { html: '<b>x</b>' } }] }, 's', new Set(['x:1'])).actions
+  assert.equal(bare.summary, '')
+})

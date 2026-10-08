@@ -39,6 +39,9 @@ export function inlineBlockState(message, sessionId, keys) {
     actions.push({ key: raw.key, label: shortText(raw.label, 40),
       disabled: raw.disabled === true, busy: raw.busy === true, confirming: raw.confirming === true,
       hidden: raw.hidden === true, note: shortText(raw.note, 500),
+      // What the app itself says the confirmation will do. Without it the host
+      // offers no Confirm: the block's own text is model-authored, not the app's.
+      summary: shortText(raw.summary, 500), busyLabel: shortText(raw.busyLabel, 40),
       tone: SESSION_TONES.has(raw.tone) ? raw.tone : 'neutral',
       status: shortText(raw.status, 40),
       statusTone: SESSION_TONES.has(raw.statusTone) ? raw.statusTone : 'neutral', links,

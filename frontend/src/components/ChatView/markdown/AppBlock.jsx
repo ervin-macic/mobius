@@ -32,7 +32,7 @@ function labelStyle(hex) {
 
 /** A PR as a compact row: the title is the link into the app, details sit
  *  underneath, and the app's one action takes the bottom-right corner. */
-export function PullSnapshot({ block, pull, href, open, action, session, compact = false }) {
+export function PullSnapshot({ block, pull, href, open, action, session, appName, confirming = false, compact = false }) {
   const files = pull.files === null ? null : `${pull.files} ${pull.files === 1 ? 'file' : 'files'}`
   const ref = !compact && pull.number ? `${pull.repo}#${pull.number}` : pull.repo
   const status = session?.status || STATE_NAMES[pull.state]
@@ -40,7 +40,7 @@ export function PullSnapshot({ block, pull, href, open, action, session, compact
   return <div className={`md-app-pull${compact ? ' md-app-pull--compact' : ''}`}>
     {compact ? <>
       <span className="md-app-pull__identity-icon" aria-hidden="true"><Branch width={18} height={18} /></span>
-      <div className="md-app-pull__identity"><span>Contribution</span><span className={`md-app-pull__status is-${statusTone}`}>{status}</span></div>
+      <div className="md-app-pull__identity"><span>{appName || block.app}</span><span className={`md-app-pull__status is-${statusTone}`}>{status}</span></div>
     </> : null}
     <div className="md-app-pull__headline">
       <a className="md-app-pull__title" href={href} onClick={open}>{block.title}</a>
@@ -52,13 +52,35 @@ export function PullSnapshot({ block, pull, href, open, action, session, compact
         {pull.author ? <span>{pull.author}</span> : null}
         {files ? <span>{files}{pull.additions !== null ? <> <ins>+{pull.additions}</ins> <del>−{pull.deletions ?? 0}</del></> : null}</span> : null}
         {!compact ? <span className={`md-app-pull__badge is-${statusTone}`}>{status}</span> : null}
-        {(session?.badges ?? pull.badges).map(badge => <span key={badge.label} className={`md-app-pull__badge is-${badge.tone}`}>{badge.label}</span>)}
+        {/* While the app asks for confirmation, only its own badges show; the
+            block's saved badges are model-authored claims. */}
+        {(session?.badges ?? (confirming ? [] : pull.badges)).map(badge => <span key={badge.label} className={`md-app-pull__badge is-${badge.tone}`}>{badge.label}</span>)}
       </div>
       {session?.links?.length ? <span className="md-app-block__links">{session.links.map(link => <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer">{link.label}</a>)}</span> : null}
       {action}
     </div>
     {session?.note ? <p className={`md-app-block__note is-${session.tone}`} role="status">{session.note}</p> : null}
   </div>
+}
+
+/** Host buttons for an inline session. Confirm is offered only beside the
+ *  app's own summary of what it will do, never beside the block's
+ *  model-authored snapshot alone. */
+export function SessionControls({ target, state, appName, competingBusy = false, onEvent }) {
+  if (state?.hidden) return null
+  const confirming = state?.confirming === true
+  const canConfirm = confirming && !!state.summary
+  return <span className={`md-app-block__controls${confirming ? ' is-confirming' : ''}`}>
+    {confirming ? <span className="md-app-block__confirm" role="status">
+      {canConfirm ? <><strong>{appName}:</strong> {state.summary}</> : `Open ${appName} to review and confirm.`}</span> : null}
+    {confirming ? <button type="button" className="md-app-block__cancel" disabled={competingBusy}
+      onClick={() => onEvent(target.intent, 'cancel')}>Not now</button> : null}
+    {confirming && !canConfirm ? null : <button type="button" className="md-app-block__action" disabled={state?.disabled || competingBusy}
+      title={state?.label || target.label}
+      aria-busy={state?.busy || undefined}
+      onClick={() => onEvent(target.intent, confirming ? 'confirm' : 'activate')}>
+      {state?.busy ? state.busyLabel || 'Working…' : confirming ? 'Confirm' : state?.label || target.label}</button>}
+  </span>
 }
 
 /** Reuse the opaque app host; inline sessions hydrate only near the viewport. */
@@ -144,20 +166,16 @@ export default function AppBlock({ block, onInternalNav }) {
   }
   const open = openHref(block.href)
   const show = intent => { setViewIntent(intent); setLegacyMode(isSession && blockSupported === false ? 'view' : null); setDelivered(false); setSessionState(null); setBlockEvent(null) }
+  const appName = app?.name || block.app
+  const confirmingAny = sessionState?.actions.some(item => item.confirming) === true
+  // The block's title, facts and repo are the conversation's snapshot; say so
+  // while the app is asking for confirmation.
+  const unverified = confirmingAny
+    ? <p className="md-app-block__notice" role="note">{`The details shown here come from the conversation, not from ${appName}.`}</p>
+    : null
   const actionButton = target => (isSession && blockSupported !== false || legacyMode === 'inline') && app && target
-    ? (() => {
-      const state = actionState(target.intent)
-      if (state?.hidden) return null
-      return <span className="md-app-block__controls">
-        {state?.confirming ? <button type="button" className="md-app-block__cancel" disabled={competingBusy}
-          onClick={() => dispatchBlockEvent(target.intent, 'cancel')}>Not now</button> : null}
-        <button type="button" className="md-app-block__action" disabled={state?.disabled || competingBusy}
-          title={state?.label || target.label}
-          aria-busy={state?.busy || undefined}
-          onClick={() => dispatchBlockEvent(target.intent, state?.confirming ? 'confirm' : 'activate')}>
-          {state?.busy ? 'Contributing…' : state?.confirming ? 'Confirm' : state?.label || target.label}</button>
-      </span>
-    })()
+    ? <SessionControls target={target} state={actionState(target.intent)} appName={appName}
+      competingBusy={competingBusy} onEvent={dispatchBlockEvent} />
     : canExpand && app && target
     ? <button type="button" className="md-app-block__action" aria-pressed={viewIntent === target.intent}
       onClick={() => show(viewIntent === target.intent ? null : target.intent)}>{target.label}</button>
@@ -190,7 +208,7 @@ export default function AppBlock({ block, onInternalNav }) {
       <ul className="md-app-batch__list">
         {block.items.map(item => <li key={item.intent}>
           {item.pull
-            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} session={actionState(item.action?.intent)} compact={isSession} />
+            ? <PullSnapshot block={item} pull={item.pull} href={sharedBrowserShellHref(item.href)} open={openHref(item.href)} action={actionButton(item.action)} session={actionState(item.action?.intent)} appName={appName} confirming={confirmingAny} compact={isSession} />
             : <a className="md-app-batch__title" href={sharedBrowserShellHref(item.href)} onClick={openHref(item.href)}>{item.title}</a>}
         </li>)}
       </ul>
@@ -199,7 +217,7 @@ export default function AppBlock({ block, onInternalNav }) {
       </footer> : null}
       {actionState(block.action?.intent)?.note ? <p className={`md-app-block__note is-${actionState(block.action.intent).tone}`} role="status">{actionState(block.action.intent).note}</p> : null}
       {sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}
-      {view}
+      {unverified}{view}
     </section>
   }
   if (block.pull) {
@@ -207,9 +225,9 @@ export default function AppBlock({ block, onInternalNav }) {
     // or details toggle: its one action is the only inline view.
     const label = block.pull.number ? `Pull request ${block.pull.repo}#${block.pull.number}` : `Proposed pull request for ${block.pull.repo}`
     return <section ref={rootRef} className={`md-app-block md-app-block--pull${isSession ? ' md-app-block--compact' : ''}`} aria-label={label}>
-      <PullSnapshot block={block} pull={block.pull} href={href} open={open} action={action} session={actionState(block.action?.intent)} compact={isSession} />
+      <PullSnapshot block={block} pull={block.pull} href={href} open={open} action={action} session={actionState(block.action?.intent)} appName={appName} confirming={confirmingAny} compact={isSession} />
       {sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}
-      {view}
+      {unverified}{view}
     </section>
   }
   return <section ref={rootRef} className={`md-app-block${canExpand ? '' : ' md-app-block--link'}`} aria-label={block.title}>
@@ -218,6 +236,6 @@ export default function AppBlock({ block, onInternalNav }) {
         <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer">{link.label}</a>)}</span> : null}
       {action}<a href={href} onClick={open}>Open{app ? ` in ${app.name}` : ''}<ChevronRight width={16} height={16} aria-hidden="true" /></a></span></header>
     {block.facts.length > 0 && <dl>{block.facts.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd>{fact.href ? <a href={fact.href} target="_blank" rel="noopener noreferrer">{fact.value}</a> : fact.value}</dd></div>)}</dl>}
-    {toggle}{unavailable}{sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}{view}
+    {toggle}{unavailable}{sessionState?.notice ? <p className="md-app-block__notice" role="status">{sessionState.notice}</p> : null}{unverified}{view}
   </section>
 }

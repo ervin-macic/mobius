@@ -4,7 +4,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
-import AppBlock, { PullSnapshot } from '../markdown/AppBlock.jsx'
+import AppBlock, { PullSnapshot, SessionControls } from '../markdown/AppBlock.jsx'
 import { appBlockFromToken } from '../markdown/appBlock.js'
 import { appQueries } from '../../../hooks/queries.js'
 
@@ -103,10 +103,10 @@ test('compact live receipts preserve tags and diff counts but replace obsolete s
       labels: [{ name: 'bug', color: 'd73a4a' }], badges: [{ label: '3 linked PRs', tone: 'neutral' }] },
   }) })
   const html = renderToStaticMarkup(createElement(PullSnapshot, { block, pull: block.pull,
-    href: block.href, compact: true, session: { status: 'Open', statusTone: 'neutral', badges: [],
+    href: block.href, compact: true, appName: 'Contribute', session: { status: 'Open', statusTone: 'neutral', badges: [],
       links: [{ label: 'View PR #42', url: 'https://github.com/owner/repo/pull/42' }] } }))
   assert.match(html, /md-app-pull--compact/)
-  assert.match(html, />Contribution</)
+  assert.match(html, /md-app-pull__identity"><span>Contribute</)
   assert.match(html, />Open</)
   assert.match(html, />bug</)
   assert.match(html, /href="https:\/\/github\.com\/owner\/repo"[^>]*>owner\/repo</)
@@ -114,4 +114,42 @@ test('compact live receipts preserve tags and diff counts but replace obsolete s
   assert.match(html, /5 files <ins>\+91<\/ins> <del>−16<\/del>/)
   assert.match(html, /View PR #42/)
   assert.doesNotMatch(html, /3 linked PRs|Review details|Not sent yet/)
+})
+
+const target = { label: 'Contribute', intent: 'chat-send:1' }
+const controls = state => renderToStaticMarkup(createElement(SessionControls,
+  { target, appName: 'Contribute', state: { links: [], ...state }, onEvent: () => {} }))
+
+test('a confirming session without the app summary offers no Confirm', () => {
+  const html = controls({ confirming: true })
+  assert.doesNotMatch(html, />Confirm</)
+  assert.match(html, />Not now</)
+  assert.match(html, /Open Contribute to review and confirm\./)
+})
+
+test('Confirm sits beside the app-supplied summary, never the saved block badges', () => {
+  const html = controls({ confirming: true, summary: 'Open a pull request on owner/repo from rec-1.' })
+  assert.match(html, /<strong>Contribute:<\/strong> Open a pull request on owner\/repo from rec-1\.[^]*>Confirm<\/button>/)
+  const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
+    app: 'contribute', intent: 'review:1', title: 'Fix typo', interaction: 'inline', action: target,
+    pull: { repo: 'owner/repo', state: 'proposed', badges: [{ label: 'All clear', tone: 'success' }] } }) })
+  const row = confirming => renderToStaticMarkup(createElement(PullSnapshot, { block, pull: block.pull, href: block.href,
+    compact: true, appName: 'Contribute', confirming, session: { links: [] } }))
+  assert.match(row(false), /All clear/)
+  assert.doesNotMatch(row(true), /All clear/)
+})
+
+test('generic chrome names the installed app and uses neutral busy copy', () => {
+  const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
+    app: 'example', intent: 'open:1', title: 'Item', interaction: 'inline', action: { label: 'Run', intent: 'run:1' },
+    pull: { repo: 'owner/repo', state: 'proposed' } }) })
+  const row = renderToStaticMarkup(createElement(PullSnapshot, { block, pull: block.pull, href: block.href,
+    compact: true, appName: 'Example', session: null }))
+  const busy = renderToStaticMarkup(createElement(SessionControls, { target: block.action, appName: 'Example',
+    state: { busy: true, links: [] }, onEvent: () => {} }))
+  for (const html of [row, busy]) assert.doesNotMatch(html, /Contribution|Contributing/)
+  assert.match(row, /md-app-pull__identity"><span>Example</)
+  assert.match(busy, />Working…<\/button>/)
+  assert.match(renderToStaticMarkup(createElement(SessionControls, { target: block.action, appName: 'Example',
+    state: { busy: true, busyLabel: 'Running…', links: [] }, onEvent: () => {} })), />Running…<\/button>/)
 })
