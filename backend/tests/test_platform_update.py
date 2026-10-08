@@ -4788,8 +4788,12 @@ async def test_cancelled_apply_reports_cancellation_after_transaction_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("paused_phase", [
+  pu.PlatformUpdatePhase.FINALIZING,
+  pu.PlatformUpdatePhase.COMPLETE,
+])
 async def test_apply_keeps_cross_process_lock_through_final_progress(
-  monkeypatch, clone_env,
+  monkeypatch, clone_env, paused_phase,
 ):
   origin, platform = clone_env
   target = _advance_origin(
@@ -4799,15 +4803,33 @@ async def test_apply_keeps_cross_process_lock_through_final_progress(
   )
   pu._fetch(platform)
   preview = pu.platform_update_preview(platform, target_sha=target)
-  finalizing = threading.Event()
-  release_finalizing = threading.Event()
+  progress_published = threading.Event()
+  release_progress = threading.Event()
+  set_progress = pu._set_update_progress
 
-  def delayed_hook_refresh(*_args, **_kwargs):
-    finalizing.set()
-    assert release_finalizing.wait(timeout=5)
-    return None
+  def reconciled(repo, **kwargs):
+    assert repo == platform
+    assert kwargs["lock_already_held"] is True
+    assert kwargs["target_ref"] == target
+    return pu.ReconcileResult(
+      "updated", preview["current_sha"], target, target,
+      hook_source_sha=target,
+    )
 
-  monkeypatch.setattr(pu, "_refresh_git_hooks", delayed_hook_refresh)
+  def paused_progress(phase, **kwargs):
+    set_progress(phase, **kwargs)
+    if phase == paused_phase:
+      progress_published.set()
+      assert release_progress.wait(timeout=5)
+
+  # This tests the outer Apply transaction, not reconciliation/build latency.
+  # Keep its real flock and durable progress writes; isolate unrelated work so
+  # bounded event waits contain a broken handshake, not a full update's runtime.
+  monkeypatch.setattr(pu, "_reconcile_under_lock", reconciled)
+  monkeypatch.setattr(pu, "_record_update_activation", lambda *_args:
+    platform_activation.classify_activation([]))
+  monkeypatch.setattr(pu, "_refresh_git_hooks", lambda *_args: None)
+  monkeypatch.setattr(pu, "_set_update_progress", paused_progress)
   applying = asyncio.create_task(pu.apply_platform_update(
     SimpleNamespace(),
     plan_id=preview["plan_id"],
@@ -4815,23 +4837,26 @@ async def test_apply_keeps_cross_process_lock_through_final_progress(
     target_sha=preview["target_sha"],
     repo=platform,
   ))
-  assert await asyncio.to_thread(finalizing.wait, 2)
+  try:
+    assert await asyncio.to_thread(progress_published.wait, 2)
 
-  with pytest.raises(pu.PlatformUpdateError, match="platform_update_in_progress"):
-    with pu._reconcile_flock(blocking=False):
-      pass
-  progress = pu.platform_update_progress()
-  assert progress["active"] is True
-  assert progress["phase"] == pu.PlatformUpdatePhase.FINALIZING.value
+    with pytest.raises(pu.PlatformUpdateError, match="platform_update_in_progress"):
+      with pu._reconcile_flock(blocking=False):
+        pass
+    progress = pu.platform_update_progress()
+    assert progress["active"] is (paused_phase != pu.PlatformUpdatePhase.COMPLETE)
+    assert progress["phase"] == paused_phase.value
+  finally:
+    # Drain the admitted operation even if the handshake or lock assertion fails,
+    # before monkeypatch/temporary-repository teardown can race its worker.
+    release_progress.set()
+    result = await applying
 
-  release_finalizing.set()
-  result = await applying
-  assert result["state"] in {
-    pu.PlatformUpdateState.UP_TO_DATE.value,
-    pu.PlatformUpdateState.RESTART_NEEDED.value,
-    pu.PlatformUpdateState.ACTIVATION_NEEDED.value,
-  }
+  assert result["state"] == pu.PlatformUpdateState.UP_TO_DATE.value
   assert pu.platform_update_progress()["active"] is False
+  assert pu.platform_update_progress()["phase"] == pu.PlatformUpdatePhase.COMPLETE.value
+  with pu._reconcile_flock(blocking=False):
+    pass
 
 
 def test_preview_reports_an_active_update_instead_of_waiting(clone_env):
