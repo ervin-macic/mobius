@@ -34,6 +34,9 @@ _PROXY_USER_AGENT = "Mobius/1.0 (app proxy; +https://github.com/mobius-os/mobius
 
 # Hard limit on response size to avoid pulling in huge payloads.
 _MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+# httpx's timeout applies to each network read, so a drip-fed body could hold a
+# pooled slot for as long as it keeps sending; this bounds the whole exchange.
+_EXCHANGE_DEADLINE = 60
 
 # 512 KB — generous for API payloads, prevents memory exhaustion from abuse.
 _MAX_BODY = 512 * 1024
@@ -319,35 +322,44 @@ async def _capped_response(
   """Sends `req` streaming and reads at most `_MAX_BYTES` into memory. The prior
   code read the FULL body (`r.content`) before slicing, so a huge or malicious
   upstream response could exhaust process memory before the cap ever applied.
-  This stops at the cap and drops the rest."""
+  This stops at the cap and drops the rest, and gives up with a 504 once the
+  exchange passes `_EXCHANGE_DEADLINE`, which releases the caller's pool slot."""
   try:
-    r = await client.send(req, stream=True)
-  except Exception as exc:
-    raise HTTPException(status_code=502, detail=str(exc))
-  try:
-    buf = bytearray()
-    async for chunk in r.aiter_bytes():
-      # Append only up to the cap so the buffer is STRICTLY bounded by _MAX_BYTES
-      # (extending the whole chunk first could overshoot by a chunk's worth).
-      room = _MAX_BYTES - len(buf)
-      buf.extend(chunk[:room])
-      if len(buf) >= _MAX_BYTES:
-        break
-    headers = {
-      name: r.headers[name]
-      for name in _FORWARDED_RESPONSE_HEADERS
-      if name in r.headers
-    }
-    if cache_headers is not None:
-      headers.update(cache_headers(r))
-    return Response(
-      content=bytes(buf),
-      status_code=r.status_code,
-      headers=headers,
-      media_type=r.headers.get("content-type", "application/octet-stream"),
-    )
-  finally:
-    await r.aclose()
+    async with asyncio.timeout(_EXCHANGE_DEADLINE):
+      try:
+        r = await client.send(req, stream=True)
+      except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+      try:
+        buf = bytearray()
+        async for chunk in r.aiter_bytes():
+          # Append only up to the cap so the buffer is STRICTLY bounded by
+          # _MAX_BYTES (extending the whole chunk first could overshoot by a
+          # chunk's worth).
+          room = _MAX_BYTES - len(buf)
+          buf.extend(chunk[:room])
+          if len(buf) >= _MAX_BYTES:
+            break
+      finally:
+        await r.aclose()
+  except TimeoutError:
+    raise HTTPException(
+      status_code=504,
+      detail=f"Upstream did not finish within {_EXCHANGE_DEADLINE} seconds.",
+    ) from None
+  headers = {
+    name: r.headers[name]
+    for name in _FORWARDED_RESPONSE_HEADERS
+    if name in r.headers
+  }
+  if cache_headers is not None:
+    headers.update(cache_headers(r))
+  return Response(
+    content=bytes(buf),
+    status_code=r.status_code,
+    headers=headers,
+    media_type=r.headers.get("content-type", "application/octet-stream"),
+  )
 
 
 @router.get("/favicon")

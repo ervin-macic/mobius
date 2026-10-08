@@ -22,6 +22,7 @@ import http.cookiejar
 import threading
 
 import httpx
+from fastapi import HTTPException
 
 
 def _refuse_all_cookies() -> http.cookiejar.CookieJar:
@@ -43,11 +44,19 @@ class PinnedHostClientPool:
   Clients never follow redirects: each hop must be re-validated and re-pinned
   by the caller, so automatic redirects would let a public URL bounce into the
   container network.
+
+  A caller waits at most ``slot_wait`` seconds for one of the ``max_active``
+  slots and then gets a 503, so a saturated pool sheds load instead of queueing
+  requests without limit. How long a caller holds a slot is bounded by its
+  exchange deadline (``_capped_response`` in app.routes.proxy).
   """
 
-  def __init__(self, max_clients: int = 64, max_active: int = 64):
+  def __init__(
+    self, max_clients: int = 64, max_active: int = 64, slot_wait: float = 10,
+  ):
     self.max_clients = max_clients
     self.max_active = max_active
+    self.slot_wait = slot_wait
     self._lock = asyncio.Lock()
     self._capacity = asyncio.BoundedSemaphore(max_active)
     self._clients: OrderedDict[tuple[str, str], _PooledClient] = OrderedDict()
@@ -88,7 +97,15 @@ class PinnedHostClientPool:
 
   @asynccontextmanager
   async def lease(self, host_header: str, sni_host: str):
-    await self._capacity.acquire()
+    try:
+      async with asyncio.timeout(self.slot_wait):
+        await self._capacity.acquire()
+    except TimeoutError:
+      raise HTTPException(
+        status_code=503,
+        detail="Too many outbound requests are in flight; retry shortly.",
+        headers={"Retry-After": "1"},
+      ) from None
     try:
       key = (host_header, sni_host)
       retired: list[httpx.AsyncClient] = []

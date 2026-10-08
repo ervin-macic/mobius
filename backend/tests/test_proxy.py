@@ -675,3 +675,75 @@ def test_pooled_upstream_clients_never_carry_cookies_between_callers():
   finally:
     server.shutdown()
   assert seen == [("/login", None), ("/data", None)]
+
+
+def test_saturated_pool_answers_503_instead_of_queueing_forever():
+  from app.pinned_http_clients import PinnedHostClientPool
+
+  async def exercise():
+    pool = PinnedHostClientPool(max_active=1, slot_wait=0.05)
+    try:
+      async with pool.lease("busy.example", "busy.example"):
+        with pytest.raises(HTTPException) as exc:
+          async with pool.lease("other.example", "other.example"):
+            pass
+      assert exc.value.status_code == 503
+      assert exc.value.headers == {"Retry-After": "1"}
+      # The refused caller never took a slot, so the next one gets it at once.
+      async with pool.lease("other.example", "other.example"):
+        pass
+    finally:
+      await pool.close()
+
+  asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
+def test_drip_fed_upstream_cannot_hold_a_pool_slot_past_the_deadline(monkeypatch):
+  """httpx times out each read, not the response, so an upstream sending a
+  byte at a time must still lose its slot once the exchange deadline passes."""
+  import threading
+  import time
+  from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+  from app.pinned_http_clients import PinnedHostClientPool
+
+  class DripFeed(BaseHTTPRequestHandler):
+    def do_GET(self):
+      self.send_response(200)
+      self.send_header("Content-Length", "1000000")
+      self.end_headers()
+      try:
+        for _ in range(200):
+          self.wfile.write(b"x")
+          self.wfile.flush()
+          time.sleep(0.02)
+      except OSError:
+        pass
+
+    def log_message(self, *args):
+      pass
+
+  server = ThreadingHTTPServer(("127.0.0.1", 0), DripFeed)
+  server.daemon_threads = True
+  port = server.server_address[1]
+  threading.Thread(target=server.serve_forever, daemon=True).start()
+  monkeypatch.setattr("app.routes.proxy._EXCHANGE_DEADLINE", 0.3)
+
+  async def exercise():
+    pool = PinnedHostClientPool(max_active=1, slot_wait=0.05)
+    try:
+      with pytest.raises(HTTPException) as exc:
+        async with pool.lease("drip.example", "drip.example") as client:
+          request = client.build_request("GET", f"http://127.0.0.1:{port}/")
+          await _capped_response(client, request)
+      assert exc.value.status_code == 504
+      assert pool.metrics()["active_requests"] == 0
+      async with pool.lease("next.example", "next.example"):
+        pass
+    finally:
+      await pool.close()
+
+  try:
+    asyncio.run(asyncio.wait_for(exercise(), timeout=3))
+  finally:
+    server.shutdown()
