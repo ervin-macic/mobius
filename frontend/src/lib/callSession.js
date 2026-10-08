@@ -962,10 +962,8 @@ function startCall(request, channel, environment) {
       if (other === track) continue
       try { other.stop() } catch { /* already stopped */ }
     }
-    try {
-      // Keep text and edges legible when bandwidth is short.
-      if ('contentHint' in track) track.contentHint = 'detail'
-    } catch { /* the browser keeps its default */ }
+    // Keep text and edges legible when bandwidth is short.
+    if ('contentHint' in track) track.contentHint = 'detail'
     screenTrack = track
     screenStream = wrapped
     // The browser's own "Stop sharing" control ends the track.
