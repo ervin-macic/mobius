@@ -69,10 +69,9 @@ test('all finished Goals are read-only records with an expandable plan', () => {
 })
 
 test('completed Goals show the checklist without repeating the final reply', () => {
-  for (const status of ['completed', 'cannot_complete', 'cancelled']) {
   for (const result of ['The release is ready.', { summary: 'The release is ready.' }]) {
     const summary = {
-      objective: 'Prepare the release', status, result,
+      objective: 'Prepare the release', status: 'completed', result,
       plan: { tasks: [{ id: 'prepare', title: 'Check the release', status: 'completed' }] },
     }
     const original = structuredClone(summary)
@@ -83,7 +82,6 @@ test('completed Goals show the checklist without repeating the final reply', () 
     assert.match(html, /Check the release/)
     assert.doesNotMatch(html, /The release is ready|chat__goal-result|<button/)
     assert.deepEqual(summary, original)
-  }
   }
 })
 
@@ -96,14 +94,14 @@ test('a completed Goal with only a result has no empty disclosure or clipped obj
   assert.doesNotMatch(html, /The release is ready|<details|objective--preview/)
 })
 
-test('cancelled and unsuccessful records do not repeat the final answer', () => {
+test('cancellation and unsuccessful Goal reasons remain visible without opening details', () => {
   for (const status of ['cannot_complete', 'cancelled', 'failed']) {
     const html = render(h(GoalHistoryCard, { summary: {
       objective: 'Prepare the release', status, result: { reason: 'The required account is unavailable.' },
       plan: { tasks: [{ id: 'prepare', title: 'Prepare', status: 'cancelled' }] },
     } }))
     const [visible, details] = html.split('</summary>')
-    assert.doesNotMatch(visible, /The required account is unavailable\./)
+    assert.match(visible, /The required account is unavailable\./)
     assert.doesNotMatch(details, /The required account is unavailable\./)
   }
 })

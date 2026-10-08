@@ -1409,8 +1409,6 @@ export default function ChatView({
       // must not install an older terminal snapshot over its successor.
       if (chatIdStaleRef.current || fetchGenRef.current !== gen
           || isCurrent?.() === false) return
-      // Resume acknowledgement owns recovery-to-running until its row is visible.
-      if (resumeRequestRef.current?.chatId === String(chatId)) return null
       const runtimeTransition = inspectRuntimeSnapshot(data)
       if (!runtimeTransition.adopt) return null
       commitRuntimeSnapshot(runtimeTransition)
@@ -1587,6 +1585,8 @@ export default function ChatView({
       // never loaded; a resumed reply would then look like the whole chat.
       if (!activationSettledRef.current) return null
       if (fetchGenRef.current !== gen) return null
+      // Runtime-only reads cannot retire recovery before Resume appends its acknowledged row.
+      if (resumeRequestRef.current?.chatId === String(chatId)) return null
       const runtimeTransition = inspectRuntimeSnapshot(data)
       if (!runtimeTransition.adopt) return null
       const serverPending = data.pending_messages || []

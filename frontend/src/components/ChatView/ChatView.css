@@ -4360,6 +4360,7 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 
 .chat__goal-history--failed { --lifecycle-tone: var(--danger); }
 .chat__goal-history--cancelled { --lifecycle-tone: var(--muted); }
+.chat__goal-history-reason { color: var(--text); font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
 .chat__wait-history { --lifecycle-tone: var(--accent); }
 .chat__wait-history--attention { --lifecycle-tone: var(--warning, #d8922f); }
 .chat__wait-history--stopped { --lifecycle-tone: var(--muted); }

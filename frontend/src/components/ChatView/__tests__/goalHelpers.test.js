@@ -44,6 +44,7 @@ test('a nested saved question is visible even in the collapsed owning Goal, with
   }))
   const html = render(h(Rail, { items }))
   assert.match(html, /aria-expanded="false"/)
+  assert.match(html, /aria-label="Helper questions" tabindex="0"/)
   assert.match(html, /Verify the migration · Needs an answer/)
   assert.match(html, /Which release should I verify/)
   assert.match(html, /Stable/)
