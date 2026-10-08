@@ -98,8 +98,10 @@ notification and closed out the DB row.
 - **Round claims but never completes** — no provider is authed, so the spawned
   turn can't run. Authenticate a provider, or use the automated
   `test_autopilot_loop.py` for the token-free path.
-- **`/respond` returns `escalated`** — the record used up its five rounds (or hit
-  repeated failures). Resume it from the app's autopilot panel and re-run.
+- **`/respond` returns `escalated`** — two rounds in a row went stale or failed
+  (`reason: stale_rounds`), or the record completed 20 rounds since the owner
+  last took control without the PR settling (`reason: round_ceiling`, the
+  runaway guard). Resume it from the app's autopilot panel and re-run.
 - **Submit 409 "no longer waiting for approval"** — the ledger record wasn't
   written raw; the storage PUT body must be the record JSON itself (no envelope).
 - **git "dubious ownership"** — the staging worktree must be owned by `mobius`
