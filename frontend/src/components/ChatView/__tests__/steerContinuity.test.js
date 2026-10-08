@@ -252,7 +252,7 @@ test('a terminal-section replay hides live partials but reveals divergence and s
 })
 
 
-test('terminal-section replay preserves unsafe Markdown instead of hiding real formatting', () => {
+test('terminal-section replay carries formatting context without hiding real content', () => {
   const sealed = assistant('Earlier\n\n**Plan', {
     blocks: [
       { type: 'text', content: 'Earlier' },
@@ -261,7 +261,10 @@ test('terminal-section replay preserves unsafe Markdown instead of hiding real f
   })
   const continuation = assistant('**Planned** maintenance')
 
-  assert.equal(projectSteerContinuationMessage(sealed, continuation), continuation)
+  const projected = projectSteerContinuationMessage(sealed, continuation)
+  assert.equal(projected.blocks[0].content, 'ned** maintenance')
+  assert.ok(projected.blocks[0].markdown_range)
+  assert.equal(continuation.blocks[0].content, '**Planned** maintenance')
 })
 
 
@@ -392,22 +395,35 @@ test('plain-text cuts preserve graphemes and character references', () => {
 })
 
 
-test('an unsafe Markdown split keeps the full post-steer response', () => {
+test('a formatted split preserves the parsed context instead of replaying its prefix', () => {
   const sealed = assistant('**Plan')
   const continuation = assistant('**Planned** maintenance')
-  const activePartial = assistant('**Planned')
-  const activeExact = assistant('**Plan')
+  const projected = projectSteerContinuationMessage(sealed, continuation)
+  assert.equal(projected.blocks[0].content, 'ned** maintenance')
+  assert.equal(projected.blocks[0].source_text_offset, '**Plan'.length)
+  assert.ok(projected.blocks[0].markdown_range)
+  assert.ok(projected.steer_replay.prefixRange)
+  assert.equal(continuation.content, '**Planned** maintenance')
+})
 
-  assert.equal(
-    projectSteerContinuationMessage(sealed, continuation),
-    continuation,
-  )
-  assert.equal(
-    projectSteerContinuationMessage(sealed, activePartial, { active: true }),
-    activePartial,
-  )
-  assert.equal(
-    projectSteerContinuationMessage(sealed, activeExact, { active: true }),
-    activeExact,
-  )
+
+test('unmappable code, links and math still preserve the complete response', () => {
+  for (const [prefix, text] of [
+    ['```js\nconst', '```js\nconst x = 1\n```'],
+    ['[see](https://exa', '[see](https://example.com)'],
+    ['$x', '$x + y$'],
+  ]) {
+    const continuation = assistant(text)
+    assert.equal(projectSteerContinuationMessage(assistant(prefix), continuation), continuation)
+  }
+})
+
+test('an unfinished emphasis replay remains lossless while catching up to the sealed text', () => {
+  const sealed = assistant('**Plan')
+  for (const [text, expected] of [['**Pl', ''], ['**Plan', ''], ['**Planned', 'ned']]) {
+    const projected = projectSteerContinuationMessage(sealed, assistant(text), { active: true })
+    assert.equal(projected.content, expected)
+  }
+  const shorter = assistant('**Pl')
+  assert.equal(projectSteerContinuationMessage(sealed, shorter), shorter)
 })

@@ -191,6 +191,7 @@ import {
   chooseActiveAssistantDataKey,
   findTrailingAssistantPartialIndex,
   streamItemsHaveRenderableContent,
+  streamItemsToAssistantPayload,
 } from './streamPromotion.js'
 import {
   commitAssistantPromotion,
@@ -200,6 +201,7 @@ import { assistantReplyGroups } from './assistantReplies.js'
 import {
   assistantReplyRoot,
   projectSettledSteerContinuations,
+  projectSteerContinuationMessage,
   sealedAssistantBeforeSteer,
 } from './steerContinuity.js'
 import {
@@ -5773,6 +5775,16 @@ export default function ChatView({
     messages,
     activeSteerContinuationIndex,
   )
+  const activeSteerPrefix = useMemo(() => {
+    if (!showActiveAssistantSurface || !sealedSteerAssistant) return null
+    const source = useDbActivePayload ? activeMirrorMsg : hasLiveAssistantPayload
+      ? { role: 'assistant', id: streamAssistantMessageId || activeAssistantMessageId,
+          ...streamItemsToAssistantPayload(streamItems, { finalize: false }) }
+      : null
+    const continuation = projectSteerContinuationMessage(sealedSteerAssistant, source, { active: activeAssistantIsStreaming })
+    return continuation?.steer_replay?.prefixRange ? { id: sealedSteerAssistant.id, continuation } : null
+  }, [showActiveAssistantSurface, sealedSteerAssistant, useDbActivePayload, activeMirrorMsg,
+    hasLiveAssistantPayload, streamAssistantMessageId, activeAssistantMessageId, streamItems, activeAssistantIsStreaming])
   useLayoutEffect(() => {
     const sourceId = activeMirrorMsg?.id || streamAssistantMessageId || activeAssistantMessageId
     if (showActiveAssistantSurface && sourceId) assistantDisplayKeys.set(sourceId, streamingDataKey)
@@ -5926,9 +5938,9 @@ export default function ChatView({
   const displayedMessages = useMemo(
     () => projectSettledSteerContinuations(
       recoveryMessages,
-      { preserveHidden: true },
+      { preserveHidden: true, activePrefix: activeSteerPrefix },
     ),
-    [recoveryMessages],
+    [recoveryMessages, activeSteerPrefix],
   )
   const peerTimeline = usePeerTimeline(
     chatId,

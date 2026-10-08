@@ -268,6 +268,7 @@ export function BlockToken({ token, onInternalNav, mediaDimensions }) {
  */
 export const MemoBlock = memo(BlockToken, (prev, next) => {
   return prev.token.raw === next.token.raw
+    && prev.token.rangeContext === next.token.rangeContext
     && prev.onInternalNav === next.onInternalNav
     && prev.mediaDimensions === next.mediaDimensions
 })

@@ -229,7 +229,7 @@ function MsgContentInner({
     // authoritative completion lost identity across request_user_input. This
     // is render-time as well as reducer-time so already-saved chats self-heal
     // without rewriting partner transcripts.
-    const displayBlocks = repairInterleavedQuestionText(msg.blocks?.length ? msg.blocks : msg.content ? [{ type: 'text', content: msg.content }] : [])
+    const displayBlocks = repairInterleavedQuestionText(msg.blocks?.length ? msg.blocks : msg.content ? [{ type: 'text', content: msg.content, markdown_range: msg.markdown_range }] : [])
     // A legacy compact activity may have sampled out the successful Restart
     // request while retaining earlier failed attempts. Mirror the ordinary
     // tool/card pairing: the latest eligible activity or standalone request
@@ -401,12 +401,14 @@ function MsgContentInner({
               ? (isActiveAnswer || block.reply_text_owner
                   ? <ProgressiveMarkdown
                       text={text}
+                      markdownRange={block.markdown_range}
                       isStreaming={block.reply_live_text || (isStreaming && i === lastEntryIdx)}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
                     />
                   : <StandardMarkdown
                       text={text}
+                      markdownRange={block.markdown_range}
                       renderFraction={block._coldRenderFraction}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
@@ -684,12 +686,14 @@ function MsgContentInner({
             ? (isActiveAnswer
                 ? <ProgressiveMarkdown
                     text={text}
+                    markdownRange={msg.markdown_range}
                     isStreaming={isStreaming}
                     onInternalNav={onInternalNav}
                     mediaDimensions={msg.media_dimensions}
                   />
                 : <StandardMarkdown
                     text={text}
+                    markdownRange={msg.markdown_range}
                     onInternalNav={onInternalNav}
                     mediaDimensions={msg.media_dimensions}
                   />)

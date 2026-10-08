@@ -1,6 +1,7 @@
 /* Project exact post-steer text replay as one continuous assistant answer. */
 
 import { safeSteerMarkdownCut } from './markdown/steerContinuation.js'
+import { splitSteerMarkdown, sliceMarkdownRange } from './markdown/steerMarkdownRange.js'
 
 
 export function isSteeredUserMessage(message) {
@@ -75,20 +76,21 @@ function firstContinuationTextBlock(blocks) {
 function projectedText(prefix, text, { active }) {
   if (!prefix || !text) return null
   if (text.startsWith(prefix)) {
-    if (!safeSteerMarkdownCut(text, prefix.length)) return null
-    return text.slice(prefix.length)
+    if (safeSteerMarkdownCut(text, prefix.length)) return { content: text.slice(prefix.length) }
+    const ranges = splitSteerMarkdown(text, prefix.length)
+    return ranges ? { content: text.slice(prefix.length), ranges } : null
   }
   // While the provider is replaying the already-visible prefix, hold that
   // provisional duplicate off-screen. If one character diverges, this branch
   // stops matching and the complete accumulated text appears unchanged.
-  if (active && prefix.startsWith(text)) return ''
+  if (active && prefix.startsWith(text)) return { content: '' }
   return null
 }
 
 
 /**
  * Return a presentation-only assistant message. Stored content is never
- * rewritten: a mismatch, a settled short response, or an unsafe Markdown cut
+ * rewritten: a mismatch, a settled short response, or an unmappable Markdown cut
  * returns the original object by identity.
  */
 export function projectSteerContinuationMessage(
@@ -114,30 +116,58 @@ export function projectSteerContinuationMessage(
     if (projected == null) return continuationMessage
     const nextBlocks = blocks.slice()
     nextBlocks[textIndex] = {
-      ...blocks[textIndex], content: projected,
+      ...blocks[textIndex], content: projected.content,
+      ...(projected.ranges ? { markdown_range: projected.ranges.after } : {}),
       // Activity offsets refer to persisted text, before this display-only cut.
-      source_text_offset: (blocks[textIndex].source_text_offset || 0) + text.length - projected.length,
+      source_text_offset: (blocks[textIndex].source_text_offset || 0) + text.length - projected.content.length,
     }
     return {
       ...continuationMessage,
-      content: projected,
+      content: projected.content,
       blocks: nextBlocks,
-      steer_replay: { textIndex, prefix, text, sourceOffset: blocks[textIndex].source_text_offset || 0 },
+      steer_replay: { textIndex, prefix, text, sourceOffset: blocks[textIndex].source_text_offset || 0,
+        ...(projected.ranges ? { prefixRange: projected.ranges.before } : {}) },
     }
   }
 
   const text = String(continuationMessage.content || '')
   const projected = projectedText(prefix, text, { active })
   if (projected == null) return continuationMessage
-  return { ...continuationMessage, content: projected,
-    steer_replay: { textIndex: 0, prefix, text, sourceOffset: 0 } }
+  return { ...continuationMessage, content: projected.content,
+    ...(projected.ranges ? { markdown_range: projected.ranges.after } : {}),
+    steer_replay: { textIndex: 0, prefix, text, sourceOffset: 0,
+      ...(projected.ranges ? { prefixRange: projected.ranges.before } : {}) } }
+}
+
+/** Give the sealed prefix the same parsed formatting as its exact continuation.
+ * Its text and position stay frozen; only the display context crosses the steer. */
+export function projectSteerPrefixMessage(sealed, continuation) {
+  const range = continuation?.steer_replay?.prefixRange
+  if (!range || !sealed) return sealed
+  const index = sealed.blocks?.length
+    ? sealed.blocks.findLastIndex(block => block.type !== 'thinking') : 0
+  const block = sealed.blocks?.length ? sealed.blocks[index] : { type: 'text', content: sealed.content }
+  if (block?.type !== 'text') return sealed
+  const replay = sealed.steer_replay?.textIndex === index ? sealed.steer_replay : null
+  const start = replay ? replay.text.length - block.content.length : 0
+  const markdownRange = sliceMarkdownRange(range, start, start + block.content.length)
+  if (!markdownRange) return sealed
+  // Carry the final parse backward only through this same exact text section.
+  // A later tool/text section must not lend its formatting to an earlier one.
+  const prefixRange = replay && range.source.startsWith(replay.text)
+    ? sliceMarkdownRange(range, 0, replay.prefix.length) : null
+  const context = prefixRange ? { steer_replay: { ...replay, prefixRange } } : {}
+  if (!sealed.blocks?.length) return { ...sealed, ...context, markdown_range: markdownRange }
+  const blocks = sealed.blocks.slice()
+  blocks[index] = { ...block, markdown_range: markdownRange }
+  return { ...sealed, ...context, blocks }
 }
 
 
 /** Apply the exact replay projection to settled transcript rows. */
-export function projectSettledSteerContinuations(messages, { preserveHidden = false } = {}) {
+export function projectSettledSteerContinuations(messages, { preserveHidden = false, activePrefix = null } = {}) {
   if (!Array.isArray(messages)) return []
-  return messages.map((message, index) => {
+  const presented = messages.map((message, index) => {
     if (message?.role !== 'assistant') return message
     const root = assistantReplyRoot(message)
     let before = index - 1
@@ -151,4 +181,18 @@ export function projectSettledSteerContinuations(messages, { preserveHidden = fa
       message,
     )
   })
+  // Latest complete formatting wins all the way back through replay chains.
+  for (let index = presented.length - 1; index >= 0; index -= 1) {
+    // The stream can be ahead of its DB mirror; apply its parse after the
+    // settled successor, so an older mirror cannot restore unfinished markup.
+    if (activePrefix && presented[index]?.id === activePrefix.id) {
+      presented[index] = projectSteerPrefixMessage(presented[index], activePrefix.continuation)
+    }
+    const message = presented[index]
+    if (!message?.steer_replay?.prefixRange) continue
+    let before = index - 1
+    while (isSteeredUserMessage(messages[before])) before -= 1
+    presented[before] = projectSteerPrefixMessage(presented[before], message)
+  }
+  return presented
 }
