@@ -14,6 +14,13 @@ export const SYSTEM_CONNECT_DEADLINE_MS = 30_000
 export const SYSTEM_READ_DEADLINE_MS = 70_000
 export const SYSTEM_QUICK_WAKE_MS = 10_000
 
+// Matches the lifetime of shared query caches, not a particular Shell mount.
+let attemptedConnectionThisPage = false
+
+export function resetSystemStreamPageForTests() {
+  attemptedConnectionThisPage = false
+}
+
 /**
  * Persistent SSE subscription to /api/events/system. Lives on the
  * Shell so system events (theme_updated, app_updated,
@@ -41,10 +48,9 @@ export const SYSTEM_QUICK_WAKE_MS = 10_000
  * the connection on the server.
  *
  * `onOpen({ signal, reconnect })` is the barrier that runs before buffered
- * events are applied. `reconnect` is false only for this hook's very first
- * connection attempt, whose mount-time reads share its page load; every later
- * attempt follows a drop, a failed attempt, or a wake, during which events
- * may have been lost.
+ * events are applied. `reconnect` is false only for this page's very first
+ * connection attempt; every later attempt follows a drop, a failed attempt,
+ * a wake, or a Shell remount, during which events may have been lost.
  */
 export default function useSystemEventStream(
   onEvent,
@@ -59,8 +65,6 @@ export default function useSystemEventStream(
   useEffect(() => { onOpenRef.current = onOpen }, [onOpen])
   const onSubscriptionRef = useRef(onSubscription)
   useEffect(() => { onSubscriptionRef.current = onSubscription }, [onSubscription])
-  // Outlives effect re-runs: re-enabling the stream is a reconnect.
-  const attemptedConnectionRef = useRef(false)
 
   useEffect(() => {
     if (!enabled) return undefined
@@ -141,9 +145,9 @@ export default function useSystemEventStream(
         lastReadAt: null,
         deadline: null,
         subscriptionId: null,
-        reconnect: attemptedConnectionRef.current,
+        reconnect: attemptedConnectionThisPage,
       }
-      attemptedConnectionRef.current = true
+      attemptedConnectionThisPage = true
       active = attempt
       armDeadline(attempt)
       let reader

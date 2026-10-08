@@ -806,6 +806,8 @@ test('shell reconciles both durable drawer lists whenever the system stream reco
     'utf8',
   )
   assert.match(shellSource, /const reconcileSystemStateOnOpen = useCallback/)
+  assert.match(shellSource, /reconcileSystemStateOnOpen[\s\S]*?\.\.\.invalidateEventFedCachesOnOpen\(queryClient\)/,
+    'event-fed domains share the every-open reconciliation path')
   assert.match(shellSource, /const SYSTEM_RECONNECT_LIST_TIMEOUT_MS = 5_000/)
   assert.match(shellSource, /reconcileSystemStateOnOpen[\s\S]*refreshApps\(\{ timeoutMs: SYSTEM_RECONNECT_LIST_TIMEOUT_MS, signal \}\)/)
   assert.match(shellSource, /reconcileSystemStateOnOpen[\s\S]*fetchFreshChats\(\{ timeoutMs: SYSTEM_RECONNECT_LIST_TIMEOUT_MS, signal \}\)/)
@@ -818,20 +820,4 @@ test('shell reconciles both durable drawer lists whenever the system stream reco
   assert.match(shellSource, /reconcileSystemStateOnOpen[\s\S]*chat\.running[\s\S]*visibleChatIdsRef\.current[\s\S]*markChatRunReconcile\(chatId\)/,
     'open chats and durable running chats reconcile even when run events were missed')
   assert.match(shellSource, /useSystemEventStream\(handleSystemEvent, \{\s*onOpen: reconcileSystemStateOnOpen[,\s]/)
-})
-
-test('event-fed caches are fully invalidated on a reconnect; the first open refreshes only restored entries', () => {
-  const shellSource = readFileSync(new URL('../Shell.jsx', import.meta.url), 'utf8')
-  assert.match(shellSource, /const reconcileSystemStateOnOpen = useCallback\(async \(\{ signal, reconnect = true \} = \{\}\)/)
-  assert.match(shellSource, /reconcileSystemStateOnOpen[\s\S]*?\.\.\.\(reconnect\s*\? invalidateEventFedCachesAfterReconnect\(queryClient\)\s*: invalidateRestoredEventFedCaches\(queryClient, PAGE_LOADED_AT\)\),\s*reconcileDeletedAppIdentities\(\)\.then\(\(\) => refreshApps\(/,
-    'the durable app list stays an every-open read beside the reconnect-only invalidations')
-  const helper = shellSource.match(/function invalidateEventFedCachesAfterReconnect\(queryClient\) \{[\s\S]*?\n\}/)?.[0] ?? ''
-  for (const invalidation of [
-    'modelQueries.registry.invalidate(queryClient)',
-    'authQueries.provider.statuses.invalidate(queryClient)',
-    'appSourceQueries.invalidate(queryClient)',
-    'chatAppArtifactQueries.invalidateAll(queryClient)',
-    'invalidateAllChatActivity(queryClient)',
-  ]) assert.ok(helper.includes(invalidation), `reconnect still invalidates ${invalidation}`)
-  assert.doesNotMatch(helper, /refreshApps|fetchFreshChats/, 'list reads are never reconnect-only')
 })

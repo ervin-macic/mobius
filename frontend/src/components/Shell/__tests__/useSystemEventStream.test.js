@@ -1,7 +1,12 @@
-import { test } from 'node:test'
+import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { renderHook } from '../../ChatView/hooks/__tests__/react-hook-shim.mjs'
 
+
+beforeEach(async () => {
+  const module = await import('../../../hooks/useSystemEventStream.js')
+  module.resetSystemStreamPageForTests()
+})
 
 function target(extra = {}) {
   return Object.assign(new EventTarget(), extra)
@@ -360,4 +365,13 @@ test('a failed first open makes the next successful open a reconnect', async t =
   const h = await connectionHarness(t, { onOpen: () => { if (++count === 1) throw new Error('fresh list unavailable') } })
   await h.tick(1000)
   assert.deepEqual(h.opens.map(open => open.reconnect), [false, true])
+})
+
+test('a second Shell mount in the same page reconnects after its listener gap', async t => {
+  const first = await connectionHarness(t)
+  assert.equal(first.opens[0].reconnect, false)
+  first.hook.unmount()
+  await first.flush()
+  const second = await connectionHarness(t)
+  assert.equal(second.opens[0].reconnect, true)
 })
