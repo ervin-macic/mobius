@@ -38,6 +38,21 @@ def _fail(message: str, status: int = 409) -> None:
   raise HTTPException(status, message)
 
 
+class PushNotAttempted(Exception):
+  """A repair push was refused before any public Git I/O started."""
+
+  def __init__(self, detail: str):
+    super().__init__(detail)
+    self.detail = detail
+
+
+def not_attempted(exc: BaseException) -> PushNotAttempted:
+  if isinstance(exc, PushNotAttempted):
+    return exc
+  detail = exc.detail if isinstance(exc, HTTPException) else "The push preflight failed."
+  return PushNotAttempted(str(detail))
+
+
 def _read(gh, cwd: Path, endpoint: str) -> dict | list:
   try:
     value = json.loads(gh(cwd, "api", endpoint).stdout)
@@ -273,18 +288,23 @@ def push_repair(gh, cwd: Path, row, target: dict, validation: dict, *, before_pu
   push itself. The PR's head projection is refreshed asynchronously and can
   still show the predecessor right after a successful push.
   """
-  snapshot = {k: validation[k] for k in
-              ("checkout", "initial_head_sha", "head_repo", "head_repo_id", "head_ref", "allowed_files")}
-  fresh = validate_repair(gh, cwd, row, target, snapshot)
-  if fresh["head_sha"] != validation.get("head_sha") or fresh["diff_sha256"] != validation.get("diff_sha256"):
-    _fail("The repair checkout changed after validation.")
-  slug, branch = fresh["head_repo"], fresh["head_ref"]
-  if _branch_head(gh, cwd, slug, branch) != target["head_sha"]:
-    _fail("The remote PR head moved before the repair push.")
-  # Route callback crosses back to its owning event loop to recheck the live
-  # run, Stop and app nonce after ALL remote preflight I/O, before public I/O.
-  if before_push is not None:
-    before_push()
+  # Every failure before the git push call is a definite no-push, reported as
+  # PushNotAttempted so the route does not record an ambiguous public outcome.
+  try:
+    snapshot = {k: validation[k] for k in
+                ("checkout", "initial_head_sha", "head_repo", "head_repo_id", "head_ref", "allowed_files")}
+    fresh = validate_repair(gh, cwd, row, target, snapshot)
+    if fresh["head_sha"] != validation.get("head_sha") or fresh["diff_sha256"] != validation.get("diff_sha256"):
+      _fail("The repair checkout changed after validation.")
+    slug, branch = fresh["head_repo"], fresh["head_ref"]
+    if _branch_head(gh, cwd, slug, branch) != target["head_sha"]:
+      _fail("The remote PR head moved before the repair push.")
+    # Route callback crosses back to its owning event loop to recheck the live
+    # run, Stop and app nonce after ALL remote preflight I/O, before public I/O.
+    if before_push is not None:
+      before_push()
+  except Exception as exc:
+    raise not_attempted(exc) from exc
   result = _git(Path(fresh["checkout"]), "push", "--porcelain",
                 f"--force-with-lease=refs/heads/{branch}:{target['head_sha']}",
                 f"https://github.com/{slug}.git",

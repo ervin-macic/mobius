@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app import chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
+from app import agent_work_claims, chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
 from app import contribution_review_presets as presets
 from app.chat_start import start_programmatic_chat_turn
 from app.chat_visibility import coerce_agent_settings
@@ -752,17 +752,35 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
       attempts = list(previous["repair_attempts"])
       try:
         # Stop and nonce rechecked after claim acquisition commits too.
-        _parent(db, row, principal)
+        try:
+          _parent(db, row, principal)
+        except Exception as exc:
+          raise repairs.not_attempted(exc) from exc
         loop = asyncio.get_running_loop()
         async def final_push_guard():
           _parent(db, row, principal)
         def before_push():
-          asyncio.run_coroutine_threadsafe(final_push_guard(), loop).result()
+          try:
+            asyncio.run_coroutine_threadsafe(final_push_guard(), loop).result()
+          except Exception as exc:
+            raise repairs.not_attempted(exc) from exc
         # push_repair confirms the new head from the branch ref. Re-reading the
         # PR here would race GitHub's asynchronous PR head update.
         await asyncio.to_thread(repairs.push_repair, _gh, cwd, row, target, validation,
                                 before_push=before_push)
         _parent(db, row, principal)
+      except repairs.PushNotAttempted as exc:
+        # Nothing public happened: drop the armed receipt and release the
+        # exact-head claim so this or a fresh grant can repair it later.
+        reviews.save_outcome(db, row, reviews.key(target), {**previous,
+          "repair_attempts": attempts[:-1], "state": "needs_you",
+          "summary": f"No push was attempted: {exc.detail}"})
+        try:
+          agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+            work_key=attempts[-1]["work_key"], outcome="Repair push was not attempted.", release=True)
+        except ValueError:
+          db.rollback()
+        return {"run": _run_view(db, row), "blocked": f"No push was attempted: {exc.detail}"}
       except Exception:
         attempts[-1] = {**attempts[-1], "state": "push_unknown"}
         reviews.save_outcome(db, row, reviews.key(target), {**previous,

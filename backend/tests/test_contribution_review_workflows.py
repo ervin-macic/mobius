@@ -672,7 +672,44 @@ def test_stop_during_final_push_preflight_is_rechecked_before_public_io(setup, m
     pytest.fail("Public push must not happen after Stop")
   monkeypatch.setattr(repairs, "push_repair", preflight)
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
-  assert result["run"]["items"][0]["repair_attempts"][0]["state"] == "push_unknown"
+  item = result["run"]["items"][0]
+  # Stop before public I/O is a definite no-push, not an ambiguous outcome.
+  assert item.get("repair_attempts", []) == []
+  assert "no push was attempted" in result["blocked"].lower()
+  claim = db.query(models.AgentWorkClaim).one()
+  db.refresh(claim)
+  assert claim.released_at is not None
+  with SessionLocal() as other:
+    other.get(models.ChatRun, principal.run_id).status = "running"
+    other.commit()
+  pushes = []
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: pushes.append(1))
+  result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
+  assert pushes == [1]
+  assert result["run"]["items"][0]["repair_attempts"][0]["state"] == "pushed"
+
+
+def test_refused_preflight_push_does_not_fence_a_fresh_grant(setup, monkeypatch):
+  db, row, principal = configure_repair(setup, monkeypatch)
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a: {"checkout": "/fake/server-repair",
+    "initial_head_sha": SHA, "allowed_files": ["owned.py"], "head_repo": "example/project",
+    "head_repo_id": 1, "head_ref": "topic", "head_sha": NEW, "files": ["owned.py"], "diff_sha256": "d" * 64})
+  monkeypatch.setattr(repairs, "_branch_head", lambda *a: "f" * 40)
+  monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pytest.fail("no public push after a moved remote head"))
+  result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
+  assert "remote pr head moved" in result["blocked"].lower()
+  assert not any(a.get("state") == "push_unknown" for a in result["run"]["items"][0].get("repair_attempts", []))
+  second = models.ContributionReviewRun(id="second-repair", app_id=1, owner_id=row.owner_id,
+    request_id="second-repair-request", mode=row.mode, github_actor_id=row.github_actor_id,
+    app_nonce=row.app_nonce, options_json=dict(row.options_json), targets_json=list(row.targets_json),
+    outcomes_json={domain.key(ITEM): {"state": "repairing", "checkout": row.outcomes_json[domain.key(ITEM)]["checkout"]}},
+    chat_id=row.chat_id)
+  db.add(second)
+  db.commit()
+  pushes = []
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: pushes.append(1))
+  result = asyncio.run(routes.publish_repair(1, second.id, publish_body(), db, principal))
+  assert "blocked" not in result and pushes == [1]
 
 
 def test_cross_grant_uncertain_push_fence_cannot_be_replayed(setup, monkeypatch):
