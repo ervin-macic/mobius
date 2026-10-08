@@ -378,14 +378,58 @@ async def retry_limit_park(
   return bool(started)
 
 
+RETIRED_SOURCE_WORK_RESULT = (
+  "This contribution preparation was queued before chat Changes became "
+  "informational and was never started. Ask in the chat to prepare it again."
+)
+_PRE_START_SOURCE_WORK_STATUSES = ("accepted", "retrying")
+
+
+def retire_unstarted_source_work(db: Session) -> int:
+  """Settle retired source-attached work that never reached a ChatRun.
+
+  The attached-work reconciler that used to start or settle these rows is
+  gone, so a row left ``accepted``/``retrying`` would otherwise project as
+  active forever. Mark it ``needs_review`` with a short notice and drop its
+  startup intent and active-chat slot. Idempotent; commits when it changes.
+  """
+  has_run = select(models.ChatRun.id).where(
+    models.ChatRun.chat_id == models.Delegation.child_chat_id,
+  ).exists()
+  rows = db.query(models.Delegation).filter(
+    models.Delegation.source_work_id.is_not(None),
+    models.Delegation.source_work_status.in_(_PRE_START_SOURCE_WORK_STATUSES),
+    models.Delegation.cancelled_at.is_(None),
+    models.Delegation.interrupted_at.is_(None),
+    ~has_run,
+  ).all()
+  for row in rows:
+    row.source_work_status = "needs_review"
+    row.source_work_result = RETIRED_SOURCE_WORK_RESULT
+    row.source_work_active_chat_id = None
+    row.startup_prompt = None
+  if rows:
+    db.commit()
+  return len(rows)
+
+
 async def reconcile_unstarted_delegations() -> int:
   """Start persisted child intents left before their first ChatRun.
 
   It is safe at boot and as a periodic runtime repair. Retired
   source-attached contribution work (``source_work_id`` set) is stored
-  history only and is never started.
+  history only and is never started; any such row still waiting to start
+  is settled by ``retire_unstarted_source_work`` instead.
   """
   from app.database import SessionLocal
+
+  try:
+    with SessionLocal() as db:
+      retire_unstarted_source_work(db)
+  except Exception:
+    logging.getLogger("moebius.delegations").warning(
+      "retired source-work cleanup failed", exc_info=True,
+    )
 
   with SessionLocal() as db:
     ids = [
