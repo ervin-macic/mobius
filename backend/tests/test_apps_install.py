@@ -8528,6 +8528,47 @@ def test_update_discovery_fallback_follows_package_id_across_id_change(
     assert response.json()["upstream_commit"]
 
 
+def test_reviewed_update_applies_package_id_rename_through_stored_address(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """An update offered after an id rename can also be applied by address."""
+  manifest = {
+    "id": "pkg-apply", "name": "Package apply", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+    "package_id": "urn:uuid:5c2a7d1e-8f3b-5e6a-b1c4-7d9e0f2a3b4c",
+  }
+  base = "https://pkg-apply.test/repo/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  stored_address = db.get(models.App, app_id).manifest_url
+  assert stored_address == base.rstrip("/") + "#manifest-id=pkg-apply"
+  renamed = {**manifest, "id": "pkg-apply-renamed", "version": "2.0.0"}
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(renamed)})
+
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    preview = client.get(
+      f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
+    )
+  assert preview.status_code == 200, preview.text
+  with patch("app.install.httpx.AsyncClient"):
+    applied = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": stored_address,
+      "reviewed_source_digest": preview.json()["source_digest"],
+      "update_app_id": app_id,
+      "reviewed_upstream_commit": preview.json()["upstream_commit"],
+    })
+
+  assert applied.status_code == 201, applied.text
+  assert applied.json()["id"] == app_id
+  assert applied.json()["version"] == "2.0.0"
+
+
 @pytest.mark.parametrize("manifest_id,previous_id,allowed", [
   ("current", None, True), ("renamed", "current", True), ("other", None, False),
 ])
