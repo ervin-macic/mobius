@@ -158,13 +158,10 @@ export function capabilityRows(contract) {
     const durationText = Number.isFinite(duration)
       ? ` for up to ${Math.round(duration / 100) / 10} seconds per request`
       : ''
-    const screenText = Number(limits.screen_share) >= 1
-      ? ' Can ask to share your screen; your browser asks you what to share.'
-      : ''
     rows.push(row(
       declaration?.title || capability,
       `v${declaration?.version || '?'}`,
-      `${declaration?.description || capability}${durationText}${screenText}${
+      `${declaration?.description || capability}${durationText}${
         declaration?.reason ? ` Reason: ${declaration.reason}` : ''
       }`,
       declaration?.risk === 'device' ? 'write' : 'read',

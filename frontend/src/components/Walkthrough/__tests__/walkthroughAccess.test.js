@@ -27,29 +27,6 @@ test('access_review_never_hides_a_grant_it_has_no_wording_for', () => {
   assert.match(rows[0].summary, /brand_new_grant/)
 })
 
-test('access_review_says_when_a_call_app_may_ask_to_share_the_screen', () => {
-  const call = (limits) => capabilityRows({
-    data: {},
-    runtime: {
-      'media.call': {
-        version: 1,
-        title: 'Join live calls',
-        description: 'Use the microphone and camera for live audio and video with people this app connects you to, while this app is visible.',
-        risk: 'device',
-        reason: 'Present to the room.',
-        limits,
-      },
-    },
-  })
-  const [presenter] = call({ max_peers: 12, screen_share: 1 })
-  assert.equal(presenter.label, 'Join live calls')
-  assert.match(
-    presenter.summary,
-    /visible\. Can ask to share your screen; your browser asks you what to share\. Reason: Present to the room\.$/,
-  )
-  assert.doesNotMatch(call({ max_peers: 12, screen_share: 0 })[0].summary, /share your screen/)
-})
-
 test('access_review_of_an_app_without_grants_is_empty_not_missing', () => {
   assert.deepEqual(capabilityRows({ data: {} }), [])
   assert.deepEqual(capabilityRows(null), [])

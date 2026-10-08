@@ -383,20 +383,18 @@ RUNTIME_CAPABILITY_DEFINITIONS: dict[str, dict[str, Any]] = {
   # The shell owns the devices, peer connections, playback, and painted video
   # tiles; the app only relays opaque signalling and steers volume and tile
   # rectangles. `max_peers` bounds the full-mesh fan-out of one participant.
-  # `screen_share` 1 lets the app ask to share the owner's screen with the
-  # people it connects; the browser's own picker chooses what is shared.
   "media.call": {
     "version": 1,
     "kind": "session",
     "title": "Join live calls",
     "description": (
-      "Use the microphone and camera for live audio and video with people "
-      "this app connects you to, while this app is visible."
+      "Use the microphone and camera, and share a screen you pick, for live "
+      "calls with people this app connects you to, while this app is visible."
     ),
     "risk": "device",
     "lifecycle": "active_frame",
-    "default_limits": {"max_peers": 8, "screen_share": 0},
-    "hard_limits": {"max_peers": (1, 32), "screen_share": (0, 1)},
+    "default_limits": {"max_peers": 8},
+    "hard_limits": {"max_peers": (1, 32)},
   },
   "workspace.screen-control": {
     "version": 1,
@@ -921,9 +919,7 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
   Update review asks the owner only for widening changes, so anything this
   cannot rank is treated as widening. Closed values are already pruned, so a
   missing leaf means "no grant" — except a limit, where a missing leaf means
-  "no ceiling" while its capability is still granted. A limit whose reviewed
-  range starts at zero (such as `screen_share`) is a quota of access rather
-  than a ceiling, so a contract accepted before it existed granted none.
+  "no ceiling" while its capability is still granted.
   """
   ranks = _ACCESS_RANKS.get(path)
   if ranks:
@@ -954,9 +950,7 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
       if after is None:
         return True  # Removed ceiling on a still-granted capability.
       if before is None:
-        if definition["hard_limits"][limit_key][0] != 0:
-          return False  # New ceiling.
-        return not (type(after) in (int, float) and after <= 0)
+        return False  # New ceiling.
       if type(before) in (int, float) and type(after) in (int, float):
         return after > before
     return True

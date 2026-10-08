@@ -1,162 +1,201 @@
 /**
- * Shell side of `media.call` v1: live audio and video calls for opaque apps.
+ * Shell side of `media.call` v1: live calls for opaque apps.
  *
- * The trusted shell owns every media object: the microphone and camera, a
- * shared screen, each RTCPeerConnection, Web Audio playback, and the painted
- * video tiles. The app frame relays this provider's opaque `signal` payloads
- * between participants over its own channels and steers per-peer volume and
- * tile rectangles. No MediaStream, track, connection, or DOM handle crosses the
- * capability channel: every ready, event, and result value is plain JSON.
+ * The shell holds the microphone, camera, any shared screen, every
+ * RTCPeerConnection, Web Audio playback and the painted video tiles. The app
+ * relays the opaque `signal` payloads between participants and steers volumes
+ * and tile rectangles; every value it sees is plain JSON.
  *
- * Peers use the standard "perfect negotiation" pattern, so either side may
- * start and offer glare resolves through the app-chosen `polite` flag. A
- * negotiated data channel (id 0) carries only each side's own
- * `{audio, video, screen, screenStream}` send state, so a remote camera turned
- * off hides its tile and reveals the app's placeholder instead of painting
- * black frames, and a remote video track is known to be a shared screen when
- * it arrives in the announced `screenStream`. Every app-supplied value is
- * checked by callRequest.js first.
+ * Each connection has one audio and one video sender from the start: the
+ * impolite side offers them, the polite side answers. Muting, a device turned
+ * on later and a shared screen (which takes the camera's place) only swap the
+ * track being sent, so a connection never renegotiates except to restart ICE.
+ * A negotiated data channel carries each side's `{audio, video, screen}` state,
+ * so a camera turned off clears its tile instead of painting black frames.
  */
 
-import {
-  assertFields, callError, clamp, finiteNumber, invalid, isPlainObject, readCallRequest,
-  readPeer, readScreenControl, readSignalData, readTiles, requirePeer, SELF,
-} from './callRequest.js'
-
 export const MEDIA_CALL = 'media.call'
+const SELF = 'self'
 
+const PEER_ID = /^[A-Za-z0-9_.:~@-]{1,80}$/
+const ICE_URL = /^(?:stun|turns?):\S+$/
+const DEFAULT_MAX_PEERS = 8
+const HARD_MAX_PEERS = 32
+const MAX_ICE_SERVERS = 4
+const MAX_SDP = 100 * 1024
+const MAX_CANDIDATE = 2048
+const MAX_FIELD = 256
 const MAX_GAINS = 64
-const MAX_PENDING_CONTROLS = 256
-const MAX_STATE_MESSAGE_CHARS = 256
-// An SDP msid stream id is at most 64 characters (RFC 8830).
-const MAX_STREAM_ID_CHARS = 64
-// Stream ids of a peer's earlier shares, remembered so a stopped screen never
-// returns looking like a camera.
-const MAX_SCREEN_IDS = 16
+const MAX_PENDING = 256
+const MAX_COORDINATE = 100_000
 const LEVEL_INTERVAL_MS = 200
-const GAIN_TIME_CONSTANT_S = 0.05
 const STATE_CHANNEL_ID = 0
-
 const CONTROLS = new Set(['connect', 'signal', 'disconnect', 'volume', 'tiles', 'local', 'screen'])
-const PEER_STATES = {
-  new: 'connecting',
-  checking: 'connecting',
-  connecting: 'connecting',
-  connected: 'connected',
-  completed: 'connected',
-  disconnected: 'disconnected',
-  failed: 'failed',
-  closed: 'closed',
+const CONNECTED = new Set(['connected', 'completed'])
+const ENDED = new Set(['disconnected', 'failed', 'closed'])
+// Screens favour legible detail over motion, capped at 1080p for the mesh.
+const DISPLAY = { video: { frameRate: { ideal: 15, max: 30 }, width: { max: 1920 }, height: { max: 1080 } }, audio: false }
+
+// --- Checking what the app sends ---------------------------------------------------------
+
+function callError(code, message, name = 'CapabilityError') {
+  return Object.assign(new Error(message), { name, code })
 }
 
-function descriptionSignal(description) {
+const invalid = (message) => callError('invalid_request', message, 'TypeError')
+const isNumber = (value) => typeof value === 'number' && Number.isFinite(value)
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value))
+const isText = (value, max) => typeof value === 'string' && value.length <= max
+
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object') return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function fields(value, allowed, label) {
+  if (!isPlainObject(value)) throw invalid(`${label} must be an object.`)
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key))
+  if (unknown.length) throw invalid(`Unknown ${label} field: ${unknown.slice(0, 4).map((k) => k.slice(0, 40)).join(', ')}.`)
+  return value
+}
+
+const readPeer = (value) => (typeof value === 'string' && value !== SELF && PEER_ID.test(value) ? value : null)
+
+function requirePeer(value) {
+  const id = readPeer(value)
+  if (!id) throw invalid('A call peer id must be 1-80 letters, digits, or `_.:~@-` characters, and not `self`.')
+  return id
+}
+
+function readIceServer(entry, index) {
+  fields(entry, ['urls', 'username', 'credential'], `iceServers[${index}]`)
+  const urls = typeof entry.urls === 'string' ? [entry.urls] : entry.urls
+  if (!Array.isArray(urls) || !urls.length || urls.length > 4 || !urls.every((u) => isText(u, 512) && ICE_URL.test(u))) {
+    throw invalid(`iceServers[${index}].urls must be 1-4 stun:, turn:, or turns: URLs of at most 512 characters.`)
+  }
+  const server = { urls: [...urls] }
+  for (const key of ['username', 'credential']) {
+    if (entry[key] === undefined) continue
+    if (!isText(entry[key], MAX_FIELD)) throw invalid(`iceServers[${index}].${key} must be a string of at most ${MAX_FIELD} characters.`)
+    server[key] = entry[key]
+  }
+  if (urls.some((u) => u.startsWith('turn')) && !(server.username && server.credential)) {
+    throw invalid(`iceServers[${index}] needs a username and credential for its TURN URLs.`)
+  }
+  return server
+}
+
+function readRequest(input, declaration) {
+  fields(input ?? {}, ['audio', 'video', 'iceServers'], 'media.call input')
+  const { audio = true, video = false, iceServers = [] } = input ?? {}
+  if (typeof audio !== 'boolean' || typeof video !== 'boolean') throw invalid('Call `audio` and `video` must be true or false.')
+  if (!Array.isArray(iceServers) || iceServers.length > MAX_ICE_SERVERS) {
+    throw invalid(`Call \`iceServers\` must be an array of at most ${MAX_ICE_SERVERS} servers.`)
+  }
+  const reviewed = Math.floor(Number(declaration?.limits?.max_peers))
   return {
-    description: {
-      type: String(description?.type || ''),
-      sdp: String(description?.sdp || ''),
-    },
+    audio,
+    video,
+    iceServers: iceServers.map(readIceServer),
+    maxPeers: reviewed >= 1 ? Math.min(HARD_MAX_PEERS, reviewed) : DEFAULT_MAX_PEERS,
   }
 }
 
-function candidateSignal(candidate) {
-  if (!candidate) return { candidate: null }
-  const json = typeof candidate.toJSON === 'function' ? candidate.toJSON() : candidate
-  const value = { candidate: typeof json?.candidate === 'string' ? json.candidate : '' }
-  if (typeof json?.sdpMid === 'string') value.sdpMid = json.sdpMid
-  if (Number.isInteger(json?.sdpMLineIndex)) value.sdpMLineIndex = json.sdpMLineIndex
-  if (typeof json?.usernameFragment === 'string') value.usernameFragment = json.usernameFragment
+function readSignal(data) {
+  const keys = isPlainObject(data) ? Object.keys(data) : []
+  if (keys.length !== 1 || !['description', 'candidate'].includes(keys[0])) {
+    throw invalid('Call signal `data` must contain exactly one `description` or `candidate`.')
+  }
+  if (data.description) {
+    const { type, sdp } = fields(data.description, ['type', 'sdp'], 'call description')
+    if ((type !== 'offer' && type !== 'answer') || !sdp || !isText(sdp, MAX_SDP)) {
+      throw invalid(`A call description needs type \`offer\` or \`answer\` and an sdp of 1-${MAX_SDP} characters.`)
+    }
+    return { description: { type, sdp } }
+  }
+  if (data.candidate === null) return { candidate: null }
+  const { candidate, sdpMid, sdpMLineIndex, usernameFragment } = fields(
+    data.candidate, ['candidate', 'sdpMid', 'sdpMLineIndex', 'usernameFragment'], 'call candidate',
+  )
+  const optional = (value) => value === undefined || value === null || isText(value, MAX_FIELD)
+  const index = sdpMLineIndex === undefined || sdpMLineIndex === null
+    || (Number.isInteger(sdpMLineIndex) && sdpMLineIndex >= 0 && sdpMLineIndex <= 65_535)
+  if (!isText(candidate, MAX_CANDIDATE) || !optional(sdpMid) || !optional(usernameFragment) || !index) {
+    throw invalid('A call candidate has a field of the wrong type or size.')
+  }
+  const value = { candidate }
+  if (sdpMid !== undefined) value.sdpMid = sdpMid
+  if (sdpMLineIndex !== undefined) value.sdpMLineIndex = sdpMLineIndex
+  if (usernameFragment !== undefined) value.usernameFragment = usernameFragment
   return { candidate: value }
 }
 
-function deniedMedia(error) {
-  return ['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error?.name)
+function readTiles(value, maxTiles) {
+  fields(value, ['tiles'], 'call tiles control')
+  if (!Array.isArray(value.tiles)) throw invalid('Call `tiles` must be an array.')
+  if (value.tiles.length > maxTiles) throw callError('limit_exceeded', `At most ${maxTiles} call tiles can be painted.`, 'RangeError')
+  return value.tiles.map((tile, i) => {
+    const label = `tiles[${i}]`
+    fields(tile, ['peer', 'x', 'y', 'width', 'height', 'radius', 'mirror', 'opacity'], label)
+    const peer = tile.peer === SELF ? SELF : readPeer(tile.peer)
+    if (!peer) throw invalid(`${label}.peer must be \`self\` or a call peer id.`)
+    if (![tile.x, tile.y, tile.width, tile.height].every(isNumber) || tile.width <= 0 || tile.height <= 0) {
+      throw invalid(`${label} needs finite x and y and a positive width and height.`)
+    }
+    if (![tile.radius, tile.opacity].every((v) => v === undefined || isNumber(v))) throw invalid(`${label} radius and opacity must be numbers.`)
+    if (tile.mirror !== undefined && typeof tile.mirror !== 'boolean') throw invalid(`${label}.mirror must be true or false.`)
+    return {
+      peer,
+      x: clamp(tile.x, -MAX_COORDINATE, MAX_COORDINATE),
+      y: clamp(tile.y, -MAX_COORDINATE, MAX_COORDINATE),
+      width: Math.min(tile.width, MAX_COORDINATE),
+      height: Math.min(tile.height, MAX_COORDINATE),
+      radius: clamp(tile.radius ?? 0, 0, MAX_COORDINATE),
+      mirror: tile.mirror,
+      opacity: clamp(tile.opacity ?? 1, 0, 1),
+    }
+  })
 }
 
-function mediaErrorCode(error) {
-  return deniedMedia(error) ? 'denied' : 'unavailable'
-}
+// --- Media helpers -----------------------------------------------------------------------
+
+const deniedMedia = (error) => ['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error?.name)
 
 function mediaFailure(errors) {
   const denied = errors.find(deniedMedia)
-  const cause = denied || errors[errors.length - 1]
-  return callError(
-    denied ? 'denied' : 'unavailable',
-    denied
-      ? 'Microphone or camera access was denied. Allow it for this site in the browser, then try again.'
-      : 'No usable microphone or camera was found, or another app is using it.',
-    typeof cause?.name === 'string' && cause.name
-      ? cause.name
-      : (denied ? 'NotAllowedError' : 'NotFoundError'),
-  )
-}
-
-function mediaConstraints(audio, video) {
-  return {
-    audio: audio
-      ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      : false,
-    video: video
-      ? {
-          facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 360 },
-          frameRate: { ideal: 24 },
-        }
-      : false,
-  }
-}
-
-// Screens favour legible detail over motion: a modest frame rate, capped at
-// 1080p so a large display does not flood every connection of the mesh.
-function displayConstraints() {
-  return {
-    video: { frameRate: { ideal: 15, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
-    audio: false,
-  }
+  return denied
+    ? callError('denied', 'Microphone or camera access was denied. Allow it for this site in the browser, then try again.', 'NotAllowedError')
+    : callError('unavailable', 'No usable microphone or camera was found, or another app is using it.', 'NotFoundError')
 }
 
 function screenFailure(error) {
   if (error?.name === 'InvalidStateError') {
-    // The browser opens its picker only for a recent click or key press.
-    return callError(
-      'denied',
-      'Screen sharing must start from a click or key press in the app. Try again.',
-      'NotAllowedError',
-    )
+    return callError('denied', 'Screen sharing must start from a click or key press in the app.', 'NotAllowedError')
   }
-  if (deniedMedia(error)) {
-    return callError(
-      'denied',
-      'Screen sharing was cancelled or blocked. Try again and choose what to share in the browser\'s picker.',
-      'NotAllowedError',
-    )
+  return deniedMedia(error)
+    ? callError('denied', 'Screen sharing was cancelled or blocked.', 'NotAllowedError')
+    : callError('unavailable', 'No screen could be shared from this device.', 'NotFoundError')
+}
+
+function mediaConstraints(audio, video) {
+  return {
+    audio: audio && { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: video && { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24 } },
   }
-  return callError('unavailable', 'No screen could be shared from this device.', 'NotFoundError')
 }
 
-function liveEnabled(track) {
-  return Boolean(track) && track.readyState !== 'ended' && track.enabled !== false
-}
+const live = (track) => Boolean(track) && track.readyState !== 'ended' && track.enabled !== false
+const receiving = (track) => Boolean(track) && track.readyState !== 'ended' && !track.muted
 
-function receiving(track) {
-  return Boolean(track) && track.readyState !== 'ended' && !track.muted
-}
-
-function releaseTrackHandlers(track) {
-  if (!track) return
-  track.onmute = null
-  track.onunmute = null
-  track.onended = null
-}
-
-function stopStream(stream) {
+function stopTracks(stream) {
   for (const track of stream?.getTracks?.() || []) {
     track.onended = null
     try { track.stop() } catch { /* already stopped */ }
   }
 }
 
-function disconnectNodes(...nodes) {
+function disconnect(...nodes) {
   for (const node of nodes) {
     try { node?.disconnect?.() } catch { /* already disconnected */ }
   }
@@ -167,55 +206,38 @@ function createMeter(audioContext, stream) {
   const analyser = audioContext.createAnalyser()
   analyser.fftSize = 512
   source.connect(analyser)
-  return { source, analyser, samples: null, smoothed: 0 }
+  return { source, analyser, samples: new Float32Array(analyser.fftSize), smoothed: 0 }
 }
 
-// A smoothed 0..1 speaking level: -60 dBFS reads as silence, -10 dBFS as full.
-// It rises quickly and decays slowly so meters do not flicker between words.
+// A smoothed 0..1 speaking level: -60 dBFS is silence and -10 dBFS full. It
+// rises fast and falls slowly, so meters do not flicker between words.
 function measure(meter) {
-  const { analyser } = meter
-  const size = analyser.fftSize || 512
+  meter.analyser.getFloatTimeDomainData(meter.samples)
   let sum = 0
-  if (typeof analyser.getFloatTimeDomainData === 'function') {
-    if (!(meter.samples instanceof Float32Array) || meter.samples.length !== size) {
-      meter.samples = new Float32Array(size)
-    }
-    analyser.getFloatTimeDomainData(meter.samples)
-    for (const sample of meter.samples) sum += sample * sample
-  } else if (typeof analyser.getByteTimeDomainData === 'function') {
-    if (!(meter.samples instanceof Uint8Array) || meter.samples.length !== size) {
-      meter.samples = new Uint8Array(size)
-    }
-    analyser.getByteTimeDomainData(meter.samples)
-    for (const byte of meter.samples) sum += ((byte - 128) / 128) ** 2
-  }
-  const rms = Math.sqrt(sum / size)
+  for (const sample of meter.samples) sum += sample * sample
+  const rms = Math.sqrt(sum / meter.samples.length)
   const raw = rms > 0 ? clamp((20 * Math.log10(rms) + 60) / 50, 0, 1) : 0
-  const previous = meter.smoothed
-  meter.smoothed = raw >= previous
-    ? raw * 0.7 + previous * 0.3
-    : raw * 0.35 + previous * 0.65
+  meter.smoothed = raw >= meter.smoothed ? raw * 0.7 + meter.smoothed * 0.3 : raw * 0.35 + meter.smoothed * 0.65
   return Math.round(meter.smoothed * 100) / 100
 }
 
-function startCall(request, channel, environment) {
-  const {
-    mediaDevices, RTCPeerConnectionCtor, MediaStreamCtor, AudioContextCtor,
-    createElement, createSurface, now, startInterval, stopInterval,
-  } = environment
-  if (
-    typeof RTCPeerConnectionCtor !== 'function'
-    || typeof MediaStreamCtor !== 'function'
-    || typeof AudioContextCtor !== 'function'
-  ) {
+function candidateSignal(candidate) {
+  if (!candidate) return { candidate: null }
+  const { candidate: text = '', sdpMid, sdpMLineIndex, usernameFragment } = candidate.toJSON?.() ?? candidate
+  const value = { candidate: text }
+  if (typeof sdpMid === 'string') value.sdpMid = sdpMid
+  if (Number.isInteger(sdpMLineIndex)) value.sdpMLineIndex = sdpMLineIndex
+  if (typeof usernameFragment === 'string') value.usernameFragment = usernameFragment
+  return { candidate: value }
+}
+
+// --- The session ----------------------------------------------------------------------------
+
+function startCall(request, channel, env) {
+  const { mediaDevices, RTCPeerConnectionCtor, MediaStreamCtor, AudioContextCtor, createElement, createSurface, now } = env
+  if (![RTCPeerConnectionCtor, MediaStreamCtor, AudioContextCtor].every((ctor) => typeof ctor === 'function')
+    || ((request.audio || request.video) && typeof mediaDevices?.getUserMedia !== 'function')) {
     throw callError('unavailable', 'Live calls are unavailable in this browser.', 'NotSupportedError')
-  }
-  if ((request.audio || request.video) && typeof mediaDevices?.getUserMedia !== 'function') {
-    throw callError(
-      'unavailable',
-      'Microphone and camera access is unavailable in this browser.',
-      'NotSupportedError',
-    )
   }
   let audioContext
   try {
@@ -223,557 +245,387 @@ function startCall(request, channel, environment) {
   } catch {
     throw callError('unavailable', 'Call audio is unavailable in this browser.', 'NotSupportedError')
   }
-
   const peers = new Map()
   const gains = new Map()
   const pending = []
-  let phase = 'starting'
-  let localStream = null
-  let localAudio = null
-  let localVideo = null
-  let selfVideo = null
+  // Local tracks, the self-view streams painted for them, and requests in flight.
+  const local = { audio: null, video: null, screen: null }
+  const selfView = { video: null, screen: null }
+  const asking = new Map() // kind -> the on/off the app wants once the device arrives
+  let screenAsk = null
   let selfMeter = null
-  // A shared screen travels in its own MediaStream, so the far side can tell
-  // it from the camera by the stream id this side announces.
-  let screenTrack = null
-  let screenStream = null
-  let screenRequest = null
-  // A microphone or camera asked for after the call joined without it.
-  let deviceRequest = null
+  let phase = 'starting'
+  let startedAt = 0
   let levelTimer = null
-  let startedAt = null
   let tiles = []
   let surface = null
-  let playback = playbackState()
+  let playback = audioContext.state === 'running' ? 'running' : 'suspended'
 
-  function playbackState() {
-    return audioContext.state === 'running' ? 'running' : 'suspended'
-  }
-
-  function notePlayback() {
-    if (phase === 'ended') return
-    const next = playbackState()
-    if (next === playback) return
-    playback = next
-    if (phase === 'live') channel.event('playback', { state: next })
-  }
-
-  function resumeAudio() {
-    if (phase === 'ended' || audioContext.state === 'running' || audioContext.state === 'closed') {
-      return
-    }
-    try {
-      Promise.resolve(audioContext.resume?.()).then(notePlayback, () => {})
-    } catch { /* a later gesture can retry through audio-resume */ }
-  }
-
-  function current(peer) {
-    return phase === 'live' && peers.get(peer.id) === peer
-  }
+  const current = (peer) => phase === 'live' && peers.get(peer.id) === peer
 
   function report(peer, error) {
     if (phase === 'ended') return
     channel.event('error', {
       peer: peer || null,
       code: typeof error?.code === 'string' ? error.code : 'provider_error',
-      message: typeof error?.message === 'string' && error.message
-        ? error.message
-        : 'The call hit an unexpected problem.',
+      message: typeof error?.message === 'string' && error.message ? error.message : 'The call hit an unexpected problem.',
     })
   }
 
-  async function acquireMedia() {
-    if (!request.audio && !request.video) return { stream: null }
-    const failures = []
-    const attempt = async (audio, video) => {
-      try {
-        return await mediaDevices.getUserMedia(mediaConstraints(audio, video))
-      } catch (error) {
-        failures.push(error)
-        return null
-      }
-    }
-    const stream = await attempt(request.audio, request.video)
-    if (stream) return { stream }
-    if (!request.audio || !request.video || phase !== 'starting') throw mediaFailure(failures)
-    // Keep whichever half still works. A refused microphone is not asked
-    // about again; a missing or busy one still lets the camera join.
-    const audioOnly = await attempt(true, false)
-    if (audioOnly) return { stream: audioOnly, videoError: mediaErrorCode(failures[0]) }
-    if (deniedMedia(failures[1]) || phase !== 'starting') throw mediaFailure(failures)
-    const videoOnly = await attempt(false, true)
-    if (videoOnly) return { stream: videoOnly, audioError: mediaErrorCode(failures[1]) }
-    throw mediaFailure(failures)
+  function notePlayback() {
+    const next = audioContext.state === 'running' ? 'running' : 'suspended'
+    if (phase === 'ended' || next === playback) return
+    playback = next
+    if (phase === 'live') channel.event('playback', { state: next })
   }
 
-  function begin({ stream, videoError, audioError }) {
-    if (phase !== 'starting') {
-      // Cancelled while the permission prompt was open: release late tracks.
-      stopStream(stream)
-      return
-    }
-    localStream = stream
-    localAudio = stream?.getAudioTracks?.()[0] || null
-    localVideo = stream?.getVideoTracks?.()[0] || null
-    for (const track of [localAudio, localVideo]) {
-      if (track) track.onended = localChanged
-    }
-    if (localVideo) selfVideo = new MediaStreamCtor([localVideo])
-    if (localAudio) {
-      try {
-        selfMeter = createMeter(audioContext, new MediaStreamCtor([localAudio]))
-      } catch {
-        selfMeter = null // The call still works; only the self level stays 0.
-      }
-    }
-    phase = 'live'
-    startedAt = now()
-    levelTimer = startInterval(emitLevels, LEVEL_INTERVAL_MS)
-    playback = playbackState()
-    const ready = {
-      audio: liveEnabled(localAudio),
-      video: liveEnabled(localVideo),
-      playback,
-    }
-    if (videoError) ready.videoError = videoError
-    if (audioError) ready.audioError = audioError
-    channel.ready(ready)
-    for (const [action, value] of pending.splice(0)) {
-      if (phase !== 'live') break
-      apply(action, value)
-    }
-    // Browsers that gate playback on activation also allow it once capture is live.
-    resumeAudio()
+  function resumeAudio() {
+    if (phase === 'ended' || audioContext.state !== 'suspended') return
+    Promise.resolve(audioContext.resume?.()).then(notePlayback, () => {})
   }
 
-  function abortStart(error) {
-    if (phase === 'ended') return
-    teardown()
-    channel.error(error)
-  }
+  // --- local media
 
-  function emitLevels() {
-    if (phase !== 'live') return
-    const remote = {}
-    let measured = false
-    for (const peer of peers.values()) {
-      if (!peer.audio) continue
-      remote[peer.id] = measure(peer.audio)
-      measured = true
-    }
-    let self = 0
-    if (selfMeter) {
-      measured = true
-      const level = measure(selfMeter)
-      self = liveEnabled(localAudio) ? level : 0
-    }
-    if (measured) channel.event('levels', { self, peers: remote })
-  }
+  const localState = () => ({ audio: live(local.audio), video: live(local.video), screen: Boolean(local.screen) })
 
-  // A remote video track is the peer's shared screen when it arrived in the
-  // stream that peer announced for sharing; any other is its camera. Tracks of
-  // earlier shares are dropped, so a stopped screen never becomes the camera.
-  function cameraOf(peer) {
-    for (const entry of peer.videos.values()) {
-      if (!peer.screenIds.has(entry.streamId)) return entry
-    }
-    return null
-  }
-
-  function screenOf(peer) {
-    const id = peer.remote.screenStream
-    if (!id) return null
-    for (const entry of peer.videos.values()) {
-      if (entry.streamId === id) return entry
-    }
-    return null
-  }
-
-  function snapshot(peer) {
-    const { pc } = peer
-    const state = PEER_STATES[pc.connectionState ?? pc.iceConnectionState] || 'connecting'
-    const flowing = state === 'connected'
-    return {
-      peer: peer.id,
-      state,
-      audio: flowing && peer.remote.audio && receiving(peer.audio?.track),
-      video: flowing && peer.remote.video && receiving(cameraOf(peer)?.track),
-      screen: flowing && peer.remote.screen && receiving(screenOf(peer)?.track),
+  function sendTracks(peer) {
+    if (!peer.senders) return
+    const sent = { audio: local.audio, video: local.screen || local.video }
+    for (const kind of ['audio', 'video']) {
+      peer.senders[kind].replaceTrack(sent[kind] || null).catch(() => {})
     }
   }
 
-  function emitPeer(peer) {
-    const value = snapshot(peer)
-    const key = `${value.state}|${value.audio}|${value.video}|${value.screen}`
-    if (peer.reported === key) return false
-    peer.reported = key
-    channel.event('peer', value)
-    return true
-  }
-
-  function refreshPeer(peer) {
-    if (current(peer) && emitPeer(peer)) repaint()
-  }
-
-  function screenLive() {
-    return Boolean(screenTrack) && screenTrack.readyState !== 'ended'
-  }
-
-  function selfStream(source) {
-    if (source === 'screen') return screenLive() ? screenStream : null
-    return liveEnabled(localVideo) ? selfVideo : null
-  }
-
-  function peerStream(peer, source) {
-    if (!peer) return null
-    const value = snapshot(peer)
-    if (source === 'screen') return value.screen ? screenOf(peer).stream : null
-    return value.video ? cameraOf(peer).stream : null
-  }
-
-  function repaint() {
-    if (phase !== 'live') return
-    const painted = []
-    for (const tile of tiles) {
-      const stream = tile.peer === SELF
-        ? selfStream(tile.source)
-        : peerStream(peers.get(tile.peer), tile.source)
-      // A tile without live video paints nothing; the app's own placeholder
-      // underneath stays visible.
-      if (stream) painted.push({ ...tile, stream })
-    }
-    if (!surface) {
-      if (!painted.length || typeof createSurface !== 'function') return
-      try { surface = createSurface() || null } catch { surface = null }
-      if (!surface) return
-    }
-    try { surface.paint(painted) } catch { /* the frame is being torn down */ }
-  }
-
-  function localState() {
-    return {
-      audio: liveEnabled(localAudio),
-      video: liveEnabled(localVideo),
-      screen: screenLive(),
-    }
-  }
-
-  function announceTo(peer) {
-    if (!current(peer) || peer.channel?.readyState !== 'open') return
-    const state = localState()
-    // The far side needs the screen's stream id to tell it from the camera;
-    // the app only ever sees the booleans.
-    state.screenStream = state.screen && typeof screenStream.id === 'string'
-      ? screenStream.id
-      : null
-    try { peer.channel.send(JSON.stringify(state)) } catch { /* closing */ }
+  function announce(peer) {
+    if (peer.channel?.readyState !== 'open') return
+    try { peer.channel.send(JSON.stringify(localState())) } catch { /* closing */ }
   }
 
   function localChanged() {
     if (phase !== 'live') return
-    for (const peer of peers.values()) announceTo(peer)
+    for (const peer of peers.values()) {
+      sendTracks(peer)
+      announce(peer)
+    }
     channel.event('local', localState())
     repaint()
   }
 
-  function releaseVideo(peer, track) {
-    releaseTrackHandlers(track)
-    peer.videos.delete(track)
+  function adoptTrack(kind, track) {
+    local[kind] = track
+    track.onended = localChanged
+    if (kind === 'audio') {
+      try { selfMeter = createMeter(audioContext, new MediaStreamCtor([track])) } catch { selfMeter = null }
+    } else {
+      selfView.video = new MediaStreamCtor([track])
+    }
   }
 
-  function receiveState(peer, data) {
-    if (!current(peer) || typeof data !== 'string' || data.length > MAX_STATE_MESSAGE_CHARS) return
-    let state
-    try { state = JSON.parse(data) } catch { return }
-    if (!isPlainObject(state) || typeof state.audio !== 'boolean' || typeof state.video !== 'boolean') {
+  async function acquireMedia() {
+    if (!request.audio && !request.video) return {}
+    const failures = []
+    const attempt = (audio, video) => mediaDevices.getUserMedia(mediaConstraints(audio, video))
+      .catch((error) => { failures.push(error); return null })
+    let stream = await attempt(request.audio, request.video)
+    if (stream) return { stream }
+    if (!request.audio || !request.video) throw mediaFailure(failures)
+    // Keep whichever half works. A refused microphone is not asked about again.
+    stream = await attempt(true, false)
+    if (stream) return { stream, videoError: deniedMedia(failures[0]) ? 'denied' : 'unavailable' }
+    if (deniedMedia(failures[1])) throw mediaFailure(failures)
+    stream = await attempt(false, true)
+    if (stream) return { stream, audioError: deniedMedia(failures[1]) ? 'denied' : 'unavailable' }
+    throw mediaFailure(failures)
+  }
+
+  function begin({ stream, audioError, videoError }) {
+    if (phase !== 'starting') {
+      stopTracks(stream) // Cancelled while the permission prompt was open.
       return
     }
-    const screenId = state.screen === true
-      && typeof state.screenStream === 'string'
-      && state.screenStream.length >= 1
-      && state.screenStream.length <= MAX_STREAM_ID_CHARS
-      ? state.screenStream
-      : null
-    peer.remote = {
-      audio: state.audio,
-      video: state.video,
-      screen: screenId !== null,
-      screenStream: screenId,
+    const [audio] = stream?.getAudioTracks() || []
+    const [video] = stream?.getVideoTracks() || []
+    if (audio) adoptTrack('audio', audio)
+    if (video) adoptTrack('video', video)
+    phase = 'live'
+    startedAt = now()
+    levelTimer = env.startInterval(emitLevels, LEVEL_INTERVAL_MS)
+    channel.ready({ audio: Boolean(audio), video: Boolean(video), playback, ...(audioError && { audioError }), ...(videoError && { videoError }) })
+    for (const [action, value] of pending.splice(0)) apply(action, value)
+    resumeAudio()
+  }
+
+  // A kind the call has no device for is asked for when the app turns it on;
+  // the latest on or off applies when the device arrives.
+  function askDevice(kind, on) {
+    if (asking.has(kind)) {
+      asking.set(kind, on)
+      return
     }
-    if (screenId) {
-      peer.screenIds.delete(screenId)
-      peer.screenIds.add(screenId)
-      for (const old of peer.screenIds) {
-        if (peer.screenIds.size <= MAX_SCREEN_IDS) break
-        peer.screenIds.delete(old)
+    if (!on) return
+    asking.set(kind, true)
+    Promise.resolve().then(() => mediaDevices.getUserMedia(mediaConstraints(kind === 'audio', kind === 'video'))).then((stream) => {
+      const wanted = asking.get(kind)
+      asking.delete(kind)
+      const track = stream?.getTracks().find((t) => t.kind === kind)
+      if (phase !== 'live' || !track || local[kind]) {
+        stopTracks(stream)
+        if (phase === 'live' && !track) report(null, mediaFailure([]))
+        return
       }
+      for (const other of stream.getTracks()) if (other !== track) other.stop()
+      track.enabled = wanted
+      adoptTrack(kind, track)
+      localChanged()
+    }, (error) => {
+      asking.delete(kind)
+      if (phase === 'live') report(null, mediaFailure([error]))
+    })
+  }
+
+  function setLocal(value) {
+    fields(value, ['audio', 'video'], 'call local control')
+    for (const kind of ['audio', 'video']) {
+      if (value[kind] === undefined) continue
+      if (typeof value[kind] !== 'boolean') throw invalid(`Call local \`${kind}\` must be true or false.`)
+      if (local[kind]) local[kind].enabled = value[kind]
+      else askDevice(kind, value[kind])
     }
-    // A stopped or replaced share's track is never shown again.
-    for (const entry of [...peer.videos.values()]) {
-      if (entry.streamId !== screenId && peer.screenIds.has(entry.streamId)) {
-        releaseVideo(peer, entry.track)
+    localChanged()
+  }
+
+  function stopScreen() {
+    screenAsk = null
+    const track = local.screen
+    if (!track) return
+    local.screen = null
+    selfView.screen = null
+    stopTracks({ getTracks: () => [track] })
+    localChanged()
+  }
+
+  function shareScreen(value) {
+    fields(value, ['share'], 'call screen control')
+    if (typeof value.share !== 'boolean') throw invalid('Call `screen` needs a boolean `share`.')
+    if (!value.share) return stopScreen()
+    // One screen per call: asking again while sharing or choosing does nothing.
+    if (local.screen || screenAsk) return
+    if (typeof mediaDevices?.getDisplayMedia !== 'function') {
+      throw callError('unavailable', 'Screen sharing is unavailable in this browser.', 'NotSupportedError')
+    }
+    const ask = {}
+    screenAsk = ask
+    // Called at once: the click in the app frame that sent this control also
+    // activated the shell, and the browser opens its picker only for that.
+    new Promise((resolve) => resolve(mediaDevices.getDisplayMedia(DISPLAY))).then((stream) => {
+      const track = stream?.getVideoTracks()[0]
+      if (screenAsk !== ask || phase !== 'live' || !track) {
+        stopTracks(stream)
+        if (screenAsk === ask) {
+          screenAsk = null
+          report(null, screenFailure(null))
+        }
+        return
       }
+      screenAsk = null
+      for (const other of stream.getTracks()) if (other !== track) other.stop()
+      if ('contentHint' in track) track.contentHint = 'detail'
+      local.screen = track
+      selfView.screen = new MediaStreamCtor([track])
+      // The browser's own "Stop sharing" button ends the track.
+      track.onended = stopScreen
+      localChanged()
+    }, (error) => {
+      if (screenAsk !== ask) return
+      screenAsk = null
+      report(null, screenFailure(error))
+    })
+  }
+
+  // --- peers
+
+  function snapshot(peer) {
+    const { pc, remote } = peer
+    const raw = pc.connectionState ?? pc.iceConnectionState
+    const state = CONNECTED.has(raw) ? 'connected' : ENDED.has(raw) ? raw : 'connecting'
+    const flowing = state === 'connected'
+    const video = flowing && (remote.video || remote.screen) && receiving(peer.video?.track)
+    return {
+      peer: peer.id,
+      state,
+      audio: flowing && remote.audio && receiving(peer.audio?.track),
+      video,
+      screen: video && remote.screen,
     }
-    emitPeer(peer)
-    // A restarted share keeps the same booleans but paints a new stream.
+  }
+
+  function refreshPeer(peer) {
+    if (!current(peer)) return
+    const value = snapshot(peer)
+    const key = `${value.state}|${value.audio}|${value.video}|${value.screen}`
+    if (peer.reported === key) return
+    peer.reported = key
+    channel.event('peer', value)
     repaint()
   }
 
-  function setGain(node, value, { immediate = false } = {}) {
-    const param = node.gain
-    if (!immediate && typeof param.setTargetAtTime === 'function') {
-      try {
-        param.setTargetAtTime(value, audioContext.currentTime || 0, GAIN_TIME_CONSTANT_S)
-        return
-      } catch { /* fall through to an immediate value */ }
-    }
-    param.value = value
+  function receiveState(peer, data) {
+    let state
+    try { state = JSON.parse(isText(data, 128) ? data : 'null') } catch { return }
+    if (!current(peer) || !isPlainObject(state) || !['audio', 'video', 'screen'].every((k) => typeof state[k] === 'boolean')) return
+    peer.remote = { audio: state.audio, video: state.video, screen: state.screen }
+    refreshPeer(peer)
   }
 
-  function releaseRemoteAudio(peer) {
-    const audio = peer.audio
-    if (!audio) return
-    peer.audio = null
-    releaseTrackHandlers(audio.track)
-    disconnectNodes(audio.source, audio.analyser, audio.gain)
-    if (audio.sink) {
-      try { audio.sink.pause?.() } catch { /* already paused */ }
-      audio.sink.srcObject = null
-    }
-  }
-
-  function attachRemoteAudio(peer, track) {
-    releaseRemoteAudio(peer)
+  function playRemoteAudio(peer, track) {
     const stream = new MediaStreamCtor([track])
-    // Chrome feeds a remote WebRTC stream into Web Audio only while a media
-    // element also consumes it. This element stays muted; sound comes only
-    // from the gain node below.
+    // Chrome feeds a remote stream into Web Audio only while a media element
+    // also plays it. The element stays muted; sound comes from the gain node.
     const sink = createElement('audio')
     if (sink) {
       sink.muted = true
       sink.srcObject = stream
-      try { sink.play?.()?.catch?.(() => {}) } catch { /* muted autoplay */ }
+      sink.play?.()?.catch?.(() => {})
     }
-    try {
-      const meter = createMeter(audioContext, stream)
-      const gain = audioContext.createGain()
-      setGain(gain, gains.get(peer.id) ?? 1, { immediate: true })
-      meter.source.connect(gain)
-      gain.connect(audioContext.destination)
-      peer.audio = { track, sink, gain, ...meter }
-    } catch {
-      if (sink) sink.srcObject = null
-      report(peer.id, callError('provider_error', 'This person\'s audio could not be played.'))
-      return
-    }
+    const meter = createMeter(audioContext, stream)
+    const gain = audioContext.createGain()
+    gain.gain.value = gains.get(peer.id) ?? 1
+    meter.source.connect(gain)
+    gain.connect(audioContext.destination)
+    peer.audio = { track, sink, gain, ...meter }
     resumeAudio()
   }
 
-  function receiveTrack(peer, track, streamId) {
+  function receiveTrack(peer, track) {
     if (!current(peer) || !track) return
-    if (track.kind === 'audio') {
-      if (peer.audio?.track !== track) attachRemoteAudio(peer, track)
-    } else if (track.kind === 'video') {
-      const id = typeof streamId === 'string' ? streamId : null
-      // A late track from a share the peer has already stopped stays hidden.
-      if (peer.screenIds.has(id) && id !== peer.remote.screenStream) {
-        releaseVideo(peer, track)
-        return
-      }
-      const known = peer.videos.get(track)
-      if (known) known.streamId = id
-      else peer.videos.set(track, { track, streamId: id, stream: new MediaStreamCtor([track]) })
-    } else {
-      return
+    if (track.kind === 'audio' && peer.audio?.track !== track) {
+      try { playRemoteAudio(peer, track) } catch { report(peer.id, callError('provider_error', 'This person\'s audio could not be played.')) }
+    } else if (track.kind === 'video' && peer.video?.track !== track) {
+      peer.video = { track, stream: new MediaStreamCtor([track]) }
     }
-    const refresh = () => refreshPeer(peer)
-    track.onmute = refresh
-    track.onunmute = refresh
-    track.onended = refresh
-    emitPeer(peer)
-    repaint()
+    track.onmute = track.onunmute = track.onended = () => refreshPeer(peer)
+    refreshPeer(peer)
   }
 
   async function negotiate(peer) {
-    if (!current(peer)) return
     try {
-      peer.makingOffer = true
       await peer.pc.setLocalDescription()
-      if (current(peer) && peer.pc.localDescription) {
-        channel.event('signal', { peer: peer.id, data: descriptionSignal(peer.pc.localDescription) })
-      }
+      if (current(peer)) channel.event('signal', { peer: peer.id, data: { description: { type: peer.pc.localDescription.type, sdp: peer.pc.localDescription.sdp } } })
     } catch {
-      if (current(peer)) {
-        report(peer.id, callError('provider_error', 'The call connection could not be negotiated.'))
-      }
-    } finally {
-      peer.makingOffer = false
+      if (current(peer)) report(peer.id, callError('provider_error', 'The call connection could not be negotiated.'))
     }
   }
 
   function createPeer(id, polite) {
     if (peers.size >= request.maxPeers) {
-      throw callError(
-        'limit_exceeded',
-        `This app can connect to at most ${request.maxPeers} people at once.`,
-        'RangeError',
-      )
+      throw callError('limit_exceeded', `This app can connect to at most ${request.maxPeers} people at once.`, 'RangeError')
     }
-    let pc
-    try {
-      pc = new RTCPeerConnectionCtor({
-        iceServers: request.iceServers.map((server) => ({ ...server, urls: [...server.urls] })),
-      })
-    } catch {
-      throw callError('provider_error', 'The browser could not create a call connection.')
-    }
-    const peer = {
-      id,
-      pc,
-      polite,
-      makingOffer: false,
-      ignoreOffer: false,
-      settingRemoteAnswer: false,
-      // Until the remote announces otherwise, trust live, unmuted tracks.
-      remote: { audio: true, video: true, screen: false, screenStream: null },
-      audio: null,
-      // Remote video track -> { track, streamId, stream }, in arrival order.
-      videos: new Map(),
-      // Stream ids this peer has announced for sharing, oldest first.
-      screenIds: new Set(),
-      screenSender: null,
-      channel: null,
-      reported: '',
-    }
+    const pc = new RTCPeerConnectionCtor({ iceServers: request.iceServers })
+    const peer = { id, pc, polite, senders: null, remote: { audio: true, video: true, screen: false }, audio: null, video: null, channel: null, queue: Promise.resolve(), reported: '' }
     peers.set(id, peer)
-    pc.onnegotiationneeded = () => { void negotiate(peer) }
     pc.onicecandidate = (event) => {
-      if (current(peer)) {
-        channel.event('signal', { peer: id, data: candidateSignal(event?.candidate) })
-      }
+      if (current(peer)) channel.event('signal', { peer: id, data: candidateSignal(event?.candidate) })
     }
-    pc.ontrack = (event) => receiveTrack(peer, event?.track, event?.streams?.[0]?.id)
+    pc.ontrack = (event) => receiveTrack(peer, event?.track)
     pc.onconnectionstatechange = () => refreshPeer(peer)
     pc.oniceconnectionstatechange = () => {
-      if (!current(peer)) return
-      if (pc.iceConnectionState === 'failed') {
-        try { pc.restartIce?.() } catch { /* the app can disconnect and retry */ }
-      }
+      // Only the offering side restarts ICE, so the two sides never offer at once.
+      if (current(peer) && pc.iceConnectionState === 'failed' && !peer.polite) pc.restartIce?.()
       refreshPeer(peer)
     }
+    pc.onnegotiationneeded = () => {
+      if (current(peer) && !peer.polite) void negotiate(peer)
+    }
     try {
-      const stateChannel = pc.createDataChannel('mobius-call-state', {
-        negotiated: true,
-        id: STATE_CHANNEL_ID,
-      })
-      stateChannel.onopen = () => {
-        announceTo(peer)
-        attachScreen(peer)
+      peer.channel = pc.createDataChannel('mobius-call-state', { negotiated: true, id: STATE_CHANNEL_ID })
+      peer.channel.onopen = () => announce(peer)
+      peer.channel.onmessage = (event) => receiveState(peer, event?.data)
+    } catch { /* remote media falls back to track liveness */ }
+    if (!polite) {
+      peer.senders = {
+        audio: pc.addTransceiver('audio', { direction: 'sendrecv' }).sender,
+        video: pc.addTransceiver('video', { direction: 'sendrecv' }).sender,
       }
-      stateChannel.onmessage = (event) => receiveState(peer, event?.data)
-      peer.channel = stateChannel
-    } catch {
-      // Without the state channel, remote media falls back to track liveness
-      // and no screen is sent, since the far side could not identify it.
+      sendTracks(peer)
     }
-    // A side without a local kind adds no transceiver for it: JSEP never reuses
-    // an addTransceiver() receiver for a remote offer, so the sending side's
-    // own negotiation adds that m-line and its media still arrives here.
-    for (const track of [localAudio, localVideo]) {
-      if (track && track.readyState !== 'ended') {
-        try { pc.addTrack(track, localStream) } catch { /* sent nothing for this kind */ }
-      }
-    }
-    emitPeer(peer)
+    refreshPeer(peer)
     return peer
   }
 
   function closePeer(peer) {
     const { pc } = peer
-    pc.onnegotiationneeded = null
-    pc.onicecandidate = null
-    pc.ontrack = null
-    pc.onconnectionstatechange = null
-    pc.oniceconnectionstatechange = null
+    pc.onicecandidate = pc.ontrack = pc.onconnectionstatechange = pc.oniceconnectionstatechange = pc.onnegotiationneeded = null
     if (peer.channel) {
-      peer.channel.onopen = null
-      peer.channel.onmessage = null
+      peer.channel.onopen = peer.channel.onmessage = null
       try { peer.channel.close() } catch { /* already closed */ }
     }
-    releaseRemoteAudio(peer)
-    for (const track of [...peer.videos.keys()]) releaseVideo(peer, track)
-    peer.screenSender = null
+    for (const track of [peer.audio?.track, peer.video?.track]) if (track) track.onmute = track.onunmute = track.onended = null
+    if (peer.audio) {
+      disconnect(peer.audio.source, peer.audio.analyser, peer.audio.gain)
+      if (peer.audio.sink) peer.audio.sink.srcObject = null
+    }
     try { pc.close() } catch { /* already closed */ }
   }
 
-  async function receiveDescription(peer, description) {
+  async function receiveSignal(peer, { description, candidate }) {
     const { pc } = peer
-    const readyForOffer = !peer.makingOffer
-      && (pc.signalingState === 'stable' || peer.settingRemoteAnswer)
-    const offerCollision = description.type === 'offer' && !readyForOffer
-    peer.ignoreOffer = !peer.polite && offerCollision
-    if (peer.ignoreOffer) return
-    peer.settingRemoteAnswer = description.type === 'answer'
-    try {
-      // A polite peer's own colliding offer rolls back implicitly here.
-      await pc.setRemoteDescription(description)
-    } finally {
-      peer.settingRemoteAnswer = false
+    if (!current(peer)) return
+    if (!description) {
+      // End-of-candidates is optional; ICE completes without it.
+      if (candidate) await pc.addIceCandidate(candidate)
+      return
     }
-    if (description.type !== 'offer' || !current(peer)) return
-    await pc.setLocalDescription()
-    if (current(peer) && pc.localDescription) {
-      channel.event('signal', { peer: peer.id, data: descriptionSignal(pc.localDescription) })
+    // The impolite side only offers and the polite side only answers.
+    if ((description.type === 'offer') !== peer.polite) {
+      report(peer.id, invalid('Both sides of a call connection passed the same `polite` value.'))
+      return
     }
+    await pc.setRemoteDescription(description)
+    if (description.type === 'answer' || !current(peer)) return
+    if (!peer.senders) {
+      // Send on the transceivers the offer created.
+      const senderFor = (kind) => {
+        const transceiver = pc.getTransceivers().find((t) => t.receiver?.track?.kind === kind)
+        if (transceiver) transceiver.direction = 'sendrecv'
+        return transceiver?.sender
+      }
+      peer.senders = { audio: senderFor('audio'), video: senderFor('video') }
+      if (!peer.senders.audio || !peer.senders.video) {
+        peer.senders = null
+        throw invalid('A call offer must carry one audio and one video section.')
+      }
+      sendTracks(peer)
+    }
+    await negotiate(peer)
   }
 
-  async function receiveCandidate(peer, candidate) {
-    // End-of-candidates is optional; ICE completes without it.
-    if (candidate === null) return
-    try {
-      await peer.pc.addIceCandidate(candidate)
-    } catch (error) {
-      // Candidates for an offer this impolite side ignored are expected to fail.
-      if (!peer.ignoreOffer) throw error
-    }
-  }
+  // --- controls
 
   function connect(value) {
-    assertFields(value, ['peer', 'polite'], 'call connect control')
+    fields(value, ['peer', 'polite'], 'call connect control')
     const id = requirePeer(value.peer)
-    if (typeof value.polite !== 'boolean') {
-      throw invalid('Call `connect` needs a boolean `polite` flag.')
-    }
-    const existing = peers.get(id)
-    // Idempotent; an offer may already have created this peer as polite.
-    if (existing) existing.polite = value.polite
-    else createPeer(id, value.polite)
+    if (typeof value.polite !== 'boolean') throw invalid('Call `connect` needs a boolean `polite` flag.')
+    if (!peers.has(id)) createPeer(id, value.polite)
   }
 
   function signal(value) {
-    assertFields(value, ['peer', 'data'], 'call signal control')
+    fields(value, ['peer', 'data'], 'call signal control')
     const id = requirePeer(value.peer)
-    const data = readSignalData(value.data)
+    const data = readSignal(value.data)
     let peer = peers.get(id)
     if (!peer) {
-      // Only an offer opens a connection. A late candidate or answer for a
-      // peer this side already disconnected is stale, not a new call.
+      // Only an offer opens a connection; anything else for an unknown peer is stale.
       if (data.description?.type !== 'offer') return
       peer = createPeer(id, true)
     }
-    const work = data.description
-      ? receiveDescription(peer, data.description)
-      : receiveCandidate(peer, data.candidate)
-    work.catch(() => {
-      if (!current(peer)) return
-      report(id, invalid(data.description
-        ? 'The browser rejected the remote call description.'
-        : 'The browser rejected a remote call network candidate.'))
+    peer.queue = peer.queue.then(() => receiveSignal(peer, data)).catch((error) => {
+      // Our own errors carry a string code; browser errors get a stable message.
+      if (current(peer)) report(id, typeof error?.code === 'string' ? error : invalid('The browser rejected a call signal from this person.'))
     })
   }
 
-  function disconnect(value) {
-    assertFields(value, ['peer'], 'call disconnect control')
+  function disconnectPeer(value) {
+    fields(value, ['peer'], 'call disconnect control')
     const id = requirePeer(value.peer)
     gains.delete(id)
     const peer = peers.get(id)
@@ -785,260 +637,62 @@ function startCall(request, channel, environment) {
   }
 
   function setVolumes(value) {
-    assertFields(value, ['gains'], 'call volume control')
+    fields(value, ['gains'], 'call volume control')
     if (!isPlainObject(value.gains)) throw invalid('Call `gains` must map peer ids to numbers.')
-    const entries = Object.entries(value.gains)
-    if (entries.length > MAX_GAINS) {
-      throw callError('limit_exceeded', `At most ${MAX_GAINS} call volumes can be set at once.`, 'RangeError')
-    }
-    for (const [key, requested] of entries) {
+    for (const [key, requested] of Object.entries(value.gains)) {
       const id = readPeer(key)
-      if (!id) {
-        report(null, invalid('Call volume keys must be call peer ids.'))
-        continue
-      }
-      if (!finiteNumber(requested)) {
-        report(id, invalid('A call volume must be a finite number from 0 to 1.'))
-        continue
-      }
-      if (!gains.has(id) && !peers.has(id) && gains.size >= MAX_GAINS) {
+      if (!id || !isNumber(requested)) {
+        report(id, invalid('Call volumes map peer ids to numbers from 0 to 1.'))
+      } else if (!gains.has(id) && gains.size >= MAX_GAINS) {
         report(id, callError('limit_exceeded', `At most ${MAX_GAINS} call volumes are remembered.`, 'RangeError'))
-        continue
-      }
-      // Remembered before a peer connects, so its audio starts at this level.
-      const gain = clamp(requested, 0, 1)
-      gains.set(id, gain)
-      const node = peers.get(id)?.audio?.gain
-      if (node) setGain(node, gain)
-    }
-  }
-
-  function setTiles(value) {
-    // Room for every participant's camera and shared screen, self included.
-    tiles = readTiles(value, 2 * (request.maxPeers + 1))
-    repaint()
-  }
-
-  function setLocal(value) {
-    assertFields(value, ['audio', 'video'], 'call local control')
-    for (const kind of ['audio', 'video']) {
-      if (value[kind] !== undefined && typeof value[kind] !== 'boolean') {
-        throw invalid(`Call local \`${kind}\` must be true or false.`)
-      }
-    }
-    // Muting toggles the track, so no renegotiation and instant unmute.
-    if (typeof value.audio === 'boolean' && localAudio) localAudio.enabled = value.audio
-    if (typeof value.video === 'boolean' && localVideo) localVideo.enabled = value.video
-    // A kind the call joined without is asked for the first time the app
-    // turns it on, so a receive-only listener can still speak up later.
-    // While the browser asks, the latest on or off for a kind being asked
-    // for decides whether it is kept when it arrives.
-    for (const kind of ['audio', 'video']) {
-      if (deviceRequest?.asked[kind] && typeof value[kind] === 'boolean') deviceRequest[kind] = value[kind]
-    }
-    const audio = value.audio === true && !localAudio
-    const video = value.video === true && !localVideo
-    if (audio || video) requestDevices(audio, video)
-    localChanged()
-  }
-
-  function requestDevices(audio, video) {
-    // One request at a time: turning a kind on again while asking is a no-op.
-    if (deviceRequest) return
-    if (typeof mediaDevices?.getUserMedia !== 'function') {
-      report(null, callError(
-        'unavailable',
-        'Microphone and camera access is unavailable in this browser.',
-        'NotSupportedError',
-      ))
-      return
-    }
-    const attempt = { asked: { audio, video }, audio, video }
-    deviceRequest = attempt
-    let asked
-    try {
-      asked = mediaDevices.getUserMedia(mediaConstraints(audio, video))
-    } catch (error) {
-      asked = Promise.reject(error)
-    }
-    Promise.resolve(asked).then((stream) => {
-      if (deviceRequest !== attempt || phase !== 'live') {
-        // The call ended while the permission prompt was open.
-        stopStream(stream)
-        return
-      }
-      deviceRequest = null
-      addDevices(stream, attempt)
-    }, (error) => {
-      if (deviceRequest !== attempt) return
-      deviceRequest = null
-      // A refused or missing device leaves the call as it was.
-      report(null, mediaFailure([error]))
-    })
-  }
-
-  function addDevices(stream, wanted) {
-    let added = false
-    let withdrawn = false
-    for (const track of stream?.getTracks?.() || []) {
-      const missing = track.readyState !== 'ended'
-        && ((track.kind === 'audio' && !localAudio) || (track.kind === 'video' && !localVideo))
-      const keep = missing && wanted[track.kind] === true
-      if (missing && !keep) withdrawn = true
-      if (!keep) {
-        // Never keep a capture the call does not use, or one turned off again.
-        try { track.stop() } catch { /* already stopped */ }
-        continue
-      }
-      track.onended = localChanged
-      if (track.kind === 'audio') {
-        localAudio = track
-        try {
-          selfMeter = createMeter(audioContext, new MediaStreamCtor([track]))
-        } catch {
-          selfMeter = null // The call still works; only the self level stays 0.
-        }
       } else {
-        localVideo = track
-        selfVideo = new MediaStreamCtor([track])
-      }
-      added = true
-    }
-    if (!added) {
-      // Everything granted was turned off again meanwhile: nothing to report.
-      if (!withdrawn) report(null, mediaFailure([]))
-      return
-    }
-    // One local stream holds every device track, so connections made later
-    // send them together and ending the call stops them all.
-    localStream = new MediaStreamCtor([localAudio, localVideo].filter(Boolean))
-    for (const peer of peers.values()) {
-      if (!current(peer)) continue
-      for (const track of stream.getTracks()) {
-        if (track !== localAudio && track !== localVideo) continue
-        // Adding a track renegotiates through perfect negotiation.
-        try { peer.pc.addTrack(track, localStream) } catch { /* this connection keeps receiving */ }
+        // Remembered before a peer's audio arrives, so it starts at this level.
+        gains.set(id, clamp(requested, 0, 1))
+        const node = peers.get(id)?.audio?.gain
+        node?.gain.setTargetAtTime(gains.get(id), audioContext.currentTime, 0.05)
       }
     }
-    localChanged()
   }
 
-  // The screen joins a connection only once its state channel is open, so the
-  // announcement naming the screen's stream always leaves before the
-  // renegotiation that delivers the track, and even a late joiner never sees a
-  // screen arrive looking like a camera.
-  function attachScreen(peer) {
-    if (!current(peer) || !screenLive() || peer.screenSender) return
-    if (peer.channel?.readyState !== 'open') return
-    try {
-      peer.screenSender = peer.pc.addTrack(screenTrack, screenStream)
-    } catch {
-      // This connection simply receives no screen.
+  const snapshotSelf = () => ({ video: Boolean(local.screen) || live(local.video), screen: Boolean(local.screen) })
+
+  function repaint() {
+    if (phase !== 'live') return
+    const painted = []
+    for (const tile of tiles) {
+      // Your own tile shows what you send: the shared screen, else the camera.
+      const self = tile.peer === SELF
+      const peer = !self && peers.get(tile.peer)
+      const shown = self ? snapshotSelf() : peer && snapshot(peer)
+      if (!shown?.video) continue
+      const stream = self ? (selfView.screen || selfView.video) : peer.video.stream
+      // A screen is letterboxed rather than cropped, and never mirrored.
+      painted.push({ ...tile, stream, fit: shown.screen ? 'contain' : 'cover', mirror: tile.mirror ?? (self && !shown.screen) })
     }
+    if (!surface && painted.length) surface = createSurface?.() || null
+    surface?.paint(painted)
   }
 
-  function detachScreen(peer) {
-    const sender = peer.screenSender
-    if (!sender) return
-    peer.screenSender = null
-    // Removing the sender renegotiates, and the far side's track goes quiet.
-    try { peer.pc.removeTrack(sender) } catch { /* the connection is closing */ }
-  }
-
-  function beginScreen(stream) {
-    const track = stream?.getVideoTracks?.()[0] || null
-    let wrapped = null
-    if (track && track.readyState !== 'ended') {
-      try { wrapped = new MediaStreamCtor([track]) } catch { /* reported below */ }
+  function emitLevels() {
+    const peersLevels = {}
+    for (const peer of peers.values()) if (peer.audio) peersLevels[peer.id] = measure(peer.audio)
+    const self = selfMeter ? measure(selfMeter) : 0
+    if (selfMeter || Object.keys(peersLevels).length) {
+      channel.event('levels', { self: live(local.audio) ? self : 0, peers: peersLevels })
     }
-    if (!wrapped) {
-      // Never leave a capture running that the call does not own.
-      stopStream(stream)
-      report(null, screenFailure(null))
-      return
-    }
-    // Only the screen itself is kept from what the picker returned.
-    for (const other of stream.getTracks?.() || []) {
-      if (other === track) continue
-      try { other.stop() } catch { /* already stopped */ }
-    }
-    // Keep text and edges legible when bandwidth is short.
-    if ('contentHint' in track) track.contentHint = 'detail'
-    screenTrack = track
-    screenStream = wrapped
-    // The browser's own "Stop sharing" control ends the track.
-    track.onended = stopScreen
-    localChanged()
-    for (const peer of peers.values()) attachScreen(peer)
-  }
-
-  function stopScreen() {
-    // A picker that is still open settles into a stopped track.
-    screenRequest = null
-    if (!screenTrack) return
-    const track = screenTrack
-    screenTrack = null
-    screenStream = null
-    track.onended = null
-    try { track.stop() } catch { /* already stopped */ }
-    for (const peer of peers.values()) detachScreen(peer)
-    localChanged()
-  }
-
-  function shareScreen(value) {
-    if (!readScreenControl(value)) {
-      stopScreen()
-      return
-    }
-    if (!request.screenShare) {
-      throw callError(
-        'denied',
-        'This app is not allowed to share your screen. Its installed access does not include screen sharing.',
-        'NotAllowedError',
-      )
-    }
-    // One screen per call: asking again while sharing or choosing is a no-op.
-    if (screenTrack || screenRequest) return
-    if (typeof mediaDevices?.getDisplayMedia !== 'function') {
-      throw callError('unavailable', 'Screen sharing is unavailable in this browser.', 'NotSupportedError')
-    }
-    const attempt = {}
-    screenRequest = attempt
-    let picked
-    try {
-      // The first browser call after the app's control arrives: the click in
-      // the app frame that sent it also activated this shell, and the browser
-      // opens its picker only while that activation lasts.
-      picked = mediaDevices.getDisplayMedia(displayConstraints())
-    } catch (error) {
-      picked = Promise.reject(error)
-    }
-    Promise.resolve(picked).then((stream) => {
-      if (screenRequest !== attempt || phase !== 'live') {
-        // Withdrawn, or the call ended, while the picker was open.
-        stopStream(stream)
-        return
-      }
-      screenRequest = null
-      beginScreen(stream)
-    }, (error) => {
-      if (screenRequest !== attempt) return
-      screenRequest = null
-      report(null, screenFailure(error))
-    })
   }
 
   function apply(action, value) {
     try {
       if (action === 'connect') connect(value)
       else if (action === 'signal') signal(value)
-      else if (action === 'disconnect') disconnect(value)
+      else if (action === 'disconnect') disconnectPeer(value)
       else if (action === 'volume') setVolumes(value)
-      else if (action === 'tiles') setTiles(value)
+      else if (action === 'tiles') { tiles = readTiles(value, 2 * (request.maxPeers + 1)); repaint() }
       else if (action === 'local') setLocal(value)
       else if (action === 'screen') shareScreen(value)
     } catch (error) {
-      // Per-peer and payload problems never end the call.
+      // Bad payloads and per-peer problems never end the call.
       report(isPlainObject(value) ? readPeer(value.peer) : null, error)
     }
   }
@@ -1047,92 +701,57 @@ function startCall(request, channel, environment) {
     if (phase === 'ended') return
     phase = 'ended'
     pending.length = 0
-    if (levelTimer != null) {
-      try { stopInterval(levelTimer) } catch { /* already cleared */ }
-      levelTimer = null
-    }
+    asking.clear()
+    screenAsk = null
+    if (levelTimer != null) env.stopInterval(levelTimer)
     for (const peer of peers.values()) closePeer(peer)
     peers.clear()
-    gains.clear()
-    tiles = []
-    if (surface) {
-      try { surface.destroy() } catch { /* elements already removed */ }
-      surface = null
-    }
-    if (selfMeter) disconnectNodes(selfMeter.source, selfMeter.analyser)
-    selfMeter = null
-    // A device that is granted after this is stopped when it arrives.
-    deviceRequest = null
-    stopStream(localStream)
-    localStream = null
-    localAudio = null
-    localVideo = null
-    selfVideo = null
-    // Closing each connection removed the screen's senders; a picker still
-    // open settles into a stopped track.
-    screenRequest = null
-    stopStream(screenStream)
-    screenTrack = null
-    screenStream = null
+    surface?.destroy()
+    surface = null
+    if (selfMeter) disconnect(selfMeter.source, selfMeter.analyser)
+    stopTracks({ getTracks: () => [local.audio, local.video, local.screen].filter(Boolean) })
     audioContext.onstatechange = null
-    try {
-      Promise.resolve(audioContext.close?.()).catch(() => {})
-    } catch { /* already closed */ }
-  }
-
-  function finish() {
-    if (phase === 'ended') return
-    const durationMs = startedAt == null ? 0 : Math.max(0, Math.round(now() - startedAt))
-    teardown()
-    channel.result({ durationMs })
-  }
-
-  function cancel() {
-    if (phase === 'ended') return
-    teardown()
-    // Settle after the host's own abort: a detached frame or changed contract
-    // reports its own reason; this settles deactivation and app cancellation.
-    Promise.resolve().then(() => channel.error(callError(
-      'aborted',
-      'The call ended because it was cancelled or this app is no longer visible.',
-      'AbortError',
-    )))
+    Promise.resolve(audioContext.close?.()).catch(() => {})
   }
 
   function control(action, value) {
     if (phase === 'ended') return
     if (action === 'finish') {
-      finish()
+      const durationMs = phase === 'live' ? Math.max(0, Math.round(now() - startedAt)) : 0
+      teardown()
+      channel.result({ durationMs })
     } else if (action === 'cancel') {
-      cancel()
+      teardown()
+      // Settles after the host's own abort, which reports its own reason.
+      Promise.resolve().then(() => channel.error(callError('aborted', 'The call ended because it was cancelled or this app is no longer visible.', 'AbortError')))
     } else if (action === 'audio-resume') {
       resumeAudio()
     } else if (!CONTROLS.has(action)) {
       report(null, invalid(`Unknown media.call control \`${String(action).slice(0, 40)}\`.`))
     } else if (phase === 'starting') {
-      // Peers attach local tracks, so connection work waits for the devices.
-      if (pending.length >= MAX_PENDING_CONTROLS) {
-        report(null, callError('limit_exceeded', 'Too many call controls arrived before the call was ready.'))
-      } else {
-        pending.push([action, value])
-      }
+      // Connections send the local tracks, so they wait for the devices.
+      if (pending.length >= MAX_PENDING) report(null, callError('limit_exceeded', 'Too many call controls arrived before the call was ready.'))
+      else pending.push([action, value])
     } else {
       apply(action, value)
     }
   }
 
   audioContext.onstatechange = notePlayback
-  // The app opens a call from its own user gesture, and that activation also
-  // reaches this ancestor shell, so an autoplay-suspended context can start.
+  // The app opens a call from its own click, which also activates the shell,
+  // so an autoplay-suspended context can start now.
   resumeAudio()
-  Promise.resolve().then(acquireMedia).then(begin).catch(abortStart)
+  Promise.resolve().then(acquireMedia).then(begin).catch((error) => {
+    if (phase === 'ended') return
+    teardown()
+    channel.error(error)
+  })
   return { control }
 }
 
 /**
- * `media.call` v1 provider. `mediaDevices` supplies both `getUserMedia` and
- * `getDisplayMedia`. `createSurface()` returns the host tile painter
- * (`{ paint(tiles), destroy() }`) for the frame that owns the session.
+ * `media.call` v1 provider. `mediaDevices` supplies `getUserMedia` and
+ * `getDisplayMedia`; `createSurface()` returns the tile painter for the frame.
  */
 export function createCallProvider({
   mediaDevices = globalThis.navigator?.mediaDevices,
@@ -1145,18 +764,14 @@ export function createCallProvider({
   setInterval: startInterval = (callback, ms) => globalThis.setInterval(callback, ms),
   clearInterval: stopInterval = (id) => globalThis.clearInterval(id),
 } = {}) {
-  const environment = {
-    mediaDevices, RTCPeerConnectionCtor, MediaStreamCtor, AudioContextCtor,
-    createElement, createSurface, now, startInterval, stopInterval,
-  }
+  const env = { mediaDevices, RTCPeerConnectionCtor, MediaStreamCtor, AudioContextCtor, createElement, createSurface, now, startInterval, stopInterval }
   return {
     version: 1,
-    // One call per app frame; a second open while one is live is `busy`.
+    // One call per app frame; a hidden app leaves the call.
     exclusive: true,
-    // A hidden app leaves the call; there is no partial result worth keeping.
     onDeactivate: 'cancel',
     open({ input, declaration, channel }) {
-      return startCall(readCallRequest(input, declaration), channel, environment)
+      return startCall(readRequest(input, declaration), channel, env)
     },
   }
 }
