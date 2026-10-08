@@ -343,11 +343,9 @@ export function shouldRepairRuntimeStream({
  * queue-promotion events, so it keeps only a slow safety read. "Demonstrably"
  * means a body read within one server keepalive (30 s) plus grace: a
  * half-open socket can stay `isStreaming` with no error indefinitely, and in
- * that state a fast read discovers a run that settled without its terminal
- * event. Reattachment requires `isStreaming` to be false; the read does not
- * repair a half-open stream while its run is still active. Without a proven
- * stream, the read also discovers a dropped connection or a queued turn the
- * server starts between streams.
+ * that state this read is the only recovery, so it must stay fast. Without a
+ * proven stream, the read is also how a dropped stream is reattached and how a
+ * queued turn the server starts between streams is discovered.
  */
 export const RUNTIME_SAFETY_POLL_MS = 15_000
 export const RUNTIME_STREAM_FRESH_MS = 35_000

@@ -1,23 +1,19 @@
-import {
-  modelQueries, authQueries, appSourceQueries, chatAppArtifactQueries,
-} from '../../hooks/queries.js'
-import { invalidateAllChatActivity } from '../ChatView/chatActivityQueries.js'
-
 /**
- * Every system-stream open closes the fetch-before-subscribe gap, including
- * the first open and Shell remounts. Mount-time reads can have taken their
- * snapshot before the server registered the listener, even on this page.
- * Without domain revisions we cannot safely skip their reconciliation.
- * Chat and app lists have their own durable reads in the open barrier.
+ * First-open refresh for event-fed caches restored from persistence.
+ *
+ * The system stream's first open of a page load does not invalidate event-fed
+ * caches: mount-time reads already fetched them. Persisted entries are the
+ * exception. They are restored with their original fetch time, so a reload
+ * inside their staleTime makes no request and would miss every event published
+ * while no page was listening. Only provider status is both event-fed and
+ * persisted (see PERSISTED_FULL_KEYS in queryClient.js); refresh it when it was
+ * fetched before this page loaded.
  */
-export function invalidateEventFedCachesOnOpen(queryClient) {
-  return [
-    modelQueries.registry.invalidate(queryClient),
-    authQueries.provider.statuses.invalidate(queryClient),
-    appSourceQueries.invalidate(queryClient),
-    chatAppArtifactQueries.invalidateAll(queryClient),
-    invalidateAllChatActivity(queryClient),
-    queryClient.invalidateQueries({ queryKey: ['projects', 'files'] }),
-    queryClient.invalidateQueries({ queryKey: ['projects', 'git'] }),
-  ]
+export function invalidateRestoredEventFedCaches(queryClient, pageLoadedAt) {
+  return [queryClient.invalidateQueries({
+    queryKey: ['auth', 'providers', 'status'],
+    exact: true,
+    predicate: (query) => query.state.dataUpdatedAt > 0
+      && query.state.dataUpdatedAt < pageLoadedAt,
+  })]
 }
