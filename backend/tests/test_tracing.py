@@ -170,3 +170,45 @@ def test_tracing_setup_failure_never_blocks_server_boot(tracing_config, monkeypa
   assert tracing._tracer is None
   with tracing.span("anything") as handle:
     assert handle is None
+
+
+@pytest.mark.parametrize("failing", ["sqlalchemy", "httpx"])
+def test_late_setup_failure_leaves_nothing_exporting(tracing_config, monkeypatch, failing):
+  """Setup is all-or-nothing: a failure after FastAPI was instrumented must not
+  leave request spans flowing to the collector or the propagator replaced."""
+  otel_sdk = _otel_sdk()
+  from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+  from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+  from opentelemetry.propagate import get_global_textmap
+
+  monkeypatch.setattr(tracing, "_tracer", None)
+  target = {"sqlalchemy": SQLAlchemyInstrumentor, "httpx": HTTPXClientInstrumentor}[failing]
+
+  def drifted(*_args, **_kwargs):
+    raise TypeError("instrumentation drifted")
+
+  monkeypatch.setattr(target, "instrument", drifted)
+  previous_textmap = get_global_textmap()
+  exporter = otel_sdk.InMemorySpanExporter()
+  app = FastAPI()
+  engine = create_engine("sqlite://")
+
+  @app.get("/x/{a}")
+  def read(a: int):
+    with engine.connect() as conn:
+      conn.execute(text("SELECT 1"))
+    return {"a": a}
+
+  try:
+    assert tracing.configure(app, engine, exporter=exporter) is False
+    assert tracing._tracer is None
+    assert get_global_textmap() is previous_textmap
+    assert getattr(app, "_is_instrumented_by_opentelemetry", False) is False
+    assert SQLAlchemyInstrumentor().is_instrumented_by_opentelemetry is False
+    assert HTTPXClientInstrumentor().is_instrumented_by_opentelemetry is False
+    assert TestClient(app).get("/x/1?token=t").status_code == 200
+  finally:
+    monkeypatch.undo()
+    HTTPXClientInstrumentor().uninstrument()
+    SQLAlchemyInstrumentor().uninstrument()
+  assert exporter.get_finished_spans() == ()
