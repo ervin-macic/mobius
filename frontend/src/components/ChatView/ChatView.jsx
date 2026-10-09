@@ -191,6 +191,7 @@ import {
   chooseActiveAssistantDataKey,
   findTrailingAssistantPartialIndex,
   streamItemsHaveRenderableContent,
+  streamItemsToAssistantPayload,
 } from './streamPromotion.js'
 import {
   commitAssistantPromotion,
@@ -200,6 +201,8 @@ import { assistantReplyGroups } from './assistantReplies.js'
 import {
   assistantReplyRoot,
   projectSettledSteerContinuations,
+  projectSteerContinuationMessage,
+  projectActiveSteerPrefix,
   sealedAssistantBeforeSteer,
 } from './steerContinuity.js'
 import {
@@ -5774,6 +5777,16 @@ export default function ChatView({
     messages,
     activeSteerContinuationIndex,
   )
+  const activeSteerPrefix = useMemo(() => {
+    if (!showActiveAssistantSurface || !sealedSteerAssistant) return null
+    const source = useDbActivePayload ? activeMirrorMsg : hasLiveAssistantPayload
+      ? { role: 'assistant', id: streamAssistantMessageId || activeAssistantMessageId,
+          ...streamItemsToAssistantPayload(streamItems, { finalize: false }) }
+      : null
+    const continuation = projectSteerContinuationMessage(sealedSteerAssistant, source, { active: activeAssistantIsStreaming })
+    return continuation?.steer_replay?.prefixRange ? { continuationIndex: activeSteerContinuationIndex, continuation } : null
+  }, [showActiveAssistantSurface, sealedSteerAssistant, activeSteerContinuationIndex, useDbActivePayload, activeMirrorMsg,
+    hasLiveAssistantPayload, streamAssistantMessageId, activeAssistantMessageId, streamItems, activeAssistantIsStreaming])
   useLayoutEffect(() => {
     const sourceId = activeMirrorMsg?.id || streamAssistantMessageId || activeAssistantMessageId
     if (showActiveAssistantSurface && sourceId) assistantDisplayKeys.set(sourceId, streamingDataKey)
@@ -5924,12 +5937,17 @@ export default function ChatView({
   // A `/goal ` composer draft keeps the goal visual open while the objective is
   // still being typed (null once the draft is no longer a goal command).
   const draftGoal = draftGoalObjective(input)
-  const displayedMessages = useMemo(
+  const settledMessages = useMemo(
     () => projectSettledSteerContinuations(
       recoveryMessages,
       { preserveHidden: true },
     ),
     [recoveryMessages],
+  )
+  const displayedMessages = useMemo(
+    // The stream may lead its DB mirror; apply its newer parse after history.
+    () => projectActiveSteerPrefix(settledMessages, activeSteerPrefix),
+    [settledMessages, activeSteerPrefix],
   )
   const peerTimeline = usePeerTimeline(
     chatId,
