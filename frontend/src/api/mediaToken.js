@@ -16,6 +16,7 @@
  */
 
 import { BASE, apiFetch, getAuthSessionCacheKey } from './client.js'
+import { closeAuthWindow, navigateAuthWindow } from '../utils/authWindow.js'
 
 // Per-chat token cache: { token: string, expiresAt: number }
 // Cache for 10 minutes (server TTL is 15 min, giving 5 min buffer for clock skew
@@ -101,8 +102,10 @@ export function openMediaLink(event, chatId, path, { query = '', download } = {}
   mediaTokenParam(chatId).then((param) => {
     const url = `${BASE}${path}${param}${param ? query : query.replace(/^&/, '?')}`
     if (tab) {
-      tab.opener = null
-      tab.location.replace(url)
+      // The shared helper severs the opener and tolerates a tab the owner
+      // closed while the token was being fetched; a tab it cannot navigate
+      // is closed rather than left blank.
+      if (!navigateAuthWindow(tab, url)) closeAuthWindow(tab)
       return
     }
     const link = document.createElement('a')

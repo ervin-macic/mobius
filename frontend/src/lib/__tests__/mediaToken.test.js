@@ -168,6 +168,60 @@ test('a blocked popup falls back to the link itself', async () => {
   })
 })
 
+async function withoutUnhandledRejections(fn) {
+  const rejections = []
+  const record = reason => rejections.push(reason)
+  process.on('unhandledRejection', record)
+  try {
+    await fn()
+  } finally {
+    process.off('unhandledRejection', record)
+  }
+  assert.deepEqual(rejections, [])
+}
+
+function mintTokens(token) {
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async json() { return { token } },
+  })
+}
+
+test('a tab closed while the token is minting is left alone', async () => {
+  clearMediaTokenCache()
+  setEphemeralAuthSession('session-closed', 'instance-1')
+  mintTokens('media-closed')
+  const tab = {
+    closed: false,
+    opener: 'shell',
+    location: { replace() { throw new Error('a closed tab must not be navigated') } },
+    close() { throw new Error('a closed tab must not be closed again') },
+  }
+  await withoutUnhandledRejections(() => withGlobals({ window: { open: () => tab } }, async () => {
+    openMediaLink(clickEvent(), 'chat-closed', '/api/chats/chat-closed/uploads/a.pdf')
+    tab.closed = true
+    await settle()
+  }))
+})
+
+test('a reserved tab that cannot be navigated is closed, not left blank', async () => {
+  clearMediaTokenCache()
+  setEphemeralAuthSession('session-stuck', 'instance-1')
+  mintTokens('media-stuck')
+  const tab = {
+    closed: false,
+    opener: 'shell',
+    location: { replace() { throw new Error('navigation blocked') } },
+    close() { tab.closed = true },
+  }
+  await withoutUnhandledRejections(() => withGlobals({ window: { open: () => tab } }, async () => {
+    openMediaLink(clickEvent(), 'chat-stuck', '/api/chats/chat-stuck/uploads/a.pdf')
+    await settle()
+  }))
+  assert.equal(tab.closed, true)
+})
+
 test('downloads also use a token that is valid at click time', async () => {
   clearMediaTokenCache()
   setEphemeralAuthSession('session-download', 'instance-1')
