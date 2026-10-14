@@ -510,10 +510,11 @@ def _install_clone(client, auth, base, manifest, responses, bare):
     })
 
 
-def test_clone_install_rejects_skill_bytes_that_differ_from_review(
+def test_clone_install_reads_skill_bytes_from_git_not_http(
   client, auth, tmp_path, bypass_url_validation,
 ):
-  """One reviewed package cannot resolve to different Git skill bytes."""
+  """A clone install reads its package from the clone; stale HTTP bytes
+  (a raw cache behind a push) can neither win nor refuse the install."""
   base = "https://raw.githubusercontent.com/acme/app-skilled/main/"
   m = _skill_manifest()
   _, bare = _make_repo(tmp_path, {
@@ -526,15 +527,14 @@ def test_clone_install_rejects_skill_bytes_that_differ_from_review(
     base + "index.jsx": (200, JSX.encode()),
     base + "contributing.md": (200, b"HTTP SKILL\n"),
   }, bare)
-  assert r.status_code == 409, r.text
-  assert r.json()["detail"]["code"] == "git_source_mismatch"
-  assert not (_skills_dir() / "contributing.md").exists()
+  assert r.status_code == 201, r.text
+  assert (_skills_dir() / "contributing.md").read_text() == "REPO SKILL\n"
 
 
 def test_clone_install_rejects_missing_reviewed_skill_file(
   client, auth, tmp_path, bypass_url_validation,
 ):
-  """A Git package must contain every source file that review fetched."""
+  """A Git package must contain every source file its manifest declares."""
   base = "https://raw.githubusercontent.com/acme/app-noskill/main/"
   m = _skill_manifest(id="noskill", name="No Skill")
   _, bare = _make_repo(tmp_path, {
@@ -546,8 +546,8 @@ def test_clone_install_rejects_missing_reviewed_skill_file(
     base + "index.jsx": (200, JSX.encode()),
     base + "contributing.md": (200, b"HTTP SKILL\n"),
   }, bare)
-  assert r.status_code == 409, r.text
-  assert r.json()["detail"]["code"] == "git_source_mismatch"
+  assert r.status_code == 422, r.text
+  assert "missing source file contributing.md" in r.json()["detail"]
   assert not (_skills_dir() / "contributing.md").exists()
 
 
@@ -596,8 +596,10 @@ def test_cloned_job_without_exec_bit_installs(
 ):
   """A job committed without execute mode still installs: its shebang decides."""
   base = "https://raw.githubusercontent.com/acme/app-cronjob/main/"
-  _, bare = _make_repo(tmp_path, {"index.jsx": JSX, "job.sh": JOB_SH})
   m = _job_manifest("cronjob")
+  _, bare = _make_repo(
+    tmp_path, {"mobius.json": json.dumps(m), "index.jsx": JSX, "job.sh": JOB_SH},
+  )
   r = _install_clone(client, auth, base, m, {
     base + "mobius.json": (200, json.dumps(m).encode()),
     base + "index.jsx": (200, JSX.encode()),
@@ -611,10 +613,11 @@ def test_cloned_job_keeps_its_committed_exec_bit(
 ):
   """The committed +x bit survives the clone unchanged."""
   base = "https://raw.githubusercontent.com/acme/app-cronjob-x/main/"
-  _, bare = _make_repo(
-    tmp_path, {"index.jsx": JSX, "job.sh": JOB_SH}, exec_names={"job.sh"},
-  )
   m = _job_manifest("cronjob-x")
+  _, bare = _make_repo(
+    tmp_path, {"mobius.json": json.dumps(m), "index.jsx": JSX, "job.sh": JOB_SH},
+    exec_names={"job.sh"},
+  )
   r = _install_clone(client, auth, base, m, {
     base + "mobius.json": (200, json.dumps(m).encode()),
     base + "index.jsx": (200, JSX.encode()),

@@ -176,8 +176,8 @@ def _prepare_owner_notification(
       agents; the /send default), 'app' + source_id=str(app_id) (also
       lights the drawer activity dot). New subsystems add a short
       stable slug.
-    - target: in-scope deep-link only — '/shell/?app=<id>' or
-      '/shell/?chat=<id>'.
+    - target: in-scope deep-link only — '/shell/?app=<id>',
+      '/shell/?chat=<id>' or '/shell/?settings=<section>'.
       Clients treat it as UNTRUSTED and fail closed on anything else.
     - tag: optional grouping key for the OS notification only (history rows
       are unaffected). It is namespaced as '<source_type>:<source_id>:<tag>'
@@ -205,7 +205,7 @@ def _prepare_owner_notification(
   # to the app. Make that canonical completion edge own the drawer dot too,
   # rather than requiring every cron script to remember a parallel signal.
   from app.app_activity import mark_from_notification
-  activity_app_id = mark_from_notification(
+  activity = mark_from_notification(
     db, source_type=source_type, source_id=source_id,
   )
   try:
@@ -243,12 +243,16 @@ def _prepare_owner_notification(
       pass
     return notification_id, None
 
-  if activity_app_id is not None:
-    # The row above is durable; this replay-free event only makes a live shell
-    # refetch immediately. A reconnect/boot refetch recovers a missed event.
+  if activity is not None:
+    # The row above is durable. The replay-free event carries the marker
+    # version written in that transaction so a live shell marks that one app
+    # instead of re-downloading every app row; a reconnect/boot refetch
+    # recovers a missed event.
     from app.broadcast import get_system_broadcast
     get_system_broadcast().publish({
-      "type": "app_activity", "appId": str(activity_app_id),
+      "type": "app_activity", "appId": str(activity.app_id),
+      "unseenActivityVersion": activity.version,
+      "appCreatedAt": activity.app_created_at,
     })
 
   # Replay-free nudge so a live shell's bell badge refetches immediately;

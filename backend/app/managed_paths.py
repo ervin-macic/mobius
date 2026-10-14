@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 STATIC_ASSETS_MANIFEST = ".mobius-static-assets.json"
+# Every file below this source directory is public at /app-assets/<app>/.
+SERVED_STATIC_DIR = "static"
 
 
 @dataclass(frozen=True)

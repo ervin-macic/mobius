@@ -54,7 +54,7 @@ def test_every_package_input_changes_the_same_incoming_identity(repo, field):
   assert summary.source_digest == _full(repo, commit).source_digest
 
 
-@pytest.mark.parametrize('missing', ['mobius.json', 'index.jsx', 'cards.js', 'large.bin', 'seed.json', 'fetch.sh', 'icon.png'])
+@pytest.mark.parametrize('missing', ['mobius.json', 'index.jsx', 'cards.js', 'large.bin', 'seed.json', 'fetch.sh'])
 def test_missing_incoming_inputs_have_identical_closed_failure(repo, missing):
   tree = _tree(); tree.pop(missing); commit = _commit(repo, tree)
   with pytest.raises(ValueError) as full:
@@ -72,6 +72,17 @@ def test_invalid_incoming_manifest_has_same_failure(repo, body):
   with pytest.raises(type(full.value)) as summary:
     install.read_git_package_summary(repo, commit)
   assert str(summary.value) == str(full.value)
+
+
+def test_missing_icon_is_nonfatal_like_an_http_404_and_identity_exact(repo):
+  tree = _tree(); tree.pop('icon.png'); commit = _commit(repo, tree)
+  full = _full(repo, commit); summary = install.read_git_package_summary(repo, commit)
+  assert full.candidate.icon_processed is None
+  assert summary.icon_warning == full.candidate.icon_warning == (
+    'icon: candidate Git tree is missing icon icon.png'
+  )
+  assert summary.source_digest == full.source_digest
+  assert install.read_git_install_candidate(repo, commit, URL).candidate.icon_warning
 
 
 def test_invalid_icon_remains_nonfatal_and_identity_exact(repo):
@@ -118,14 +129,15 @@ def test_missing_commit_does_not_fetch_or_fall_back(repo):
     install.read_git_package_summary(repo, 'not-a-reviewed-commit')
 
 
-def test_full_and_summary_fetch_share_origin_guard_before_any_fetch(repo):
+def test_update_fetch_guards_origin_before_any_transfer(repo):
+  import asyncio
   subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin', 'https://example.invalid/actual.git'], check=True)
-  wrong = ('https://example.invalid/wrong.git', 'main')
-  with patch('app.app_git.fetch_origin_ref') as fetch, patch('app.install._derive_repo_ref', return_value=wrong):
-    for reader in [install.fetch_git_install_candidate, install.fetch_git_package_summary]:
-      with pytest.raises(ValueError, match='origin does not match'):
-        reader(repo, URL)
-    fetch.assert_not_called()
+  with patch('app.app_git._transfer') as transfer:
+    with pytest.raises(ValueError, match='origin does not match'):
+      asyncio.run(install.fetch_app_commit(
+        repo, 'main', expected_origin='https://example.invalid/wrong.git',
+      ))
+    transfer.assert_not_called()
 
 
 @pytest.mark.parametrize('legacy', [False, True])
@@ -155,12 +167,10 @@ def test_real_update_route_streams_source_or_rereads_exact_legacy_commit(
     'mobius.json': json.dumps(manifest).encode(), 'index.jsx': incoming.encode(),
   })
 
-  def fetched(repo, url):
-    return install.read_git_package_summary(repo, commit)
-  monkeypatch.setattr(install, 'fetch_git_package_summary', fetched)
-  def full_fetch(*args, **kwargs):
-    pytest.fail('Update discovery must not fetch the full install candidate')
-  monkeypatch.setattr(install, 'fetch_git_install_candidate', full_fetch)
+  from app.routes import apps as apps_routes
+  async def fetched(repo, url):
+    return commit
+  monkeypatch.setattr(apps_routes, '_fetch_update_commit', fetched)
   original_reader = install.read_git_install_candidate
   legacy_reads = []
   def full_reader(repo, ref, url, **kwargs):

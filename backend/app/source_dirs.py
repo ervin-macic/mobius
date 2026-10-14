@@ -29,7 +29,13 @@ def source_dir_kind(
     return None
 
   root = apps_root(data_dir)
-  if resolved.parent == root and not resolved.name.isdigit():
+  # Dot-prefixed children are platform staging (``.git-transfers``), never
+  # an app's source.
+  if (
+    resolved.parent == root
+    and not resolved.name.isdigit()
+    and not resolved.name.startswith(".")
+  ):
     return "app"
 
   return None

@@ -15,9 +15,29 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import HTTPException
+
+# Redirect loops stay bounded; every hop must still pass validate_url_safe.
+MAX_REDIRECTS = 5
+
+
+def pinned_client(**kwargs) -> httpx.AsyncClient:
+  """An HTTP client for requests sent to `validate_url_safe`'s pinned URLs.
+
+  Pinned requests address the resolved IP, so httpx's cookie jar would file a
+  Set-Cookie under that IP and replay it to any other host sharing it (one CDN
+  edge, a later redirect hop, another app's request on a pooled client).
+  Server-side fetches never need upstream cookies, so this jar refuses all.
+  """
+  return httpx.AsyncClient(
+    follow_redirects=False,
+    cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+    **kwargs,
+  )
 
 # Networks the fetcher must never reach. Hitting them from
 # our (network-privileged) backend turns the install endpoint into

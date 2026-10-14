@@ -90,7 +90,7 @@ def test_every_declared_input_still_changes_the_exact_digest(repo, field):
   assert install.package_content_digest_from_git(repo, commit) == after
 
 
-@pytest.mark.parametrize("missing", ["index.jsx", "cards.js", "large.bin", "seed.json", "fetch.sh", "icon.png"])
+@pytest.mark.parametrize("missing", ["index.jsx", "cards.js", "large.bin", "seed.json", "fetch.sh"])
 def test_missing_declared_files_fail_closed_in_both_paths(repo, missing):
   tree = _tree()
   tree.pop(missing)
@@ -99,6 +99,15 @@ def test_missing_declared_files_fail_closed_in_both_paths(repo, missing):
     install.package_content_digest_from_tree(tree)
   with pytest.raises(install.PackageContentError):
     install.package_content_digest_from_git(repo, commit)
+
+
+def test_missing_optional_icon_digests_identically_in_both_paths(repo):
+  tree = _tree()
+  tree.pop("icon.png")
+  commit = _commit(repo, tree)
+  expected = install.package_content_digest_from_tree(tree)
+  assert install.package_content_digest_from_git(repo, commit) == expected
+  assert expected != install.package_content_digest_from_tree(_tree())
 
 
 @pytest.mark.parametrize("body", [b"broken json", b'{"id":"invalid"}'])
@@ -266,3 +275,35 @@ def test_multiple_destinations_consume_shared_blob_bytes_in_full(repo):
   tree["mobius.json"] = json.dumps(manifest).encode()
   commit = _commit(repo, tree)
   assert install.package_content_digest_from_git(repo, commit) == install.package_content_digest_from_tree(tree)
+
+
+def test_refused_icon_digests_like_install_instead_of_blocking_update_checks(repo):
+  """Install skips an icon it refuses; the update-check digest must agree."""
+  tree = _tree()
+  tree["icon.png"] = b"not an image"
+  commit = _commit(repo, tree)
+  installed = install._read_git_candidate_inputs(tree, strict=True)
+  assert installed.icon_processed is None
+  assert installed.icon_warning
+  digest = install.package_content_digest_from_tree(tree)
+  assert digest == (json.loads(tree["mobius.json"])["id"], installed.content_digest())
+  assert install.package_content_digest_from_git(repo, commit) == digest
+
+
+@pytest.mark.parametrize("limit", ["manifest", "package"])
+def test_installed_tree_over_admission_limits_digests_with_refused_icon_semantics(
+  repo, monkeypatch, limit,
+):
+  tree = _tree()
+  tree["icon.png"] = b"not an image"
+  candidate = install._read_git_candidate_inputs(tree, strict=True)
+  expected = (candidate.manifest["id"], candidate.content_digest())
+  if limit == "manifest":
+    tree["mobius.json"] += b" " * install._MANIFEST_MAX_BYTES
+  else:
+    monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", 1)
+  commit = _commit(repo, tree)
+  assert install.package_content_digest_from_tree(tree) == expected
+  assert install.package_content_digest_from_git(repo, commit) == expected
+  with pytest.raises(install.PackageTooLarge):
+    install.read_git_install_candidate(repo, commit, "https://example.test/app/")

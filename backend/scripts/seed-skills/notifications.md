@@ -28,6 +28,14 @@ item or when a completed item should be visible now.
 - When the partner may be away, also send a push with the deep link: the push is
   the durable "look at this later" channel and `open_item` is the instant one.
 
+Kind `settings` takes the partner to Settings instead, focused on a section:
+`ai-providers` (connecting Claude, Codex or Möbius), `background-agents`,
+`github`, or `models`; omit the id for Settings itself. It opens in the
+foreground, so use it when they asked to see it or accepted your offer to open
+it. Opening only navigates: signing in, entering credentials, disconnecting and
+every other change there stay the partner's own taps, so say what to tap rather
+than implying it is done. The matching push target is `/shell/?settings=SECTION`.
+
 ---
 
 ## Saved owner-input cards notify for you
@@ -44,7 +52,8 @@ prose without a card sends nothing and is not a way to wait for the owner.
 ## Sending one
 
 Call `notify_owner` with `title` and `body`. It defaults `target` to this chat;
-pass `/shell/?app=APP_ID` to open an app, and up to two `actions`
+pass `/shell/?app=APP_ID` to open an app or `/shell/?settings=SECTION` for a
+Settings section, and up to two `actions`
 (`{action, title, target}`, e.g. `open_app` and `open_chat`).
 
 Optional `tag` (1-128 chars of `A-Z a-z 0-9 _ . : -`, the same shape as a

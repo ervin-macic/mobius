@@ -122,17 +122,21 @@ def _candidate_rows(db: Session, tokens: list[str]):
   )
 
 
+def _in_owner_drawer(settings: str | None, app_id: int | None) -> bool:
+  # Raw JSON-column text, decoded as the ORM's JSON type would.
+  return chat_visibility.visible_in_owner_drawer(SimpleNamespace(
+    agent_settings_json=None if settings is None else json.loads(settings),
+    created_by_app_id=app_id,
+  ))
+
+
 def _visible_rows(rows):
   """Only chats in the owner's drawer; hidden app and helper chats never match."""
   visible = {}
   for row in rows:
     chat_id, *_rest, settings, app_id = row
     if chat_id not in visible:
-      # Raw JSON-column text, decoded as the ORM's JSON type would.
-      visible[chat_id] = chat_visibility.visible_in_owner_drawer(SimpleNamespace(
-        agent_settings_json=None if settings is None else json.loads(settings),
-        created_by_app_id=app_id,
-      ))
+      visible[chat_id] = _in_owner_drawer(settings, app_id)
     if visible[chat_id]:
       chat_id, seq, ts, role, raw, *rest = row[:8]
       yield (chat_id, seq, ts, role, bytes(raw).decode("utf-8", "replace"), *rest)
@@ -222,6 +226,31 @@ def _rank_results(rows, tokens: list[str], limit: int) -> list[dict]:
       "archived": result["archived"],
     })
   return output
+
+
+def unindexed_chat_count(db: Session) -> int:
+  """Drawer chats whose message text search will reach once converted.
+
+  Only live chats the owner's drawer shows count, since search never returns
+  any other chat. A chat whose conversion failed in this run is not waiting:
+  its message text stays unsearchable until a write converts it or a restart
+  retries it, and diagnostics (/api/debug/status, ``transcript_conversion``)
+  name it with its error.
+  """
+  from app import transcript_rows
+  from app.chat_writer import transcript_conversion_status
+
+  if transcript_rows.rows_are_authority(db):
+    return 0
+  failed = transcript_conversion_status["failed"]
+  return sum(
+    1 for chat_id, settings, app_id in db.execute(sql(
+      "SELECT c.id, c.agent_settings_json, c.created_by_app_id FROM chats c "
+      "WHERE c.deleted_at IS NULL AND NOT EXISTS "
+      "(SELECT 1 FROM chat_transcript_state s WHERE s.chat_id = c.id)"
+    ))
+    if chat_id not in failed and _in_owner_drawer(settings, app_id)
+  )
 
 
 def search(db: Session, raw_query: str, limit: int = 20) -> list[dict]:

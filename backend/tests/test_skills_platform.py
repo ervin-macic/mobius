@@ -1329,6 +1329,39 @@ def test_uninstall_snapshots_the_owned_directory_before_removal(
   assert not d.exists()
 
 
+def test_cancelled_uninstall_holds_the_skills_lock_until_its_snapshot_ends(
+  client, auth, skills_dir, monkeypatch,
+):
+  """The data-repo commit ends before a cancel releases the skills lock."""
+  from app import fs_locks
+  from app.routes import skills as rs
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  d = skills_dir / "tips"
+  d.mkdir()
+  (d / "SKILL.md").write_text("# tips\n")
+  sidecar = skills_dir / skills_mod.INSTALLED_SKILLS_SIDECAR
+  sidecar.write_text(json.dumps({"tips": {"source": "o/r"}}))
+  git_dir = skills_dir.parents[1] / ".git"
+  created_git_dir = not git_dir.is_dir()
+  if created_git_dir:
+    git_dir.mkdir()
+  worker = BlockedWorker(lambda: (True, "committed"))
+  monkeypatch.setattr(rs.data_git, "snapshot_path", worker)
+  try:
+    outcome = asyncio.run(cancel_while_worker_blocked(
+      fs_locks.shared_skills_lock(), lambda: rs.uninstall_skill("tips", None),
+      worker, while_blocked=d.is_dir,
+    ))
+  finally:
+    if created_git_dir:
+      git_dir.rmdir()
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  # The cancel stops the uninstall before deletion, with its record kept.
+  assert d.is_dir() and "tips" in json.loads(sidecar.read_text())
+
+
 def test_uninstall_rejects_traversal_name(client, auth, skills_dir):
   r = client.delete("/api/skills/..%2Fetc", headers=auth)
   assert r.status_code in (400, 404, 409)

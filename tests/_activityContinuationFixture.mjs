@@ -155,8 +155,8 @@ export async function checkActivitySpacing(page) {
   const gaps = await page.evaluate(() => {
     const host = document.createElement('div')
     host.style.cssText = 'position:fixed;left:-2000px;top:0;width:600px;visibility:hidden'
-    const row = '<li class="chat__msg chat__msg--assistant"><div class="chat__assistant-copy-surface"><div class="chat__tools"><div class="chat__activity"><div class="chat__activity-header">Tool activity</div></div></div></div></li>'
-    const anchor = '<li class="chat__msg chat__msg--assistant"><div class="chat__assistant-copy-surface"></div></li>'
+    const row = '<li class="chat__msg chat__msg--assistant"><div class="chat__markdown-copy-surface"><div class="chat__tools"><div class="chat__activity"><div class="chat__activity-header">Tool activity</div></div></div></div></li>'
+    const anchor = '<li class="chat__msg chat__msg--assistant"><div class="chat__markdown-copy-surface"></div></li>'
     host.innerHTML = `<ul class="chat__list">${row}${row}</ul><ul class="chat__reply-rows">${row}${row}</ul><ul class="chat__reply-rows">${row}${anchor}${row}</ul>`
     document.body.append(host)
     try {

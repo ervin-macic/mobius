@@ -32,10 +32,12 @@ from app import (
   github_auth,
   github_contribution_git as _git_ops,
   models,
+  settled,
 )
 from app.config import get_settings
 from app.contribution_errors import ContributionSubmitError, push_rejected
 from app.github_connection import has_full_pr_access
+from app.manifest_identity import RAW_GITHUB_HOST, parse_root_manifest
 from app.terminal_output import readable_output
 from app.github_contribution_contract import (
   BRANCH_NAME as _BRANCH_NAME,
@@ -235,11 +237,8 @@ class PublicationHandoffSpec(PublicationHandoffIdentity):
   capability_digest: str
 
   def pinned_manifest_url(self, merge_sha: str) -> str:
-    parsed = urlparse(self.manifest_url)
-    parts = [part for part in parsed.path.split("/") if part]
     return (
-      f"https://raw.githubusercontent.com/{parts[0]}/{parts[1]}/"
-      f"{merge_sha}/mobius.json"
+      f"https://{RAW_GITHUB_HOST}/{self.repo_slug}/{merge_sha}/mobius.json"
     )
 
 
@@ -267,26 +266,21 @@ def publication_handoff_identity(record: dict) -> PublicationHandoffIdentity:
     ) from None
 
   manifest_url = str(handoff.get("manifest_url") or "").strip()
-  parsed = urlparse(manifest_url)
-  parts = [part for part in parsed.path.split("/") if part]
+  root = parse_root_manifest(manifest_url)
   if (
-    parsed.scheme != "https"
-    or parsed.hostname != "raw.githubusercontent.com"
-    or parsed.netloc != "raw.githubusercontent.com"
-    or parsed.username is not None
-    or parsed.password is not None
-    or parsed.query
-    or parsed.fragment
-    or len(parts) != 4
-    or parts[0] != "mobius-os"
-    or not parts[1].startswith("app-")
-    or parts[2] != "main"
-    or parts[3] != "mobius.json"
+    root is None
+    or root.owner != "mobius-os"
+    or not root.repo.startswith("app-")
+    or root.ref != "main"
+    # Exactly the canonical spelling: no port, query, fragment or escapes.
+    or manifest_url != (
+      f"https://{RAW_GITHUB_HOST}/{root.owner}/{root.repo}/main/mobius.json"
+    )
   ):
     raise ContributionSubmitError(
       "This publication does not use a canonical Möbius app manifest."
     )
-  repo_slug = f"{parts[0]}/{parts[1]}"
+  repo_slug = f"{root.owner}/{root.repo}"
   if str(plan.get("repo") or record.get("repo") or "") != repo_slug:
     raise ContributionSubmitError(
       "This publication manifest belongs to a different repository."
@@ -296,7 +290,7 @@ def publication_handoff_identity(record: dict) -> PublicationHandoffIdentity:
     target_app_id=target_app_id,
     repo_slug=repo_slug,
     manifest_url=manifest_url,
-    manifest_id=parts[1].removeprefix("app-"),
+    manifest_id=root.repo.removeprefix("app-"),
   )
 
 
@@ -838,9 +832,9 @@ async def _record_pending_equivalence_locked(
     return None
   source_repo, _review_repo = repos
   if str(source_repo) in already_locked:
-    return await asyncio.to_thread(_record_pending_equivalence, record)
+    return await settled.run_settled(_record_pending_equivalence, record)
   async with fs_locks.source_dir_lock(str(source_repo)):
-    return await asyncio.to_thread(_record_pending_equivalence, record)
+    return await settled.run_settled(_record_pending_equivalence, record)
 
 
 def _merged_upstream_sha(record: dict, repo: Path) -> str | None:

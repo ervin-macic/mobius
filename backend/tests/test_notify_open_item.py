@@ -215,3 +215,69 @@ async def test_open_item_numeric_app_source_accepted(client, auth):
     assert ev["sourceKind"] == "app" and ev["sourceId"] == "42"
   finally:
     sb.unsubscribe(q)
+
+
+# ── Settings: navigation only, never placement ─────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body,expected", [
+  (
+    {"type": "open_item", "itemKind": "settings", "itemId": "ai-providers"},
+    {"type": "open_item", "itemKind": "settings", "itemId": "ai-providers"},
+  ),
+  (
+    {"type": "open_item", "itemKind": "settings", "activation": "foreground"},
+    {"type": "open_item", "itemKind": "settings"},
+  ),
+])
+async def test_open_item_settings_navigates_to_a_section_or_settings_itself(
+  client, auth, body, expected,
+):
+  """An agent may take the owner to Settings (optionally one section). The
+  event carries only the section: no source, placement or activation, because
+  the shell navigates to its single Settings screen rather than placing it."""
+  sb = get_system_broadcast()
+  q = sb.subscribe()
+  try:
+    r = client.post("/api/notify", headers=auth, json=body)
+    assert r.status_code == 204, r.text
+    assert await asyncio.wait_for(q.get(), timeout=1.0) == expected
+  finally:
+    sb.unsubscribe(q)
+
+
+@pytest.mark.parametrize("body", [
+  {"type": "open_item", "itemKind": "settings", "itemId": "danger-zone"},
+  {"type": "open_item", "itemKind": "settings", "itemId": ""},
+  # Settings is never placed beside a chat or opened unseen.
+  {"type": "open_item", "itemKind": "settings", "itemId": "github",
+   "sourceKind": "chat", "sourceId": "chat-z"},
+  {"type": "open_item", "itemKind": "settings", "placement": "beside-source"},
+  {"type": "open_item", "itemKind": "settings", "activation": "background"},
+  {"type": "open_item", "itemKind": "settings", "label": "x"},
+  # A Settings section is never a placement source either.
+  {"type": "open_item", "itemKind": "app", "itemId": "42",
+   "sourceKind": "settings", "sourceId": "ai-providers"},
+])
+def test_open_item_settings_rejects_unknown_sections_and_placement(client, auth, body):
+  r = client.post("/api/notify", headers=auth, json=body)
+  assert r.status_code == 422, r.text
+
+
+def test_settings_section_ids_match_the_shell_vocabulary():
+  """The route's closed set and the shell's settingsSections.js are one
+  vocabulary: an id only one side knows would 422 a valid open or open
+  Settings unfocused."""
+  import re
+  from pathlib import Path
+
+  from app.routes.notify import _SETTINGS_SECTIONS
+
+  source = (
+    Path(__file__).resolve().parents[2]
+    / "frontend" / "src" / "lib" / "settingsSections.js"
+  ).read_text()
+  block = re.search(r"SETTINGS_SECTIONS = Object\.freeze\(\[(.*?)\]\)", source, re.S)
+  assert block, "settingsSections.js exports its frozen id list"
+  assert set(re.findall(r"'([a-z-]+)'", block.group(1))) == _SETTINGS_SECTIONS

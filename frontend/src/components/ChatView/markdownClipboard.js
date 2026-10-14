@@ -1,7 +1,7 @@
-/** Clipboard contract for rendered assistant prose.
+/** Clipboard contract for rendered chat prose: replies and owner messages.
  *
  * Copy keeps native selection, but replaces the clipboard payload with two
- * representations of the selected assistant text:
+ * representations of the selected text:
  *   - text/markdown: source Markdown (or an equivalent serialization when the
  *     selection cuts through only part of a rendered block)
  *   - text/plain: the same selection without Markdown punctuation
@@ -37,15 +37,25 @@ function escapeMarkdownText(text) {
     .replace(/(\d+)([.)])(?=\s)/g, '$1\\$2')
 }
 
-function inlineCode(text) {
+/** Backtick delimiters that keep `text` one inline code span: longer than any
+ * backtick run inside it, and padded with a space when it starts or ends with
+ * a backtick or a space (CommonMark strips one padding space per side). The
+ * composer's code shortcut shares this rule with copy. */
+export function inlineCodeDelimiters(text) {
   const value = String(text || '')
   const runs = value.match(/`+/g) || []
   const fence = '`'.repeat(Math.max(1, ...runs.map(run => run.length + 1)))
-  const needsPadding = /^`|`$|^\s|\s$/.test(value)
-  return `${fence}${needsPadding ? ' ' : ''}${value}${needsPadding ? ' ' : ''}${fence}`
+  const padding = /^`|`$|^\s|\s$/.test(value) ? ' ' : ''
+  return { open: `${fence}${padding}`, close: `${padding}${fence}` }
 }
 
-function codeFence(text) {
+function inlineCode(text) {
+  const { open, close } = inlineCodeDelimiters(text)
+  return `${open}${String(text || '')}${close}`
+}
+
+/** A code-block fence longer than any backtick fence inside `text`. */
+export function codeFence(text) {
   const runs = String(text || '').match(/`{3,}/g) || []
   return '`'.repeat(Math.max(3, ...runs.map(run => run.length + 1)))
 }
@@ -266,18 +276,25 @@ function cloneRangeWithContext(range, block) {
   return selected
 }
 
-function selectedAssistantPayload(root, selection, markdownForBlock) {
+function selectedMarkdownPayload(root, selection, markdownForBlock) {
   if (!root || !selection || selection.rangeCount !== 1 || selection.isCollapsed) return null
   const range = selection.getRangeAt(0)
-  const blocks = Array.from(root.querySelectorAll('[data-assistant-markdown-block]'))
+  // A selection that starts or ends outside this message keeps the native
+  // copy: this surface can only serialize its own blocks, so overriding the
+  // clipboard here would silently drop the other messages in the selection.
+  const within = node => node === root || root.contains(node)
+  if (!within(range.startContainer) || !within(range.endContainer)) return null
+  const blocks = Array.from(root.querySelectorAll('[data-markdown-block]'))
     .filter(block => rangeIntersectsNode(range, block))
   if (blocks.length === 0) return null
 
   const markdown = []
   const plain = []
+  let covered = ''
   for (const block of blocks) {
     const overlap = rangeInsideNode(range, block)
     if (!overlap) continue
+    covered += overlap.toString()
     const fragment = cloneRangeWithContext(overlap, block)
     const fullRange = block.ownerDocument.createRange()
     fullRange.selectNodeContents(block)
@@ -289,6 +306,13 @@ function selectedAssistantPayload(root, selection, markdownForBlock) {
     if (plainPart) plain.push(plainPart)
   }
   if (markdown.length === 0 || plain.length === 0) return null
+  // A selection can include visible text that no Markdown block owns — an
+  // attachment name beside the prose, for instance. This surface serializes
+  // only its blocks, so overriding the clipboard would silently drop that
+  // text: keep the native copy instead. Whitespace differs between the DOM
+  // and the serialization, so compare the selected characters without it.
+  const bare = text => String(text || '').replace(/\s+/g, '')
+  if (bare(covered) !== bare(range.toString())) return null
   return { markdown: markdown.join('\n\n'), plainText: plain.join('\n\n') }
 }
 
@@ -305,10 +329,10 @@ export function markdownClipboardHtml(markdown, plainText) {
   return `<span ${MARKDOWN_CARRIER_ATTR}="${encoded}">${escapeHtml(plainText).replace(/\n/g, '<br>')}</span>`
 }
 
-/** React onCopy handler used by the response-level copy surface. */
-export function copyAssistantSelection(event, markdownForBlock) {
+/** React onCopy handler used by the message-level Markdown copy surface. */
+export function copyMarkdownSelection(event, markdownForBlock) {
   const selection = event.currentTarget?.ownerDocument?.getSelection?.()
-  const payload = selectedAssistantPayload(event.currentTarget, selection, markdownForBlock)
+  const payload = selectedMarkdownPayload(event.currentTarget, selection, markdownForBlock)
   if (!payload || !event.clipboardData) return false
 
   let plainWritten = false
@@ -370,8 +394,10 @@ export function insertClipboardText(value, selectionStart, selectionEnd, text) {
  * the replacement to the textarea's native undo stack. The command emits the
  * normal input event, so React's existing onChange path remains the sole owner
  * of composer state. It must run just after the cancelled paste event; running
- * it inside that event makes Chromium discard the edit's undo transaction. */
-export function queueClipboardTextUndoably(textarea, text, onRejected) {
+ * it inside that event makes Chromium discard the edit's undo transaction.
+ * Formatting shortcuts reuse the same edit; `onInserted` runs right after a
+ * native insert so they can select the text the owner will type over. */
+export function queueClipboardTextUndoably(textarea, text, onRejected, onInserted) {
   const document = textarea?.ownerDocument
   const queueMicrotask = document?.defaultView?.queueMicrotask
   if (
@@ -385,7 +411,8 @@ export function queueClipboardTextUndoably(textarea, text, onRejected) {
     try {
       inserted = document.execCommand('insertText', false, String(text || ''))
     } catch { /* the controlled fallback below preserves paste itself */ }
-    if (!inserted) onRejected?.()
+    if (inserted) onInserted?.()
+    else onRejected?.()
   })
   return true
 }

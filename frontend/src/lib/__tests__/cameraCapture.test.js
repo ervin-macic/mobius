@@ -3,6 +3,47 @@ import assert from 'node:assert/strict'
 
 import { startCameraCapture } from '../cameraCapture.js'
 
+test('camera audio holds the recording session until cancellation releases it', async () => {
+  const navigator = { audioSession: { type: 'auto' } }
+  let resolveStream
+  const stream = videoStream()
+  const capture = startCameraCapture({
+    navigator,
+    audio: true,
+    MediaRecorderCtor: class {},
+    mediaDevices: {
+      getUserMedia() {
+        assert.equal(navigator.audioSession.type, 'play-and-record')
+        return new Promise((resolve) => { resolveStream = resolve })
+      },
+    },
+  })
+  await Promise.resolve()
+  capture.cancel()
+  await assert.rejects(capture.done, { name: 'AbortError' })
+  assert.equal(navigator.audioSession.type, 'auto')
+  resolveStream(stream)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(stream.stops, 1)
+  assert.equal(navigator.audioSession.type, 'auto')
+})
+
+test('video-only capture leaves audio routing unchanged', async () => {
+  const navigator = { audioSession: { type: 'auto' } }
+  const capture = startCameraCapture({
+    navigator,
+    audio: false,
+    MediaRecorderCtor: class {},
+    mediaDevices: {
+      async getUserMedia() {
+        assert.equal(navigator.audioSession.type, 'auto')
+        throw new Error('denied')
+      },
+    },
+  })
+  await assert.rejects(capture.done, /denied/)
+})
+
 function videoStream({ width = 1920, height = 1080 } = {}) {
   let stops = 0
   const track = {

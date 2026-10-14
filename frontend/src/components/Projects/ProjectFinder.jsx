@@ -51,6 +51,10 @@ import {
   openFolder as finderOpenFolder,
   parentPath,
 } from '../../lib/projectFinderNav.js'
+import {
+  PROJECT_CHANGES_ACTIVE_MS,
+  nextProjectChangesDelay,
+} from '../../lib/projectChangeCadence.js'
 import ProjectPdfPreview from './ProjectPdfPreview.jsx'
 import ImageLightbox from '../ChatView/markdown/ImageLightbox.jsx'
 import ProjectPreviewFrame from './ProjectPreviewFrame.jsx'
@@ -489,9 +493,9 @@ export default function ProjectFinder({
     let cursor = null
     let controller = null
     let timer = null
-    let delay = 2_500
+    let delay = PROJECT_CHANGES_ACTIVE_MS
     const handleChanges = async (changes, truncated = false) => {
-      if (!active || (!truncated && (!changes || changes.length === 0))) return
+      if (!active || (!truncated && (!changes || changes.length === 0))) return false
       await source.invalidate(queryClient)
       const selectedNow = liveFileRef.current?.selected
       if (
@@ -511,6 +515,7 @@ export default function ProjectFinder({
           await refreshSelectedFromRemote({ change: selectedChange })
         } catch { /* the completion-scheduled poll retries */ }
       }
+      return true
     }
     const schedule = (wait = delay) => {
       if (!active) return
@@ -531,13 +536,13 @@ export default function ProjectFinder({
         cursor = Number(payload.cursor || cursor || 0)
         // Reconcile once after the baseline arrives. This closes the gap where
         // a save lands between the first file read and the first cursor read.
-        await handleChanges(
+        const changed = await handleChanges(
           payload.changes || [],
           !!payload.truncated || establishingBaseline,
         )
-        delay = 2_500
+        delay = nextProjectChangesDelay(delay, changed ? 'changed' : 'unchanged')
       } catch (cause) {
-        if (cause?.name !== 'AbortError') delay = Math.min(delay * 2, 30_000)
+        if (cause?.name !== 'AbortError') delay = nextProjectChangesDelay(delay, 'failed')
       } finally {
         controller = null
         if (!document.hidden) schedule()

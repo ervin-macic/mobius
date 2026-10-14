@@ -13,6 +13,7 @@ import json
 import os
 import math
 import threading
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -23,8 +24,9 @@ from app.chat_writer import create_chat
 from app.database import SessionLocal, engine
 
 
-# Conversion mechanics pin the converted state themselves.
-pytestmark = pytest.mark.converted_chats
+# Conversion mechanics pin the converted state themselves, and background
+# conversion never depends on the test host's free disk.
+pytestmark = [pytest.mark.converted_chats, pytest.mark.usefixtures("healthy_data_disk")]
 
 
 TYPED = [
@@ -486,6 +488,29 @@ def test_a_view_raises_for_a_position_that_has_since_vanished():
     assert [m["content"] for m in view] == ["0"]
 
 
+def test_opening_an_unconverted_chat_decodes_its_legacy_value_once(client, auth, monkeypatch):
+  """The page, its coordinates and the live overlay share one decoded value."""
+  with SessionLocal() as db:
+    db.add(create_chat(id="opened", title="Opened", messages=[], live_assistant={
+      "role": "assistant", "id": "live-1", "blocks": [{"type": "text", "content": "streaming"}],
+    }))
+    db.commit()
+  previous_release_writes("opened", [
+    {"role": "user", "content": "question", "ts": 1},
+    {"role": "assistant", "id": "live-1", "content": "older", "ts": 2},
+  ])
+  decodes = []
+  real = rows._parse_legacy
+  monkeypatch.setattr(rows, "_parse_legacy", lambda raw: decodes.append(1) or real(raw))
+
+  response = client.get("/api/chats/opened", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert [m.get("content") for m in response.json()["messages"]][0] == "question"
+  assert len(decodes) == 1
+  assert not converted("opened")
+
+
 def test_cid_lookup_and_timestamp_helpers_never_decode_history(monkeypatch):
   chat_id = seed(messages=[{"role": "user", "content": "x" * 1000, "ts": i, "cid": f"c{i}"}
                            for i in range(50)])
@@ -696,6 +721,32 @@ def test_a_writes_conversion_is_never_refused_by_the_background_disk_floor(monke
                       lambda _dir: {"pressure": {"disk": {"state": "critical"}}})
   convert_now(chat_id)
   assert converted(chat_id)
+
+
+def test_the_search_note_counts_only_drawer_chats_awaiting_conversion(client, auth):
+  """Deleted, hidden helper and app chats never appear in search; a chat whose
+  conversion failed is not waiting for it (diagnostics names it instead)."""
+  chats = {
+    "waiting": {},
+    "app-shown": {"created_by_app_id": 7, "agent_settings_json": {"owner_visible": True}},
+    "deleted": {"deleted_at": datetime(2026, 1, 1)},
+    "helper": {"agent_settings_json": {"drawer_hidden": True, "owner_visible": False}},
+    "app-panel": {"created_by_app_id": 7},
+    "failed": {},
+    "converted": {},
+  }
+  with SessionLocal() as db:
+    for chat_id, fields in chats.items():
+      db.add(create_chat(id=chat_id, title=chat_id, messages=[], **fields))
+    db.commit()
+  for chat_id in chats:
+    if chat_id != "converted":
+      previous_release_writes(chat_id, [{"role": "user", "content": "older prose"}])
+  chat_writer.transcript_conversion_status["failed"]["failed"] = "RuntimeError: projection bug"
+
+  response = client.get("/api/chats/search?q=older", headers=auth)
+  assert response.status_code == 200
+  assert response.headers["X-Search-Unindexed-Chats"] == "2"  # waiting, app-shown
 
 
 def test_a_chat_that_cannot_convert_never_blocks_a_route(client, auth, monkeypatch):

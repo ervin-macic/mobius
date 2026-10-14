@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app import transcript_rows
 from app import models
 from app.continuations import PEER_MESSAGE_WAKE_KIND
+from app.delegations import delegation_source_work_filter, delegation_source_work_id
 from app.goal_plans import paused_goal_run
 from app.timeutil import now_naive_utc
 
@@ -199,8 +200,10 @@ def scope_for_chat(
         kind="project", id=str(project_id), root_chat_id=root_chat.id,
         project_id=str(project_id),
       )
+    # Same ownership as delegations: a Goal helper belongs to its Goal, not
+    # to the physical attempt that spawned it, matching the parent's scope.
     return CoordinationScope(
-      kind="delegation", id=str(top.parent_root_run_id),
+      kind="delegation", id=str(delegation_source_work_id(top)),
       root_chat_id=root_chat.id,
     )
 
@@ -285,7 +288,7 @@ def _scope_membership(
   else:
     roots = db.query(models.Delegation).filter(
       models.Delegation.parent_chat_id == scope.root_chat_id,
-      models.Delegation.parent_root_run_id == scope.id,
+      delegation_source_work_filter(scope.id),
     ).order_by(models.Delegation.created_at.asc()).all()
     delegated = _descendant_delegations(db, roots, limit=limit)
     delegation_by_chat = {row.child_chat_id: row for row in delegated}
@@ -913,7 +916,7 @@ def _delegation_scope_has_children(
   """Avoid building a full roster for the common single-agent scope."""
   return db.query(models.Delegation.id).filter(
     models.Delegation.parent_chat_id == scope.root_chat_id,
-    models.Delegation.parent_root_run_id == scope.id,
+    delegation_source_work_filter(scope.id),
   ).first() is not None
 
 
@@ -1851,6 +1854,7 @@ async def _wake_idle_recipient(
         hidden=True,
         message_kind=PEER_MESSAGE_WAKE_KIND,
         source_work_id=goal_run.id,
+        goal_id=goal_run.goal_id,
       )
     except Exception:
       log.warning("peer wake failed chat=%s", chat_id, exc_info=True)

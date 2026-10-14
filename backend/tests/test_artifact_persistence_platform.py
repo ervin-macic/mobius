@@ -97,6 +97,45 @@ def test_publish_registry_binds_live_generation_and_serves(client, auth, db):
   assert client.get(f"/sites/{token}/").status_code == 200
 
 
+def test_cancelled_publish_holds_the_storage_lock_until_its_snapshot_ends(
+  client, auth, db, monkeypatch,
+):
+  """A cancel cannot release the lock, or roll back, under a live copy."""
+  import asyncio
+
+  from app import fs_locks
+  from app.deps import Principal
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  app_id = _create_app(client, auth)
+  _seed_site(app_id, "cancelled", "<h1>draft</h1>")
+  staging = Path(get_settings().data_dir) / "published" / ".staging"
+  worker = BlockedWorker(wraps=shutil.copytree)
+  monkeypatch.setattr(publication_route.shutil, "copytree", worker)
+  principal = Principal(owner=db.query(models.Owner).one(), app_id=None)
+
+  def states():
+    return {
+      record.state for record in
+      publication_route._registry_records_for_app(get_settings(), app_id)
+    }
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.app_storage_lock(app_id),
+    lambda: publication_route.publish_app_site(
+      app_id, publication_route.PublishRequest(project_id="cancelled"), db,
+      principal,
+    ),
+    worker,
+    while_blocked=lambda: states() == {"staged"},
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  # The cancelled first publish revoked its reservation and left no stage.
+  assert not any(staging.iterdir())
+  assert states() == {"revoked"}
+
+
 def test_publish_injects_absolute_link_preview_into_snapshot_only(
   client, auth,
 ):

@@ -112,7 +112,26 @@ test('the modified-Enter submit uses one direct request and presents it inline',
   )
   assert.match(
     source,
-    /function handleSubmitSteer\(e\) \{[\s\S]*?if \(submitSteerInFlightRef\.current\) return[\s\S]*?submitSteerInFlightRef\.current = true[\s\S]*?doSend\(input\.trim\(\), \{ directSteer: true \}\)[\s\S]*?\.finally\(\(\) => \{ submitSteerInFlightRef\.current = false \}\)/,
+    /function handleSubmitSteer\(e[^)]*\) \{[\s\S]*?if \(submitSteerInFlightRef\.current\) return[\s\S]*?submitSteerInFlightRef\.current = true[\s\S]*?doSend\(input\.trim\(\), \{\s*directSteer: true,[^}]*\}\)[\s\S]*?\.finally\(\(\) => \{ submitSteerInFlightRef\.current = false \}\)/,
     'the keyboard handler must synchronously guard the one direct request',
+  )
+})
+
+test('ChatView routes queued edits, cancels, and Send now through one per-message order', () => {
+  // The ordering itself is tested behaviourally in
+  // hooks/__tests__/queuedEditOrder.test.js; this pins only the wiring.
+  assert.match(
+    source,
+    /const handleUpdatePending = useCallback\(\(cid, content\) => \(\s*queuedEditOrder\.run\(cid, \(\) => updateQueuedContent\(cid, content\)\)/,
+  )
+  assert.match(
+    source,
+    /const handleCancelPending = useCallback\(\(cid\) => queuedEditOrder\.run\(cid, async \(\) => \{/,
+    'the cancellation itself runs on the per-message chain',
+  )
+  assert.match(
+    source,
+    /async function handleSteerOne\(cid\) \{[\s\S]*?await queuedEditOrder\.run\(cid, async \(\) => \{[\s\S]*?const findRow/,
+    'Send now runs on the per-message chain too',
   )
 })

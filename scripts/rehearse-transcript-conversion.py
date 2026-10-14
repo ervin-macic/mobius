@@ -25,7 +25,7 @@ def main(path: str) -> dict:
   wal = Path(f"{path}-wal")
   os.environ.setdefault("MOBIUS_TEST_DATABASE_ISOLATED", "1")
   from sqlalchemy import text
-  from app import models, transcript_rows as rows
+  from app import transcript_rows as rows
   from app.database import SessionLocal, engine
   from app.schema_migrations import _add_transcript_rows
 

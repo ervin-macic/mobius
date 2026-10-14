@@ -4,14 +4,17 @@ Validates the boot-time invariants: ordered installs, canonical manifest
 identity, per-app uninstall policy, and failure isolation.
 """
 
+import asyncio
+import errno
 from datetime import datetime, timezone
 import re
-from unittest.mock import AsyncMock, patch
+import socket
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-from app import app_git, models
+from app import app_git, install, models
 from app.bootstrap import (
   BOOTSTRAP_IDENTITY_MANIFEST_URL,
   BOOTSTRAP_INTEGRATIONS_MANIFEST_URL,
@@ -25,6 +28,10 @@ from app.bootstrap import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_git_transfer(monkeypatch):
+  """These tests replace the installer, so nothing needs a prepared package."""
+  monkeypatch.setattr("app.bootstrap.prepare_package", AsyncMock(return_value=None))
 
 
 def _install_result(name="App", slug="app", app_id=1, mode="install"):
@@ -639,11 +646,11 @@ async def test_bootstrap_recognizes_skills_row_installed_at_other_ref(
   earlier release's fixed commit is the SAME app (identity is the repo, not the
   ref) — bootstrap must recognize it and never reinstall a duplicate."""
   monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
-  from app.install import _canonical_identity_key, _trusted_catalog_repo_base
+  from app.install import _canonical_identity_key, _trusted_catalog_origin_url
 
-  assert _trusted_catalog_repo_base(BOOTSTRAP_SKILLS_MANIFEST_URL) == (
-    "https://raw.githubusercontent.com/mobius-os/app-skills"
-  )
+  assert _trusted_catalog_origin_url(BOOTSTRAP_SKILLS_MANIFEST_URL) == (
+    _trusted_catalog_origin_url(_SKILLS_COMMIT_MANIFEST)
+  ) == "https://github.com/mobius-os/app-skills.git"
   db.add(models.App(
     source_dir="/tmp/mobius-tests/skills",
     id=50, name="Skills", slug="skills",
@@ -723,3 +730,348 @@ async def test_undecidable_default_pins_never_stop_bootstrap(db, monkeypatch):
   apps = db.query(models.App).all()
   assert len(apps) == len(_bootstrap_urls())
   assert not any(app.pinned_at for app in apps)
+
+
+def _store_failing_once(db, exc):
+  """Install stand-in whose first Store attempt fails with `exc`."""
+  install = _installing_rows(db)
+  failures = [exc]
+
+  async def flaky(db_, *, manifest_url, **kwargs):
+    if manifest_url == BOOTSTRAP_STORE_MANIFEST_URL and failures:
+      raise failures.pop()
+    return await install(db_, manifest_url=manifest_url, **kwargs)
+
+  return flaky
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
+  db, monkeypatch,
+):
+  """A GitHub rate limit on first boot is a wait, not a stranded instance."""
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  rate_limited = HTTPException(
+    429, "GitHub rate-limited this app request.",
+    headers={"Retry-After": "600"},
+  )
+  delays = []
+
+  async def no_wait(seconds):
+    delays.append(seconds)
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  broadcast = MagicMock()
+  with patch(
+    "app.bootstrap.install_from_manifest", _store_failing_once(db, rate_limited),
+  ), patch("app.bootstrap.get_system_broadcast", return_value=broadcast):
+    outcome = await ensure_bootstrap_apps_installed(db)
+    assert outcome == bootstrap_mod.BootstrapOutcome(
+      ("store",), rate_limited=True, retry_after=600,
+    )
+    assert db.query(models.App).filter_by(slug="store").first() is None
+    broadcast.reset_mock()
+
+    await bootstrap_mod.retry_bootstrap_apps(outcome)
+
+  # The upstream hint lengthened the first one-minute step.
+  assert delays == [600]
+  db.expire_all()
+  store = db.query(models.App).filter_by(slug="store").one()
+  pinned = {app.slug for app in db.query(models.App).all() if app.pinned_at}
+  assert pinned == {"store"}
+  # The Shell hears about the Store the retry installed.
+  assert {"type": "app_updated", "appId": str(store.id)} in [
+    call.args[0] for call in broadcast.publish.call_args_list
+  ]
+  # One quick successful retry never bothers the owner.
+  assert db.query(models.Notification).count() == 0
+
+
+def _unresolvable_host(errno_=socket.EAI_AGAIN):
+  exc = HTTPException(400, "Cannot resolve host 'api.github.com'")
+  exc.__cause__ = socket.gaierror(errno_, "name resolution failed")
+  return exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [
+  HTTPException(422, "App failed to compile."),
+  HTTPException(404, "Not found"),
+  install.git_source_error("Nothing changed.", RuntimeError("bad origin")),
+  # A full disk fails the same way on every retry.
+  install.git_source_error(
+    "Nothing was installed.", OSError(errno.ENOSPC, "No space left on device"),
+    code="git_install_unavailable",
+  ),
+  # A missing repository or branch, or a name that does not exist, stays so.
+  install.git_source_error(
+    "Nothing was installed.",
+    app_git.GitTransferFailed("repository not found", transient=False),
+    code="git_install_unavailable",
+  ),
+  app_git.GitTransferFailed("couldn't find remote ref", transient=False),
+  socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+  _unresolvable_host(socket.EAI_NONAME),
+  ValueError("unexpected"),
+])
+async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  with patch(
+    "app.bootstrap.install_from_manifest", _store_failing_once(db, exc),
+  ):
+    outcome = await ensure_bootstrap_apps_installed(db)
+
+  assert outcome == bootstrap_mod.BootstrapOutcome()
+
+
+@pytest.mark.parametrize("exc", [
+  HTTPException(502, "Upstream 500"),
+  HTTPException(503, "Unavailable"),
+  HTTPException(504, "Timeout"),
+  install.git_source_error("Nothing changed.", app_git.GitTransferTimeout("slow")),
+  install.git_source_error(
+    "Nothing was installed.", app_git.GitTransferFailed("offline"),
+    code="git_install_unavailable",
+  ),
+  install.git_source_error(
+    "Nothing changed.", app_git.HistoryIncomplete("merge base hidden"),
+  ),
+  HTTPException(409, {"code": "git_source_mismatch", "retryable": True}),
+  app_git.GitTransferFailed("could not resolve host"),
+  app_git.GitTransferTimeout("clone exceeded its ceiling"),
+  app_git.HistoryIncomplete("merge base hidden"),
+  socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+  _unresolvable_host(),
+])
+def test_gateway_and_transfer_timeouts_are_transient(exc):
+  assert install.transient_failure(exc) == (True, None)
+
+
+def test_rate_limit_is_transient_with_its_upstream_wait():
+  exc = HTTPException(429, "Rate limited", headers={"Retry-After": "120"})
+  assert install.transient_failure(exc) == (True, 120)
+
+
+@pytest.mark.asyncio
+async def test_retry_tells_the_owner_once_and_stops_after_a_day(
+  db, monkeypatch,
+):
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  db.add(models.Owner(username="owner", hashed_password="unused"))
+  db.commit()
+  clock = [0.0]
+
+  async def advance(seconds):
+    clock[0] += seconds
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", advance)
+  monkeypatch.setattr(bootstrap_mod.time, "monotonic", lambda: clock[0])
+  install = _installing_rows(db)
+
+  async def store_and_social_limited(db_, *, manifest_url, **kwargs):
+    if manifest_url in (
+      BOOTSTRAP_STORE_MANIFEST_URL, BOOTSTRAP_SOCIAL_MANIFEST_URL,
+    ):
+      raise HTTPException(429, "rate limited")
+    return await install(db_, manifest_url=manifest_url, **kwargs)
+
+  with patch("app.bootstrap.install_from_manifest", store_and_social_limited):
+    await bootstrap_mod.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(
+      ("store", "social"), rate_limited=True,
+    ))
+
+  assert clock[0] <= bootstrap_mod._RETRY_WINDOW_SECS
+  assert clock[0] > bootstrap_mod._RETRY_WINDOW_SECS - 2 * 60 * 60
+  notes = db.query(models.Notification).all()
+  assert [note.body for note in notes] == [
+    "App Store and Social couldn't be installed yet (GitHub rate limit); "
+    "retrying automatically.",
+  ]
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_for_owner_lifecycle_work_and_respects_its_uninstall(
+  db, monkeypatch,
+):
+  """The serving-time retry takes the install/uninstall lock per app.
+
+  An owner installs and then uninstalls Social while the retry is due; the
+  retry must wait for that work and then honor the owner's tombstone instead
+  of reinstalling from an identity check made before it.
+  """
+  from app import bootstrap as bootstrap_mod
+  from app import fs_locks
+  from app.install import _canonical_identity_key
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  real_sleep = asyncio.sleep
+
+  async def no_wait(_seconds):
+    await real_sleep(0)
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  install = AsyncMock(side_effect=_installing_rows(db))
+  lock = fs_locks.install_uninstall_lock()
+  with patch("app.bootstrap.install_from_manifest", install):
+    await lock.acquire()
+    try:
+      retry = asyncio.create_task(bootstrap_mod.retry_bootstrap_apps(
+        bootstrap_mod.BootstrapOutcome(
+          ("store", "social"), rate_limited=True,
+        ),
+      ))
+      for _ in range(20):
+        await real_sleep(0)
+      assert not retry.done()
+      install.assert_not_awaited()
+      db.add(models.App(
+        source_dir="/tmp/mobius-tests/social",
+        name="Social", description="", jsx_source="", slug="social",
+        manifest_url=_canonical_identity_key(
+          BOOTSTRAP_SOCIAL_MANIFEST_URL, "social",
+        ),
+        deleted_at=datetime.now(timezone.utc),
+      ))
+      db.commit()
+    finally:
+      lock.release()
+    await asyncio.wait_for(retry, timeout=10)
+
+  urls = [call.kwargs["manifest_url"] for call in install.await_args_list]
+  assert BOOTSTRAP_STORE_MANIFEST_URL in urls
+  assert BOOTSTRAP_SOCIAL_MANIFEST_URL not in urls
+  assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_retry_stages_each_clone_before_taking_the_lifecycle_lock(
+  db, monkeypatch,
+):
+  """No network runs under the lock, and a staging timeout stays transient."""
+  from app import app_git, fs_locks
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  locked = []
+
+  async def prepare(url):
+    locked.append(fs_locks.install_uninstall_lock().locked())
+    if url == BOOTSTRAP_SOCIAL_MANIFEST_URL:
+      raise app_git.GitTransferTimeout("it ran longer than 600 seconds")
+    return None
+
+  monkeypatch.setattr(bootstrap_mod, "prepare_package", prepare)
+  install = AsyncMock(side_effect=_installing_rows(db))
+  with patch("app.bootstrap.install_from_manifest", install):
+    outcome = await bootstrap_mod.ensure_bootstrap_apps_installed(
+      db, retry=("store", "social"),
+    )
+
+  assert locked == [False, False]
+  assert outcome.pending == ("social",)
+  assert [call.kwargs["manifest_url"] for call in install.await_args_list] == [
+    BOOTSTRAP_STORE_MANIFEST_URL,
+  ]
+
+
+@pytest.mark.asyncio
+async def test_unreachable_git_host_at_first_boot_leaves_apps_pending(
+  db, monkeypatch,
+):
+  """Staging the clone is the first network step; a resolver that could not
+  answer is retried, while a host that does not exist is not."""
+  from app import bootstrap as bootstrap_mod
+  from app import install as install_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  monkeypatch.setattr(bootstrap_mod, "prepare_package", install_mod.prepare_package)
+  monkeypatch.setattr(install_mod, "_derive_repo_ref", lambda _url: (
+    "https://unresolvable.invalid/app.git", "main",
+  ))
+  for errno_, pending in (
+    (socket.EAI_AGAIN, tuple(
+      app.manifest_id for app in bootstrap_mod._CORE_BOOTSTRAP_APPS
+    )),
+    (socket.EAI_NONAME, ()),
+  ):
+    def resolve(*_args, errno_=errno_):
+      raise socket.gaierror(errno_, "name resolution failed")
+
+    monkeypatch.setattr(app_git.socket, "getaddrinfo", resolve)
+    install = AsyncMock()
+    with patch("app.bootstrap.install_from_manifest", install):
+      outcome = await bootstrap_mod.ensure_bootstrap_apps_installed(db)
+
+    install.assert_not_awaited()
+    assert outcome.pending == pending
+
+
+@pytest.mark.asyncio
+async def test_runtime_supervisors_own_the_retry_until_shutdown(monkeypatch):
+  import logging
+
+  from app import bootstrap as bootstrap_mod
+  from app.runtime_supervisors import RuntimeSupervisors
+
+  started = asyncio.Event()
+
+  async def retry_forever(_outcome):
+    started.set()
+    await asyncio.Event().wait()
+
+  monkeypatch.setattr(bootstrap_mod, "retry_bootstrap_apps", retry_forever)
+  supervisors = RuntimeSupervisors(
+    settings=MagicMock(data_dir="/tmp"),
+    logger=logging.getLogger("test"),
+    restart_authorization=None,
+    restart_fallback_chats=[],
+  )
+  supervisors.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(("social",)))
+  await asyncio.wait_for(started.wait(), timeout=5)
+  task = supervisors._tasks["bootstrap-apps-retry"]
+
+  await supervisors.stop()
+
+  assert task.cancelled()
+  assert supervisors._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_retry_installs_only_pending_apps_and_respects_a_store_uninstall(
+  db, monkeypatch,
+):
+  """Startup reinstalls an uninstalled Store; a mid-session retry must not."""
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  db.add_all([
+    row for row in _installed_default_rows(
+      datetime.now(timezone.utc), deleted=("store",),
+    )
+    if row.slug != "social"
+  ])
+  db.commit()
+
+  async def no_wait(_seconds):
+    pass
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  install = AsyncMock(side_effect=_installing_rows(db))
+  with patch("app.bootstrap.install_from_manifest", install):
+    await bootstrap_mod.retry_bootstrap_apps(
+      bootstrap_mod.BootstrapOutcome(("social",), rate_limited=True),
+    )
+
+  assert [call.kwargs["manifest_url"] for call in install.await_args_list] == [
+    BOOTSTRAP_SOCIAL_MANIFEST_URL,
+  ]
+  db.expire_all()
+  assert db.query(models.App).filter_by(slug="store").one().deleted_at
+  assert db.query(models.App).filter_by(slug="social").one().deleted_at is None

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   assistantClipboardText,
+  copyMarkdownSelection,
   insertClipboardText,
   markdownClipboardHtml,
   markdownFromFragment,
@@ -187,11 +188,103 @@ test('Markdown insertion can fall back when the browser rejects native editing',
   assert.equal(rejected, 1)
 })
 
-test('assistant prose and the composer share the Markdown clipboard boundary', () => {
+test('a formatting edit selects its text only after the native insert lands', () => {
+  for (const accepted of [true, false]) {
+    const events = []
+    let runQueued
+    assert.equal(queueClipboardTextUndoably({
+      ownerDocument: {
+        defaultView: { queueMicrotask: callback => { runQueued = callback } },
+        execCommand: () => { events.push('insert'); return accepted },
+      },
+    }, '**text**', () => events.push('fallback'), () => events.push('select')), true)
+    assert.deepEqual(events, [], 'nothing runs inside the keydown itself')
+    runQueued()
+    assert.deepEqual(events, accepted ? ['insert', 'select'] : ['insert', 'fallback'])
+  }
+})
+
+function copySelectionFixture({ endsOutside = false, startsInAttachment = false } = {}) {
+  const inside = text('Hello')
+  const outsideMessage = text('tail selected in the next message')
+  // An attachment name rendered beside the prose, inside the same copy
+  // surface but outside every Markdown block.
+  const attachmentName = text('report.pdf')
+  const overlap = {
+    collapsed: false,
+    setStart: () => {},
+    setEnd: () => {},
+    toString: () => 'Hello',
+    cloneContents: () => fragment([text('Hello')]),
+    commonAncestorContainer: null,
+  }
+  const doc = {
+    createRange: () => ({
+      selectNodeContents: () => {},
+      cloneRange: () => overlap,
+      toString: () => 'Hello',
+    }),
+  }
+  const block = {
+    ownerDocument: doc,
+    contains: node => node === inside,
+  }
+  overlap.commonAncestorContainer = block
+  const range = {
+    startContainer: startsInAttachment ? attachmentName : inside,
+    endContainer: endsOutside ? outsideMessage : inside,
+    startOffset: 0,
+    endOffset: 5,
+    intersectsNode: node => node === block,
+    toString: () => (startsInAttachment ? 'report.pdf Hello' : 'Hello'),
+  }
+  doc.getSelection = () => ({ rangeCount: 1, isCollapsed: false, getRangeAt: () => range })
+  const root = {
+    ownerDocument: doc,
+    contains: node => node === inside || node === block || node === attachmentName,
+    querySelectorAll: selector => (selector === '[data-markdown-block]' ? [block] : []),
+  }
+  const written = {}
+  const event = {
+    currentTarget: root,
+    clipboardData: { setData: (type, value) => { written[type] = value } },
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true },
+  }
+  return { event, written }
+}
+
+test('a selection contained in one message copies its Markdown source', () => {
+  const { event, written } = copySelectionFixture({ endsOutside: false })
+  assert.equal(copyMarkdownSelection(event, () => '**Hello**'), true)
+  assert.equal(event.defaultPrevented, true)
+  assert.equal(written['text/markdown'], '**Hello**')
+  assert.equal(written['text/plain'], 'Hello')
+})
+
+test('a selection reaching into the next message keeps the native copy untruncated', () => {
+  const { event, written } = copySelectionFixture({ endsOutside: true })
+  assert.equal(copyMarkdownSelection(event, () => '**Hello**'), false)
+  assert.equal(event.defaultPrevented, false,
+    'overriding here would truncate the visible selection to one message')
+  assert.deepEqual(written, {}, 'the native clipboard payload must stay untouched')
+})
+
+test('a selection that includes an attachment name keeps the native copy', () => {
+  // Both endpoints sit inside the surface, but the attachment text belongs to
+  // no Markdown block: serializing only the blocks would silently drop it.
+  const { event, written } = copySelectionFixture({ startsInAttachment: true })
+  assert.equal(copyMarkdownSelection(event, () => '**Hello**'), false)
+  assert.equal(event.defaultPrevented, false,
+    'the blocks alone cannot represent the attachment text the user selected')
+  assert.deepEqual(written, {}, 'the native clipboard payload must stay untouched')
+})
+
+test('chat prose and the composer share the Markdown clipboard boundary', () => {
   const message = readFileSync(new URL('../MsgContent.jsx', import.meta.url), 'utf8')
   const composer = readFileSync(new URL('../ChatInputBar.jsx', import.meta.url), 'utf8')
-  assert.match(message, /onCopy=\{\(event\) => copyAssistantSelection\(event, markdownForBlock\)\}/)
-  assert.match(message, /data-assistant-markdown-block=/)
+  assert.match(message, /onCopy=\{\(event\) => copyMarkdownSelection\(event, markdownForBlock\)\}/)
+  assert.match(message, /data-markdown-block=/)
   assert.match(message, /if \(markdownByIndex\) return markdownByIndex\.get\(index\) \?\? ''/,
     'a partial cold render must not fall back to the hidden full message source')
   assert.match(composer, /assistantClipboardText\(\s*e\.clipboardData,\s*preferPlainText/)

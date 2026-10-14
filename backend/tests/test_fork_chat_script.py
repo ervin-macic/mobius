@@ -106,6 +106,66 @@ def test_claude_uses_exact_fork_and_reports_distinct_session():
   )
 
 
+def test_side_question_fork_answers_on_the_chats_model_and_is_never_saved():
+  seen = {}
+
+  def runner(args, **kwargs):
+    seen["args"] = args
+    return subprocess.CompletedProcess(
+      args,
+      0,
+      stdout=json.dumps({"session_id": "fork-session", "result": "an answer"}),
+      stderr="",
+    )
+
+  _fork_claude(
+    "source-session", "/data", "side question",
+    model="claude-haiku-5-5", ephemeral=True, runner=runner,
+  )
+
+  args = seen["args"]
+  # Without --model the CLI would answer with its own default model.
+  assert args[args.index("--model") + 1] == "claude-haiku-5-5"
+  assert "--no-session-persistence" in args
+  assert args.index("--fork-session") < args.index("--print")
+  # Still a tool-less exact fork.
+  assert args[-2:] == ["--tools", ""]
+
+
+def test_coaching_fork_keeps_its_saved_session_and_default_model():
+  seen = {}
+
+  def runner(args, **kwargs):
+    seen["args"] = args
+    return subprocess.CompletedProcess(
+      args, 0, stdout=json.dumps({"session_id": "fork", "result": "r"}), stderr="",
+    )
+
+  _fork_claude("source", "/data", "coach", runner=runner)
+  assert "--model" not in seen["args"]
+  assert "--no-session-persistence" not in seen["args"]
+
+
+def test_cli_passes_side_question_options_only_when_given(monkeypatch, capsys):
+  seen = []
+
+  def fake_fork(provider, session_id, cwd, prompt, **options):
+    seen.append(options)
+    return ForkResult(
+      provider=provider, source_session_id=session_id,
+      forked_session_id="fork", answer="ok",
+    )
+
+  monkeypatch.setattr(fork_session_module, "fork_session", fake_fork)
+  assert fork_session_module.main([
+    "--json", "--ephemeral", "--model", "gpt-5.5",
+    "codex", "thread", "/data", "side question",
+  ]) == 0
+  assert fork_session_module.main(["--json", "codex", "thread", "/data", "coach"]) == 0
+  assert seen == [{"model": "gpt-5.5", "ephemeral": True}, {}]
+  capsys.readouterr()
+
+
 @pytest.mark.parametrize(
   ("payload", "expected"),
   [
@@ -244,6 +304,65 @@ def test_codex_uses_sdk_thread_fork_and_read_only_turn(tmp_path, monkeypatch):
   after = try_acquire_codex_session_sweep(data_dir)
   assert after is not None
   after.release()
+
+
+def test_codex_side_question_fork_is_ephemeral_and_uses_the_chats_model(
+  tmp_path, monkeypatch,
+):
+  # The fork derives its lock directory from CODEX_HOME; without this pin the
+  # test would reach for the instance's real /data, which CI does not have.
+  monkeypatch.setenv("CODEX_HOME", str(tmp_path / "cli-auth" / "codex"))
+  calls = {}
+
+  class FakeConfig:
+    def __init__(self, **kwargs):
+      calls["config"] = kwargs
+
+  class FakeApprovalMode:
+    deny_all = "deny_all"
+
+  class FakeSandbox:
+    read_only = "read-only"
+
+  class FakeThread:
+    id = "forked-codex-thread"
+
+    async def run(self, prompt, **kwargs):
+      calls["run"] = kwargs
+      return SimpleNamespace(error=None, final_response="side answer")
+
+  class FakeClient:
+    async def request(self, method, params, *, response_model):
+      return response_model.model_validate({"data": [], "nextCursor": None})
+
+  class FakeCodex:
+    def __init__(self, config):
+      self._client = FakeClient()
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *args):
+      return None
+
+    async def thread_fork(self, source_session_id, **kwargs):
+      calls["fork"] = kwargs
+      return FakeThread()
+
+  def mcp_inventory_runner(args, **kwargs):
+    return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+  result = asyncio.run(_fork_codex_async(
+    "source-codex-thread", "/data", "side question",
+    model="gpt-5.5", ephemeral=True,
+    sdk_loader=lambda: (FakeCodex, FakeConfig, FakeApprovalMode, FakeSandbox, None),
+    mcp_inventory_runner=mcp_inventory_runner,
+  ))
+
+  assert result.answer == "side answer"
+  assert calls["fork"]["ephemeral"] is True
+  assert calls["fork"]["sandbox"] == "read-only"
+  assert calls["run"]["model"] == "gpt-5.5"
 
 
 def test_codex_mcp_inventory_is_encoded_as_one_exact_disable_map():

@@ -3,20 +3,29 @@
 #
 #   scripts/test-transcript-rollback.sh <previous-image> <candidate-image>
 #
-# The candidate keeps the previous release's chats.messages as an exact mirror
-# of its message rows, so the previous image may run on the same database at
-# any time. Each container gets a fresh /data (its own baked code) and shares
-# only /data/db, so every step reads and writes with that release's own code
+# The candidate keeps chats.messages as an exact mirror of its message rows,
+# so an earlier release may run on the same database at any time. Each round
+# rolls back to one of the two earlier releases an owner can return to:
+#
+#   round 1, across the conversion: the conversion's parent, the newest
+#     release without message rows (named after the <previous-image>
+#     repository). It reads and writes chats.messages only.
+#   round 2, the release owners ran last: <previous-image>, the newest
+#     published release, which stores rows itself and writes through them.
+#
+# Each container gets a fresh /data (its own baked code) and shares only
+# /data/db, so every step reads and writes with that release's own code
 # (scripts/transcript_rollback_probe.py runs inside it).
 #
-# 1. previous: seed typed, bulk, damaged and tombstoned chats.
+# 1. the conversion's parent seeds typed, bulk, damaged and tombstoned chats.
 # 2. candidate: ready at once; converts in the background; every transcript is
 #    exact, the damaged bytes are kept; then writes through writer commands.
-# 3. previous: reads every chat exactly as the candidate left it; writes.
-# 4. before the candidate returns, exactly the chats the previous release
-#    changed or created lack a conversion marker and its purge left nothing;
-#    the candidate re-converts them and nothing is lost.
-# 5. one more candidate -> previous -> candidate cycle (steady state).
+# 3. the round's release reads every chat exactly as the candidate left it,
+#    then writes.
+# 4. before the candidate returns, exactly the chats a release without rows
+#    changed or created lack a conversion marker (none for a release with
+#    rows), and its purge left nothing; the candidate re-converts them.
+# 5. the candidate returns after both rounds and nothing is lost.
 #
 # Transcripts are compared as canonical JSON text, and every converted chat's
 # legacy bytes must equal '[' + ', '.join(row bodies) + ']' exactly.
@@ -24,7 +33,7 @@
 
 set -euo pipefail
 
-PREVIOUS="${1:?previous image}"
+LATEST="${1:?previous image}"
 CANDIDATE="${2:?candidate image}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 name="mobius-transcript-rollback-$$"
@@ -115,24 +124,19 @@ PY
 
 docker volume create "$db_volume" >/dev/null
 
-# "previous" is a release without message rows: the one an owner rolls back to
-# across the conversion. Once the newest published ancestor stores rows itself,
-# use the conversion's parent, which the candidate must still be able to run on.
-if [ "$(offline_probe "$PREVIOUS" stores-rows)" = '{"rows": true}' ]; then
-  conversion=$(git -C "$ROOT" log --first-parent --diff-filter=A --format=%H -- backend/app/transcript_rows.py | tail -1)
-  [ -n "$conversion" ] || fail "cannot find the release that introduced message rows"
-  PREVIOUS="${PREVIOUS%%:*}:sha-$(git -C "$ROOT" rev-parse "$conversion^")"
-  echo "previous release already stores message rows; rolling back to $PREVIOUS"
-  docker pull -q "$PREVIOUS" >/dev/null || fail "cannot pull $PREVIOUS"
-fi
+conversion=$(git -C "$ROOT" log --first-parent --diff-filter=A --format=%H -- backend/app/transcript_rows.py | tail -1)
+[ -n "$conversion" ] || fail "cannot find the release that introduced message rows"
+BEFORE_ROWS="${LATEST%%:*}:sha-$(git -C "$ROOT" rev-parse "$conversion^")"
+docker pull -q "$BEFORE_ROWS" >/dev/null || fail "cannot pull $BEFORE_ROWS"
 
-echo "1. previous release seeds history"
-start "$PREVIOUS"
+echo "1. the release before message rows ($BEFORE_ROWS) seeds history"
+start "$BEFORE_ROWS"
 probe seed >/dev/null
 probe dump > "$work/seeded.json"
 docker stop "$name" >/dev/null
 
 for round in 1 2; do
+  if [ "$round" = 1 ]; then previous=$BEFORE_ROWS; else previous=$LATEST; fi
   echo "2.$round candidate converts and writes"
   start "$CANDIDATE"
   converge
@@ -153,15 +157,15 @@ PY
   probe dump > "$work/candidate.json"
   docker stop "$name" >/dev/null
 
-  echo "3.$round previous release reads everything and writes"
-  start "$PREVIOUS"
+  echo "3.$round $previous reads everything and writes"
+  start "$previous"
   probe dump > "$work/previous-view.json"
   same "previous release sees the candidate's transcripts" "$work/candidate.json" "$work/previous-view.json"
   wrote=$(probe write-old)
   probe dump > "$work/seeded.json"
   docker stop "$name" >/dev/null
 
-  echo "4.$round only the previous release's changes are marked"
+  echo "4.$round only the changes of a release without rows are marked"
   marks=$(offline_probe "$CANDIDATE" unconverted)
   python3 - "$marks" "$wrote" <<'PY' || fail "the previous release's changes were not detected exactly: $marks (expected per $wrote)"
 import json, sys

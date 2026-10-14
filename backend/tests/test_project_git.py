@@ -180,6 +180,35 @@ def test_owner_can_initialize_and_commit_only_a_project_owned_repository(
   assert _git(root, "log", "-1", "--pretty=%s") == "Update the greeting"
 
 
+def test_cancelled_init_holds_the_source_lock_until_git_finishes(
+  client, auth, db, monkeypatch,
+):
+  import asyncio
+
+  from app import fs_locks
+  from app.deps import ProjectPrincipal
+  from app.routes import projects as routes
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  project = client.post(
+    "/api/projects", headers=auth,
+    json={"name": "Cancelled init", "template_id": "blank"},
+  ).json()
+  root = _project_root(db, project)
+  worker = BlockedWorker(wraps=project_git.initialize_project)
+  monkeypatch.setattr(project_git, "initialize_project", worker)
+  principal = ProjectPrincipal(owner=db.query(models.Owner).one(), role="owner")
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(root)),
+    lambda: routes.initialize_project_git(project["id"], principal, db),
+    worker,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  assert (root / ".git").is_dir()
+
+
 def test_commit_route_refuses_to_stage_the_shared_data_repository(client, auth, db):
   project = client.post(
     "/api/projects", headers=auth,

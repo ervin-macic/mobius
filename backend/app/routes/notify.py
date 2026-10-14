@@ -16,13 +16,12 @@ import logging
 import time
 from typing import Annotated
 
-import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app import models
+from app.streaming import ClosingStreamingResponse
 from app.broadcast import (
   get_active_broadcast,
   get_all_active_broadcasts,
@@ -44,21 +43,6 @@ log = logging.getLogger(__name__)
 # Keepalive cadence for the shell-level SSE — same value used in
 # chats_stream so proxies behave consistently.
 _KEEPALIVE_INTERVAL = 30
-
-
-class _SystemEventStreamingResponse(StreamingResponse):
-  """Close the event iterator when ASGI abandons an in-flight body send."""
-
-  async def __call__(self, scope, receive, send):
-    try:
-      await super().__call__(scope, receive, send)
-    finally:
-      close = getattr(self.body_iterator, "aclose", None)
-      if close is not None:
-        # A server can cancel the outer ASGI task as well as Starlette's body
-        # task. Re-enter the suspended async generator even in that state.
-        with anyio.CancelScope(shield=True):
-          await close()
 
 
 # Characters kept from a build_phase label. The label is the one free-text
@@ -94,6 +78,12 @@ _OPEN_ITEM_FIELDS = (
   "itemKind", "itemId", "sourceKind", "sourceId", "placement", "activation",
 )
 _OPEN_ITEM_KINDS = frozenset({"app", "chat"})
+# Settings opens the shell's one Settings screen, optionally focused on a
+# section. It is navigation, never placement: no source, no placement, and only
+# a foreground activation, and every action inside Settings stays the owner's.
+# The ids mirror frontend/src/lib/settingsSections.js (pinned by
+# tests/test_notify_open_item.py).
+_SETTINGS_SECTIONS = frozenset({"ai-providers", "background-agents", "github", "models"})
 _OPEN_ITEM_PLACEMENTS = frozenset({"beside-source", "with-source", "with-focus"})
 _OPEN_ITEM_ACTIVATIONS = frozenset({"background", "foreground"})
 
@@ -174,8 +164,10 @@ class NotifyBody(BaseModel):
       for name in ("label", "chatId", "appId", "error"):
         if getattr(self, name) is not None:
           raise ValueError(f"{name} is not valid for open_item events")
+      if self.itemKind == "settings":
+        return self._confine_settings_open()
       if self.itemKind not in _OPEN_ITEM_KINDS:
-        raise ValueError("open_item requires itemKind in {app, chat}")
+        raise ValueError("open_item requires itemKind in {app, chat, settings}")
       # itemId / sourceId must be non-empty AND non-whitespace: an empty string
       # passes a bare None-check and the pairing check below, but names nothing —
       # the shell would drop it, so reject at the wire instead of a silent 204.
@@ -227,6 +219,20 @@ class NotifyBody(BaseModel):
       return self
     if self.label is not None:
       self.label = self.label[:_LABEL_MAX]
+    return self
+
+
+  def _confine_settings_open(self) -> "NotifyBody":
+    if self.itemId is not None and self.itemId not in _SETTINGS_SECTIONS:
+      raise ValueError(
+        "open_item settings itemId must be one of "
+        f"{', '.join(sorted(_SETTINGS_SECTIONS))}, or omitted for Settings itself"
+      )
+    for name in ("sourceKind", "sourceId", "placement"):
+      if getattr(self, name) is not None:
+        raise ValueError(f"{name} is not valid when opening Settings")
+    if self.activation not in (None, "foreground"):
+      raise ValueError("Settings opens in the foreground only")
     return self
 
 
@@ -297,7 +303,11 @@ def notify(
   # A missing or deleted item is refused here, so every caller (the open_item
   # tool, a direct POST) learns nothing was opened; the shell still confirms
   # before placing in case the item disappears in between.
-  if body.type == "open_item":
+  if body.type == "open_item" and body.itemKind == "settings":
+    event["itemKind"] = "settings"
+    if body.itemId is not None:
+      event["itemId"] = body.itemId
+  elif body.type == "open_item":
     if not _open_item_exists(db, body.itemKind, body.itemId):
       raise HTTPException(
         status_code=404,
@@ -429,7 +439,7 @@ async def stream_system_events(
     finally:
       broadcast.unsubscribe(queue)
 
-  return _SystemEventStreamingResponse(
+  return ClosingStreamingResponse(
     revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

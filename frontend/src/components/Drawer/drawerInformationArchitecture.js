@@ -54,11 +54,15 @@ function recentAt({ kind, item }) {
     return item?.activity_at || item?.updated_at || item?.created_at || ''
   }
   if (kind === 'artifact') return item?.last_opened_at || ''
+  // A project the agent created but the owner never opened is still new to
+  // them: rank it by creation, never by file edits (updated_at), so work in
+  // its tree cannot manufacture recency.
+  if (kind === 'project') return item?.last_opened_at || item?.created_at || ''
   return item?.last_opened_at || item?.updated_at || item?.created_at || ''
 }
 
 function newestRecentFirst(a, b) {
-  return recentAt(b).localeCompare(recentAt(a))
+  return normalizedStamp(recentAt(b)).localeCompare(normalizedStamp(recentAt(a)))
 }
 
 /**
@@ -99,10 +103,12 @@ export function projectPendingDrawerPins(
  * oldest-pin-first, so a
  * new pin appends at the bottom and manual drag-to-reorder owns the rest.
  * Unpinned chats and apps share one newest-first Recents section; archived
- * chats leave both for the Archived section, newest archive first. Projects and
- * built artifacts join only after an explicit open; file changes and rebuilds
- * alone never manufacture recency. An artifact row is its own destination and
- * carries no project belonging; the composite id only addresses it.
+ * chats leave both for the Archived section, newest archive first. Unpinned
+ * projects join at their last open, or at creation until the first open, so a
+ * project the agent made is findable; built artifacts join only after an
+ * explicit open. File changes and rebuilds alone never manufacture recency.
+ * An artifact row is its own destination and carries no project belonging;
+ * the composite id only addresses it.
  * Chat activity follows owner conversation activity; app activity follows
  * explicit opens, falling back to bundle update/creation time until the first
  * open. The searchable apps grid keeps its own stable ordering.
@@ -155,7 +161,7 @@ export function buildDrawerSections(chats = [], apps = [], projects = []) {
       .filter(app => !app.pinned_at)
       .map(item => ({ kind: 'app', item })),
     ...projects
-      .filter(project => !project.pinned_at && project.last_opened_at)
+      .filter(project => !project.pinned_at)
       .map(item => ({ kind: 'project', item })),
     ...projects.flatMap(project => (
       Array.isArray(project?.artifacts) ? project.artifacts : []

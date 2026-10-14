@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.agent_lifecycle import stable_activation_id
 from app.config import get_settings
+from app.continuations import SIDE_QUESTION_MESSAGE_KIND
 from app.tool_summaries import summarize_tool_input
 
 
@@ -94,8 +95,8 @@ def _delegation_conversation(db: Session, delegation: models.Delegation) -> dict
 
   Its tasks read as ``{"role": "user", "content"}``, its replies as
   ``{"role": "assistant", "content"}``, and tool blocks as stored; hidden
-  product messages (result carriers, wakes) are not its conversation. A
-  running turn's live steps are included.
+  product messages (result carriers, wakes) and kept side questions are not
+  its conversation. A running turn's live steps are included.
   """
   from app.chat_transcript import materialized_messages
 
@@ -108,6 +109,11 @@ def _delegation_conversation(db: Session, delegation: models.Delegation) -> dict
   blocks: list[dict] = []
   for message in materialized_messages(child):
     if not isinstance(message, dict) or message.get("hidden"):
+      continue
+    # A kept /btw answer is the owner's aside from a temporary copy, not the
+    # helper's conversation; a parent reading it here would take model text
+    # for its own task.
+    if message.get("kind") == SIDE_QUESTION_MESSAGE_KIND:
       continue
     if message.get("role") == "user":
       content = message.get("content")

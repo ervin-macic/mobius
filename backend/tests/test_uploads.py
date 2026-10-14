@@ -660,3 +660,29 @@ def test_upload_cleanup_only_when_the_record_did_not_land(db, chat, monkeypatch,
     assert on_disk == [] and not chat.uploads
   else:
     assert on_disk == ["kept.txt"] and [u["name"] for u in chat.uploads] == ["kept.txt"]
+
+
+@pytest.mark.parametrize("step", ["_record_uploads", "_forget_draft"])
+def test_a_cancelled_upload_write_holds_the_chat_lock_until_it_ends(
+  client, db, auth, chat, monkeypatch, step,
+):
+  """A client that goes away never releases the chat lock under its commit."""
+  from fastapi import UploadFile
+  from app import chat_queue
+  from app.deps import Principal
+  from app.routes import uploads
+  from tests.cancel_helpers import assert_cancellation_drains_worker_under_lock
+
+  record = _upload(client, auth, chat, "draft.txt", b"draft")
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+
+  def operation():
+    if step == "_record_uploads":
+      file = UploadFile(file=io.BytesIO(b"new"), filename="new.txt")
+      return uploads.upload_files(chat.id, [file], principal, db)
+    return uploads.delete_upload(chat.id, record["name"], principal=principal, db=db)
+
+  assert_cancellation_drains_worker_under_lock(
+    chat_queue.get_lock(chat.id), operation, monkeypatch, uploads, step,
+    then=lambda: [] if step == "_record_uploads" else False,
+  )

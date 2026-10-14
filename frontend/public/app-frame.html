@@ -612,8 +612,10 @@
     //      registered before iframe.onLoad fires in the parent).
     //   2. parent (AppCanvas.jsx) posts
     //      {type:'moebius:frame-init', token, themeCss, bg,
-    //       capabilityContract} on
-    //      its iframe.onLoad handler.
+    //       capabilityContract, navLocation, waitForNavigationReady} on
+    //      its iframe.onLoad handler. navLocation is the JSON text this app's
+    //      previous frame reported through window.mobius.nav.setLocation, or
+    //      null; the runtime validates it and exposes it as nav.location.
     //   3. iframe applies theme and requests its compiled module from the
     //      parent. The controlled shell can read the versioned service-worker
     //      cache offline; this opaque frame cannot. The parent transfers only
@@ -640,6 +642,10 @@
     //      frame answers {type:'moebius:app-intent-applied', appId, nonce}.
     //   9. pointer input posts {type:'moebius:frame-focus'} so the shell can focus
     //      this app's pane; iframe events do not bubble into the parent wrapper.
+    //  10. parent posts {type:'moebius:frame-visibility', visible} at load and on
+    //      every foreground change. The first one usually lands before the app
+    //      runtime evaluates, so this frame keeps the latest verdict and hands
+    //      it to the runtime's init (`frameVisible` in its config).
     //
     // Origin check: the opaque iframe still sees the parent shell's concrete
     // origin on incoming postMessage events and rejects every other sender.
@@ -649,6 +655,8 @@
     let initialized = false;
     let currentToken = null;
     let currentCapabilityContract = null;
+    let currentNavLocation = null;
+    let waitForNavigationReady = false;
     let tokenRefreshPromise = null;
     let tokenRefreshResolve = null;
     let mountedRoot = null;
@@ -658,6 +666,7 @@
     let Fragment = null;
     const COMPILED_RUNTIME_ABI = 1;
     let suspendedScrollFrame = null;
+    let frameVisible = null;
     let nextModuleRequest = 0;
     const pendingModuleRequests = new Map();
     const suspendedScrollOffsets = new Map();
@@ -1384,6 +1393,11 @@
           appInstanceId: tokenAppInstanceId(currentToken),
           getToken: runtimeToken,
           capabilityContract: currentCapabilityContract,
+          navLocation: currentNavLocation,
+          waitForNavigationReady,
+          // Read when the runtime initializes, not when the module load
+          // starts, so a verdict posted during the module fetch still counts.
+          get frameVisible() { return frameVisible; },
         };
         // Opaque sandboxed frames are intentionally NOT controlled by the
         // shell's service worker. Loading /module directly from here therefore
@@ -1478,6 +1492,10 @@
         setFrameInteractivity(msg.interactive === true, msg.suspendScrolling === true);
         return;
       }
+      if (msg.type === 'moebius:frame-visibility') {
+        if (typeof msg.visible === 'boolean') frameVisible = msg.visible;
+        return;
+      }
       if (msg.type === 'moebius:frame-font-check') {
         const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
         if (!requestId || requestId.length > 160) return;
@@ -1546,6 +1564,8 @@
         acceptToken(msg.token);
         if (initialized) return;
         initialized = true;
+        waitForNavigationReady = msg.waitForNavigationReady === true;
+        currentNavLocation = typeof msg.navLocation === 'string' ? msg.navLocation : null;
         if (typeof window.__mobiusHydrateLocalStorage === 'function') {
           window.__mobiusHydrateLocalStorage(msg.storage);
         }

@@ -16,6 +16,7 @@ import pytest
   [
     "/shell/?app=42",
     "/shell/?chat=abc-123",
+    "/shell/?settings=ai-providers",
   ],
 )
 def test_notification_target_round_trips(client, auth, target):

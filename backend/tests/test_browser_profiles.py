@@ -141,6 +141,7 @@ def _fake_browser_process(
   (process / "cmdline").write_bytes(
     f"/usr/local/lib/{executable}\0".encode()
   )
+  (process / "exe").symlink_to(f"/usr/local/lib/{executable}")
   values = {
     "CHAT_ID": chat_id,
     "AGENT_BROWSER_SESSION": session,
@@ -657,6 +658,87 @@ def test_named_profile_outlives_the_chat_idle_horizon(tmp_path):
   )
 
   assert profile.exists()
+  assert result["profiles_pruned"] == 0
+
+
+def test_ad_hoc_profile_named_after_a_chat_retires_with_that_chat(tmp_path):
+  """An agent's extra `sd-<chat id>` or `qa-refresh-<chat id>` profile is
+  that chat's scratch.
+
+  Left on the named-session grace, a 41 MB leftover outlived its chat on a
+  434 MB volume; it now follows the chat's own idle and deletion horizon.
+  """
+  idle_chat = "12345678-1234-1234-1234-123456789abc"
+  deleted_chat = "22345678-1234-1234-1234-123456789abc"
+  recent_chat = "32345678-1234-1234-1234-123456789abc"
+  running_chat = "42345678-1234-1234-1234-123456789abc"
+  now = datetime.now(UTC).replace(tzinfo=None)
+  idle = _named_profile(tmp_path, f"sd-{idle_chat}", cache_bytes=0, durable_bytes=20)
+  deleted = _named_profile(
+    tmp_path, f"qa-refresh-{deleted_chat}", cache_bytes=0, durable_bytes=20,
+  )
+  recent = _named_profile(tmp_path, f"sd-{recent_chat}", cache_bytes=0, durable_bytes=20)
+  running = _named_profile(tmp_path, f"sdv3-{running_chat}", cache_bytes=0, durable_bytes=20)
+  chats = {
+    idle_chat: {"activity_at": now - timedelta(days=3), "deleted_at": None, "running": False},
+    deleted_chat: {"activity_at": now, "deleted_at": now, "running": False},
+    recent_chat: {"activity_at": now - timedelta(hours=1), "deleted_at": None, "running": False},
+    running_chat: {"activity_at": now - timedelta(days=9), "deleted_at": None, "running": True},
+  }
+
+  result = enforce_browser_profile_quota(
+    tmp_path, chats, set(), now=now, max_bytes=10**9, low_water_bytes=10**9,
+    inactive_days=2, active_profile_names=set(),
+  )
+
+  assert not idle.exists()
+  assert not deleted.exists()
+  assert recent.exists()
+  assert running.exists()
+  assert result["profiles_pruned"] == 2
+  assert result["non_chat_profile_count"] == 0
+
+
+def test_profile_naming_an_unknown_id_keeps_the_named_session_grace(tmp_path):
+  profile = _named_profile(
+    tmp_path, "qa-92345678-1234-1234-1234-123456789abc",
+    cache_bytes=0, durable_bytes=20,
+  )
+  now = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=10)
+
+  result = enforce_browser_profile_quota(
+    tmp_path, {}, set(), now=now, max_bytes=10**9, low_water_bytes=10**9,
+    inactive_days=2, active_profile_names=set(),
+  )
+
+  assert profile.exists()
+  assert result["non_chat_profile_count"] == 1
+
+
+def test_only_a_prefix_dash_chat_id_name_retires_with_the_chat(tmp_path):
+  """A name that merely contains a chat id is a deliberate named session.
+
+  The prefix may have several lowercase words, but it must be a clean
+  hyphen-separated prefix and the chat id must end the name.
+  """
+  chat = "52345678-1234-1234-1234-123456789abc"
+  now = datetime.now(UTC).replace(tzinfo=None)
+  kept = [
+    _named_profile(tmp_path, name, cache_bytes=0, durable_bytes=20)
+    for name in (
+      f"{chat}-touch", f"keep-{chat}-long", f"qa-refresh-{chat}-2",
+      f"QA-{chat}", f"QA-refresh-{chat}", f"qa_refresh-{chat}",
+      f"qa--{chat}", f"-{chat}",
+    )
+  ]
+  chats = {chat: {"activity_at": now - timedelta(days=3), "deleted_at": now, "running": False}}
+
+  result = enforce_browser_profile_quota(
+    tmp_path, chats, set(), now=now, max_bytes=10**9, low_water_bytes=10**9,
+    inactive_days=2, active_profile_names=set(),
+  )
+
+  assert all(profile.exists() for profile in kept)
   assert result["profiles_pruned"] == 0
 
 

@@ -7,8 +7,8 @@ const chatViewSrc = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'u
 const changeHandler = inputBarSrc.match(
   /function handleTextareaChange\(e\) \{[\s\S]*?\n  \}/,
 )?.[0] || ''
-const historyMoveHandler = inputBarSrc.match(
-  /function applyHistoryMove\(historyMove\) \{[\s\S]*?\n    \}/,
+const historyValueHandler = inputBarSrc.match(
+  /function showComposerValue\(value\) \{[\s\S]*?\n  \}/,
 )?.[0] || ''
 const slashCommandHandler = inputBarSrc.match(
   /function acceptSlashCommand\(command\) \{[\s\S]*?\n  \}/,
@@ -33,13 +33,13 @@ test('ChatView connects manual voice edits to the voice-input session', () => {
   assert.match(chatViewSrc, /onManualVoiceEdit=\{acceptManualEdit\}/)
 })
 
-test('sent-message recall rebases live dictation before changing the draft', () => {
-  assert.match(historyMoveHandler,
-    /if \(listeningRef\?\.current\) \{[\s\S]*?onManualVoiceEdit\?\.\(historyMove\.value\)/,
+test('history recall and the returning draft rebase live dictation before changing the box', () => {
+  assert.match(historyValueHandler,
+    /if \(listeningRef\?\.current\) \{[\s\S]*?onManualVoiceEdit\?\.\(value\)/,
     'history recall must take the same voice-session ownership as typed edits')
   assert.ok(
-    historyMoveHandler.indexOf('onManualVoiceEdit?.(historyMove.value)')
-      < historyMoveHandler.indexOf('onInputChange(historyMove.value)'),
+    historyValueHandler.indexOf('onManualVoiceEdit?.(value)')
+      < historyValueHandler.indexOf('onInputChange(value)'),
     'the voice baseline must update before the controlled composer value',
   )
 })

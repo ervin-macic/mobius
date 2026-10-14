@@ -12,16 +12,21 @@ import {
 test('idle waking helpers own one visible automatic Waiting handoff', () => {
   const helpers = {
     count: 2,
-    items: [{ task_key: 'review_copy' }, { task_key: 'verify-build' }],
+    items: [
+      { task_key: 'review-copy', title: 'review-copy' },
+      { task_key: 'verify-build', title: 'verify-build' },
+    ],
   }
-  assert.equal(classifyChatHandoff({ backgroundHelpers: helpers }), 'automatic')
-  assert.deepEqual(helperPresentation(helpers), {
+  assert.equal(classifyChatHandoff({ backgroundHelpers: helpers, authoritativeHandoff: { kind: 'automatic' } }), 'automatic')
+  assert.deepEqual(helperPresentation(helpers, { kind: 'automatic' }), {
     count: 2,
-    tasks: ['Review copy', 'Verify build'],
+    tasks: ['review-copy', 'verify-build'],
     summary: 'Waiting on 2 helpers',
     owner: '2 helper agents',
-    usage: 'Helpers use their own turns · no separate monitor is polling',
+    automatic: true,
+    usage: 'Usage unknown',
   })
+  assert.equal(helperPresentation(helpers, { kind: 'recovery' }).automatic, false)
 })
 
 test('declared waits stay compact and disclose ownership, deadline, and cost', () => {
@@ -57,7 +62,7 @@ test('waits without timestamps keep their ordinary fallback labels', () => {
 
 test('live parent work suppresses the helper handoff without erasing it', () => {
   const backgroundHelpers = { count: 1, items: [] }
-  assert.equal(classifyChatHandoff({ backgroundHelpers }), 'automatic')
+  assert.equal(classifyChatHandoff({ backgroundHelpers, authoritativeHandoff: { kind: 'automatic' } }), 'automatic')
   assert.equal(classifyChatHandoff({
     turnActive: true,
     backgroundHelpers,
@@ -141,3 +146,8 @@ for (const kind of ['model_capacity', 'rate_limit', 'memory', 'storage']) {
     assert.doesNotMatch(restart.wakeUp, /choose another model/)
   })
 }
+
+test('helper count alone cannot promise an automatic executor', () => {
+  assert.equal(classifyChatHandoff({ backgroundHelpers: { count: 3, items: [] } }), 'none')
+  assert.equal(helperPresentation({ count: 3 }).automatic, false)
+})

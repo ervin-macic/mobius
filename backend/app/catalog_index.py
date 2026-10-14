@@ -30,6 +30,7 @@ import httpx
 from app import install, skills
 from app.config import get_settings
 from app.manifest_contract import SKILL_MAX_BYTES
+from app.net_utils import pinned_client
 from app.storage_io import atomic_write
 
 log = logging.getLogger(__name__)
@@ -281,7 +282,7 @@ async def refresh(force: bool = False, sources: list[dict] | None = None) -> dic
     }
 
   generated_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-  async with httpx.AsyncClient(follow_redirects=False, timeout=install._HTTP_TIMEOUT) as client:
+  async with pinned_client(timeout=install._HTTP_TIMEOUT) as client:
     per_source = [await _scan_source(client, s) for s in src_list]
 
   atomic_write(target, build_index(per_source, generated_at, fingerprint))

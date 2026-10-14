@@ -371,6 +371,51 @@ def test_goal_report_supplies_completion_keys_without_bloating_progress_updates(
   assert "test:verified" not in settled
 
 
+def test_a_compile_refusal_carries_its_diagnostic_not_just_that_it_failed():
+  control = _control_module()
+  body = json.dumps({"detail": {
+    "code": "compile_failed", "message": "Compilation failed.",
+    "stderr": "[PARSE_ERROR] Unexpected token\n   ╭─[ index.jsx:2:47 ]",
+  }})
+
+  reason = control._refusal_message(body)
+
+  assert reason.startswith("Compilation failed.\n[PARSE_ERROR] Unexpected token")
+  assert "index.jsx:2:47" in reason
+
+
+def test_a_long_compile_refusal_survives_the_http_error_body_read(monkeypatch):
+  import io
+  import urllib.error
+
+  control = _control_module()
+  monkeypatch.setenv("API_BASE_URL", "http://backend.test")
+  monkeypatch.setenv("AGENT_TOKEN", "t")
+  stderr = "\n".join(f"[UNRESOLVED_IMPORT] missing-{i} at index.jsx:{i}:1" for i in range(150))
+  assert len(stderr) > 4000
+  body = json.dumps({"detail": {
+    "code": "compile_failed", "message": "Compilation failed.", "stderr": stderr,
+  }}).encode()
+
+  def refuse(request, timeout=None):
+    raise urllib.error.HTTPError(request.full_url, 422, "Unprocessable", {}, io.BytesIO(body))
+
+  monkeypatch.setattr(control, "urlopen", refuse)
+  with pytest.raises(RuntimeError) as caught:
+    control._agent_api_json("POST", "/api/apps/x/apply")
+
+  text = str(caught.value)
+  assert text.startswith("Refused (422): Compilation failed.\n[UNRESOLVED_IMPORT] missing-0")
+  assert not text.lstrip("Refused (422): ").startswith("{")
+  assert len(text) < 5200
+
+
+def test_only_a_compile_refusal_appends_stderr():
+  control = _control_module()
+  body = json.dumps({"detail": {"code": "other", "message": "Nope.", "stderr": "secret"}})
+  assert control._refusal_message(body) == "Nope."
+
+
 def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
   control = _control_module()
   monkeypatch.setenv("CHAT_ID", "chat-1")
@@ -1193,6 +1238,33 @@ def test_open_item_places_beside_this_chat_in_the_background_by_default(monkeypa
   })]
 
 
+def test_open_item_settings_only_navigates_to_the_named_section(monkeypatch):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control)
+
+  receipt = control._call_open_item({"kind": "settings", "id": "ai-providers"})
+  control._call_open_item({"kind": "settings"})
+
+  assert sent == [
+    ("POST", "/api/notify", {
+      "type": "open_item", "itemKind": "settings", "itemId": "ai-providers",
+    }),
+    ("POST", "/api/notify", {"type": "open_item", "itemKind": "settings"}),
+  ]
+  assert "they still make any change there themselves" in receipt
+
+
+def test_open_item_settings_refuses_a_background_open(monkeypatch):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control)
+
+  with pytest.raises(ValueError, match="foreground only"):
+    control._call_open_item({"kind": "settings", "id": "github", "activation": "background"})
+  with pytest.raises(ValueError, match="needs: id"):
+    control._call_open_item({"kind": "app"})
+  assert sent == []
+
+
 def test_request_secret_saves_a_sealed_card_and_never_offers_reveal(monkeypatch):
   control = _control_module()
   saved = []
@@ -1417,3 +1489,63 @@ def test_legacy_success_text_is_readable_but_not_repeated_in_write_receipts():
   assert "Historical result" in control._goal_report(payload, full=True)
   payload["goal"]["status"] = "cannot_complete"
   assert "Historical result" in control._goal_report(payload, full=False)
+
+
+def test_helper_checklist_tool_is_task_only_and_returns_a_compact_receipt(monkeypatch):
+  control = _control_module()
+  assert 'update_goal_tasks' in platform_tools.expected_control_tool_names(top_level=False)
+  assert 'update_goal_tasks' not in platform_tools.expected_control_tool_names(top_level=True)
+  schema = control._TOOL_DEFINITIONS['update_goal_tasks']['inputSchema']
+  assert set(schema['properties']) == {'tasks'}
+  assert schema['additionalProperties'] is False
+  monkeypatch.setenv('CHAT_ID', 'helper-chat')
+  calls = []
+  receipt = {'goal_id': 'g', 'revision': 4, 'tasks': [{'id': 'branch-check', 'status': 'running'}]}
+  def request(*args):
+    calls.append(args)
+    return receipt
+  monkeypatch.setattr(control, '_agent_api_call', request)
+  patch = {'tasks': [{'id': 'branch-check', 'status': 'running'}]}
+  assert control._call_update_goal_tasks(patch) == receipt
+  assert calls == [('POST', '/api/chats/helper-chat/goal/tasks', patch)]
+  with pytest.raises(ValueError, match='only tasks'):
+    control._call_update_goal_tasks({**patch, 'complete': True})
+
+
+def test_helper_checklist_edits_use_the_calling_turn_identity_on_a_shared_host(
+  monkeypatch, tmp_path,
+):
+  # A shared helper host's process environment is the host's; the scoped
+  # /goal/tasks route requires the URL chat to be the bearer's own chat.
+  control = _control_module()
+  for name in ('MOBIUS_RUN_TOKEN', control.CALLER_ENV_FILE_ENV):
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv('API_BASE_URL', 'http://api.test')
+  monkeypatch.setenv('CHAT_ID', 'host-chat')
+  monkeypatch.setenv('AGENT_TOKEN', 'host-token')
+  monkeypatch.setenv(control.HELPER_HOST_ENV, 'host-digest')
+  turn_env = tmp_path / 'turn.env'
+  turn_env.write_text('export CHAT_ID=turn-chat\nexport AGENT_TOKEN=turn-token\n')
+  sent = []
+
+  class Response:
+    def __enter__(self):
+      return self
+    def __exit__(self, *_exc):
+      return False
+    def read(self):
+      return b'{"goal_id": "g", "revision": 2, "tasks": []}'
+
+  def urlopen(request, timeout):
+    sent.append((request.full_url, request.get_header('Authorization')))
+    return Response()
+
+  monkeypatch.setattr(control, 'urlopen', urlopen)
+  patch = {'tasks': [{'id': 'branch-check', 'status': 'running'}]}
+  result = control._call_tool({'name': 'update_goal_tasks', 'arguments': {
+    **patch, control.CALLER_ENV_ARGUMENT: str(turn_env),
+  }})
+
+  assert not result.get('isError'), result
+  assert sent == [('http://api.test/api/chats/turn-chat/goal/tasks', 'Bearer turn-token')]
+  assert os.environ['CHAT_ID'] == 'host-chat'

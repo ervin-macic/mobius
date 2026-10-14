@@ -1,6 +1,7 @@
 """Regression coverage for authenticated screenshot readiness checks."""
 
 import fcntl
+import importlib.util
 import math
 import os
 import shutil
@@ -83,10 +84,15 @@ def _fake_browser(tmp_path: Path) -> tuple[Path, Path]:
     "\"${AGENT_BROWSER_SESSION-}\" \"${AGENT_BROWSER_PROFILE-}\" "
     "\"${AGENT_BROWSER_ARGS-}\" \"${AGENT_BROWSER_DEFAULT_TIMEOUT-}\" "
     ">> \"$FAKE_BROWSER_IDENTITY_LOG\"\n"
+    "printf '%s\\n' \"${MOBIUS_SCREENSHOT_DEADLINE-}\" >> \"$FAKE_DEADLINE_LOG\"\n"
+    "if [ -n \"${FAKE_COMMAND_DELAY:-}\" ]; then\n"
+    "  python3 -c 'import sys, time; time.sleep(float(sys.argv[1]))' \"$FAKE_COMMAND_DELAY\"\n"
+    "fi\n"
     "if [ -e /proc/$$/fd/9 ]; then : > \"$FAKE_CAPTURE_LOCK_INHERITED\"; fi\n"
     "if [ \"$1\" = eval ] && [ \"${2:-}\" != --stdin ]; then\n"
     "  case \"${FAKE_TIMEOUT_EVAL_MODE:-}\" in\n"
     "    always) exit 124 ;;\n"
+    "    freshness) case \"$2\" in *src.split*) exit 124 ;; esac ;;\n"
     "    once)\n"
     "      if [ ! -e \"$FAKE_TIMEOUT_EVAL_MARKER\" ]; then\n"
     "        : > \"$FAKE_TIMEOUT_EVAL_MARKER\"\n"
@@ -97,6 +103,10 @@ def _fake_browser(tmp_path: Path) -> tuple[Path, Path]:
     "fi\n"
     "case \"$1\" in\n"
     "  open)\n"
+    "    if [ -n \"${FAKE_FIRST_OPEN_DELAY:-}\" ] && [ ! -e \"$FAKE_FIRST_OPEN_MARKER\" ]; then\n"
+    "      : > \"$FAKE_FIRST_OPEN_MARKER\"\n"
+    "      python3 -c 'import sys, time; time.sleep(float(sys.argv[1]))' \"$FAKE_FIRST_OPEN_DELAY\"\n"
+    "    fi\n"
     "    if [ \"${FAKE_SINGLETON_LOCK_ALWAYS:-0}\" = 1 ]; then\n"
     "      echo 'Failed to create a ProcessSingleton for your profile directory' >&2\n"
     "      exit 1\n"
@@ -206,6 +216,8 @@ def _run_helper(
   existing_output: bytes | None = None,
   profile_locked: bool = False,
   subprocess_timeout: float | None = None,
+  first_open_delay: float | None = None,
+  extra_env: dict[str, str] | None = None,
   profile_lock_target: str | None = None,
   singleton_lock_once: bool = False,
   singleton_lock_always: bool = False,
@@ -286,6 +298,10 @@ def _run_helper(
     "FAKE_SINGLETON_LOCK_ONCE": "1" if singleton_lock_once else "0",
     "FAKE_SINGLETON_LOCK_ALWAYS": "1" if singleton_lock_always else "0",
     "FAKE_SINGLETON_LOCK_MARKER": str(tmp_path / "singleton-lock-once"),
+    "FAKE_FIRST_OPEN_DELAY": "" if first_open_delay is None else str(first_open_delay),
+    "FAKE_FIRST_OPEN_MARKER": str(tmp_path / "first-open-delayed"),
+    "FAKE_DEADLINE_LOG": str(tmp_path / "deadline.log"),
+    **(extra_env or {}),
   }
   args = ["bash", str(script)]
   if content_only:
@@ -354,16 +370,19 @@ def test_recycled_local_profile_lock_pid_is_cleared(tmp_path: Path):
   )
 
 
-def test_live_local_chromium_profile_lock_is_preserved(tmp_path: Path):
+@pytest.mark.parametrize("browser", ["chrome", "chrome-headless-shell"])
+def test_live_local_chromium_profile_lock_is_preserved(tmp_path: Path, browser):
   profile = tmp_path / "browser-profile"
   owner = subprocess.Popen(
-    ["bash", "-c", "exec -a chrome python3 -c 'import time; time.sleep(30)' "
+    ["bash", "-c", f"exec -a {browser} python3 -c 'import time; time.sleep(30)' "
      '"--user-data-dir=$1"', "bash", str(profile)],
   )
   try:
     # Wait for exec to replace bash so the lock target names the live browser.
     for _ in range(100):
-      if (Path("/proc") / str(owner.pid) / "cmdline").read_bytes().startswith(b"chrome\0"):
+      if (Path("/proc") / str(owner.pid) / "cmdline").read_bytes().startswith(
+        f"{browser}\0".encode()
+      ):
         break
       time.sleep(0.01)
     result, output, marker, _ = _run_helper(
@@ -394,6 +413,27 @@ def test_singleton_contention_resets_exact_profile_once_then_verifies_capture(tm
   assert any(c.startswith("wait --fn ") and 'iframe[data-app-id="42"]' in c for c in commands)
 
 
+def test_singleton_recovery_inherits_the_original_capture_deadline(tmp_path: Path):
+  # The profile-contention reset re-execs too; like die()'s recovery it must
+  # keep the first attempt's deadline rather than start a fresh budget.
+  started = int(time.time())
+  result, _, _, _ = _run_helper(
+    tmp_path, auth_ok=True, singleton_lock_once=True, record_resets=True,
+    extra_env={
+      "MOBIUS_SCREENSHOT_DEADLINE": "1", "MOBIUS_SCREENSHOT_BUDGET_SECONDS": "90",
+    },
+  )
+
+  assert result.returncode == 0, result.stderr
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 1
+  recovered = {
+    value for value in (tmp_path / "deadline.log").read_text().splitlines()
+    if value not in ("", "1")
+  }
+  assert len(recovered) == 1
+  assert started + 90 <= int(recovered.pop()) <= int(time.time()) + 90
+
+
 def test_repeated_singleton_contention_fails_after_one_reset(tmp_path: Path):
   result, output, marker, _ = _run_helper(
     tmp_path, auth_ok=True, singleton_lock_always=True, record_resets=True,
@@ -413,7 +453,7 @@ def test_unreadable_profile_owner_state_does_not_authorize_lock_removal(monkeypa
     raise PermissionError("cannot inspect process")
 
   monkeypatch.setattr(Path, "read_bytes", unreadable)
-  monkeypatch.setattr(sys, "argv", ["-", "123", "/tmp/profile"])
+  monkeypatch.setattr(sys, "argv", ["-", "123", "/tmp/profile", str(SCRIPT.parents[1])])
   with pytest.raises(SystemExit) as stopped:
     exec(compile(probe, str(SCRIPT), "exec"), {})
   assert stopped.value.code == 0  # retain the lock when ownership is unknown
@@ -848,7 +888,9 @@ def test_cold_capture_retries_viewport_until_browser_socket_is_ready(tmp_path: P
   assert output.exists()
   assert marker.exists()
   commands = browser_log.read_text(encoding="utf-8").splitlines()
-  assert commands.count("set viewport 412 915 1") == 5
+  # Two startup attempts, the final configuration, and the warm-up capture;
+  # the kept capture reuses the page the warm-up just prepared.
+  assert commands.count("set viewport 412 915 1") == 4
   assert commands.index("set viewport 412 915 1") < max(
     i for i, command in enumerate(commands)
     if command == "open http://mobius.test/api/browser-bootstrap"
@@ -882,7 +924,9 @@ def test_final_target_reapplies_the_requested_viewport_at_capture_boundary(tmp_p
     i for i, command in enumerate(commands)
     if i > target_index and command == "set viewport 412 915 1"
   ]
-  assert len(target_viewports) == 3
+  # Final configuration and the warm-up capture. The kept capture follows the
+  # warm-up on the same page, and its IHDR check still proves the viewport.
+  assert len(target_viewports) == 2
   assert target_index < final_viewport_index < final_screenshot_index
 
 
@@ -1240,8 +1284,9 @@ def test_command_deadline_kills_a_term_resistant_client(tmp_path: Path):
 BROWSER_ERROR_FILE="$TEST_ERROR"
 BROWSER_TIMEOUT_FILE="$TEST_TIMEOUT"
 BROWSER_PHASE="resistant client"
+BROWSER_STEP_CEILING_SECONDS=1
 status=0
-browser_command 0.2 eval true || status=$?
+browser_command eval true || status=$?
 printf '%s' "$status"
 '''
   started = time.monotonic()
@@ -1256,7 +1301,8 @@ printf '%s' "$status"
   assert result.returncode == 0, result.stderr
   assert result.stdout == "124"
   assert time.monotonic() - started < 6
-  assert (tmp_path / "timeout").read_text().strip() == "resistant client"
+  # A step-ceiling kill marks a stuck browser, which earns the reset path.
+  assert (tmp_path / "timeout").read_text().splitlines() == ["resistant client", "step"]
   pid = int((tmp_path / "pid").read_text())
   # The killed client can vanish between any two /proc reads, so read once:
   # a missing entry or a zombie's empty cmdline both mean it is gone.
@@ -1283,3 +1329,197 @@ def test_current_page_timeout_cleans_up_without_retrying_lost_document(tmp_path:
   assert sum(command.startswith("eval ") for command in commands) == 1
   assert not any(command.startswith("open ") for command in commands)
   assert not list(tmp_path.glob("mobius-agent-browser-*.??????"))
+
+
+def test_slow_first_navigation_on_a_busy_machine_is_not_killed_or_reset(tmp_path: Path):
+  """A loaded 1 GB server answers every command in ~5 s; that is not a hang.
+
+  A fixed 5 s kill once cut the first navigation mid-flight, wedged the
+  daemon, and then reset a healthy session. Only agent-browser's own action
+  timeout plus a grace marks a command as stuck.
+  """
+  result, output, marker, browser_log = _run_helper(
+    tmp_path, auth_ok=True, first_open_delay=6.5, record_resets=True,
+    subprocess_timeout=60,
+  )
+
+  assert result.returncode == 0, result.stderr
+  assert "timed out" not in result.stderr
+  assert not (tmp_path / "browser-profile.resets").exists()
+  assert output.exists() and marker.exists()
+  assert browser_log.read_text().splitlines()[0].startswith(
+    "open http://mobius.test/api/browser-bootstrap"
+  )
+
+
+def test_command_past_agent_browser_own_timeout_resets_the_stuck_session_once(tmp_path: Path):
+  # agent-browser answers within its 1 s action timeout unless its daemon is
+  # stuck, so the helper's step ceiling is that bound plus a 15 s grace.
+  result, output, marker, _ = _run_helper(
+    tmp_path, auth_ok=True, first_open_delay=30, record_resets=True,
+    extra_env={"AGENT_BROWSER_DEFAULT_TIMEOUT": "1000"}, subprocess_timeout=40,
+  )
+
+  assert result.returncode == 0, result.stderr
+  assert "browser startup timed out; restarting this chat's isolated browser session once" in result.stderr
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 1
+  assert output.exists() and marker.exists()
+
+
+def test_capture_deadline_stops_a_slow_command_without_resetting(tmp_path: Path):
+  # The recovery attempt inherits the original deadline; eight seconds remain,
+  # so the slow navigation starts and the deadline, not the step ceiling, ends it.
+  started = time.monotonic()
+  result, output, marker, _ = _run_helper(
+    tmp_path, auth_ok=True, first_open_delay=30, record_resets=True,
+    existing_output=b"previous good capture", subprocess_timeout=25,
+    extra_env={
+      "MOBIUS_SCREENSHOT_BUDGET_SECONDS": "140",
+      "MOBIUS_SCREENSHOT_RECOVERY_COUNT": "1",
+      "MOBIUS_SCREENSHOT_DEADLINE": str(int(time.time()) + 8),
+    },
+  )
+
+  assert result.returncode != 0
+  assert time.monotonic() - started < 15
+  assert "browser startup did not finish within the 140s capture budget" in result.stderr
+  assert "left running instead of being reset" in result.stderr
+  assert "timed out again" not in result.stderr
+  # The step that the deadline cut short must not report its own reason.
+  assert "did not become ready for viewport configuration" not in result.stderr
+  assert not (tmp_path / "browser-profile.resets").exists()
+  assert output.read_bytes() == b"previous good capture"
+  assert not marker.exists()
+
+
+def test_too_little_budget_left_fails_before_starting_a_command(tmp_path: Path):
+  # Three seconds is less than one busy-machine command: starting it would only
+  # kill it mid-flight, which can wedge the daemon.
+  started = time.monotonic()
+  result, output, marker, browser_log = _run_helper(
+    tmp_path, auth_ok=True, record_resets=True,
+    existing_output=b"previous good capture", subprocess_timeout=20,
+    extra_env={
+      "MOBIUS_SCREENSHOT_BUDGET_SECONDS": "140",
+      "MOBIUS_SCREENSHOT_RECOVERY_COUNT": "1",
+      "MOBIUS_SCREENSHOT_DEADLINE": str(int(time.time()) + 3),
+    },
+  )
+
+  assert result.returncode != 0
+  assert time.monotonic() - started < 10
+  assert "browser startup did not finish within the 140s capture budget" in result.stderr
+  assert "capture budget ran out before the next command" in result.stderr
+  assert not browser_log.exists()
+  assert not (tmp_path / "browser-profile.resets").exists()
+  assert output.read_bytes() == b"previous good capture"
+  assert not marker.exists()
+
+
+def test_timeout_reports_its_phase_not_the_skipped_check_reason(tmp_path: Path):
+  # After the freshness probe times out, the check never ran: reporting "stale
+  # shell loaded (got none)" would send the agent after a build problem.
+  result, output, marker, _ = _run_helper(
+    tmp_path, auth_ok=True, timeout_eval_mode="freshness", record_resets=True,
+    existing_output=b"previous good capture", subprocess_timeout=20,
+  )
+
+  assert result.returncode != 0
+  assert "shell freshness verification timed out; restarting" in result.stderr
+  assert "shell freshness verification timed out again" in result.stderr
+  assert "stale shell" not in result.stderr
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 2
+  assert output.read_bytes() == b"previous good capture"
+  assert not marker.exists()
+
+
+def test_leading_zero_action_timeout_is_decimal_not_octal(tmp_path: Path):
+  # Bash arithmetic reads 09000 as invalid octal and would abort the helper.
+  result, output, marker, _ = _run_helper(
+    tmp_path, auth_ok=True, extra_env={"AGENT_BROWSER_DEFAULT_TIMEOUT": "09000"},
+  )
+
+  assert result.returncode == 0, result.stderr
+  assert output.exists() and marker.exists()
+
+
+def _control_module():
+  path = Path(__file__).resolve().parents[1] / "scripts" / "mobius_control_mcp.py"
+  spec = importlib.util.spec_from_file_location("mobius_control_mcp_screenshot", path)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+def test_screenshot_tool_gives_the_helper_its_budget_below_the_tool_timeout(monkeypatch):
+  control = _control_module()
+  seen = {}
+
+  def fake_run(command, **kwargs):
+    seen.update(kwargs)
+    return subprocess.CompletedProcess(command, 1, "", "capture failed")
+
+  monkeypatch.setattr(control.subprocess, "run", fake_run)
+  with pytest.raises(RuntimeError):
+    control._call_screenshot({"route": "/settings"})
+
+  budget = int(seen["env"]["MOBIUS_SCREENSHOT_BUDGET_SECONDS"])
+  assert budget == control.SCREENSHOT_CAPTURE_BUDGET_SECONDS
+  assert 0 < budget < seen["timeout"] == control.SCREENSHOT_TIMEOUT_SECONDS
+
+
+def test_capture_at_four_seconds_per_command_finishes_within_the_tool_budget(tmp_path: Path):
+  """A busy machine slows every browser command, not just one.
+
+  A fixed 90 s capture deadline once failed captures at ~3 s per command that
+  had succeeded in ~100 s before it, well inside the screenshot tool's own
+  limit. The helper's budget now comes from the tool, and an app capture makes
+  few enough commands to finish at 4 s each.
+  """
+  control = _control_module()
+  started = time.monotonic()
+  result, output, marker, browser_log = _run_helper(
+    tmp_path, auth_ok=True, route="/app/42", record_resets=True,
+    subprocess_timeout=control.SCREENSHOT_TIMEOUT_SECONDS,
+    extra_env={
+      "FAKE_COMMAND_DELAY": "4",
+      "MOBIUS_SCREENSHOT_BUDGET_SECONDS": str(control.SCREENSHOT_CAPTURE_BUDGET_SECONDS),
+    },
+  )
+  elapsed = time.monotonic() - started
+
+  assert result.returncode == 0, result.stderr
+  assert "timed out" not in result.stderr and "budget" not in result.stderr
+  assert not (tmp_path / "browser-profile.resets").exists()
+  assert output.exists() and marker.exists()
+  assert elapsed < control.SCREENSHOT_CAPTURE_BUDGET_SECONDS
+  # The helper's own pauses are stubbed here; real ones add a few seconds.
+  assert len(browser_log.read_text().splitlines()) <= 29
+
+
+def test_tool_budget_covers_a_full_capture_on_a_loaded_small_server():
+  """~5 s per command on a loaded 1 GB server times up to 29 commands, with
+  room for the helper's pauses, must fit the budget the tool hands over."""
+  control = _control_module()
+  assert control.SCREENSHOT_CAPTURE_BUDGET_SECONDS >= 29 * 5 * 1.25
+  assert control.SCREENSHOT_CAPTURE_BUDGET_SECONDS < control.SCREENSHOT_TIMEOUT_SECONDS
+
+
+def test_recovery_attempt_inherits_the_original_capture_deadline(tmp_path: Path):
+  # One poisoned eval triggers the single reset. The re-exec must keep the
+  # first attempt's deadline, or a capture could outlive the tool's limit; a
+  # stale inherited deadline is ignored by a fresh capture.
+  started = int(time.time())
+  result, _, _, _ = _run_helper(
+    tmp_path, auth_ok=True, timeout_eval_mode="once", record_resets=True,
+    extra_env={
+      "MOBIUS_SCREENSHOT_DEADLINE": "1", "MOBIUS_SCREENSHOT_BUDGET_SECONDS": "90",
+    },
+  )
+
+  assert result.returncode == 0, result.stderr
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 1
+  seen = (tmp_path / "deadline.log").read_text().splitlines()
+  recovered = {value for value in seen if value != "1"}
+  assert len(recovered) == 1
+  assert started + 90 <= int(recovered.pop()) <= int(time.time()) + 90

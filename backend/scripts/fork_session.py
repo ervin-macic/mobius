@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Fork an exact Claude or Codex session for Agent Coaching.
+"""Fork an exact Claude or Codex session for Agent Coaching and side questions.
 
 This module intentionally has one success path: the provider forks the named
-session and the coaching prompt runs inside that fork. Missing, expired, or
-unforkable sessions fail loudly. Stored chat messages are never used to seed a
+session and the prompt runs inside that fork. Missing, expired, or unforkable
+sessions fail loudly. Stored chat messages are never used to seed a
 replacement agent.
+
+An ``ephemeral`` fork is never written to the provider's session storage, so
+it leaves nothing behind to clean up, even when its process is killed. The
+composer's ``/btw`` side questions use it; coaching keeps its forks.
 
 ``after_call_id`` narrows the fork to a *call moment*. The id is the
 provider's own id for the model's call (Claude ``toolu_...`` tool_use id;
@@ -319,6 +323,8 @@ def _fork_claude(
   prompt: str,
   *,
   after_call_id: str | None = None,
+  model: str | None = None,
+  ephemeral: bool = False,
   runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> ForkResult:
   env = _coaching_env()
@@ -343,6 +349,10 @@ def _fork_claude(
       source_session_id,
       "--fork-session",
       *cut,
+      # Without --model the CLI answers with its own default model, not the
+      # one the chat runs on.
+      *(["--model", model] if model else []),
+      *(["--no-session-persistence"] if ephemeral else []),
       "--print",
       prompt,
       "--output-format",
@@ -434,6 +444,8 @@ async def _fork_codex_async(
   prompt: str,
   *,
   after_call_id: str | None = None,
+  model: str | None = None,
+  ephemeral: bool = False,
   sdk_loader: Callable[[], tuple[Any, Any, Any, Any, Any]] | None = None,
   mcp_inventory_runner: Callable[
     ..., subprocess.CompletedProcess[str]
@@ -483,6 +495,7 @@ async def _fork_codex_async(
           approval_mode=ApprovalMode.deny_all,
           cwd=cwd,
           sandbox=Sandbox.read_only,
+          **({"ephemeral": True} if ephemeral else {}),
         )
       else:
         # The SDK's thread_fork does not take the app-server's lastTurnId yet;
@@ -492,6 +505,7 @@ async def _fork_codex_async(
           "cwd": cwd,
           "approvalPolicy": "never",
           "sandbox": "read-only",
+          **({"ephemeral": True} if ephemeral else {}),
         })
         thread = AsyncThread(codex, forked.thread.id)
       await _assert_codex_mcp_isolated(codex, str(thread.id or ""))
@@ -500,6 +514,7 @@ async def _fork_codex_async(
         approval_mode=ApprovalMode.deny_all,
         cwd=cwd,
         sandbox=Sandbox.read_only,
+        **({"model": model} if model else {}),
       )
   finally:
     ownership.release()
@@ -522,6 +537,8 @@ def fork_session(
   prompt: str,
   *,
   after_call_id: str | None = None,
+  model: str | None = None,
+  ephemeral: bool = False,
 ) -> ForkResult:
   provider = provider.strip().lower()
   if provider not in {"claude", "codex"}:
@@ -537,7 +554,8 @@ def fork_session(
   if provider == "claude":
     try:
       return _fork_claude(
-        source_session_id, cwd, prompt, after_call_id=after_call_id
+        source_session_id, cwd, prompt, after_call_id=after_call_id,
+        model=model, ephemeral=ephemeral,
       )
     except ForkError:
       raise
@@ -546,7 +564,8 @@ def fork_session(
   try:
     return asyncio.run(
       _fork_codex_async(
-        source_session_id, cwd, prompt, after_call_id=after_call_id
+        source_session_id, cwd, prompt, after_call_id=after_call_id,
+        model=model, ephemeral=ephemeral,
       )
     )
   except ForkError:
@@ -560,6 +579,14 @@ def _parser() -> argparse.ArgumentParser:
     description="Fork and coach one exact Claude or Codex session"
   )
   parser.add_argument("--json", action="store_true", dest="as_json")
+  parser.add_argument(
+    "--model", default=None,
+    help="answer with this model instead of the provider's default",
+  )
+  parser.add_argument(
+    "--ephemeral", action="store_true",
+    help="never save the fork to the provider's session storage",
+  )
   parser.add_argument("provider_or_session")
   parser.add_argument("session_or_cwd")
   parser.add_argument("cwd_or_prompt")
@@ -587,7 +614,15 @@ def _parse_invocation(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
   args = _parse_invocation(argv)
   try:
-    result = fork_session(args.provider, args.session_id, args.cwd, args.prompt)
+    # Pass only the options a caller chose, so a coaching call's fork is
+    # exactly the one it always was.
+    options = {
+      **({"model": args.model} if args.model else {}),
+      **({"ephemeral": True} if args.ephemeral else {}),
+    }
+    result = fork_session(
+      args.provider, args.session_id, args.cwd, args.prompt, **options,
+    )
   except ForkError as exc:
     print(f"fork-session: {exc}", file=sys.stderr)
     return 1

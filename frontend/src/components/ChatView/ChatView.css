@@ -213,7 +213,7 @@
 /* A reply is one conversation item; source rows keep their anchors and
    compact block spacing without cancelling the surrounding conversation gap. */
 .chat__reply-rows { list-style: none; padding: 0; margin: 0; }
-.chat__reply-rows > .chat__msg + .chat__msg:not(:has(> .chat__assistant-copy-surface:empty)) {
+.chat__reply-rows > .chat__msg + .chat__msg:not(:has(> .chat__markdown-copy-surface:empty)) {
   margin-top: 8px;
 }
 
@@ -402,7 +402,7 @@
 
 /* Event-only owner for Markdown-aware native selection copy. `contents` keeps
    every prose/tool child in the message row's existing flex and gap geometry. */
-.chat__assistant-copy-surface { display: contents; }
+.chat__markdown-copy-surface { display: contents; }
 
 /* A search jump is a one-shot held position, not a new scrolling mode. The
    restrained row wash and text highlight make the destination legible without
@@ -612,6 +612,20 @@
   border-radius: 18px 18px 5px 18px;
   max-width: min(85%, 75ch);
   white-space: pre-wrap;
+}
+
+/* Markdown in your own bubble (colours live in index.css). The bubble already
+   pads its text, so the reply column's prose gutters drop away, and blocks sit
+   a little closer than in a reply. pre-wrap stays with plain bubble text;
+   code blocks keep their own white-space. */
+.chat__text--user .md-blocks {
+  gap: 0.5rem;
+  white-space: normal;
+}
+
+.chat__text--user :is(.md-paragraph, .md-heading) {
+  padding-left: 0;
+  padding-right: 0;
 }
 
 /* Boundary between owner messages delivered together in one bubble: a
@@ -2387,6 +2401,8 @@
 }
 
 .chat__foot .queued,
+.chat__foot .side-question,
+.chat__foot .chat__history-strip,
 .chat__foot .connection-status,
 .chat__foot .chat__attach-tray,
 .chat__foot .chat__question-nudge,
@@ -2463,6 +2479,121 @@
   color: var(--danger, #b42318);
   background: color-mix(in srgb, var(--danger, #b42318) 7%, var(--surface));
   text-align: center;
+}
+
+/* ── Composer history strip (ChatInputBar contract 8) ─────────────────────
+   Shown above the pill while ↑/↓ or the queue's pencil puts another message
+   in the box: what it is, what Enter does, and that the draft is kept. Same
+   column and quiet surface as the queue tray, so it reads as part of the
+   composer rather than a transcript notice. */
+.chat__history-strip {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 5px 6px 5px 12px;
+  border-radius: 12px;
+  background: var(--surface); /* CONTRACT: opaque card fill, like the queue tray */
+  border: 1px solid var(--border-light);
+  font-size: 12.5px;
+  line-height: 1.35;
+  animation: chat-foot-rise 0.16s var(--ease-out-soft, ease-out);
+}
+
+.chat__history-strip--warn {
+  border-color: color-mix(in srgb, var(--warning, #d8922f) 45%, var(--border-light));
+}
+
+.chat__history-strip-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__history-strip-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat__history-strip-hint {
+  color: var(--muted);
+}
+
+.chat__history-strip--warn .chat__history-strip-hint {
+  color: var(--text);
+}
+
+.chat__history-strip-draft {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  padding: 1px 9px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__history-strip-back {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* The visible well. The ::after below makes the tap target 44px. */
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+/* The well stays 26px, but the tap target is 44px. The strip's 5px padding
+   plus the 6px gaps above and below it leave room, so the extra area covers
+   no other control (the draft chip beside it is not interactive). */
+.chat__history-strip-back::after {
+  content: '';
+  position: absolute;
+  inset: -9px;
+}
+
+.chat__history-strip-back:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.chat__history-strip-back:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* Phones: the hint wraps under the title instead of hiding behind an
+   ellipsis, and the draft chip keeps one short line. */
+@media (max-width: 560px) {
+  .chat__history-strip { flex-wrap: wrap; row-gap: 4px; }
+  .chat__history-strip-text { white-space: normal; flex-basis: calc(100% - 40px); }
+  .chat__history-strip-draft { max-width: calc(100% - 40px); order: 3; }
+  .chat__history-strip-back { order: 2; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat__history-strip { animation: none; }
+}
+
+/* While history holds the box, the attached files stay with the set-aside
+   draft (an earlier message sent again goes without them), so they are dimmed
+   rather than reading as part of the message shown. */
+.chat__pill--draft-aside .chat__attach-tray {
+  opacity: 0.5;
 }
 
 /* The pill: TRANSLUCENT surface with backdrop-blur — chat content
@@ -3865,9 +3996,9 @@
   animation: progress-rail-in 0.22s ease both;
 }
 
-/* Expanded Goal and Waiting share the same translucent reading surface. */
+/* Expanded details need an opaque reading surface above the transcript. */
 .chat__progress-rail:has(.chat__goal-plan) {
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: var(--surface);
 }
 
 @keyframes progress-rail-in {
@@ -4115,7 +4246,7 @@
 
 .chat__wait-card--expanded {
   border-color: color-mix(in srgb, var(--accent) 34%, var(--border-light));
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: var(--surface);
 }
 
 .chat__wait-summary {
@@ -4334,6 +4465,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   gap: 2px;
   max-height: min(42vh, 360px);
   overflow-y: auto;
+  /* Long saved helper questions scroll here without moving the transcript. */
+  overscroll-behavior: contain;
   margin-top: 2px;
   padding: 7px 0 1px;
   border-top: 1px solid var(--border-light);
@@ -4694,63 +4827,26 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   text-overflow: ellipsis;
 }
 
-.queued__row--editing {
-  padding: 6px;
-  background: var(--bg);
+/* The queued message open in the chat box (ChatInputBar's history strip says
+   "Editing queued message N of M"). The row stays in place, tinted, and its
+   pencil becomes a quiet label so the owner can see where the edit will land. */
+.queued__row--in-composer {
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface)); /* CONTRACT: accent wash on opaque fill */
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
-.queued__editor {
-  flex: 1;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 4px;
+.queued__row--in-composer:hover {
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
 }
 
-.queued__editor-input {
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 56px;
-  max-height: 160px;
-  padding: 8px 10px;
-  /* Grow to fit the message being edited (capped by max-height, then scroll)
-     so a longer draft is visible instead of scrolling a cramped fixed box.
-     Browsers without field-sizing fall back to autoGrowTextarea's measurement. */
-  field-sizing: content;
-  overflow-y: auto;
-  resize: none;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  outline: none;
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-  /* Keep at 16px: iOS Safari zooms focused inputs below 16px (see contract above). */
-  font-size: 16px;
-  line-height: 1.4;
-}
-
-.queued__editor-input:focus {
-  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
-}
-
-.queued__editor-actions {
-  display: flex;
-  align-items: flex-start;
-}
-
-.queued__edit-save:not(:disabled) {
-  color: var(--accent);
-}
-
-.queued__editor-error {
-  grid-column: 1 / -1;
-  padding: 0 4px 2px;
-  color: var(--danger);
-  font-size: 11px;
-  line-height: 1.3;
+.queued__in-composer {
+  flex-shrink: 0;
+  align-self: center;
+  margin: 0 4px 0 2px;
+  font-size: 11.5px;
+  line-height: 1.2;
+  color: var(--accent); /* CONTRACT: matches the strip's draft chip */
+  white-space: nowrap;
 }
 
 /* Compact, evenly spaced send / edit / cancel wells. The button IS the visible
@@ -4846,8 +4942,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 
 /* Only the outer transcript owns the 24px conversation gap being cancelled.
    Nested reply rows already own their compact spacing; never pull them upward. */
-.chat__list > .chat__msg:has(> .chat__tools:last-child, > .chat__assistant-copy-surface > .chat__tools:last-child)
-  + .chat__msg:has(> .chat__tools:first-child, > .chat__assistant-copy-surface > .chat__tools:first-child) {
+.chat__list > .chat__msg:has(> .chat__tools:last-child, > .chat__markdown-copy-surface > .chat__tools:last-child)
+  + .chat__msg:has(> .chat__tools:first-child, > .chat__markdown-copy-surface > .chat__tools:first-child) {
   margin-block-start: calc(var(--activity-row-gap, 4px) - 24px);
 }
 .chat__msg--peer .chat__tools { width: 100%; }
@@ -4877,3 +4973,13 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   font-size: 14px;
   line-height: 1.4;
 }
+
+/* Execution records are secondary evidence, outside the counted work tree. */
+.chat__goal-execution { margin: 8px 10px 4px; border-top: 1px solid var(--border-light); }
+.chat__goal-execution summary { padding: 10px 0; cursor: pointer; color: var(--muted); font-size: 12px; }
+.chat__goal-execution summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chat__goal-execution p { margin: 0 0 8px; }
+.chat__goal-execution ul { list-style: none; margin: 0; padding: 0; }
+.chat__goal-execution li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; font-size: 12px; overflow-wrap: anywhere; }
+.chat__goal-helper-question { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--border-light); }
+.chat__goal-execution .chat__goal-helper-question p { margin: 0; white-space: pre-wrap; color: var(--text); }

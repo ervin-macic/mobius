@@ -1,13 +1,15 @@
 import { stripAugmentation } from './msgText.js'
-import { isContinuationMessage } from './chatRuntimeState.js'
+import { isContinuationMessage, isSideQuestionMessage } from './chatRuntimeState.js'
 
 /** What "copy this message" means: the message's prose — text blocks joined
  *  by blank lines — never tool output, thinking, question cards, or error
  *  chrome (each has its own surface). User text is stripped of hidden
  *  augmentation exactly as it renders, so the clipboard matches the screen.
- *  System rows (compaction, continuation markers) copy nothing. */
+ *  System rows (compaction, continuation markers, side questions) copy
+ *  nothing. */
 export function messageCopyText(msg) {
-  if (!msg || msg.kind === 'compaction' || isContinuationMessage(msg)) return ''
+  if (!msg || msg.kind === 'compaction' || isContinuationMessage(msg)
+      || isSideQuestionMessage(msg)) return ''
   const clean = (t) => (msg.role === 'user' ? stripAugmentation(t) : t)
   if (Array.isArray(msg.blocks) && msg.blocks.length > 0) {
     return msg.blocks

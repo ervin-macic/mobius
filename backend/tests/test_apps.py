@@ -32,23 +32,22 @@ def _service_auth():
   return {"Authorization": f"Bearer {token}"}
 
 
-def _published_candidate(row: models.App) -> install.InstallCandidate:
+def _published_candidate(
+  row: models.App, entry_bytes: bytes | None = None,
+) -> install.InstallCandidate:
+  """The candidate a fetch of the row's package returns, as fetches build it."""
   tree = app_git.read_ref_tree(row.source_dir, row.source_commit)
   manifest = json.loads(tree["mobius.json"])
-  return install.InstallCandidate(
+  return install._new_candidate(
     manifest=manifest,
     raw_base="https://raw.githubusercontent.com/example/app/main/",
-    entry_bytes=tree[manifest["entry"]],
+    entry_bytes=entry_bytes or tree[manifest["entry"]],
     icon_processed=None,
     icon_warning=None,
     bundled_job=None,
     static_assets={},
     source_files={},
     seeds={},
-    capability_contract={},
-    capability_digest="test-capabilities",
-    candidate_digest="test-candidate",
-    source_review_digest="test-source",
   )
 
 
@@ -173,6 +172,53 @@ def test_update_app_attaches_distribution_manifest_without_changing_install_iden
   fetch.assert_awaited_once_with(distribution_url)
 
 
+@pytest.mark.parametrize("address_kind", ["plain", "stored", "previous-id", "wrong-id"])
+def test_update_app_distribution_fetch_normalizes_and_binds_stored_addresses(
+  client, auth, db, address_kind,
+):
+  app = create_local_app(
+    client, auth, name="Address probe", description="test",
+    manifest_extra={"previous_id": "previous-app"},
+  )
+  row = db.query(models.App).filter(models.App.id == app["id"]).one()
+  tree = app_git.read_ref_tree(row.source_dir, row.source_commit)
+  manifest = json.loads(tree["mobius.json"])
+  base = "https://example.test/address-probe"
+  bound_id = {
+    "wrong-id": "wrong-app", "previous-id": "previous-app",
+  }.get(address_kind, manifest["id"])
+  address = (
+    base + "/mobius.json" if address_kind == "plain"
+    else base + "#manifest-id=" + bound_id
+  )
+
+  async def fetch_bytes(cli, url, *args, **kwargs):
+    assert url.startswith(base + "/"), url
+    return tree[url.removeprefix(base + "/")]
+
+  with patch("app.install._http_get", new=AsyncMock(side_effect=fetch_bytes)) as fetch:
+    response = client.patch(
+      f"/api/apps/{app['id']}",
+      json={"published_manifest_url": address},
+      headers=auth,
+    )
+
+  assert fetch.await_args_list[0].args[1] == base + "/mobius.json"
+  db.refresh(row)
+  assert row.manifest_url is None
+  if address_kind == "wrong-id":
+    assert response.status_code == 409, response.text
+    assert "no longer the 'wrong-app' app" in response.json()["detail"]
+    assert fetch.await_count == 1
+    assert row.published_manifest_url is None
+  else:
+    assert response.status_code == 200, response.text
+    assert row.published_manifest_url == base + "/mobius.json"
+    assert response.json()["distribution_manifest"] == {
+      "id": manifest["id"], "url": base + "/mobius.json", "kind": "published",
+    }
+
+
 def test_update_app_rejects_distribution_package_that_is_not_the_accepted_revision(
   client, auth, db,
 ):
@@ -180,8 +226,7 @@ def test_update_app_rejects_distribution_package_that_is_not_the_accepted_revisi
     client, auth, name="Stale publication", description="test",
   )
   row = db.query(models.App).filter(models.App.id == app["id"]).one()
-  candidate = _published_candidate(row)
-  candidate = replace(candidate, entry_bytes=b"export default 'stale'\n")
+  candidate = _published_candidate(row, b"export default 'stale'\n")
 
   with patch(
     "app.install.fetch_install_candidate",
@@ -361,8 +406,12 @@ def test_list_apps_does_not_hydrate_source_or_icon_payloads(client, auth, db):
   assert "apps.icon_override_png AS apps_icon_override_png" not in projection
 
 
+@pytest.mark.parametrize("base", [
+  "https://raw.githubusercontent.com/example/app/main",
+  "https://raw.githubusercontent.com/example/app/main/mobius.json?ref=main",
+])
 def test_list_apps_exposes_one_fetchable_source_manifest_contract(
-  client, auth, db,
+  client, auth, db, base,
 ):
   app = models.App(
     source_dir="/tmp/mobius-tests/source-manifest-contract",
@@ -370,10 +419,7 @@ def test_list_apps_exposes_one_fetchable_source_manifest_contract(
     description="Installed from a published manifest",
     jsx_source="export default function App() { return null }",
     slug="published-app",
-    manifest_url=(
-      "https://raw.githubusercontent.com/example/app/main"
-      "#manifest-id=published-app"
-    ),
+    manifest_url=base + "#manifest-id=published-app",
   )
   db.add(app)
   db.commit()
@@ -460,6 +506,64 @@ def test_delete_then_purge_preserves_platform_core_source(client, auth, db):
 
   assert source_dir.exists()
   assert (source_dir / "index.jsx").exists()
+
+
+@pytest.mark.parametrize("action", ["purge", "uninstall", "clear storage"])
+def test_cancelled_removal_holds_its_lock_until_its_thread_ends(
+  client, auth, db, monkeypatch, action,
+):
+  """A cancelled uninstall, purge or data wipe keeps its lock while it writes."""
+  import asyncio
+  from datetime import UTC, datetime, timedelta
+  from app import fs_locks
+  from app.routes import apps as routes
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  data_dir = Path(get_settings().data_dir)
+  source_dir = data_dir / "apps" / "removal"
+  source_dir.mkdir(parents=True)
+  (source_dir / "index.jsx").write_text("export default function App() {}")
+  app = models.App(
+    name="Removal", jsx_source="", source_dir=str(source_dir), slug="removal",
+  )
+  db.add(app)
+  db.commit()
+  app_id = app.id
+  storage = data_dir / "apps" / str(app_id)
+  storage.mkdir()
+  (storage / "notes.json").write_text("{}")
+  if action == "purge":
+    app.deleted_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=8)
+    db.commit()
+  owner = db.query(models.Owner).one()
+  target, attr, lock, operation = {
+    "purge": (
+      routes, "_rmtree_strict", fs_locks.install_uninstall_lock(),
+      lambda: routes.list_apps(db, None),
+    ),
+    "uninstall": (
+      routes.app_jobs, "terminate_app_jobs", fs_locks.install_uninstall_lock(),
+      lambda: routes.delete_app(app_id, db, owner),
+    ),
+    "clear storage": (
+      routes, "_rmtree_strict", fs_locks.app_storage_lock(app_id),
+      lambda: routes.delete_app_data(app_id, db, None),
+    ),
+  }[action]
+  worker = BlockedWorker(wraps=getattr(target, attr))
+  monkeypatch.setattr(target, attr, worker)
+
+  outcome = asyncio.run(cancel_while_worker_blocked(lock, operation, worker))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.expire_all()
+  row = db.get(models.App, app_id)
+  if action == "purge":
+    assert row is None  # The purge ran to its end, not half-way.
+  elif action == "uninstall":
+    assert row.deleted_at is not None
+  else:
+    assert not storage.exists()
 
 
 def test_delete_scheduled_app_disables_own_cron_replay(

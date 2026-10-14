@@ -17,12 +17,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import agent_admission, chat as chat_mod, chat_writer, models, resource_pressure, startup
+from app import agent_admission, chat as chat_mod, chat_search, chat_writer, models, resource_pressure, startup
 from app import transcript_rows
 from app.chat_writer import create_chat
 from app.config import get_settings
 from app.database import SessionLocal, engine
 from tests.test_drain_for_restart import _live_turn, _run, _seed
+
+# Boot starts background conversion, which must not depend on the host's disk.
+pytestmark = pytest.mark.usefixtures("healthy_data_disk")
 
 
 def _unconvert(*chat_ids):
@@ -330,6 +333,6 @@ def test_search_reports_how_many_chats_are_searchable_by_title_only(client, auth
   assert response.status_code == 200
   assert isinstance(response.json(), list)
   with SessionLocal() as db:
-    count = transcript_rows.unconverted_count(db)
-  assert count >= 1
+    count = chat_search.unindexed_chat_count(db)
+  assert count >= 1  # The unconverted helper chat shows in this test's drawer.
   assert response.headers["X-Search-Unindexed-Chats"] == str(count)

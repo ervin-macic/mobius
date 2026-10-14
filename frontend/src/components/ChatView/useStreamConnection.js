@@ -2117,5 +2117,6 @@ export default function useStreamConnection(chatId, {
     disconnect,
     clearStreamItems,
     patchQuestionAnswers,
+    lastReadAtRef,
   }
 }

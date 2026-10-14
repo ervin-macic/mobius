@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
-from app import models, chat_queue
+from app import chat_queue, models, settled
 from app.auth_helpers import TokenSource, get_auth_token_source
 from app.config import get_settings
 from app.database import get_db
@@ -135,11 +135,13 @@ async def upload_files(
     raise
   async with chat_queue.get_lock(chat_id):
     try:
-      expired = await run_in_threadpool(_record_uploads, db, chat, saved)
+      expired = await settled.run_settled(_record_uploads, db, chat, saved)
     except Exception:
       # The commit failed and rolled back. A cancelled request is left alone:
       # its commit may already have landed, and its files must then stay.
-      await run_in_threadpool(remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
+      await settled.run_settled(
+        remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved],
+      )
       raise
   await run_in_threadpool(remove_upload_files, upload_dir, expired)
   return saved
@@ -243,7 +245,7 @@ async def delete_upload(
   # Serialize with send/answer admission (which holds this lock while the
   # writer claims): whichever wins, the other sees its committed result.
   async with chat_queue.get_lock(chat_id):
-    removed = await run_in_threadpool(_forget_draft, db, chat, filename)
+    removed = await settled.run_settled(_forget_draft, db, chat, filename)
   if removed:
     await run_in_threadpool(remove_upload_files, upload_dir, [file_path])
   return Response(status_code=204)

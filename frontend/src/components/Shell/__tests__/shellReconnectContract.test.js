@@ -4,6 +4,13 @@ import assert from 'node:assert/strict'
 import { QueryClient } from '@tanstack/react-query'
 import { api } from '../../../api/client.js'
 import { fetchFreshShellList } from '../shellListReconciliation.js'
+import {
+  applyAppActivityEvent,
+  applyAppActivitySeenEvent,
+  reconcileSeenAppActivity,
+  rememberSeenAppActivity,
+  withAppActivitySeen,
+} from '../newAppAttention.js'
 import { chatQueries, appQueries } from '../../../hooks/queries.js'
 
 function freshReader(t, queryClient, fetch, kind = 'chats') {
@@ -89,3 +96,89 @@ for (const kind of ['chats', 'apps']) {
     } finally { client.clear() }
   })
 }
+
+test('a stale apps-list response resolving after another tab seen receipt cannot restore unread activity', async t => {
+  const client = new QueryClient()
+  const seen = new Map()
+  const rows = [{ id: 7, created_at: 'current', has_unseen_activity: true, unseen_activity_version: 5 }]
+  client.setQueryData(appQueries.keys.all, rows)
+  let release
+  const fresh = freshReader(t, client, () => new Promise(resolve => { release = resolve }), 'apps')
+  try {
+    const pending = fresh({ reconcile: data => reconcileSeenAppActivity(data, seen) })
+    while (!release) await Promise.resolve()
+    rememberSeenAppActivity(seen, 7, 'current', 5)
+    client.setQueryData(appQueries.keys.all, data => withAppActivitySeen(data, 7, 5, 'current'))
+    release(rows)
+    await pending
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].has_unseen_activity, false)
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].unseen_activity_version, null)
+  } finally { client.clear() }
+})
+
+const activityRow = (overrides = {}) => ({
+  id: 7, created_at: 'current', has_unseen_activity: false, unseen_activity_version: null, ...overrides,
+})
+const activityEvent = (overrides = {}) => ({
+  type: 'app_activity', appId: '7', unseenActivityVersion: 4, appCreatedAt: 'current', ...overrides,
+})
+
+test('a versioned app_activity event marks the one cached app without a refetch', () => {
+  const client = new QueryClient()
+  client.setQueryData(appQueries.keys.all, [activityRow(), activityRow({ id: 8, created_at: 'other' })])
+  try {
+    assert.equal(applyAppActivityEvent(client, appQueries.keys.all, activityEvent(), new Map()), true)
+    const [seven, eight] = client.getQueryData(appQueries.keys.all)
+    assert.equal(seven.has_unseen_activity, true)
+    assert.equal(seven.unseen_activity_version, 4)
+    assert.equal(eight.has_unseen_activity, false)
+  } finally { client.clear() }
+})
+
+test('badge-only, uncached or other-lifetime app_activity events fall back to a full refetch', () => {
+  const client = new QueryClient()
+  const rows = [activityRow()]
+  client.setQueryData(appQueries.keys.all, rows)
+  try {
+    for (const ev of [
+      { type: 'app_activity', appId: '7' },
+      activityEvent({ appId: '9' }),
+      activityEvent({ appCreatedAt: 'recreated' }),
+    ]) {
+      assert.equal(applyAppActivityEvent(client, appQueries.keys.all, ev, new Map()), false)
+    }
+    assert.equal(client.getQueryData(appQueries.keys.all), rows)
+  } finally { client.clear() }
+})
+
+test('an app_activity event arriving while the list is fetching defers to that refetch', async t => {
+  const client = new QueryClient()
+  const rows = [activityRow()]
+  client.setQueryData(appQueries.keys.all, rows)
+  let release
+  const fresh = freshReader(t, client, () => new Promise(resolve => { release = resolve }), 'apps')
+  try {
+    const pending = fresh()
+    while (!release) await Promise.resolve()
+    assert.equal(applyAppActivityEvent(client, appQueries.keys.all, activityEvent(), new Map()), false)
+    assert.equal(client.getQueryData(appQueries.keys.all), rows)
+    release(rows)
+    await pending
+  } finally { client.clear() }
+})
+
+test('app_activity_seen clears the cached dot and stops a delayed older event re-lighting it', () => {
+  const client = new QueryClient()
+  const seen = new Map()
+  client.setQueryData(appQueries.keys.all, [activityRow({ has_unseen_activity: true, unseen_activity_version: 4 })])
+  try {
+    applyAppActivitySeenEvent(client, appQueries.keys.all, {
+      type: 'app_activity_seen', appId: '7', appCreatedAt: 'current', seenThroughVersion: 4,
+    }, seen)
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].has_unseen_activity, false)
+    assert.equal(applyAppActivityEvent(client, appQueries.keys.all, activityEvent({ unseenActivityVersion: 3 }), seen), true)
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].has_unseen_activity, false)
+    assert.equal(applyAppActivityEvent(client, appQueries.keys.all, activityEvent({ unseenActivityVersion: 5 }), seen), true)
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].unseen_activity_version, 5)
+  } finally { client.clear() }
+})

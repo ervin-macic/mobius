@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 
-from app import app_python_env, applied_app_runtime, models, platform_update, fs_locks
+from app import app_python_env, applied_app_runtime, models, platform_update, fs_locks, settled
 from app.config import get_settings
 from app.database import SessionLocal
 from app.manifest_contract import job_interpreter, validate_setup
@@ -64,23 +64,15 @@ async def command(argv, cwd=None, *, plan=False) -> tuple[int, str]:
 
 async def cleanup(process):
   """Always kill the group; never wait for a descendant to close a pipe."""
-  finish = asyncio.create_task(asyncio.to_thread(
-    terminate_process_group, process.pid, logger=log, label="setup",
-  ))
-  interrupted = False
   try:
-    while not finish.done():
-      try:
-        await asyncio.shield(finish)
-      except asyncio.CancelledError:
-        interrupted = True  # even repeated cancellation must finish cleanup
-    finish.result()
+    # Even repeated cancellation must finish the kill before unwinding.
+    await settled.run_settled(
+      terminate_process_group, process.pid, logger=log, label="setup",
+    )
   finally:
     # asyncio.Process has no public close API. Close inherited pipes locally;
     # asyncio's child watcher reaps the leader independently of pipe EOF.
     process._transport.close()
-  if interrupted:
-    raise asyncio.CancelledError
 
 
 async def apt(requirements, action) -> tuple[int, str]:
@@ -153,7 +145,7 @@ class Runner:
               app = db.get(models.App, app_id)
               if app is None or app.deleted_at or not app.runtime_revision:
                 continue
-              root = await asyncio.to_thread(applied_app_runtime.runtime_root, app)
+              root = await settled.run_settled(applied_app_runtime.runtime_root, app)
             path = root / "mobius.json"
             manifest = json.loads(path.read_text()) if path.exists() else {}
             validate_setup(manifest)

@@ -212,6 +212,17 @@ jobs:
         run: |
           ruff check app tests
           mypy
+      - name: Verify recovery timer and queued-request dispatch on real systemd
+        run: sudo env GITHUB_ACTIONS=true python3 scripts/test-rebuild-recovery-units.py
+      - name: Prove rebuild recovery against disposable Docker and the real ledger
+        # Root is needed for the Host's root-trusted receipt checks. This runs
+        # only on GitHub-hosted runners, uses unique local images/projects, and
+        # never reaches a production daemon or registry.
+        run: >-
+          sudo env PATH="$PATH" GITHUB_ACTIONS=true
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          MOBIUS_DOCKER_RECOVERY_PROOF=1
+          python3 scripts/test-rebuild-recovery-docker.py
       - name: Audit locked Python runtime dependencies
         working-directory: backend
         run: pip-audit --strict --disable-pip -r requirements.lock
@@ -283,20 +294,53 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  backend-all-unconverted:
+    # The first boot after an update serves chats the previous release wrote
+    # last, so none of them is converted. MOBIUS_TEST_ALL_UNCONVERTED=1 makes
+    # every commit leave every chat that way (tests/conftest.py). The suites
+    # that read and write transcripts across that boundary (transcripts, chat
+    # routes, run supervisors, delegations) run here, about a minute of tests
+    # in parallel with the shards rather than a second full suite. A fixed
+    # file list, not a shard, so every run covers the same tests.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/backend-env
+      - name: Run the transcript boundary suites with every chat unconverted
+        working-directory: backend
+        env:
+          MOBIUS_TEST_ALL_UNCONVERTED: '1'
+        run: >-
+          pytest -q -n auto --dist worksteal
+          tests/test_transcript_*.py
+          tests/test_helper_transcripts.py
+          tests/test_chat_transcript_compact.py
+          tests/test_chats.py
+          tests/test_chats_stream_steer.py
+          tests/test_runtime_supervisors.py
+          tests/test_writer_supervisor.py
+          tests/test_delegations.py
+          tests/test_core_delegation_*.py
+
   backend:
     # The required backend check. It fails unless every backend job passed (a
     # skipped or cancelled dependency must not read as success), then applies
     # the coverage floor to the combined shards.
     if: always()
-    needs: [backend-checks, backend-tests]
+    needs: [backend-checks, backend-tests, backend-all-unconverted]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Require every backend job
-        if: needs.backend-checks.result != 'success' || needs.backend-tests.result != 'success'
+        if: >-
+          needs.backend-checks.result != 'success'
+          || needs.backend-tests.result != 'success'
+          || needs.backend-all-unconverted.result != 'success'
         run: |
           echo "backend-checks: ${{ needs.backend-checks.result }}"
           echo "backend-tests: ${{ needs.backend-tests.result }}"
+          echo "backend-all-unconverted: ${{ needs.backend-all-unconverted.result }}"
           exit 1
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

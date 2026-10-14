@@ -428,6 +428,69 @@ textarea:focus-visible {
   box-shadow: 0 2px 14px -4px var(--accent-dim);
 }
 
+/* Markdown in your own bubble uses the reply formatter, whose surfaces and
+   accent colours would disappear on the accent gradient. Here they become
+   translucent dark washes with white text, which read on any accent and in
+   both themes. Spacing for the same elements lives in ChatView.css. */
+.chat__text--user :is(.md-heading, .md-code, .md-blockquote, .md-project-download) {
+  color: inherit;
+}
+
+.chat__text--user .md-inline-code {
+  color: inherit;
+  background: rgb(0 0 0 / 0.25);
+  border-color: rgb(255 255 255 / 0.18);
+}
+
+.chat__text--user .md-code-block {
+  background: rgb(0 0 0 / 0.32);
+  border-color: rgb(255 255 255 / 0.14);
+}
+
+.chat__text--user .md-code-lang {
+  color: rgb(255 255 255 / 0.72);
+}
+
+.chat__text--user .md-code-copy,
+.chat__text--user .md-code-copy--copied {
+  background: rgb(0 0 0 / 0.28);
+  border-color: rgb(255 255 255 / 0.22);
+  color: rgb(255 255 255 / 0.88);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .chat__text--user .md-code-copy:hover,
+  .chat__text--user .md-code-copy--copied:hover {
+    background: rgb(0 0 0 / 0.42);
+    color: #ffffff;
+  }
+}
+
+.chat__text--user .md-blocks a,
+.chat__text--user .md-blocks a:hover {
+  color: inherit;
+  text-decoration: underline;
+}
+
+.chat__text--user .md-blockquote {
+  background: rgb(0 0 0 / 0.14);
+  border-color: rgb(255 255 255 / 0.3);
+}
+
+.chat__text--user .md-table th,
+.chat__text--user .md-table td {
+  border-color: rgb(255 255 255 / 0.28);
+}
+
+.chat__text--user .md-table th,
+.chat__text--user .md-table tr:nth-child(even) td {
+  background: rgb(0 0 0 / 0.14);
+}
+
+.chat__text--user .md-hr {
+  border-top-color: rgb(255 255 255 / 0.35);
+}
+
 .chat__empty-title {
   font-size: 30px;
   font-weight: 700;

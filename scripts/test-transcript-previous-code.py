@@ -3,9 +3,12 @@
   python3 scripts/test-transcript-previous-code.py <previous-git-ref>
 
 A Docker-free companion to scripts/test-transcript-rollback.sh for a checkout
-that has the previous release in its history. It exports that release's
-backend, then alternates processes running each release's code on one
-disposable SQLite file:
+that has the previous release in its history, run against the same two kinds
+of earlier release: the conversion's parent (``<conversion>^``, without
+message rows) and the newest release (which stores rows itself). It exports
+that release's backend, then alternates processes running each release's
+code on one disposable SQLite file; the previous release reads and writes
+through scripts/transcript_rollback_probe.py, as in the image proofs:
 
 1. this release creates the schema, seeds typed chats and converts them, then
    leaves the database in each interesting state: mid-conversion (a chat the
@@ -15,10 +18,11 @@ disposable SQLite file:
    ledger, mapped-schema check) and must find the database serviceable, read
    every chat exactly as this release's rows hold it, then write: an append,
    a new chat, a rename and a purge;
-3. this release must find exactly the chats the previous one changed or
-   created unconverted, nothing left of the purged chat, every transcript
-   read (before converting) equal to the previous release's view, and the
-   same again after converting.
+3. this release must find unconverted exactly the mid-conversion chat and the
+   chats a release without rows changed or created (a release with rows
+   writes through them and leaves its chats converted), nothing left of the
+   purged chat, every transcript read (before converting) equal to the
+   previous release's view, and the same again after converting.
 
 Prints one JSON report and exits non-zero on the first broken contract.
 """
@@ -33,6 +37,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PROBE = ROOT / "scripts" / "transcript_rollback_probe.py"
 
 THIS_SEED = r'''
 import json, sqlite3
@@ -48,18 +53,18 @@ typed = [{"role": "user", "content": "héllo", "ts": 1, "cid": "c1"},
          "bare", 7, None]
 with SessionLocal() as db:
   db.add(create_chat(id="typed", title="Typed", messages=typed))
+  # The probe's first round appends to, renames and purges bulk-0013..0015.
   for i in range(30):
-    db.add(create_chat(id=f"bulk-{i:02d}", title=f"Bulk {i}",
+    db.add(create_chat(id=f"bulk-{i:04d}", title=f"Bulk {i}",
                        messages=[{"role": "user", "content": f"q{i}", "ts": i}]))
   db.add(create_chat(id="damaged", title="Damaged", messages=[]))
-  db.add(create_chat(id="purge-me", title="Purge", messages=[{"role": "user", "content": "secret"}]))
   db.commit()
   rows.append(db, "typed", {"role": "assistant", "id": "a2", "content": "appended by this release", "ts": 3})
   db.commit()
 path = engine.url.database
 with sqlite3.connect(path) as conn:
   # Mid-conversion: written by the previous release, not yet converted here.
-  conn.execute("UPDATE chats SET messages = ? WHERE id = 'bulk-00'",
+  conn.execute("UPDATE chats SET messages = ? WHERE id = 'bulk-0000'",
                (json.dumps([{"role": "user", "content": "previous wrote this"}]),))
   conn.execute("UPDATE chats SET messages = ? WHERE id = 'damaged'", (b"{broken",))
 with SessionLocal() as db:
@@ -69,33 +74,16 @@ with SessionLocal() as db:
 print(json.dumps({"unconverted": rows.unconverted_count(SessionLocal())}))
 '''
 
-PREVIOUS_ROUND = r'''
+PREVIOUS_BOOT = r'''
 import json
-from datetime import timedelta
 from app.main import _init_db
 boot = _init_db()
 assert boot.serviceable, boot
-from app.database import SessionLocal
-from app import models
-from app.chat_retention import purge_expired_chat_tombstones
-from app.timeutil import now_naive_utc
-from sqlalchemy.orm.attributes import flag_modified
-with SessionLocal() as db:
-  view = {c.id: {"title": c.title, "messages": c.messages} for c in db.query(models.Chat)}
-  chat = db.get(models.Chat, "bulk-01")
-  chat.messages = list(chat.messages) + [{"role": "assistant", "content": "previous appended", "ts": 99}]
-  flag_modified(chat, "messages")
-  db.add(models.Chat(id="from-previous", title="Previous", messages=[{"role": "user", "content": "born"}]))
-  db.get(models.Chat, "bulk-02").title = "Renamed by previous"
-  db.get(models.Chat, "purge-me").deleted_at = now_naive_utc() - timedelta(days=30)
-  db.commit()
-  purge_expired_chat_tombstones(db)
-  after = {c.id: {"title": c.title, "messages": c.messages} for c in db.query(models.Chat)}
-print(json.dumps({"view": view, "after": after}))
+print(json.dumps({"serviceable": True}))
 '''
 
 THIS_VIEW = r'''
-import json
+import json, sys
 from app.database import SessionLocal
 from app import models, transcript_rows as rows
 from sqlalchemy import text
@@ -103,7 +91,7 @@ with SessionLocal() as db:
   unconverted, after = [], None
   while (after := rows.next_unconverted(db, after)) is not None:
     unconverted.append(after)
-  leftovers = {t: db.execute(text(f"SELECT COUNT(*) FROM {t} WHERE chat_id = 'purge-me'")).scalar()
+  leftovers = {t: db.execute(text(f"SELECT COUNT(*) FROM {t} WHERE chat_id = :id"), {"id": sys.argv[1]}).scalar()
                for t in ("chat_messages", "chat_search_entries", "chat_transcript_state", "chat_transcript_damage")}
   # Before converting, readers serve each unconverted chat from its legacy value.
   before = {c.id: {"title": c.title, "messages": rows.read_all(db, c)} for c in db.query(models.Chat)}
@@ -142,8 +130,9 @@ print(json.dumps(converted))
 '''
 
 
-def run(backend: Path, env: dict, code: str) -> dict:
-  result = subprocess.run([sys.executable, "-c", code], cwd=backend, env={**env, "PYTHONPATH": str(backend)},
+def run(backend: Path, env: dict, *argv: str) -> dict:
+  """Run one release's code (``-c`` source, or the probe and its command)."""
+  result = subprocess.run([sys.executable, *argv], cwd=backend, env={**env, "PYTHONPATH": str(backend)},
                           capture_output=True, text=True)
   if result.returncode:
     sys.exit(f"{backend}: {result.stderr[-4000:]}")
@@ -171,30 +160,34 @@ def _run_rounds(previous_ref: str, work: Path) -> dict:
   subprocess.run(["tar", "-x", "-C", str(previous)], input=archive, check=True)
   env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
   env.update(DATABASE_URL=f"sqlite:///{work / 'shared.db'}", DATA_DIR=str(work / "data"),
-             SECRET_KEY=secrets.token_hex(32), MOEBIUS_SKIP_BOOTSTRAP="1")
+             SECRET_KEY=secrets.token_hex(32), MOEBIUS_SKIP_BOOTSTRAP="1", PROBE_ROUND="1")
   (work / "data").mkdir()
   this_backend, previous_backend = ROOT / "backend", previous / "backend"
   report = {"previous_ref": previous_ref}
 
-  report["seed"] = run(this_backend, env, THIS_SEED)
-  report["mirror_not_byte_exact"] = run(this_backend, env, THIS_MIRROR)["differ"]
-  expected = canonical(run(this_backend, env, THIS_ROWS))
-  previous_round = run(previous_backend, env, PREVIOUS_ROUND)
-  seen = canonical(previous_round["view"])
+  report["seed"] = run(this_backend, env, "-c", THIS_SEED)
+  report["mirror_not_byte_exact"] = run(this_backend, env, "-c", THIS_MIRROR)["differ"]
+  expected = canonical(run(this_backend, env, "-c", THIS_ROWS))
+  run(previous_backend, env, "-c", PREVIOUS_BOOT)
+  previous_view = run(previous_backend, env, str(PROBE), "dump")
+  wrote = run(previous_backend, env, str(PROBE), "write-old")
+  previous_after = run(previous_backend, env, str(PROBE), "dump")
+  seen = canonical(previous_view)
   mismatched = sorted(k for k, v in expected.items() if seen.get(k) != v)
   report["previous_reads_every_converted_chat_exactly"] = not mismatched
-  report["previous_sees_unconverted_legacy"] = previous_round["view"]["bulk-00"]["messages"] == [
+  report["previous_sees_unconverted_legacy"] = previous_view["bulk-0000"]["messages"] == [
     {"role": "user", "content": "previous wrote this"}]
-  returned = run(this_backend, env, THIS_VIEW)
+  report["previous_wrote"] = wrote
+  returned = run(this_backend, env, "-c", THIS_VIEW, wrote["purged"])
   report["unconverted_after_previous"] = returned["unconverted"]
   report["purge_leftovers"] = returned["leftovers"]
-  report["nothing_lost"] = canonical(returned["view"]) == canonical(previous_round["after"])
+  report["nothing_lost"] = canonical(returned["view"]) == canonical(previous_after)
   report["reads_exact_before_converting"] = (
-    canonical(returned["before"]) == canonical(previous_round["after"]))
-  report["mirror_not_byte_exact_after_return"] = run(this_backend, env, THIS_MIRROR)["differ"]
+    canonical(returned["before"]) == canonical(previous_after))
+  report["mirror_not_byte_exact_after_return"] = run(this_backend, env, "-c", THIS_MIRROR)["differ"]
   ok = (not mismatched and report["previous_sees_unconverted_legacy"]
         and not report["mirror_not_byte_exact"] and not report["mirror_not_byte_exact_after_return"]
-        and returned["unconverted"] == ["bulk-00", "bulk-01", "from-previous"]
+        and returned["unconverted"] == sorted(["bulk-0000", *wrote["expect_unconverted"]])
         and set(returned["leftovers"].values()) == {0} and report["nothing_lost"]
         and report["reads_exact_before_converting"])
   report["ok"] = ok

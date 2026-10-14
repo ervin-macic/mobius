@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import useScreenWakeLock from '../../hooks/useScreenWakeLock.js'
+import { acquireAudioSession } from '../../lib/audioSession.js'
 
 /**
  * Hook encapsulating Web Speech API voice input.
@@ -48,10 +49,12 @@ export default function useVoiceInput({ onTranscript, inputRef }) {
   // cancel it and prevent a session restart from firing after teardown.
   const restartTimerRef = useRef(null)
 
-  // Each mounted chat owns its own voice session. Keeping the wake lock here
-  // avoids a shell-wide boolean race when multiple panes are mounted, and ties
-  // release directly to the same state that stops microphone recognition.
+  // Each mounted chat owns its own voice session. Keeping the wake lock and
+  // recording audio session here avoids a shell-wide boolean race when
+  // multiple panes are mounted, and ties release directly to the same state
+  // that stops microphone recognition.
   useScreenWakeLock(listening)
+  useEffect(() => (listening ? acquireAudioSession('play-and-record') : undefined), [listening])
 
   // Cleanup on unmount.
   useEffect(() => () => {

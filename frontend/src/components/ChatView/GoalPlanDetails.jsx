@@ -2,6 +2,10 @@
 
 import { Check } from '@openai/apps-sdk-ui/components/Icon'
 import { goalTaskDisplayStatus } from './goalProgress'
+import { goalHelpers } from './goalHelpers'
+import {
+  HELPER_AWAITING_PARENT_LABEL, isHelperAwaitingParent, isWorkingHelperStatus,
+} from './workingHelper.js'
 
 function taskMeta(task, tasksById) {
   if (task.status === 'running') {
@@ -20,30 +24,41 @@ function taskMeta(task, tasksById) {
   return waiting.length ? `Waiting for ${waiting.join(' + ')}` : 'Pending'
 }
 
+// A task whose helper asked a question names who owes the answer.
+function awaitingParentTaskMeta(helpers) {
+  return helpers.some(node => isWorkingHelperStatus(node.status))
+    ? `In progress · helper ${HELPER_AWAITING_PARENT_LABEL.toLowerCase()}`
+    : HELPER_AWAITING_PARENT_LABEL
+}
+
 function delegationMeta(node) {
-  const provider = node.provider === 'claude'
-    ? 'Claude'
-    : node.provider === 'codex'
-      ? 'Codex'
-      : null
   const state = node.status === 'completed'
     ? 'Complete'
     : node.status === 'paused'
-      ? 'Paused'
-      : ['starting', 'running', 'resuming'].includes(node.status)
+      ? 'On hold'
+      : ['accepted', 'retrying', 'starting', 'running', 'resuming'].includes(node.status)
         ? 'In progress'
         : node.status === 'cancelled'
           ? 'Cancelled'
           : node.status === 'stopped'
             ? 'Stopped'
+          : isHelperAwaitingParent(node)
+            ? HELPER_AWAITING_PARENT_LABEL
             : 'Needs review'
-  return [provider, state].filter(Boolean).join(' · ')
+  return state
 }
 
-function delegationTitle(node) {
-  return String(node.task_key || '')
-    .replace(/[._-]+/g, ' ')
-    .replace(/^./, letter => letter.toUpperCase())
+/* The exact saved question stays inspectable here, as a record addressed to
+   the coordinating agent rather than an answer control for the owner. */
+function HelperQuestionRecord({ question }) {
+  if (!question?.text) return null
+  return <div className="chat__goal-helper-question">
+    <span className="chat__goal-task-meta">Asked its coordinating agent</span>
+    <p>{question.text}</p>
+    {!!question.options?.length && <span className="chat__goal-task-meta">
+      Options offered: {question.options.join(' · ')}
+    </span>}
+  </div>
 }
 
 function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
@@ -72,42 +87,24 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
 export default function GoalPlanDetails({ plan, holdReason = null }) {
   const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
-  if (!tasks.length && !reason) return null
+  if (!tasks.length && !plan?.delegations?.length && !reason) return null
   const tasksById = new Map(tasks.map(task => [task.id, task]))
   const delegations = Array.isArray(plan?.delegations) ? plan.delegations : []
-  // Each helper records the plan task it works on (plan_task) when it starts;
-  // it nests under that task in start order. Helpers with no task stay after
-  // the plan rather than being matched by name.
+  // Execution is evidence for task status, never another checklist step.
   const helpersByTask = new Map()
-  const unfiledHelpers = []
-  for (const node of delegations) {
-    if (tasksById.has(node.plan_task)) {
-      helpersByTask.set(node.plan_task, [...(helpersByTask.get(node.plan_task) || []), node])
-    } else {
-      unfiledHelpers.push(node)
-    }
+  const allHelpers = goalHelpers({ plan })
+  for (const node of allHelpers) {
+    helpersByTask.set(node.plan_task, [...(helpersByTask.get(node.plan_task) || []), node])
   }
   const childrenByParent = new Map()
   for (const task of tasks) {
     const parent = tasksById.has(task.parent_id) ? task.parent_id : null
     childrenByParent.set(parent, [...(childrenByParent.get(parent) || []), task])
   }
-  const renderDelegation = (node, depth = 0) => (
-    <GoalPlanRow
-      key={node.id}
-      title={delegationTitle(node)}
-      status={node.status}
-      depth={depth}
-      meta={delegationMeta(node)}
-    >
-      {(node.children || []).map(child => renderDelegation(child, depth + 1))}
-    </GoalPlanRow>
-  )
   const renderBranch = (task, depth = 0) => {
     const helpers = helpersByTask.get(task.id) || []
     const children = [
       ...(childrenByParent.get(task.id) || []).map(child => renderBranch(child, depth + 1)),
-      ...helpers.map(node => renderDelegation(node, depth + 1)),
     ]
     return <GoalPlanRow
       key={task.id}
@@ -115,7 +112,10 @@ export default function GoalPlanDetails({ plan, holdReason = null }) {
       status={goalTaskDisplayStatus(task, helpers)}
       depth={depth}
       emphasized={task.ready_to_verify ? 'verify' : task.ready ? 'ready' : ''}
-      meta={task.ready_to_verify ? 'Ready to verify' : taskMeta(task, tasksById)}
+      meta={helpers.some(isHelperAwaitingParent)
+        ? awaitingParentTaskMeta(helpers)
+        : goalTaskDisplayStatus(task, helpers) !== task.status
+          ? 'In progress' : task.ready_to_verify ? 'Ready to verify' : taskMeta(task, tasksById)}
     >
       {children}
     </GoalPlanRow>
@@ -125,8 +125,18 @@ export default function GoalPlanDetails({ plan, holdReason = null }) {
       {reason && <p className="chat__goal-result">{reason}</p>}
       <div className="chat__goal-plan-tasks" role="list" aria-label="Full goal todo list">
         {(childrenByParent.get(null) || []).map(task => renderBranch(task))}
-        {unfiledHelpers.map(node => renderDelegation(node))}
       </div>
+      {!!delegations.length && <details className="chat__goal-execution">
+        <summary>Helper activity · {allHelpers.length}</summary>
+        <p className="chat__goal-task-meta">Execution history, not additional checklist steps.</p>
+        <ul>
+          {allHelpers.map(node => <li key={node.id}>
+            <span>{node.title || tasksById.get(node.plan_task)?.title || 'Unassigned helper'}</span>
+            <span className="chat__goal-task-meta">{delegationMeta(node)}</span>
+            {isHelperAwaitingParent(node) && <HelperQuestionRecord question={node.question} />}
+          </li>)}
+        </ul>
+      </details>}
     </div>
   )
 }

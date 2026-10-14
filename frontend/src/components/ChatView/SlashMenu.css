@@ -18,7 +18,9 @@
   margin: 0;
   padding: 4px;
   list-style: none;
-  max-height: min(46vh, 320px);
+  /* Room for every command at once on a desktop; a short phone viewport
+     (keyboard up) still scrolls the list. */
+  max-height: min(46vh, 410px);
   overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -79,6 +81,19 @@
   font-size: 0.9rem;
   font-weight: 600;
   color: var(--accent);
+}
+
+/* The other name a command answers to. Quiet, and kept whole: it is what
+   tells someone typing "/clear" that this row is theirs. */
+.slash-menu__alias {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  line-height: 1.5;
+  color: var(--muted);
 }
 
 .slash-menu__args {

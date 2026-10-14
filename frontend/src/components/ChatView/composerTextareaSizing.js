@@ -151,3 +151,27 @@ export function reconcileComposerTextarea(
   }
   return resizeComposerTextarea(textarea, value)
 }
+
+/**
+ * Whether any line of the textarea's text wraps onto a second visual row.
+ *
+ * Compares the rendered content height with one row per source line, so it
+ * needs layout: unknown geometry (no layout yet, `line-height: normal`)
+ * answers true, which callers treat as the conservative case. Composer
+ * history uses it to decide whether a ↑ that lands at the very start proves
+ * the caret was already on the top row.
+ */
+export function textareaHasWrappedLines(
+  textarea,
+  getStyle = globalThis.getComputedStyle,
+) {
+  if (!textarea || typeof getStyle !== 'function') return true
+  const style = getStyle(textarea)
+  const lineHeight = parseFloat(style?.lineHeight)
+  const padding = (parseFloat(style?.paddingTop) || 0)
+    + (parseFloat(style?.paddingBottom) || 0)
+  const contentHeight = Number(textarea.scrollHeight) - padding
+  if (!(lineHeight > 0) || !(contentHeight > 0)) return true
+  const sourceLines = String(textarea.value ?? '').split('\n').length
+  return Math.round(contentHeight / lineHeight) > sourceLines
+}
