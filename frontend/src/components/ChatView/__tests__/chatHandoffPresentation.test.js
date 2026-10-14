@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { currentChatAnnouncement, currentProgressGoal, goalContinuationHandoff } from '../chatHandoffPresentation.js'
+import { currentChatAnnouncement, currentProgressGoal, goalAwaitsChanges, goalContinuationHandoff } from '../chatHandoffPresentation.js'
 
 const held = {
   id: 'goal-a', revision: 7, objective: 'Review the change', status: 'paused',
@@ -58,4 +58,22 @@ test('an existing recovery surface owns continuation after a live turn settles',
   for (const turnActive of [true, false]) {
     assert.equal(goalContinuationHandoff(held, { turnActive, hasPendingResume: true, chatHandoff: 'recovery' }), null)
   }
+})
+
+test('only an open Goal keeps an embedded chat listening for its changes', () => {
+  // Active work and every hold (Stop, interruption, deferral, saved question)
+  // can still be resumed, woken by a helper result or Wait, or replanned.
+  for (const goal of [
+    { ...held, status: 'active', pause_reason: undefined },
+    held,
+    { ...held, pause_reason: 'owner' },
+    { ...held, pause_reason: 'unknown' },
+    { ...held, status: 'active', handoff: { kind: 'owner_input' } },
+  ]) assert.equal(goalAwaitsChanges(goal), true, goal.status + ':' + goal.pause_reason)
+  // Settlement requires settled helpers and closes Goal Waits; it stays history.
+  for (const status of ['completed', 'cannot_complete', 'cancelled']) {
+    assert.equal(goalAwaitsChanges({ ...held, status }), false, status)
+  }
+  assert.equal(goalAwaitsChanges(null), false)
+  assert.equal(goalAwaitsChanges({ ...held, id: null }), false)
 })

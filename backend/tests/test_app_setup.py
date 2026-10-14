@@ -282,3 +282,25 @@ async def test_pointer_is_read_after_pin_and_python_waits_for_apply_rollback(set
   await setup.reconcile()
   assert events == ["rollback", "restored"]
   assert app_setup.status()[f"app:{row.id}:python"]["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cleanup_finishes_the_kill_and_keeps_the_cancel_message(monkeypatch):
+  from tests.cancel_helpers import BlockedWorker
+
+  worker = BlockedWorker()
+  monkeypatch.setattr(app_setup, "terminate_process_group", worker)
+  closed = []
+  process = SimpleNamespace(
+    pid=4321, _transport=SimpleNamespace(close=lambda: closed.append(True)),
+  )
+  task = asyncio.create_task(app_setup.cleanup(process))
+  assert await asyncio.to_thread(worker.entered.wait, 5)
+  for _ in range(2):
+    task.cancel("server stopping")
+    await asyncio.sleep(.02)
+    assert not task.done() and not closed
+  worker.release.set()
+  with pytest.raises(asyncio.CancelledError, match="^server stopping$"):
+    await task
+  assert worker.exited.is_set() and closed == [True]

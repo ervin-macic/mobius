@@ -11,11 +11,12 @@ const component = readFileSync(new URL('../QuestionCard.jsx', import.meta.url), 
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const css = readFileSync(new URL('../QuestionCard.css', import.meta.url), 'utf8')
 
-test('the paperclip is an icon left of the last answer box, not a row below', () => {
+test('every answer has its own paperclip, an icon left of its box', () => {
   const single = renderToStaticMarkup(createElement(QuestionCard, {
     chatId: 'clip', questionId: 'clip-q', questions: [{ question: 'Anything else?', options: [] }],
   }))
-  assert.match(single, /class="qcard__answer-row"><input[^>]*class="qcard__file-input"[^>]*\/><button[^>]*class="qcard__attach"[\s\S]*?<\/button><div class="qcard__composer/)
+  assert.match(single, /class="qcard__answer-row"><button[^>]*class="qcard__attach"[\s\S]*?<\/button><div class="qcard__composer/)
+  assert.equal((single.match(/class="qcard__file-input"/g) || []).length, 1)
   assert.doesNotMatch(single, /attach or paste/)
   const grouped = renderToStaticMarkup(createElement(QuestionCard, {
     chatId: 'clip', questionId: 'clip-g', questions: [
@@ -23,8 +24,8 @@ test('the paperclip is an icon left of the last answer box, not a row below', ()
       { question: 'Second?', options: [] },
     ],
   }))
-  assert.equal((grouped.match(/class="qcard__attach"/g) || []).length, 1)
-  assert.ok(grouped.indexOf('class="qcard__attach"') > grouped.indexOf('Second?'))
+  assert.equal((grouped.match(/class="qcard__answer-row"><button[^>]*class="qcard__attach"/g) || []).length, 2)
+  assert.equal((grouped.match(/class="qcard__file-input"/g) || []).length, 1)
 })
 
 test('a file-only question answer can submit and ordinary cards offer upload', () => {
@@ -53,6 +54,7 @@ test('a file-only question answer can submit and ordinary cards offer upload', (
     }))
     assert.match(submitted, /aria-label="Files for this answer"/)
     assert.match(submitted, /chat__attachments/)
+    assert.doesNotMatch(submitted, /Files for all answers/)
     // The attach row stays with the Submitted action row, so answering never
     // moves the card; it only stops taking files.
     assert.match(submitted, /class="qcard__attach"[^>]*disabled=""/)
@@ -265,7 +267,7 @@ test('multiple questions read as one compact decision panel', () => {
 
 test('a failed question submission does not append a transcript row', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   assert.ok(start >= 0 && end > start, 'doSendSilent source should be present')
   const silentSubmit = chatView.slice(start, end)
   assert.doesNotMatch(
@@ -292,7 +294,7 @@ test('a failed question submission does not append a transcript row', () => {
 
 test('question submission paints a resumed turn only after the POST commits', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   const silentSubmit = chatView.slice(start, end)
   const send = silentSubmit.indexOf('const response = await streamSend')
   const paintRunning = silentSubmit.indexOf('setServerRunningState(true)')
@@ -307,7 +309,7 @@ test('question submission paints a resumed turn only after the POST commits', ()
 
 test('question submission freezes the visible anchor before the async handoff', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   const silentSubmit = chatView.slice(start, end)
   const freeze = silentSubmit.indexOf('freezeQuestionSubmission(questionSubmissionContext)')
   const send = silentSubmit.indexOf('const response = await streamSend')

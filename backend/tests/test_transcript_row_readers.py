@@ -108,14 +108,14 @@ def test_detail_read_owner_pins_live_count_coordinates_and_bodies(db, monkeypatc
   ])
   db.add(chat)
   db.commit()
-  metadata = transcript_rows.metadata
-  def append_between_detail_reads(session, current):
+  metadata = transcript_rows.History.metadata
+  def append_between_detail_reads(view):
     with SessionLocal() as other:
       transcript_rows.append(other, other.get(type(chat), chat.id),
                              {"role": "assistant", "id": "later", "content": "new", "ts": 2})
       other.commit()
-    return metadata(session, current)
-  monkeypatch.setattr(transcript_rows, "metadata", append_between_detail_reads)
+    return metadata(view)
+  monkeypatch.setattr(transcript_rows.History, "metadata", append_between_detail_reads)
   payload = _chat_detail_response(chat, db=db)
   assert payload["total"] == 1
   assert [m["content"] for m in payload["messages"]] == ["original"]

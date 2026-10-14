@@ -10,7 +10,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import chat_writer
-from app import chat_queue, contribution_review_runs as reviews, models
+from app import chat_queue, contribution_review_runs as reviews, models, settled
 from app.chat_start import start_programmatic_chat_turn
 from app.config import get_settings
 from app.contribution_autopilot import resolve_round_choice
@@ -137,10 +137,10 @@ async def start_reviews(app_id: int, body: StartReviews,
                                   "chat_id": row.chat_id, "run_id": row.id})
     else:
       cwd = Path(get_settings().data_dir) / "platform"
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
+      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub API reads)
       if not actor.get("id"):
         raise HTTPException(409, "Connect GitHub before starting this review.")
-      targets = [await asyncio.to_thread(reviews.inspect_target, _gh, cwd, item, body.mode)
+      targets = [await asyncio.to_thread(reviews.inspect_target, _gh, cwd, item, body.mode)  # unsettled: read-only (GitHub API reads)
                  for item in selection]
       # Consent in chat stays in that chat. An app selection without a source
       # conversation still receives its own durable review conversation.
@@ -219,7 +219,7 @@ async def report_outcome(app_id: int, run_id: str, body: ReviewOutcome,
       return {"run": reviews.view(row)}
     cwd = Path(get_settings().data_dir) / "platform"
     try:
-      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
+      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
     except HTTPException as exc:
       # A changed/unavailable PR must not erase the durable attempt receipt.
       # If that same head returns later, it is still reconciliation, not retry.
@@ -233,7 +233,7 @@ async def report_outcome(app_id: int, run_id: str, body: ReviewOutcome,
       if pull.get("merged"):
         outcome = {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
       else:
-        checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)
+        checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
         entry = reviews.queue_entry(checks, target)
         if entry:
           outcome = {**previous, "state": "queued", "queue_entry_id": entry["id"]}
@@ -249,10 +249,10 @@ async def report_outcome(app_id: int, run_id: str, body: ReviewOutcome,
         outcome.update(state="merged", merge_sha=pull.get("merge_commit_sha"))
         reviews.save_outcome(db, row, item_key, outcome)
         return {"run": reviews.view(row)}
-      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)
+      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
       existing_entry = reviews.queue_entry(checks, target)
       if existing_entry:
-        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
         outcome.update(state="queued", queue_entry_id=existing_entry["id"])
         reviews.save_outcome(db, row, item_key, outcome)
         return {"run": reviews.view(row)}
@@ -263,11 +263,11 @@ async def report_outcome(app_id: int, run_id: str, body: ReviewOutcome,
         # Hold the existing credential mutation lock from actor recheck through
         # public I/O: reconnecting another account cannot spend this grant.
         async with _github_connection_transaction():
-          actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
+          actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub API reads)
           if str(actor.get("id") or "") != row.github_actor_id:
             outcome.update(state="needs_you", summary="The connected GitHub account changed. Approve a new review selection.")
           else:
-            await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+            await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
             _assert_execution_live(db, row, principal)
             # Persist before network I/O. A crash or lost response cannot
             # authorize replay. CAS also fences other server processes.
@@ -281,10 +281,12 @@ async def report_outcome(app_id: int, run_id: str, body: ReviewOutcome,
             outcome["merge_attempted"] = True
             try:
               if checks.get("isMergeQueueEnabled") is True:
-                receipt = await asyncio.to_thread(reviews.enqueue, _gh, cwd, target)
+                receipt = await settled.run_settled(reviews.enqueue, _gh, cwd, target)
                 outcome.update(state="queued", queue_entry_id=receipt["id"])
               else:
-                receipt = await asyncio.to_thread(reviews.perform_merge, _gh, cwd, target, repo)
+                receipt = await settled.run_settled(
+                  reviews.perform_merge, _gh, cwd, target, repo,
+                )
                 if receipt.get("merged") is not True:
                   raise HTTPException(409, "GitHub did not confirm a merge.")
                 outcome.update(state="merged", merge_sha=receipt.get("sha"))

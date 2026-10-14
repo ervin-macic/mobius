@@ -6,7 +6,7 @@ import asyncio
 import base64
 from datetime import UTC, datetime
 import hashlib
-import mimetypes
+from pathlib import Path
 import re
 from typing import Any, Literal
 from urllib.parse import quote
@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import fs_locks, github_auth, models
+from app import fs_locks, github_auth, models, settled, store_listing_source
 from app.community_broker import (
   COMMUNITY_PREFIX,
   CommunityBrokerError,
@@ -27,12 +27,16 @@ from app.community_broker import (
 from app.community_publish import (
   CommunityPublicationJournal,
   CommunityPublicationError,
+  accepted_history_contains,
   build_public_snapshot,
   delete_publication_journal,
   list_publication_journals,
   new_publication_journal,
   public_store_listing,
-  read_public_store_asset,
+  store_listing_review,
+  read_public_snapshot,
+  public_store_asset,
+  read_public_store_asset_bytes,
   read_publication_journal,
   write_publication_journal,
 )
@@ -603,7 +607,7 @@ async def publish_local_app_to_github(
 
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)
+      accepted_commit, files = await settled.run_settled(build_public_snapshot, app)
     await asyncio.to_thread(public_store_listing, files)
   except CommunityPublicationError as exc:
     raise HTTPException(
@@ -798,10 +802,16 @@ async def _publish_local_source(
         github, "GET", f"/repos/{encoded_repo}/commits/{parent_sha}",
       )
       parent_message = str((parent.get("commit") or {}).get("message") or "")
-      if repository_marker not in parent_message:
+      # A repository is continued only when it is provably this app's: either
+      # an earlier Store publication marked it, or its main branch is already
+      # part of the app's accepted history, so the fast-forward below keeps
+      # everything on GitHub. Anything else is someone else's code.
+      if repository_marker not in parent_message and not await asyncio.to_thread(
+        accepted_history_contains, app, accepted_commit, parent_sha,
+      ):
         raise HTTPException(
           409,
-          "That repository already exists and was not created for this local app. Choose another name.",
+          "That repository already exists, and its latest version is not part of this app's history. Choose another name.",
         )
     else:
       # GitHub rejects every Git Database write while a repository has no
@@ -893,8 +903,19 @@ async def preview_local_app_publication(
     raise HTTPException(404, "App not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)
-    listing = await asyncio.to_thread(public_store_listing, files)
+      # Lenient: whatever publication would refuse becomes a checklist item,
+      # so the editor always gets a draft to fix it from.
+      accepted_commit, files, problems = await settled.run_settled(
+        read_public_snapshot, app,
+      )
+    # The review is pure work on the bytes already read (decoding images,
+    # scanning for metadata), so it holds no lock.
+    review = await asyncio.to_thread(store_listing_review, files, problems)
+    async with fs_locks.source_dir_lock(str(app.source_dir)):
+      await settled.run_settled(
+        store_listing_source.note_what_saving_fixes,
+        review["checklist"], Path(str(app.source_dir)), app,
+      )
   except CommunityPublicationError as exc:
     raise HTTPException(
       exc.status_code, {"code": exc.code, "message": exc.detail},
@@ -903,15 +924,19 @@ async def preview_local_app_publication(
     f"/api/community/publications/github/preview/assets/{app.id}/"
     f"{accepted_commit}/"
   )
+  icon = (review["listing"] or review["draft"])["icon"]
   return {
     "app_id": app.id,
     "name": app.name,
     "slug": app.slug,
     "accepted_commit": accepted_commit,
     "repository_name": app.slug,
-    "icon_url": preview_base + quote(str(listing["icon"]), safe="/"),
-    "asset_base": preview_base + "static/",
-    "listing": listing,
+    "icon_url": preview_base + quote(str(icon), safe="/") if icon else None,
+    "asset_root": preview_base,
+    "ready": review["ready"],
+    "checklist": review["checklist"],
+    "listing": review["listing"],
+    "draft": review["draft"],
   }
 
 
@@ -939,19 +964,23 @@ async def preview_local_app_publication_asset(
     raise HTTPException(404, "Listing asset not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      content = await asyncio.to_thread(
-        read_public_store_asset, app, accepted_commit, asset_path,
+      raw = await settled.run_settled(
+        read_public_store_asset_bytes, app, accepted_commit, asset_path,
       )
+    # Decoding and stripping work on the bytes already read, off the lock.
+    content, media_type = await asyncio.to_thread(public_store_asset, raw)
   except CommunityPublicationError as exc:
     raise HTTPException(
       exc.status_code, {"code": exc.code, "message": exc.detail},
     ) from exc
-  media_type = mimetypes.guess_type(asset_path)[0] or "application/octet-stream"
   return Response(
     content,
     media_type=media_type,
     headers={
-      "Cache-Control": "public, max-age=31536000, immutable",
+      # Commit-keyed, so immutable; private because an incomplete listing's
+      # draft art must not sit in shared caches. Telling drafts apart here
+      # would need the whole review, and only the owner's editor reads it.
+      "Cache-Control": "private, max-age=31536000, immutable",
       "X-Content-Type-Options": "nosniff",
     },
   )

@@ -1,0 +1,183 @@
+/* The /btw answer card: a temporary card in the chat-foot column, above the
+   chat box. It takes clicks through the foot's pointer-events allow-list
+   (ChatView.css), like the queued-message tray it sits beside. */
+.side-question {
+  width: 100%;
+  max-width: 720px;
+  margin: 0 auto var(--chat-foot-card-gap, 6px);
+  box-sizing: border-box;
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(46vh, 420px);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--chat-status-font-size, 0.875rem);
+  line-height: 1.45;
+  animation: chat-foot-rise 0.22s var(--ease-out-soft, ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .side-question { animation: none; }
+}
+
+.side-question__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.side-question__icon {
+  flex: none;
+  color: var(--accent);
+}
+
+.side-question__title {
+  font-weight: 600;
+}
+
+/* Says, before anything is pressed, that this answer is not in the chat. */
+.side-question__badge {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.side-question__close {
+  flex: none;
+  margin: -8px -8px -8px auto;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  position: relative;
+}
+
+/* A 44px touch target without widening the header row. */
+.side-question__close::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+}
+
+.side-question__close:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.side-question__question {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* The answer scrolls inside the card so a long one never pushes the chat box
+   off a phone screen. */
+.side-question__answer {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.side-question__answer .md-blocks { gap: 0.5rem; }
+
+.side-question__answer .md-paragraph,
+.side-question__answer .md-heading {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.side-question__thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.side-question__spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: side-question-spin 0.8s linear infinite;
+}
+
+@keyframes side-question-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .side-question__spinner { animation-duration: 2.4s; }
+}
+
+.side-question__error {
+  margin: 0;
+  color: var(--danger);
+}
+
+.side-question__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.side-question__button {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.side-question__button:hover { background: var(--surface-2); }
+
+.side-question__button--primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg, #fff);
+}
+
+.side-question__button--primary:hover {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+
+.side-question__button:focus-visible,
+.side-question__close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.side-question__button:disabled {
+  opacity: 0.6;
+  cursor: default;
+  filter: none;
+}
+
+/* Touch needs the 44px target on any width — tablets included, where the
+   narrow-width rule below never applies. */
+@media (pointer: coarse) {
+  .side-question__actions .side-question__button { min-height: 44px; }
+}
+
+@media (max-width: 520px) {
+  .side-question__actions .side-question__button { flex: 1; min-height: 44px; }
+}

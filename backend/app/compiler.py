@@ -13,7 +13,8 @@ from pathlib import Path
 from app import timeutil, tracing
 from app.app_compile_contract import (
   COMPILED_RUNTIME_BANNER,
-  ROLLDOWN_TIMEOUT_SECS,
+  ROLLDOWN_WALL_LIMIT_SECS,
+  RolldownStalled,
   rolldown_command,
   rolldown_report_contract_error,
 )
@@ -344,14 +345,12 @@ async def _spawn_rolldown(
     )
   try:
     _, stderr = await asyncio.wait_for(
-      proc.communicate(), timeout=ROLLDOWN_TIMEOUT_SECS,
+      proc.communicate(), timeout=ROLLDOWN_WALL_LIMIT_SECS,
     )
   except asyncio.TimeoutError:
     proc.kill()
     await proc.communicate()
-    raise RuntimeError(
-      f"Rolldown timed out after {ROLLDOWN_TIMEOUT_SECS} seconds"
-    )
+    raise RolldownStalled() from None
   except asyncio.CancelledError:
     # Shutdown must not leave a child writing after locks are released.
     proc.kill()
@@ -388,6 +387,8 @@ async def compile_jsx(
 
   Raises:
     CompileError: If the JSX is invalid or Rolldown rejects the source.
+    RolldownStalled: If the build outlived its wall-time limit; the source
+      was not judged.
   """
   # Fail loudly on malformed source before invoking Rolldown — the
   # silent-0-byte case produces a downstream "no default export" at
@@ -430,10 +431,9 @@ async def compile_jsx(
       cwd=compile_cwd,
     )
     if returncode != 0:
-      decoded_stderr = stderr.decode()
       raise CompileError(
         "Compilation failed.",
-        stderr=decoded_stderr,
+        stderr=stderr.decode(),
         source_path=entry_path,
       )
     try:

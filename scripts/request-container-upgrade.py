@@ -24,7 +24,9 @@ the target is a fetched official release that ships this bridge, descends
 from the running image, and is not older than any official Python package
 declaration of the installed source; no update is prepared or parked; and the
 helper is installed and idle. They hold the updater's lock while checking and
-requesting. The helper then drains chats, replaces the
+requesting. The helper must also have certified the target's
+``deployment/self-hosted-helper.required`` protocol, so an outdated helper is
+asked to be reinstalled instead of running its old cutover. The helper then drains chats, replaces the
 container, verifies it, and restores the previous container if it is not
 healthy. See scripts/CONTAINER-REBUILD.md.
 """
@@ -183,7 +185,24 @@ def check_no_pending_update() -> None:
             )
 
 
-def check_helper_idle() -> Path:
+def required_helper_protocol(target: str) -> int:
+    """The host helper protocol the target release requires.
+
+    Every release that ships this bridge also ships the requirement, so 0 (no
+    requirement) is only a defensive reading. Any requirement, even one older
+    than certification, refuses an uncertified helper: the old helper's
+    cutover path is the hazard whatever the target.
+    """
+    shown = git("show", f"{target}:deployment/self-hosted-helper.required")
+    if shown.returncode != 0:
+        return 0
+    try:
+        return int(shown.stdout.strip())
+    except ValueError:
+        raise Refused("the target release's host helper requirement is unreadable") from None
+
+
+def check_helper_idle(target: str) -> Path:
     inbox = CONTROL / "inbox"
     try:
         status = json.loads((CONTROL / "status.json").read_text(encoding="utf-8"))
@@ -196,6 +215,15 @@ def check_helper_idle() -> Path:
         raise Refused("the helper inbox is not writable from this container")
     if str(status.get("state") or "idle") in ACTIVE_STATES:
         raise Refused("a container replacement is already running")
+    required = required_helper_protocol(target)
+    installed = status.get("helper_protocol")
+    if required and not (isinstance(installed, int) and not isinstance(installed, bool)
+                         and installed >= required):
+        raise Refused(
+            "the host replacement helper is older than this release requires; "
+            "update the Möbius checkout on the host and rerun "
+            "sudo scripts/install-rebuild-helper.sh there first"
+        )
     if (inbox / "request.json").exists():
         raise Refused("a container replacement request is already queued")
     return inbox
@@ -244,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX)
             image = check_target(target)
             check_no_pending_update()
-            inbox = check_helper_idle()
+            inbox = check_helper_idle(target)
             if args.check:
                 print(
                     f"Ready: a container-only upgrade from {image[:12]} to "

@@ -78,6 +78,28 @@ def test_platform_source_status_ignores_unrelated_environment(
   assert "release_ref" not in result
 
 
+def test_status_reads_never_take_the_index_lock(tmp_path):
+  """A read must not refresh the index, so it can never strand index.lock."""
+  import os
+
+  repo = tmp_path / "repo"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+  (repo / "a.txt").write_text("same\n")
+  subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+  subprocess.run(
+    ["git", "-C", str(repo), "-c", "user.name=Fixture", "-c",
+     "user.email=fixture@example.invalid", "commit", "-qm", "fixture"],
+    check=True,
+  )
+  # Same bytes, newer stat data: an ordinary status would rewrite the index.
+  stamp = (repo / "a.txt").stat().st_mtime + 100
+  os.utime(repo / "a.txt", (stamp, stamp))
+  index = (repo / ".git" / "index").read_bytes()
+  result = source_status._git(repo, "status", "--porcelain")
+  assert result.returncode == 0 and result.stdout == ""
+  assert (repo / ".git" / "index").read_bytes() == index
+
+
 def test_local_published_app_uses_distribution_manifest_as_repository_identity():
   repo = _repo("published-demo")
   app = _app(repo)

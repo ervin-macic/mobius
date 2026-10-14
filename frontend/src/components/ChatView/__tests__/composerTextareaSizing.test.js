@@ -8,6 +8,7 @@ import {
   resetComposerTextarea,
   resizeComposerTextarea,
   syncComposerTallState,
+  textareaHasWrappedLines,
 } from '../composerTextareaSizing.js'
 
 function textareaStub({ value = '', scrollHeight = 31, tall = false } = {}) {
@@ -130,4 +131,23 @@ test('ChatView reconciles textarea geometry on value commits and foreground retu
   assert.doesNotMatch(voiceSource, /resizeComposerTextarea/)
   const resets = source.match(/resetComposerTextarea\(inputRef\.current\)/g) || []
   assert.equal(resets.length, 2, 'both queued and immediate sends collapse stale textarea geometry')
+})
+
+test('wrapped-line detection compares rendered rows with source lines', () => {
+  // The composer's own metrics: 16px text at line-height 1.45, 4px padding.
+  const style = () => ({ lineHeight: '23.2px', paddingTop: '4px', paddingBottom: '4px' })
+  const rows = (value, visualRows) => ({ value, scrollHeight: Math.round(visualRows * 23.2 + 8) })
+
+  assert.equal(textareaHasWrappedLines(rows('one line', 1), style), false)
+  assert.equal(textareaHasWrappedLines(rows('two\nlines', 2), style), false)
+  assert.equal(textareaHasWrappedLines(rows('a long line that wraps', 2), style), true)
+  assert.equal(textareaHasWrappedLines(rows('first\nsecond wraps', 3), style), true)
+})
+
+test('wrapped-line detection answers true when geometry is unknown', () => {
+  const textarea = { value: 'text', scrollHeight: 31 }
+  assert.equal(textareaHasWrappedLines(null), true)
+  assert.equal(textareaHasWrappedLines(textarea, null), true)
+  assert.equal(textareaHasWrappedLines(textarea, () => ({ lineHeight: 'normal' })), true)
+  assert.equal(textareaHasWrappedLines({ value: 'text', scrollHeight: 0 }, () => ({ lineHeight: '23.2px' })), true)
 })

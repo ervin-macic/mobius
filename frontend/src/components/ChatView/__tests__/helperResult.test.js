@@ -47,3 +47,12 @@ test('failed, reviewable and stopped helpers say how they ended', () => {
   assert.match(render({ status: 'cancelled' }), /· Stopped/)
   assert.match(render({ status: 'failed' }), /chat__subagent-dot--failed/)
 })
+
+test('a helper paused on its question waits for its coordinating agent, not the owner, and has not finished or failed', () => {
+  const html = render({ status: 'needs_input' })
+  assert.match(html, /· Waiting for coordinating agent/)
+  assert.doesNotMatch(html, /Needs an answer|Waiting for you/)
+  assert.doesNotMatch(html, /Helper finished|Failed|Stopped/)
+  assert.doesNotMatch(html, /chat__subagent-dot--(done|failed)/)
+  assert.doesNotMatch(html, /chat__helper-working/)
+})

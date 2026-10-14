@@ -436,7 +436,9 @@ test('continuations render as product markers, not user bubbles', () => {
   assert.match(continuationCard, /Retry check due — trying the provider again/)
   assert.match(msgContent, /onClick=\{onResume\}/,
     'Resume delegates the lifecycle action instead of manufacturing owner text')
-  assert.match(chatView, /chat__msg--\$\{continuationMarker \? 'marker' : msg\.role\}/,
+  assert.match(chatView, /const markerRow = isContinuationMessage\(msg\)/,
+    'continuation rows are marker rows')
+  assert.match(chatView, /chat__msg--\$\{markerRow \? 'marker' : msg\.role\}/,
     'the row shell must not inherit owner-user alignment')
   assert.match(chatView, /supersedeResumedPauseBlocks\(messages,/,
     'a completed continuation replaces its stale actionable pause in the render projection')

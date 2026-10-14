@@ -190,3 +190,22 @@ def test_boot_policy_replaces_a_symlink_instead_of_following_it(tmp_path):
   assert (tmp_path / ".gitignore").read_text(encoding="utf-8") == (
     init_data_repo.DATA_GITIGNORE
   )
+
+
+def test_upgrade_untracks_app_update_batch_receipts(tmp_path):
+  """Receipts committed before the policy existed leave the safety repo."""
+  _init_repo(tmp_path)
+  receipts = tmp_path / "app-update-batches"
+  receipts.mkdir()
+  receipt = receipts / "00000000-0000-0000-0000-000000000001.json"
+  receipt.write_text("{}\n", encoding="utf-8")
+  _git(tmp_path, "add", "app-update-batches")
+  _commit(tmp_path, "historical receipt")
+
+  init_data_repo.write_ignore(tmp_path)
+  assert init_data_repo.reconcile(tmp_path) == ("reconciled", 1)
+  assert not any(
+    path.startswith("app-update-batches/")
+    for path in _git(tmp_path, "ls-files").splitlines()
+  )
+  assert receipt.read_text(encoding="utf-8") == "{}\n"

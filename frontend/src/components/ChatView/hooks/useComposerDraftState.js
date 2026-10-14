@@ -75,12 +75,20 @@ export default function useComposerDraftState({ chatId, hidden, inputRef }) {
   ))
   const submittedComposerRequestTokenRef = useRef(null)
   const failedSendAttemptRef = useRef(initial.failedAttempt)
+  // The owner's own draft text while the box shows another message (history).
+  // It stays the stored draft, so a chat switch, reload, or another surface
+  // finds the draft, never the message being browsed. Null: the box is it.
+  const draftAsideRef = useRef(null)
+
+  const persistDraft = useCallback((boxText, files) => {
+    persistComposerDraft(chatId, draftAsideRef.current ?? boxText, files)
+  }, [chatId])
 
   const setComposerInput = useCallback((nextInput) => {
     inputValueRef.current = nextInput
-    persistComposerDraft(chatId, nextInput, draftAttachmentsRef.current)
+    persistDraft(nextInput, draftAttachmentsRef.current)
     setInputState(nextInput)
-  }, [chatId])
+  }, [persistDraft])
 
   const {
     files: pendingFiles,
@@ -94,9 +102,23 @@ export default function useComposerDraftState({ chatId, hidden, inputRef }) {
     initialFiles: initial.attachments,
     onFilesChange: nextFiles => {
       draftAttachmentsRef.current = nextFiles
-      persistComposerDraft(chatId, inputValueRef.current, nextFiles)
+      persistDraft(inputValueRef.current, nextFiles)
     },
   })
+
+  /** History is about to show another message: keep this text as the draft. */
+  const setDraftAside = useCallback((text) => {
+    draftAsideRef.current = String(text ?? '')
+    persistDraft(inputValueRef.current, draftAttachmentsRef.current)
+  }, [persistDraft])
+
+  /** History is giving the box back: the draft as it now stands (another
+   * surface may have edited it meanwhile), or null when none was set aside. */
+  const takeDraftBack = useCallback(() => {
+    const draft = draftAsideRef.current
+    draftAsideRef.current = null
+    return draft
+  }, [])
 
   useEffect(() => {
     if (hidden) return
@@ -214,7 +236,11 @@ export default function useComposerDraftState({ chatId, hidden, inputRef }) {
 
   const restoreDurableDraft = useCallback(() => {
     const saved = readComposerDraft(chatId)
-    if (saved.input !== inputValueRef.current) {
+    if (draftAsideRef.current != null) {
+      // The box shows a browsed message; the stored draft is the one set
+      // aside, so an edit made elsewhere updates that, not the box.
+      draftAsideRef.current = saved.input
+    } else if (saved.input !== inputValueRef.current) {
       inputValueRef.current = saved.input
       setInputState(saved.input)
     }
@@ -243,5 +269,7 @@ export default function useComposerDraftState({ chatId, hidden, inputRef }) {
     handleComposerRemoveFile,
     restoreComposerText,
     restoreDurableDraft,
+    setDraftAside,
+    takeDraftBack,
   }
 }

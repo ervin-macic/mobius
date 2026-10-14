@@ -1,4 +1,4 @@
-import { chatQueries, modelQueries, settingsQueries } from '../../hooks/queries.js'
+import { settingsQueries } from '../../hooks/queries.js'
 import BrainUsageIcon from './BrainUsageIcon.jsx'
 import {
   providerAllowance,
@@ -8,8 +8,8 @@ import {
 import {
   contextUsedPercent,
   formatRoundedTokenCount,
-  resolvedContextTokenCounts,
 } from './brainUsage.js'
+import useContextTokens from './hooks/useContextTokens.js'
 
 const PROVIDER_LABELS = {
   claude: 'Claude',
@@ -25,20 +25,19 @@ export default function BrainUsageButton({
   providerSessionId = null,
   model = null,
   liveContext = null,
+  started = true,
 }) {
   const providerUsageQuery = settingsQueries.providerUsage.useQuery(provider, {
     enabled: usageEnabled && Boolean(provider),
   })
-  const contextUsageQuery = chatQueries.currentUsage.useQuery(
+  const { tokens: contextTokens } = useContextTokens({
+    enabled: usageEnabled,
     chatId,
     provider,
     providerSessionId,
-    { enabled: usageEnabled },
-  )
-  // The registry supplies the ceiling before a session exists, for a fresh
-  // session, and during a turn whose provider reports no window mid-turn.
-  const modelRegistryQuery = modelQueries.registry.useQuery({
-    enabled: usageEnabled && Boolean(provider && model),
+    model,
+    liveContext,
+    started,
   })
   const allowance = providerUsageQuery.isLoading
     ? providerAllowance(provider, null)
@@ -46,24 +45,6 @@ export default function BrainUsageButton({
   const allowanceSummary = providerAllowanceSummary(provider, allowance)
   const extraUsage = providerExtraUsage(providerUsageQuery.data)
   const leftPercent = allowance.usedPercent
-  const contextSnapshot = contextUsageQuery.isLoading
-    ? null
-    : contextUsageQuery.data
-  // A chat with no provider session yet never enables the usage query, so the
-  // snapshot is undefined rather than a null-session record. The registry
-  // fallback still owns the pre-first-turn estimate there.
-  const noSession = (
-    usageEnabled
-    && !providerSessionId
-    && Boolean(provider && model)
-  )
-  const contextTokens = resolvedContextTokenCounts(
-    contextSnapshot,
-    modelRegistryQuery.isLoading ? null : modelRegistryQuery.data,
-    provider,
-    model,
-    { noSession, live: usageEnabled ? liveContext : null },
-  )
   const rightPercent = contextTokens === null
     ? null
     : contextUsedPercent({

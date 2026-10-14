@@ -40,8 +40,8 @@ def resource(request, db, auth, monkeypatch):
       "app.routes.apps.reconcile_app_cron_supervision",
       lambda _: (0, [], True),
     )
-    monkeypatch.setattr("app.install.restore_app_skills", AsyncMock(return_value=[]))
-    monkeypatch.setattr("app.install.deactivate_app_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr("app.app_skills.restore_app_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr("app.app_skills.deactivate_app_skills", AsyncMock(return_value=[]))
     monkeypatch.setattr("app.routes.apps._drop_cron_only", lambda _: None)
   else:
     project_id = str(uuid4())
@@ -350,7 +350,7 @@ def test_retry_reads_completion_after_obtaining_lifecycle_lock(
     assert child_ids
     assert all(math.isfinite(current_run_generation(chat_id)) for chat_id in child_ids)
   else:
-    restore_skills = import_module("app.install").restore_app_skills
+    restore_skills = import_module("app.app_skills").restore_app_skills
     assert restore_skills.await_count == 1
 
 
@@ -413,7 +413,7 @@ def test_receipt_retry_repairs_lost_projection_without_replacing_a_live_run(
     },), {}))
   elif kind == "app":
     expected.append((({"type": "app_recovered", "appId": str(row.id)},), {}))
-    assert import_module("app.install").restore_app_skills.await_count == 1
+    assert import_module("app.app_skills").restore_app_skills.await_count == 1
   assert broadcast.publish.call_args_list == expected
   for chat_id in chat_ids:
     assert chat_mod.current_run_generation(chat_id) == generations[chat_id]

@@ -151,6 +151,31 @@ def test_refuses_without_touching_the_inbox_when_a_precondition_fails(
   assert "Container upgrade not requested" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("installed,allowed", [(None, False), (5, False), (True, False), (6, True)])
+def test_an_uncertified_helper_is_asked_to_reinstall_instead_of_upgrading(
+  install, installed, allowed, capsys,
+):
+  # Production 2026-10-12: a helper whose installer never certified the
+  # release's protocol ran its old cutover again. Refuse before the inbox.
+  target = _commit(install["platform"], "helper-protocol-release", lock="pkg==2\n", bridge=True)
+  (install["platform"] / "deployment").mkdir(exist_ok=True)
+  (install["platform"] / "deployment/self-hosted-helper.required").write_text("6\n")
+  _git(install["platform"], "add", "-A")
+  _git(install["platform"], "commit", "-q", "-m", "require helper protocol 6")
+  target = _git(install["platform"], "rev-parse", "HEAD")
+  _git(install["platform"], "reset", "-q", "--hard", install["old"])
+  _git(install["platform"], "update-ref", "refs/remotes/origin/main", target)
+  status = {"state": "succeeded"}
+  if installed is not None:
+    status["helper_protocol"] = installed
+  (install["control"] / "status.json").write_text(json.dumps(status))
+
+  assert (upgrade.main([]) == 0) is allowed
+  assert _request(install).exists() is allowed
+  if not allowed:
+    assert "install-rebuild-helper.sh" in capsys.readouterr().err
+
+
 def test_a_release_marker_on_a_local_commit_does_not_block_the_upgrade(install):
   """Older updaters could record a local merge commit as the installed
   release. The target's own history still proves its packages are newer."""

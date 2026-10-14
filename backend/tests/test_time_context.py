@@ -26,17 +26,18 @@ from app.goal_commands import goal_request_for_agent
 
 
 def _frontend_slash_command_names(source: str) -> set[str]:
-  """Read every command name from the top-level frontend registry."""
+  """Read every command name and alias from the top-level frontend registry."""
   match = re.search(
     r"export const SLASH_COMMANDS\s*=\s*\[(?P<commands>.*?)^\]",
     source,
     flags=re.DOTALL | re.MULTILINE,
   )
   assert match, "could not find the frontend slash-command registry"
-  return {
-    f"/{name}"
-    for name in re.findall(r"name:\s*'([^']+)'", match.group("commands"))
-  }
+  commands = match.group("commands")
+  names = set(re.findall(r"name:\s*'([^']+)'", commands))
+  for aliases in re.findall(r"aliases:\s*\[([^\]]*)\]", commands):
+    names.update(re.findall(r"'([^']+)'", aliases))
+  return {f"/{name}" for name in names}
 
 
 def test_includes_timezone_label_and_clock():
@@ -217,6 +218,18 @@ def test_slash_command_registry_parity():
     "composer menu and backend dispatch disagree: "
     f"menu={sorted(offered)} backend={sorted(dispatched)}"
   )
+
+
+def test_slash_command_registry_parser_counts_aliases_as_commands():
+  """An alias is typed and dispatched like its command, so parity covers it."""
+  source = """
+export const SLASH_COMMANDS = [
+  { name: 'new', aliases: ['clear'], summary: 'New chat' },
+  { name: 'btw', providers: ['claude', 'codex'] },
+]
+"""
+
+  assert _frontend_slash_command_names(source) == {"/new", "/clear", "/btw"}
 
 
 def test_slash_command_registry_parser_reads_commands_after_nested_arrays():

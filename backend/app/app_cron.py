@@ -1,16 +1,20 @@
 """Shared cron declaration and parsing primitives for installed apps."""
 
 import json
+import logging
 import os
 import re
 import shlex
 import subprocess
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from fastapi import HTTPException
 
 from app.config import get_settings
+
+log = logging.getLogger(__name__)
 
 BAKED_CRON_SCAFFOLD = Path("/app/scripts/init-cron-scaffold.sh")
 _ALLOW_TEST_CRON_ENV = "MOBIUS_ALLOW_TEST_CRON"
@@ -83,6 +87,55 @@ def record_schedule_choice(app_id: int, choice: ScheduleChoice) -> None:
 
 def clear_schedule_choice(app_id: int) -> None:
   (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).unlink(missing_ok=True)
+
+
+def _restore_schedule_file(path: Path, data: bytes | None, mode: int | None) -> None:
+  if data is None:
+    path.unlink(missing_ok=True)
+    return
+  tmp = path.with_name(f".{path.name}.{os.getpid()}.rollback")
+  try:
+    tmp.write_bytes(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+  finally:
+    tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def schedule_choice_rollback(app_id: int):
+  """Restore a rejected save, not an accepted install awaiting cron retry.
+
+  The caller holds install_uninstall_lock from validation through rollback.
+  Snapshot raw bytes: unreadable or malformed provenance is not absence, and
+  a failed snapshot must refuse the save before either durable file changes.
+  """
+  snapshots = []
+  for name in (_SCHEDULE_CHOICE_FILE, "init-cron.sh"):
+    path = schedule_state_dir(app_id) / name
+    try:
+      try:
+        data = path.read_bytes()
+      except FileNotFoundError:
+        data, mode = None, None
+      else:
+        mode = path.stat().st_mode & 0o7777
+    except OSError as exc:
+      raise CronInfrastructureError(
+        500, "Could not read the current schedule; nothing was changed.",
+      ) from exc
+    snapshots.append((path, data, mode))
+  try:
+    yield
+  except BaseException:
+    for path, data, mode in snapshots:
+      try:
+        _restore_schedule_file(path, data, mode)
+      except OSError:
+        log.exception(
+          "Could not roll back schedule file %s for app %s", path.name, app_id,
+        )
+    raise
 
 
 def read_schedule_choice(app_id: int) -> ScheduleChoice | None:
@@ -324,3 +377,69 @@ def crontab_command_path(line: str) -> str:
   while tokens and _SHELL_ASSIGNMENT.match(tokens[0]):
     tokens.pop(0)
   return tokens[0] if tokens else ""
+
+
+def crontab_without_app(current: str, source_dir: Path) -> str | None:
+  """Return `current` crontab text with every line whose COMMAND runs a
+  script under `source_dir` removed — or None if nothing matched, so the
+  caller can skip rewriting entirely.
+
+  Matches on the command's executable path (see `crontab_command_path`),
+  NOT a whole-line substring: that keeps the news/news-2 prefix safe AND
+  avoids dropping an unrelated app whose ARGUMENTS merely reference this
+  app's dir (e.g. `... /data/apps/agg/run.sh --feed /data/apps/news/x`).
+  Comments, blanks, and `PATH=`/env lines run no command and are preserved;
+  `@daily`/`@reboot` shorthand and inline `VAR=val <cmd>` are handled too.
+  """
+  needle = f"{str(source_dir).rstrip('/')}/"
+  kept, dropped = [], False
+  for ln in current.splitlines():
+    if crontab_command_path(ln).startswith(needle):
+      dropped = True
+    else:
+      kept.append(ln)
+  if not dropped:
+    return None
+  return ("\n".join(kept) + "\n") if kept else ""
+
+
+def unregister_cron(source_dir: Path) -> None:
+  """Remove crontab entries that invoke scripts under `source_dir`.
+
+  Called on app delete so a removed app does not leave a crontab entry
+  firing a now-missing script. The spool isn't on the /data volume, so
+  an orphan self-clears on the next container restart anyway — this just
+  stops it firing (and erroring) in the meantime, and prevents stale
+  lines like the `news-2/job.sh` orphan from accumulating across
+  reinstalls. Best-effort: every failure is swallowed, exactly like the
+  source-tree rmtree this accompanies. Runs `crontab -u mobius` (the
+  server runs as mobius, which may edit its own crontab).
+  """
+  if cron_mutation_blocked_in_test_runtime():
+    return
+  try:
+    listing = subprocess.run(
+      ["crontab", "-u", "mobius", "-l"],
+      capture_output=True, text=True, timeout=10,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return
+  if listing.returncode != 0:
+    # No crontab yet, or no crontab binary (as in the test image) —
+    # nothing to clean.
+    return
+  new_crontab = crontab_without_app(listing.stdout, source_dir)
+  if new_crontab is None:
+    return  # no entry referenced this app — leave the crontab untouched
+  try:
+    proc = subprocess.run(
+      ["crontab", "-u", "mobius", "-"],
+      input=new_crontab, text=True, timeout=10, check=False,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return
+  if proc.returncode != 0:
+    log.warning(
+      "cron: failed to rewrite mobius crontab on app delete (rc=%s)",
+      proc.returncode,
+    )

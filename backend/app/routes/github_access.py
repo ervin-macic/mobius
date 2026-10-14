@@ -355,7 +355,7 @@ async def github_source_status(
     async with semaphore:
       async with fs_locks.source_dir_lock(app["source_dir"]):
         try:
-          return await asyncio.to_thread(
+          return await asyncio.to_thread(  # unsettled: read-only (git status, optional locks off)
             source_status.build_app_status, app, since_commits,
           )
         except Exception:
@@ -422,7 +422,7 @@ async def github_source_diff(
     db.close()
     repo = Path(get_settings().data_dir).resolve() / "platform"
     async with fs_locks.source_dir_lock(repo):
-      inspected = await asyncio.to_thread(source_status.build_platform_status)
+      inspected = await asyncio.to_thread(source_status.build_platform_status)  # unsettled: read-only (git status, optional locks off)
       return await build_diff(repo, inspected)
 
   match = re.fullmatch(r"app:([1-9][0-9]*)", project)
@@ -450,7 +450,7 @@ async def github_source_diff(
   }
   db.close()
   async with fs_locks.source_dir_lock(app["source_dir"]):
-    inspected = await asyncio.to_thread(source_status.build_app_status, app)
+    inspected = await asyncio.to_thread(source_status.build_app_status, app)  # unsettled: read-only (git status, optional locks off)
     if inspected is None:
       raise HTTPException(status_code=404, detail="Project not found.")
     return await build_diff(Path(app["source_dir"]), inspected)

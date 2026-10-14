@@ -130,9 +130,10 @@ the additions. Its own search tables are left to it; it reconciles them from
   exists, a prose entry counts only for a chat with a marker, because the
   previous release may have replaced that transcript since the entry was
   derived. Titles are indexed and found for every chat. The search response
-  carries `X-Search-Unindexed-Chats`, the number of chats not yet converted,
-  and the shell shows a quiet note when it is above zero; there is no
-  fallback read of the previous release's index.
+  carries `X-Search-Unindexed-Chats`, the number of live drawer chats still
+  awaiting conversion (a chat whose conversion failed is reported in
+  diagnostics instead), and the shell shows a quiet note when it is above
+  zero; there is no fallback read of the previous release's index.
 - `chat_search_entries` (stripped title at seq -1, one row per prose item,
   FTS5) is maintained by triggers on `chat_messages` and `chats.title` for
   every writer. Search reads entry text as bytes and decodes with

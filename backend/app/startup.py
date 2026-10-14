@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import inspect
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 from app.database import SessionLocal
 from app.memory_observability import record_memory_checkpoint
 from app.storage_io import atomic_write
+
+if TYPE_CHECKING:
+  from app.bootstrap import BootstrapOutcome
 
 
 class StartupState(Protocol):
@@ -73,6 +77,8 @@ class StartupContext:
   # regression) — assertable by a contract test and visible to diagnostics,
   # instead of vanishing into a single ERROR log line.
   failed_tasks: list[str] = field(default_factory=list)
+  # Default apps that failed only transiently, retried once serving.
+  bootstrap_retry: BootstrapOutcome | None = None
 
 
 TaskAction = Callable[[StartupContext], object | Awaitable[object]]
@@ -457,6 +463,13 @@ def _reap_staging_bundles(_context: StartupContext) -> None:
   reap_staging_bundles()
 
 
+def _sweep_git_transfers(_context: StartupContext) -> None:
+  """Discard Git transfers an earlier process left unfinished."""
+  from app.git_transfers import git_transfer_root
+
+  shutil.rmtree(git_transfer_root(), ignore_errors=True)
+
+
 async def _reconcile_compiled_bundles(context: StartupContext) -> None:
   from app.compiler import (
     reap_orphaned_bundles,
@@ -596,9 +609,10 @@ async def _install_bootstrap_apps(context: StartupContext) -> None:
   from app.bootstrap import ensure_bootstrap_apps_installed
 
   with SessionLocal() as db:
-    await ensure_bootstrap_apps_installed(db)
-
-
+    outcome = await ensure_bootstrap_apps_installed(db)
+  # A rate limit or slow transfer must not leave the instance without its
+  # default apps until the next restart: the runtime supervisors retry them.
+  context.bootstrap_retry = outcome if outcome.pending else None
 
 
 def _reconcile_app_cron(context: StartupContext) -> None:
@@ -716,6 +730,7 @@ DATABASE_STARTUP_TASKS = (
   ),
   StartupTask("reconcile agent lifecycle", _reconcile_agent_lifecycle),
   StartupTask("reap staging bundles", _reap_staging_bundles),
+  StartupTask("sweep app Git transfers", _sweep_git_transfers),
   StartupTask(
     "reconcile compiled bundles",
     _reconcile_compiled_bundles,

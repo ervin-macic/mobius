@@ -1,6 +1,6 @@
 """Chat naming policy shared by the fallback, owner, and summary paths."""
 
-from app.continuations import is_continuation_message
+from app.continuations import not_owner_speech_label
 from app.goal_commands import goal_objective
 
 FIRST_MESSAGE_TITLE_MAX_CHARS = 80
@@ -49,7 +49,7 @@ def first_user_message_title(messages: list[object] | None) -> str:
     if (
       not isinstance(message, dict)
       or message.get("role") != "user"
-      or is_continuation_message(message)
+      or not_owner_speech_label(message) is not None
     ):
       continue
     title = first_message_title(message.get("content"))

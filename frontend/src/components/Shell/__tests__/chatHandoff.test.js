@@ -489,7 +489,7 @@ test('cold activation keeps one composer visible but refuses sends until runtime
   assert.doesNotMatch(chatView, /chat__activation-retry|Chat activation (?:still )?needs a retry/,
     'a failed activation never adds a warning above the composer')
   assert.match(chatView,
-    /function handleSubmit\(e\) \{[\s\S]{0,900}if \(!activationSettled\) \{\s*if \(activationFailed\) retryActivation\(\)\s*return\s*\}/,
+    /function handleSubmit\(e[^)]*\) \{[\s\S]{0,900}if \(!activationSettled\) \{\s*if \(activationFailed\) retryActivation\(\)\s*return\s*\}/,
     'after a failed activation, Send retries it now and never sends before runtime truth')
   assert.match(chatView,
     /submissionBlocked=\{\s*\(!activationSettled && !activationFailed\)/,

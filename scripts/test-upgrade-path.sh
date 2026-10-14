@@ -151,14 +151,28 @@ if as_mobius grep -q "def local_image_changes" /data/platform/backend/app/platfo
 fi
 
 echo "3. an available host helper supports the replacement handshake"
+# Replacement dispatch refuses a helper whose certified protocol is older than
+# the serving and target releases require (deployment/self-hosted-helper.required),
+# so the stand-in certifies the larger of the two, like a helper freshly
+# installed from the trusted checkout. Releases from before the requirement
+# have no file and accept any certification.
+helper_protocol=$(
+  { git -C "$REPO" show "$previous:deployment/self-hosted-helper.required" 2>/dev/null
+    git -C "$REPO" show "$candidate:deployment/self-hosted-helper.required" 2>/dev/null
+    echo 1
+  } | sort -n | tail -1 | tr -d '[:space:]'
+)
+[[ "$helper_protocol" =~ ^[0-9]+$ ]] \
+  || fail "deployment/self-hosted-helper.required is not a number: $helper_protocol"
 docker exec "$name" sh -c '
   set -e
   mkdir -p /data/mobius-rebuild/inbox
   chown mobius:mobius /data/mobius-rebuild/inbox
-  chmod 0700 /data/mobius-rebuild/inbox
-  printf "%s\n" "{\"supported\":true,\"state\":\"idle\",\"handoff\":\"external-cutover-v1\",\"request_versions\":[1,2]}" \
-    > /data/mobius-rebuild/status.json
-  chmod 0644 /data/mobius-rebuild/status.json'
+  chmod 0700 /data/mobius-rebuild/inbox'
+printf '{"supported":true,"state":"idle","handoff":"external-cutover-v1","request_versions":[1,2],"helper_protocol":%s}\n' \
+    "$helper_protocol" \
+  | docker exec -i "$name" sh -c \
+    'cat > /data/mobius-rebuild/status.json && chmod 0644 /data/mobius-rebuild/status.json'
 
 echo "4. the owner presses Update"
 reply=$(api GET /api/platform/update-preview)
@@ -201,8 +215,8 @@ if [ "$needs_image" = True ]; then
   # verify, finalize the chat handoff, report success.
   operation=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
   helper_status() {  # <state> <message>: what the helper mirrors into /data
-    printf '{"supported":true,"operation_id":"%s","state":"%s","expected_sha":"%s","request_nonce":"%s","code":null,"message":"%s","handoff":"external-cutover-v1","request_versions":[1,2],"updated_at":"%s"}\n' \
-      "$operation" "$1" "$candidate" "$nonce" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{"supported":true,"operation_id":"%s","state":"%s","expected_sha":"%s","request_nonce":"%s","code":null,"message":"%s","handoff":"external-cutover-v1","request_versions":[1,2],"helper_protocol":%s,"updated_at":"%s"}\n' \
+      "$operation" "$1" "$candidate" "$nonce" "$2" "$helper_protocol" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   }
   write_status() { helper_status "$@" | docker exec -i "$name" sh -c 'cat > /data/mobius-rebuild/status.json'; }
   ledger() { docker exec "$name" python3 -P /app/runtime/restart_ledger.py "$1" "$operation"; }

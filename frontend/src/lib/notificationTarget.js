@@ -17,9 +17,16 @@
 // and used by the bounded preview):
 //   /shell/?app=<id-or-slug>[&intent=...]  → { view: 'canvas', app, intent }
 //   /shell/?chat=<id>[&focus=question]      → { view: 'chat', chatId, focusQuestion }
+//   /shell/?settings[=<section>]            → { view: 'settings', section }
+//
+// A settings target only navigates. Its section is narrowed to the known ids
+// (settingsSections.js); an unknown one opens Settings with no focus, so a
+// link minted before a section was renamed still lands somewhere sensible.
 //
 // `app` is returned as the RAW accepted string (id or slug) because the shell
 // resolves slugs via openAppWithIntent, exactly like the cold deepLink parser.
+
+import { settingsSectionOrNull } from './settingsSections.js'
 
 const ID_RE = /^[A-Za-z0-9_-]+$/
 // Ids plus the ':' and '.' that namespace an intent's target (see sw.js).
@@ -67,6 +74,9 @@ export function parseNotificationTarget(target) {
     }
     if (chat && ID_RE.test(chat)) {
       return { view: 'chat', chatId: chat, focusQuestion: params.get('focus') === 'question' }
+    }
+    if (!app && !chat && params.has('settings')) {
+      return { view: 'settings', section: settingsSectionOrNull(params.get('settings')) }
     }
     return null
   }

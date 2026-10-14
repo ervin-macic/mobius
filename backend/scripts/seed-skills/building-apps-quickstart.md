@@ -229,6 +229,11 @@ defaults, or deleting records—switch to `building-apps.md` and use
 empty. Do not use `localStorage`, IndexedDB, native `alert`/`confirm`/`prompt`,
 or owner credentials.
 
+If the app polls, animates, or plays audio, pause that work while
+`window.mobius.visible` is false and resume it from
+`window.mobius.onVisibilityChange(cb)`: hidden apps stay loaded, and
+`document.hidden` alone does not see them (see `building-apps.md`).
+
 ### 5. Verify the rendered app without exploring the whole shell
 
 Use the already-loaded `visual-testing.md` workflow. Start with the
@@ -288,6 +293,9 @@ Run validation once:
 ```bash
 python "$SCRIPTS_DIR/validate-app.py" /data/apps/<slug>
 ```
+
+`INCONCLUSIVE` (exit 3) or an apply `build_stalled` means the machine was too
+busy to finish the build, not a source error: retry later instead of editing.
 
 Do not run `git add` or `git commit`. `apply_app` owns every accepted source
 commit and leaves later edits as an unpublished draft until the next apply.

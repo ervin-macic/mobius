@@ -44,8 +44,12 @@ primitive that makes the no-clobber verdict possible — is a porcelain we
 get for free without a libgit2 binding to pin and maintain.
 
 CONCURRENCY: callers MUST hold `fs_locks.source_dir_lock(<source_dir>)`
-around every entry point here, so explicit apply cannot race the installer's
-merge on the same repo. This module does not take the
+around every entry point that reads or writes an app repository, so explicit
+apply cannot race the installer's merge on the same repo. The exceptions are
+the staging functions (`stage_fetch`, `stage_clone`), which write only a
+private staging repository and must run with no app lock held; their local
+counterparts (`import_staged`, `adopt_clone`) need the lock. This module does
+not take the
 lock itself — the lock is keyed on the source dir, which only the caller
 knows, and nesting lock acquisition inside would hide the ordering the
 rest of install.py reasons about.
@@ -62,8 +66,11 @@ import logging
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -103,10 +110,39 @@ _EXCLUDE_END = "# END MOBIUS MANAGED IGNORE RULES"
 _GIT_NAME = "Mobius"
 _GIT_EMAIL = "mobius@localhost"
 
-# Subprocess timeout. App repos are tiny (one source file plus a couple
-# of scripts), so any git op that runs longer than this is wedged, not
-# slow.
+# The ceiling for local Git commands, which may run under app locks.
 _GIT_TIMEOUT = 30
+# Git reaches the network only in ``_transfer``, which never runs under an app
+# lock or in a live app repository. A healthy slow download may therefore take
+# minutes; a stalled one still fails once it stays below the low-speed limit.
+_GIT_TRANSFER_TIMEOUT = 600
+_GIT_LOW_SPEED_LIMIT = 1024  # bytes per second
+_GIT_LOW_SPEED_TIME = 60  # seconds
+# The last transferred candidate. Keeping it on a private ref protects it from
+# garbage collection between preview and install; no managed branch moves.
+FETCHED_REF = "refs/mobius/fetched"
+
+
+class GitTransferFailed(RuntimeError):
+  """A Git network transfer failed: the host, the network or the repository.
+
+  ``transient`` says whether the same transfer may later succeed unchanged: a
+  timeout or a dropped connection may, a missing ref or repository, refused
+  credentials, a name that does not exist or a full disk will not.
+  """
+
+  def __init__(self, message: str, *, transient: bool = True) -> None:
+    super().__init__(message)
+    self.transient = transient
+
+
+class GitTransferTimeout(GitTransferFailed):
+  """A Git transfer exceeded its wall-clock ceiling."""
+
+
+class HistoryIncomplete(RuntimeError):
+  """A shallow app repository hides the merge base an update needs."""
+
 
 # Contribute records a reviewed change as a Git object in the repository that
 # owns the live source.  The pending ref proves the reviewed diff came from a
@@ -141,6 +177,8 @@ class ReconciliationReceipt:
   compatible_paths: tuple[str, ...] = ()
   unresolved_conflict_paths: tuple[str, ...] = ()
   provenance_refs_used: tuple[str, ...] = ()
+  # Ancillary conflicts kept locally, dropping the incoming edit.
+  kept_local_paths: tuple[str, ...] = ()
 
   def as_dict(self) -> dict[str, list[str]]:
     return {
@@ -150,6 +188,7 @@ class ReconciliationReceipt:
       "compatible_paths": list(self.compatible_paths),
       "unresolved_conflict_paths": list(self.unresolved_conflict_paths),
       "provenance_refs_used": list(self.provenance_refs_used),
+      "kept_local_paths": list(self.kept_local_paths),
     }
 
 
@@ -389,12 +428,24 @@ def _git_env(
   return env
 
 
+def ref_file_size(source_dir: str | Path, ref: str, path: str) -> int | None:
+  """One file's size at ``ref`` without reading it, or None when it has none."""
+  proc = _run(Path(source_dir), "cat-file", "-s", f"{ref}:{path}", check=False, read_only=True)
+  return int(proc.stdout.strip()) if proc.returncode == 0 else None
+
+
+def ref_file(source_dir: str | Path, ref: str, path: str) -> bytes | None:
+  """One file's bytes at ``ref``, or None when ``ref`` has no file there."""
+  return _ref_blob(Path(source_dir), ref, path, read_only=True)
+
+
 def _run(
   repo: Path,
   *args: str,
   check: bool = True,
   read_only: bool = False,
   timeout: int = _GIT_TIMEOUT,
+  env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
   """Runs `git -C <repo> <args>` with the fixed Mobius identity.
 
@@ -412,10 +463,28 @@ def _run(
     "-C", str(repo),
     *args,
   ]
-  return subprocess.run(
-    cmd, capture_output=True, text=True, timeout=timeout,
-    check=check, env=_git_env(repo, read_only=read_only),
-  )
+  with subprocess.Popen(
+    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    start_new_session=True,
+    env={**_git_env(repo, read_only=read_only), **(env or {})},
+  ) as process:
+    try:
+      stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+      # Git removes its locks on SIGTERM; stop transport children with it.
+      try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+          process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+          os.killpg(process.pid, signal.SIGKILL)
+          process.communicate()
+      except ProcessLookupError:
+        pass  # The whole group exited on its own in the meantime.
+      raise
+    if check and process.returncode:
+      raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
 def _run_with_index(
@@ -620,6 +689,79 @@ def _refresh_ignore_rules(
       "rm", "-r", "--cached", "--ignore-unmatch", "--",
       *_MANAGED_RUNTIME_PATHS, check=False,
     )
+
+
+def ignore_migration_paths(
+  source_dir: str | Path, accepted: str, tree: str | None = None,
+) -> set[str]:
+  """Paths that differ from ``accepted`` only through managed-ignore migration.
+
+  The read-only mirror of ``_refresh_ignore_rules``, which apply runs before
+  every snapshot: a synthetic repo's ``.gitignore`` rewritten to the managed
+  rules, a stale managed ``.gitignore`` dropped from a real-origin repo, and
+  managed runtime paths untracked. ``tree`` is the candidate to compare, or
+  ``None`` for the worktree, where untracking leaves files in place, so any
+  change to a managed runtime path there is part of the migration too.
+  """
+  repo = Path(source_dir)
+  before = _ref_blob(repo, accepted, ".gitignore", read_only=True)
+  if tree is None:
+    gitignore = repo / ".gitignore"
+    after = gitignore.read_bytes() if gitignore.is_file() else None
+  else:
+    after = _ref_blob(repo, tree, ".gitignore", read_only=True)
+  paths: set[str] = set()
+  if before != after and (
+    after == _GITIGNORE.encode("utf-8")
+    or (
+      after is None and before is not None
+      and _looks_like_managed_gitignore(before.decode("utf-8", "replace"))
+    )
+  ):
+    paths.add(".gitignore")
+  if tree is not None:
+    untracked = [_run(
+      repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
+      accepted, tree, "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+    )]
+  else:
+    # Apply untracks these runtime paths, so whatever they hold in the
+    # worktree (changed, or new under older ignore rules) never reaches it.
+    untracked = [
+      _run(
+        repo, "diff", "--name-only", "--no-renames", "-z", accepted,
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+      _run(
+        repo, "ls-files", "--others", "--exclude-standard", "-z",
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+    ]
+  for proc in untracked:
+    if proc.returncode == 0:
+      paths.update(path for path in proc.stdout.split("\0") if path)
+  return paths
+
+
+def worktree_diff_paths(source_dir: str | Path, ref: str) -> set[str] | None:
+  """Paths whose worktree differs from ``ref``, untracked included, read-only.
+
+  Ignored files are left out, as apply never commits them. ``None`` when Git
+  cannot answer. Unlike a snapshot, this never touches ignore rules or any
+  index, so read-only views can use it.
+  """
+  repo = Path(source_dir)
+  diff = _run(
+    repo, "diff", "--name-only", "--no-renames", "-z", ref, "--",
+    check=False, read_only=True,
+  )
+  untracked = _run(
+    repo, "ls-files", "--others", "--exclude-standard", "-z",
+    check=False, read_only=True,
+  )
+  if diff.returncode or untracked.returncode:
+    return None
+  return {path for path in (diff.stdout + untracked.stdout).split("\0") if path}
 
 
 def is_repo(source_dir: str | Path) -> bool:
@@ -2090,80 +2232,6 @@ def _landed_equivalent_changes(repo: Path) -> list[EquivalentChange]:
   return _equivalent_changes(repo, _EQUIVALENCE_LANDED_PREFIX)
 
 
-def fetch_origin_commit(
-  source_dir: str | Path,
-  commit_sha: str,
-  *,
-  depth: int | None = None,
-) -> str:
-  """Fetch one immutable origin commit without moving any local ref.
-
-  Publication handoff verification needs GitHub's merge commit in the live app
-  object database before it can prove that the reviewed change really landed.
-  Importing the object without FETCH_HEAD or a branch update keeps that proof
-  read-only with respect to the app's source and updater-owned refs.
-  """
-  repo = Path(source_dir)
-  requested = str(commit_sha or "").lower()
-  if not _HEX_OID.fullmatch(requested):
-    raise ValueError("invalid origin commit")
-  if origin_url(repo) is None:
-    raise RuntimeError("source repository has no origin")
-  fetch_args = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"]
-  if depth is not None:
-    fetch_args.extend(("--depth", str(depth)))
-  _run(repo, *fetch_args, "origin", requested)
-  fetched = _resolve_commit(repo, requested)
-  if fetched != requested:
-    raise RuntimeError("origin returned a different commit")
-  return fetched
-
-
-def fetch_origin_ref(
-  source_dir: str | Path,
-  ref: str,
-  *,
-  depth: int = 1,
-) -> str:
-  """Fetch one named or immutable origin ref without moving managed branches.
-
-  Update discovery and review need one immutable candidate commit, but must not
-  advance ``main`` or ``upstream`` before the owner accepts it. ``FETCH_HEAD``
-  is intentionally transient Git metadata; callers hold the per-app source
-  lock while fetching and reading the returned object id.
-  """
-  repo = Path(source_dir)
-  requested = str(ref or "")
-  immutable = requested.lower() if _HEX_OID.fullmatch(requested.lower()) else None
-  if immutable is None:
-    if (
-      not requested
-      or requested.startswith("-")
-      or "\\" in requested
-      or "\n" in requested
-      or "\r" in requested
-    ):
-      raise ValueError("invalid origin ref")
-    valid = _run(
-      repo, "check-ref-format", "--branch", requested, check=False,
-      read_only=True,
-    )
-    if valid.returncode != 0:
-      raise ValueError("invalid origin ref")
-  if origin_url(repo) is None:
-    raise RuntimeError("source repository has no origin")
-  _run(
-    repo, "fetch", "--quiet", "--no-tags", "--depth", str(depth),
-    "origin", immutable or requested,
-  )
-  fetched = _resolve_commit(repo, "FETCH_HEAD")
-  if fetched is None:
-    raise RuntimeError("origin ref did not resolve to a commit")
-  if immutable is not None and fetched != immutable:
-    raise RuntimeError("origin returned a different commit")
-  return fetched
-
-
 def verify_landed_equivalent_change(
   source_dir: str | Path,
   *,
@@ -2640,151 +2708,293 @@ def has_origin(source_dir: str | Path) -> bool:
   return origin_url(source_dir) is not None
 
 
-def clone_upstream(
-  source_dir: str | Path, repo_url: str, ref: str, *, depth: int = 1,
-) -> str:
-  """Clone a real upstream repo and check out local ``main`` at ``ref``.
+@dataclass(frozen=True)
+class Staged:
+  """A private repository holding one commit transferred from ``url``."""
 
-  This is the REAL-origin install variant of `record_upstream`: instead of
-  synthesizing an installer-owned `upstream` branch from fetched bytes, it keeps
-  the app repository's own origin and makes the resolved repository commit the
-  pristine upstream. Named refs use Git's ordinary clone path. Immutable
-  40/64-character commit ids are fetched directly because ``git clone
-  --branch`` does not accept an object id. Either way, the installed baseline
-  is a real catalog commit an update can fetch from and a local fix can be
-  pushed against as a PR. Local edits then commit onto ``main``.
+  path: Path
+  sha: str
+  url: str
+  # The origin branch the commit came from, when the ref named a branch.
+  branch: str | None = None
 
-  `source_dir` may already exist as an empty directory. The clone is built in a
-  sibling temp directory first and moved into place after success, so a failed
-  clone leaves the caller free to fall back to the synthetic `record_upstream`
-  path without a half-created `.git`.
 
-  Returns:
-    The checked-out HEAD sha.
+# Neither the transfer nor the import may start background maintenance that
+# outlives the staging directory or the app's source lock.
+_NO_AUTO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+
+
+def same_origin(left: str | None, right: str | None) -> bool:
+  """Whether two Git remote URLs name the same repository."""
+  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
+  return bool(left and right) and normalize(left) == normalize(right)
+
+
+def _is_shallow(repo: Path) -> bool:
+  return _run(
+    repo, "rev-parse", "--is-shallow-repository", read_only=True,
+  ).stdout.strip() == "true"
+
+
+# Failures, in Git's untranslated text, that a later identical fetch repeats.
+_PERMANENT_FETCH_ERROR = re.compile(
+  r"couldn't find remote ref|not our ref|repository\b.*\bnot found"
+  r"|does not appear to be a git repository|authentication failed"
+  r"|could not read (?:username|password)|returned error: 40[134]\b"
+  r"|no space left on device|disk quota exceeded",
+  re.IGNORECASE,
+)
+_DNS_RECHECK_TIMEOUT = 5  # seconds
+_UNRESOLVED_HOST = re.compile(r"could not resolve host: ([^\s']+)", re.IGNORECASE)
+
+
+def _transient_fetch_error(stderr: str) -> bool:
+  """Whether a failed fetch may succeed unchanged later; anything unknown may.
+
+  Git reports every resolver failure alike, so the host is looked up again:
+  as for connectors, only a resolver that could not answer (``EAI_AGAIN``) is
+  temporary, while a name that does not exist stays missing.
+  """
+  if _PERMANENT_FETCH_ERROR.search(stderr):
+    return False
+  unresolved = _UNRESOLVED_HOST.search(stderr)
+  if unresolved is None:
+    return True
+  answers: list[bool] = []
+
+  def lookup() -> None:
+    try:
+      socket.getaddrinfo(unresolved.group(1), None)
+    except socket.gaierror as exc:
+      answers.append(exc.errno == socket.EAI_AGAIN)
+    except (OSError, UnicodeError):
+      pass
+
+  # A resolver too slow to answer is itself a temporary failure.
+  lookup_thread = threading.Thread(target=lookup, daemon=True)
+  lookup_thread.start()
+  lookup_thread.join(_DNS_RECHECK_TIMEOUT)
+  return answers[0] if answers else True
+
+
+def _transfer(
+  stage: Path, url: str, ref: str, *, unshallow: bool,
+) -> tuple[str, str | None]:
+  """Fetch ``ref`` from ``url`` into ``stage``; Git's only network command.
+
+  ``stage`` is always a private staging repository, never a live app
+  repository, and no app lock is held: a slow transfer delays only its own
+  request. A full commit id is fetched exactly; a name prefers the branch and
+  falls back to the tag, as ``git clone --branch`` did. Returns the commit and
+  the branch it came from, if any.
+  """
+  requested = str(ref or "")
+  immutable = requested.lower() if _HEX_OID.fullmatch(requested.lower()) else None
+  if immutable is None and (
+    not requested
+    or requested.startswith("-")
+    or any(char in requested for char in "\\\n\r")
+    or _run(
+      stage, "check-ref-format", "--branch", requested, check=False,
+    ).returncode != 0
+  ):
+    raise ValueError("invalid origin ref")
+  sources = (
+    [immutable] if immutable
+    else [f"refs/heads/{requested}", f"refs/tags/{requested}"]
+  )
+  for source in sources:
+    try:
+      _run(
+        stage, *_NO_AUTO_GC,
+        "-c", f"http.lowSpeedLimit={_GIT_LOW_SPEED_LIMIT}",
+        "-c", f"http.lowSpeedTime={_GIT_LOW_SPEED_TIME}",
+        "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+        *(["--unshallow"] if unshallow else []),
+        "--end-of-options", url, f"+{source}:{FETCHED_REF}",
+        # The tag fallback and the failure's classification read Git's
+        # untranslated error text.
+        timeout=_GIT_TRANSFER_TIMEOUT, env={"LC_ALL": "C"},
+      )
+      break
+    except subprocess.TimeoutExpired as exc:
+      raise GitTransferTimeout(
+        f"it ran longer than {_GIT_TRANSFER_TIMEOUT} seconds"
+      ) from exc
+    except subprocess.CalledProcessError as exc:
+      if source == sources[-1] or "couldn't find remote ref" not in exc.stderr:
+        lines = (exc.stderr or "").strip().splitlines()
+        raise GitTransferFailed(
+          lines[-1] if lines else f"git exited with status {exc.returncode}",
+          transient=_transient_fetch_error(exc.stderr or ""),
+        ) from exc
+  fetched = _resolve_commit(stage, FETCHED_REF)
+  if fetched is None:
+    raise RuntimeError("origin ref did not resolve to a commit")
+  if immutable is not None and fetched != immutable:
+    raise RuntimeError("origin returned a different commit")
+  return fetched, requested if source == f"refs/heads/{requested}" else None
+
+
+def _record_origin_branch(repo: Path, staged: Staged) -> None:
+  """Keep ``origin/<branch>`` where ``git fetch origin`` would have left it.
+
+  Source status and Contribute compare an app with its last-fetched origin.
+  """
+  if staged.branch:
+    _run(repo, "update-ref", f"refs/remotes/origin/{staged.branch}", staged.sha)
+
+
+def _staging_dir(root: Path, prefix: str) -> Path:
+  root.mkdir(parents=True, exist_ok=True)
+  return Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+
+
+def stage_fetch(source_dir: str | Path, url: str, ref: str, root: Path) -> Staged:
+  """Transfer ``ref`` for an existing app repo without touching that repo.
+
+  The bare staging repository borrows the live objects through alternates, so
+  Git negotiates with everything the app already has and downloads only new
+  objects. A legacy shallow repo's boundary is copied and completed here, so
+  the later local import gives it full history.
   """
   repo = Path(source_dir)
-  if repo.exists() and not repo.is_dir():
-    raise RuntimeError(f"source_dir exists and is not a directory: {repo}")
-  repo.parent.mkdir(parents=True, exist_ok=True)
-  clone_parent = repo.parent
-  with tempfile.TemporaryDirectory(
-    prefix=f".{repo.name}.clone-", dir=clone_parent,
-  ) as tmp:
-    clone_dir = Path(tmp) / "repo"
-    immutable_ref = ref.lower() if _HEX_OID.fullmatch(ref.lower()) else None
-    if immutable_ref is not None:
-      # A pinned catalog URL should create the same real-origin repository as
-      # a branch install, not fall back to an unrelated synthetic history.
-      # Initialize first so the exact object can be fetched without asking
-      # clone's --branch parser to treat an oid as a branch name.
-      cmd = ["git", "init", "-q"]
-      if len(immutable_ref) == 64:
-        cmd.append("--object-format=sha256")
-      cmd.append(str(clone_dir))
-      subprocess.run(
-        cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-        check=True, env=_git_env(repo),
+  git_dir = Path(_run(
+    repo, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    read_only=True,
+  ).stdout.strip())
+  object_format = _run(
+    repo, "rev-parse", "--show-object-format", read_only=True,
+  ).stdout.strip()
+  stage = _staging_dir(root, "fetch-")
+  try:
+    _run(stage, "init", "-q", "--bare", f"--object-format={object_format}")
+    (stage / "objects" / "info" / "alternates").write_text(
+      f"{git_dir / 'objects'}\n", encoding="utf-8",
+    )
+    unshallow = (git_dir / "shallow").is_file()
+    if unshallow:
+      shutil.copyfile(git_dir / "shallow", stage / "shallow")
+    sha, branch = _transfer(stage, url, ref, unshallow=unshallow)
+    return Staged(stage, sha, url, branch)
+  except BaseException:
+    shutil.rmtree(stage, ignore_errors=True)
+    raise
+
+
+def import_staged(source_dir: str | Path, staged: Staged) -> str:
+  """Copy one staged commit into the app repo; local only, under its lock.
+
+  The repository must still have the origin the transfer came from. Only
+  objects, ``FETCHED_REF`` and the shallow marker change. The import is
+  proportional to the download, so it shares the transfer ceiling.
+  """
+  repo = Path(source_dir)
+  if not same_origin(origin_url(repo), staged.url):
+    raise SourceTreeChanged(
+      "the app's Git origin is not the repository this update came from"
+    )
+  try:
+    _run(
+      repo, *_NO_AUTO_GC, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+      *(["--unshallow"] if _is_shallow(repo) else []),
+      str(staged.path), f"+{FETCHED_REF}:{FETCHED_REF}",
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
+  except subprocess.TimeoutExpired as exc:
+    raise GitTransferTimeout(
+      f"it ran longer than {_GIT_TRANSFER_TIMEOUT} seconds"
+    ) from exc
+  if _resolve_commit(repo, staged.sha) != staged.sha:
+    raise RuntimeError("staged commit did not import")
+  _record_origin_branch(repo, staged)
+  return staged.sha
+
+
+def present_commit(source_dir: str | Path, ref: str) -> str | None:
+  """``ref`` when it is a full commit id already present with full history."""
+  repo = Path(source_dir)
+  commit = str(ref or "").lower()
+  if not _HEX_OID.fullmatch(commit) or _is_shallow(repo):
+    return None
+  return commit if _resolve_commit(repo, commit, read_only=True) == commit else None
+
+
+def stage_clone(url: str, ref: str, root: Path) -> Staged:
+  """Build a complete real-origin app checkout privately, with no lock held.
+
+  ``main`` and ``upstream`` start at the resolved catalog commit, so the
+  installed baseline is a real commit an update can fetch from and a local
+  fix can be pushed against. A 64-character commit id implies a SHA-256
+  repository. ``adopt_clone`` moves the result into place under the locks.
+  """
+  stage = _staging_dir(root, "clone-")
+  try:
+    sha256 = len(ref) == 64 and _HEX_OID.fullmatch(ref.lower())
+    _run(stage, "init", "-q", *(["--object-format=sha256"] if sha256 else []))
+    _run(stage, "remote", "add", "origin", url)
+    # Catalog repos are untrusted content. Check out any tracked symlink as a
+    # plain file holding the link text, never a real filesystem symlink that
+    # could point outside the app directory. Set before the first checkout.
+    _run(stage, "config", "core.symlinks", "false")
+    sha, branch = _transfer(stage, url, ref, unshallow=False)
+    staged = Staged(stage, sha, url, branch)
+    _record_origin_branch(stage, staged)
+    if branch:
+      # Source status reads the remote's default branch through origin/HEAD.
+      _run(
+        stage, "symbolic-ref", "refs/remotes/origin/HEAD",
+        f"refs/remotes/origin/{branch}",
       )
-      _run(clone_dir, "remote", "add", "origin", repo_url)
-      remote_ref = fetch_origin_commit(
-        clone_dir, immutable_ref, depth=depth,
-      )
-    else:
-      cmd = [
-        "git",
-        "-c", f"user.name={_GIT_NAME}",
-        "-c", f"user.email={_GIT_EMAIL}",
-        # core.symlinks=false: check out any tracked symlink as a PLAIN FILE
-        # (the link text as content), never a real filesystem symlink. Catalog
-        # repos are untrusted content; a materialized symlink (e.g. `static` ->
-        # outside the app dir, or `index.jsx` -> /data/service-token.txt) would
-        # escape the containment the fetched-source path enforces via
-        # _assert_within — that guard is skipped for the cloned tree, so the
-        # non-symlink checkout is what keeps the clone inside its own dir.
-        "-c", "core.symlinks=false",
-        "clone", "-q",
-        "--depth", str(depth),
-        "--branch", ref,
-        repo_url,
-        str(clone_dir),
-      ]
-      subprocess.run(
-        cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-        check=True, env=_git_env(repo),
-      )
-      remote_ref = f"origin/{ref}"
-      _run(clone_dir, "rev-parse", "--verify", remote_ref)
-    # Keep later checkouts under the same safety policy as clone's first
-    # checkout instead of relying on a process-local ``git -c`` forever. On
-    # the immutable path this is set BEFORE its first checkout.
-    _run(clone_dir, "config", "core.symlinks", "false")
-    _run(clone_dir, "branch", "-f", UPSTREAM_BRANCH, remote_ref)
-    _run(clone_dir, "checkout", "-q", "-B", LOCAL_BRANCH, remote_ref)
+    _run(stage, "branch", "-f", UPSTREAM_BRANCH, sha)
+    # Writing a large working tree is proportional to the download.
+    _run(
+      stage, "checkout", "-q", "-B", LOCAL_BRANCH, sha,
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
     # Keep the app's OWN .gitignore committed (it travels upstream), but layer
     # Möbius's managed-artifact ignores locally via .git/info/exclude so a
-    # later `git add -A` never tracks generated per-install files (static/,
-    # the static-asset manifest, init-cron.sh, *.bak, the compiled/id trees).
-    # A committed catalog .gitignore rarely lists these; without this, the
-    # first commit pollutes `main` and — since record_upstream preserves the
-    # on-disk .gitignore — never self-heals (the card-099 orphan-cron class).
-    _refresh_ignore_rules(clone_dir)
-    sha = _run(clone_dir, "rev-parse", "HEAD").stdout.strip()
-    repo.mkdir(parents=True, exist_ok=True)
-    existing = list(repo.iterdir())
-    if existing:
-      raise RuntimeError(f"source_dir is not empty: {repo}")
-    for child in clone_dir.iterdir():
-      shutil.move(str(child), str(repo / child.name))
-    return sha
+    # later `git add -A` never tracks generated per-install files.
+    _refresh_ignore_rules(stage)
+    return staged
+  except BaseException:
+    shutil.rmtree(stage, ignore_errors=True)
+    raise
 
 
-def fetch_upstream(
-  source_dir: str | Path,
-  ref: str,
-  *,
-  trusted_origin_adoption: bool = False,
-  verify: Callable[[str], None] | None = None,
-) -> FetchUpstreamResult:
-  """Fetch `origin/<ref>` and advance local `upstream` to that real commit.
+def adopt_clone(staged: Staged, source_dir: str | Path) -> Callable[[], None]:
+  """Move a staged clone into an empty ``source_dir``; local, under the locks.
 
-  This is the cloned-app update analogue of `record_upstream`: the catalog's
-  complete git tree is fetched from the real remote, then the installer-owned
-  `upstream` branch is moved to the fetched remote-tracking commit.
-  Depth-1 fetches can leave the previous upstream behind a shallow boundary;
-  when that happens, unshallow so Git can prove ancestry and the existing merge
-  path can compute a real merge base.
-
-  ``trusted_origin_adoption`` is the narrow legacy-adoption exception. The
-  caller must first prove that this repo's configured origin is the trusted
-  package identity. Rebinding an old synthetic ``upstream`` is safe only when
-  the fetched origin has the exact same complete tree as local ``main``: that
-  proof guarantees moving the ref cannot change any installed byte. Shared
-  history alone is insufficient because it also describes a genuine remote
-  rollback or force-push, which must stay on the conservative fallback path.
-
-  Returns:
-    The fetched commit and any trusted equal-tree adoption proof.
+  Returns the undo, which moves the checkout back and resets it to the staged
+  commit, so a rolled-back install pass can adopt it again without another
+  transfer.
   """
-  repo = Path(source_dir)
-  _run(repo, "fetch", "--depth", "1", "origin", ref)
-  # A branch/tag fetch updates ``origin/<ref>``.  Fetching an immutable commit
-  # oid does not create that remote-tracking name; Git records the exact fetched
-  # commit only in FETCH_HEAD.  Store updates are commonly review-bound to a
-  # commit-pinned raw URL, so resolve that shape through FETCH_HEAD rather than
-  # falling back to a synthetic upstream with unrelated history.
-  remote_ref = (
-    "FETCH_HEAD"
-    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", ref)
-    else f"origin/{ref}"
-  )
-  sha = _run(repo, "rev-parse", "--verify", remote_ref).stdout.strip()
-  if verify is not None:
-    verify(sha)
-  return promote_upstream(
-    repo,
-    sha,
-    trusted_origin_adoption=trusted_origin_adoption,
-  )
+  repo = Path(source_dir).resolve()
+  if repo.exists() and not repo.is_dir():
+    raise RuntimeError(f"source_dir exists and is not a directory: {repo}")
+  repo.mkdir(parents=True, exist_ok=True)
+  if any(repo.iterdir()):
+    raise RuntimeError(f"source_dir is not empty: {repo}")
+  moved: list[str] = []
+
+  def undo() -> None:
+    for name in reversed(moved):
+      shutil.move(str(repo / name), str(staged.path / name))
+    moved.clear()
+    _run(
+      staged.path, "checkout", "-q", "-f", "-B", LOCAL_BRANCH, staged.sha,
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
+    _run(staged.path, "clean", "-q", "-ffdx", timeout=_GIT_TRANSFER_TIMEOUT)
+
+  try:
+    for child in list(staged.path.iterdir()):
+      shutil.move(str(child), str(repo / child.name))
+      moved.append(child.name)
+  except BaseException:
+    undo()
+    raise
+  return undo
 
 
 def _release_continues(repo: Path, previous: str, fetched: str) -> bool:
@@ -2822,10 +3032,7 @@ def promote_upstream(
     repo, "rev-parse", "--verify", UPSTREAM_BRANCH, check=False,
   )
   previous_sha = previous.stdout.strip() if previous.returncode == 0 else ""
-  # A depth-one fetch can re-graft even an unchanged tip. Repair based on the
-  # relationship the installer actually needs (local main ↔ fetched tip), not
-  # only on whether the remote SHA string changed.
-  _restore_shallow_history_if_needed(repo, LOCAL_BRANCH, fetched_ref)
+  require_merge_history(repo, LOCAL_BRANCH, fetched_ref)
   equal_local_adoption = (
     trusted_origin_adoption
     and ref_trees_equal(repo, LOCAL_BRANCH, fetched_ref)
@@ -3299,43 +3506,44 @@ def local_diverged_from(source_dir: str | Path, base_commit: str) -> bool:
   return proc.returncode != 0
 
 
-def _restore_shallow_history_if_needed(
+def require_merge_history(
   source_dir: str | Path,
   left: str = LOCAL_BRANCH,
   right: str = UPSTREAM_BRANCH,
 ) -> None:
-  """Restore remote history when a shallow graft may hide a merge base.
+  """Refuse a merge whose base a legacy shallow boundary may hide.
 
-  Depth-one app fetches can make ``main`` and ``upstream`` appear unrelated
-  even though both came from the same origin. The update verdict and the
-  resolver's real merge both require that base, so they self-heal at their
-  entry points. A failed/offline fetch raises without moving refs or the
-  working tree. If unshallowing proves the histories are genuinely unrelated,
-  return normally: the merge seam handles that valid legacy-adoption shape
-  with Git's empty-base semantics.
+  Local only: callers complete history before taking locks (see
+  ``install.fetch_app_commit``). Without a shallow boundary, a missing merge
+  base is a genuine fact that the merge seam handles itself.
   """
   repo = Path(source_dir)
-  shallow_raw = _run(repo, "rev-parse", "--git-path", "shallow").stdout.strip()
-  shallow_path = Path(shallow_raw)
-  if not shallow_path.is_absolute():
-    shallow_path = repo / shallow_path
-  if not shallow_path.is_file():
+  if (
+    not _is_shallow(repo)
+    or not ref_exists(repo, left)
+    or not ref_exists(repo, right)
+    or _run(repo, "merge-base", left, right, check=False).stdout.strip()
+  ):
     return
-  if not ref_exists(repo, left) or not ref_exists(repo, right):
-    return
-  base = _run(repo, "merge-base", left, right, check=False)
-  if base.returncode == 0 and base.stdout.strip():
-    return
-  if not has_origin(repo):
-    raise RuntimeError(
-      f"no merge base between {left} and {right} in shallow repo without origin"
-    )
-  fetched = _run(
-    repo, "fetch", "--unshallow", "--no-tags", "origin", check=False,
+  raise HistoryIncomplete(
+    f"the app's Git history is incomplete (no merge base between {left} and "
+    f"{right}); retry when the app's source is reachable"
   )
-  if fetched.returncode != 0:
-    detail = fetched.stderr.strip() or fetched.stdout.strip()
-    raise RuntimeError(f"failed to restore app git history: {detail}")
+
+
+def origin_branch(source_dir: str | Path) -> str | None:
+  """The last-fetched origin branch, preferring ``main`` and ``master``."""
+  branches = [
+    name for name in _run(
+      Path(source_dir), "for-each-ref", "--format=%(refname:lstrip=3)",
+      "refs/remotes/origin/", read_only=True,
+    ).stdout.split()
+    if name != "HEAD"
+  ]
+  for preferred in ("main", "master"):
+    if preferred in branches:
+      return preferred
+  return branches[0] if branches else None
 
 
 def merge_upstream(
@@ -3363,7 +3571,7 @@ def merge_upstream(
   """
   repo = Path(source_dir)
   ensure_repo(repo)
-  _restore_shallow_history_if_needed(repo)
+  require_merge_history(repo)
   ordinary_base = _run(
     repo, "merge-base", LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
   ).stdout.strip()
@@ -3533,7 +3741,7 @@ def materialize_tree(
 
   Catalog repositories are untrusted input. Paths are confined to
   ``target_dir`` and Git symlinks are written as plain files containing their
-  link text, matching ``clone_upstream``'s ``core.symlinks=false`` policy.
+  link text, matching ``stage_clone``'s ``core.symlinks=false`` policy.
   Submodules and other non-blob entries are rejected.
   """
   repo = Path(source_dir)
@@ -3646,7 +3854,7 @@ def start_conflict_merge(
   repo = Path(source_dir)
   ensure_repo(repo)
   if merge_base is None:
-    _restore_shallow_history_if_needed(repo, local_branch, upstream_branch)
+    require_merge_history(repo, local_branch, upstream_branch)
   local_sha = head_sha(repo, local_branch)
   upstream_sha = head_sha(repo, upstream_branch)
   if _run(repo, "status", "--porcelain").stdout.strip():
@@ -3779,13 +3987,66 @@ _APP_VERSION_RE = re.compile(
 
 
 def read_blob(source_dir: str | Path, ref: str, rel: str) -> bytes | None:
-  """Raw bytes of `rel` at `ref`, or None if the path is absent there."""
+  """Raw blob bytes of `rel` at `ref`, or None for absent/non-file paths."""
   repo = Path(source_dir)
   proc = subprocess.run(
-    ["git", "-C", str(repo), "cat-file", "-p", f"{ref}:{rel}"],
+    ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{rel}"],
     capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
   )
   return proc.stdout if proc.returncode == 0 else None
+
+
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_REGULAR_FILE_MODES = frozenset({b"100644", b"100755"})
+
+
+def read_committed_file(
+  source_dir: str | Path,
+  commit: str,
+  rel: str,
+  *,
+  max_bytes: int,
+  timeout: float = 5,
+) -> bytes | None:
+  """Bytes of one regular file in an exact accepted commit, or None.
+
+  Reads only Git's object database, so uncommitted worktree edits, symlinks,
+  and other non-regular tree entries can never reach the caller. ``commit``
+  must be a full object id (an accepted ``source_commit``), not a moving ref.
+  """
+  if not isinstance(commit, str) or not _COMMIT_SHA_RE.fullmatch(commit):
+    return None
+  repo = Path(source_dir)
+  env = _git_env(repo, read_only=True)
+  try:
+    listing = subprocess.run(
+      ["git", "--literal-pathspecs", "-C", str(repo),
+       "ls-tree", "-l", "-z", commit, "--", rel],
+      capture_output=True, timeout=timeout, check=False, env=env,
+    )
+    if listing.returncode != 0:
+      return None
+    meta, tab, name = listing.stdout.removesuffix(b"\0").partition(b"\t")
+    fields = meta.split()
+    if (
+      not tab
+      or name != rel.encode()
+      or len(fields) != 4
+      or fields[0] not in _REGULAR_FILE_MODES
+      or fields[1] != b"blob"
+      or not fields[3].isdigit()
+      or int(fields[3]) > max_bytes
+    ):
+      return None
+    blob = subprocess.run(
+      ["git", "-C", str(repo), "cat-file", "blob", fields[2].decode("ascii")],
+      capture_output=True, timeout=timeout, check=False, env=env,
+    )
+  except (OSError, subprocess.SubprocessError, UnicodeError):
+    return None
+  if blob.returncode != 0 or len(blob.stdout) > max_bytes:
+    return None
+  return blob.stdout
 
 
 # Sentinels for the structural JSON merge: a key that is absent on a side, and
@@ -3972,32 +4233,38 @@ class BenignResolution:
   APP_VERSION taken from upstream); `tree_oid` is the merge-tree oid it was built
   from, so the caller can read exec bits off the same tree the clean-merge path
   uses (`read_tree_exec_paths`) rather than approximating from a branch.
+  `kept_local` names conflicting paths outside the package that keep the
+  local version as is.
   """
   tree: dict[str, bytes]
   tree_oid: str
+  kept_local: tuple[str, ...] = ()
 
 
 def resolve_benign_conflict(
   source_dir: str | Path, conflict_paths: list[str],
   *, merge_base: str | None = None,
+  package_paths: set[str] | None = None,
+  incoming: str = UPSTREAM_BRANCH,
 ) -> BenignResolution | None:
-  """Full merged source tree with every BENIGN conflict auto-resolved, or None
-  when any conflicting file carries a genuine overlap.
+  """Reconcile package conflicts or keep local ancillary paths, else None.
 
-  Call only after `merge_upstream` verdicted a conflict. We PROVE each conflict
-  is benign rather than assume it: JSON manifests get a structural three-way
-  merge (serialization drift and disjoint edits reconcile; true overlap does
-  not), and other source files get the narrow APP_VERSION-only line resolution.
-  If every conflicting file resolves, we return the whole merged tree
-  (non-conflict files carry their clean three-way merge; conflicting files carry
-  the reconciled result). If any file still carries a real clash we return None
-  and the caller falls back to the owner-resolver flow. Fail-safe by
-  construction: a genuine local edit is never silently dropped, because a
-  residual conflict aborts the whole attempt.
+  Call after a merge with ``incoming`` reports a conflict. Try each narrow
+  per-file merge first (structural JSON or APP_VERSION-only line resolution).
+  Residual conflicts outside ``package_paths`` retain local bytes/deletions;
+  package conflicts still need the owner-resolver flow. The returned tree
+  includes all clean merges, and ``kept_local`` reports dropped upstream edits.
+  The caller must establish source completeness before accepting kept paths.
 
   Pass ``merge_base`` when the caller's merge verdict used an explicit base
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
+
+  An entry ending in ``/`` protects every path below that directory.
+  If the per-file merge fails, a path outside ``package_paths`` can keep its
+  local version, including a local deletion of a base file. Synthetic conflict
+  paths absent from both local and base trees need the resolver. None protects
+  every path.
   """
   repo = Path(source_dir)
   if not conflict_paths:
@@ -4013,7 +4280,7 @@ def resolve_benign_conflict(
   if merge_base is not None:
     args.extend(("--merge-base", merge_base))
   proc = _run(
-    repo, *args, LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
+    repo, *args, LOCAL_BRANCH, incoming, check=False,
   )
   if proc.returncode != 1:
     return None
@@ -4031,27 +4298,44 @@ def resolve_benign_conflict(
   base_ref = merge_base
   if base_ref is None:
     base_proc = _run(
-      repo, "merge-base", LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
+      repo, "merge-base", LOCAL_BRANCH, incoming, check=False,
     )
     base_ref = base_proc.stdout.strip() if base_proc.returncode == 0 else ""
   if not base_ref:
     return None
-  resolved: dict[str, bytes] = {}
+  resolved: dict[str, bytes | None] = {}
+  kept_local: list[str] = []
   for rel in merge_conflicts:
     ours = read_blob(repo, LOCAL_BRANCH, rel)
-    theirs = read_blob(repo, UPSTREAM_BRANCH, rel)
-    # A deletion on either side is not a benign shape; leave it to the owner.
-    if ours is None or theirs is None:
-      return None
-    merged = _resolve_benign_conflict_file(
-      rel, read_blob(repo, base_ref, rel), ours, theirs,
+    theirs = read_blob(repo, incoming, rel)
+    base = read_blob(repo, base_ref, rel)
+    merged = (
+      _resolve_benign_conflict_file(rel, base, ours, theirs)
+      if ours is not None and theirs is not None else None
     )
-    if merged is None:
+    if merged is not None:
+      resolved[rel] = merged
+    elif (
+      package_paths is not None
+      and not any(
+        rel == path or (path.endswith("/") and rel.startswith(path))
+        for path in package_paths
+      )
+      and (ours is not None or base is not None)
+    ):
+      resolved[rel] = ours
+      kept_local.append(rel)
+    else:
       return None
-    resolved[rel] = merged
   full = read_merged_tree(repo, tree_oid)
-  full.update(resolved)
-  return BenignResolution(tree=full, tree_oid=tree_oid)
+  for rel, data in resolved.items():
+    if data is None:
+      full.pop(rel, None)
+    else:
+      full[rel] = data
+  return BenignResolution(
+    tree=full, tree_oid=tree_oid, kept_local=tuple(kept_local),
+  )
 
 
 # Smells

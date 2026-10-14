@@ -18,7 +18,7 @@ from app.app_compile_contract import (
   COMPILED_RUNTIME_ABI,
   COMPILED_RUNTIME_ARTIFACT_REVISION,
   COMPILED_RUNTIME_BANNER,
-  ROLLDOWN_TIMEOUT_SECS,
+  ROLLDOWN_WALL_LIMIT_SECS,
   mobius_runtime_path,
   rolldown_command,
   rolldown_report_contract_error,
@@ -66,7 +66,7 @@ def _compile(entry: Path, output: Path, *, report: Path | None = None):
     capture_output=True,
     check=False,
     text=True,
-    timeout=ROLLDOWN_TIMEOUT_SECS,
+    timeout=ROLLDOWN_WALL_LIMIT_SECS,
   )
 
 

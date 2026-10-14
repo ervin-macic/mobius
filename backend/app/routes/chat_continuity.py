@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.concurrency import run_in_threadpool
 
 from app import transcript_rows
-from app import chat_queue, models
+from app import chat_queue, models, settled
 from app.broadcast import get_system_broadcast
 from app.chat_continuity import apply_checkpoint, checkpoint_coverage, note_path, write_note
 from app.chat_titles import renamed_event
@@ -74,7 +73,7 @@ async def checkpoint_chat(
     )))
     if result.get("status") != "ok":
       raise HTTPException(status_code=409, detail="This run can no longer save this chat.")
-    renamed = await run_in_threadpool(
+    renamed = await settled.run_settled(
       _save_note, get_settings().data_dir, chat_id, body, principal.run_id or "",
     )
   if renamed is not None and result.get("title_applied"):

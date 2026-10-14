@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 
-from sqlalchemy.orm import object_session
-
 from app import transcript_rows
 from app.events import tool_output_exit_code
 from app.memory_recall import (
@@ -16,6 +14,7 @@ from app.memory_recall import (
 )
 from app.owner_card_receipts import owner_card_receipt_id
 from app.peer_message import bounded_peer_message
+from app.screenshot_steps import SAVED_IMAGE_FIELD, saved_screenshot_file
 from app.tool_sources import normalize_tool_sources
 
 
@@ -121,7 +120,7 @@ class MaterializedHistory:
     live = chat.live_assistant
     self.live = live if (isinstance(live, dict) and live.get("role") == "assistant"
                          and isinstance(live.get("blocks"), list) and live["blocks"]) else None
-    self.live_index = (transcript_rows.assistant_index(self.history.db, chat, self.live)
+    self.live_index = (self.history.assistant_index(self.live)
                        if self.live is not None else -1)
 
   def __len__(self):
@@ -166,8 +165,8 @@ def materialized_messages(chat):
 
 def materialized_metadata(chat, view=None):
   """Cheap stable coordinates for Goal, Wait and recovery placement."""
-  rows = transcript_rows.metadata(object_session(chat), chat)
   view = view if view is not None else materialized_messages(chat)
+  rows = view.history.metadata()
   if view.live is not None:
     if view.live_index < 0:
       rows.append(view.live)
@@ -179,6 +178,7 @@ def materialized_metadata(chat, view=None):
 def project_messages_for_detail(
   messages: list[dict],
   *,
+  chat_id: str,
   fetchable_tool_output_ids: set[str],
   live_message: dict | None = None,
 ) -> list[dict]:
@@ -192,6 +192,10 @@ def project_messages_for_detail(
   A task (helper or background command) still marked running in a historical
   message lost its terminal fact when its turn ended or was interrupted first,
   so it reads as stopped rather than live forever.
+
+  A screenshot step stored before steps named their saved picture recovers
+  ``saved_image`` from its excerpt here, before the excerpt is dropped, so the
+  chat never downloads the full result to find it (see screenshot_steps).
 
   Copy only messages and blocks that change.  This keeps the persisted JSON and
   live-assistant snapshot immutable, and preserves the common small-chat path.
@@ -210,6 +214,12 @@ def project_messages_for_detail(
       if not isinstance(block, dict) or block.get("type") != "tool":
         continue
       next_block = block
+      if SAVED_IMAGE_FIELD not in block:
+        saved_image = saved_screenshot_file(
+          block.get("tool"), block.get("output"), chat_id,
+        )
+        if saved_image is not None:
+          next_block = {**block, SAVED_IMAGE_FIELD: saved_image}
       if (
         block.get("output_truncated") is True
         and isinstance(block.get("tool_use_id"), str)
@@ -217,7 +227,7 @@ def project_messages_for_detail(
         and block["tool_use_id"] in fetchable_tool_output_ids
         and "output" in block
       ):
-        next_block = dict(block)
+        next_block = dict(next_block)
         next_block.pop("output", None)
       tasks = block.get("subagent")
       if isinstance(tasks, dict) and any(

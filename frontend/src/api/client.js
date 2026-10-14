@@ -6,6 +6,7 @@
 import { del as idbDel } from 'idb-keyval'
 import * as setupSession from '../lib/setupSession.js'
 import { clearLatchedTokens } from '../lib/appToken.js'
+import { clearAppNavLocations } from '../lib/appNavLocationStore.js'
 import { clearOwnerDraftStorage } from '../lib/ownerDraftStorage.js'
 import { clearReadingPositions } from '../components/ChatView/scroll/readingPositions.js'
 import { clearDurableComposerDrafts } from '../components/ChatView/composerDraft.js'
@@ -292,6 +293,8 @@ function clearOwnerClientState({ preserveChatOutbox }) {
   // harmless shell preferences, they must not survive logout/token expiry and
   // appear in a later owner's session on the same browser.
   clearOwnerDraftStorage()
+  // Where each app was (a search query, an open item) is owner app data too.
+  clearAppNavLocations()
   // Media token cache is per-owner (tokens carry the owner's epoch). Clear
   // on logout so a new session doesn't inherit stale media tokens.
   try {
@@ -803,9 +806,15 @@ export async function jsonOrThrow(response, label = 'Request failed') {
   }
   if (!response.ok) {
     const detail = body?.detail
-    const message = typeof detail === 'string'
+    const reason = typeof detail === 'string'
       ? detail
       : (detail?.message || `${label} (${response.status})`)
+    // A compile refusal's reason and location live in its sanitized
+    // diagnostic; the message alone only says that compilation failed.
+    const diagnostic = detail?.code === 'compile_failed' && typeof detail.stderr === 'string'
+      ? detail.stderr.trim()
+      : ''
+    const message = diagnostic ? `${reason}\n${diagnostic}` : reason
     const error = new Error(message)
     error.status = response.status
     error.detail = detail
@@ -944,13 +953,21 @@ export const api = {
     }),
     // In-place compaction: optional owner guidance shapes the fresh briefing;
     // omitting it preserves the bodyless route used by older clients.
-    compact: (chatId, { instructions = '', ...options } = {}) => apiFetch(
+    compact: (chatId, { instructions = '', batch_id, recovery_id, ...options } = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/compact`,
       {
         ...options,
         method: 'POST',
-        ...(instructions ? { body: JSON.stringify({ instructions }) } : {}),
+        ...(instructions || batch_id || recovery_id
+          ? { body: JSON.stringify({ ...(instructions ? { instructions } : {}), batch_id, recovery_id }) }
+          : {}),
       },
+    ),
+    compactProgress: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/compact-progress`, options,
+    ),
+    compactStop: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/compact-stop`, { ...options, method: 'POST' },
     ),
     runtime: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/runtime`,
@@ -963,6 +980,27 @@ export const api = {
     usage: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/usage`,
       options,
+    ),
+    // Estimated tokens of each part Möbius adds to the context (/context).
+    contextSizes: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/context-sizes`,
+      options,
+    ),
+    // `/btw`: an answer from a temporary copy of the chat. The copy rereads the
+    // whole chat first, so it can take far longer than an ordinary read.
+    askSideQuestion: (chatId, question, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/btw`,
+      {
+        timeoutMs: 200_000,
+        ...options,
+        method: 'POST',
+        body: JSON.stringify({ question }),
+      },
+    ),
+    // "Add to chat" for a side question; `cid` makes a retried add idempotent.
+    keepSideQuestion: (chatId, payload, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/side-questions`,
+      { ...options, method: 'POST', body: JSON.stringify(payload) },
     ),
     goalPlan: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/goal-plan`,
@@ -1128,9 +1166,9 @@ export const api = {
     markOpened: (appId) => apiFetch(`/apps/${appId}/opened`, {
       method: 'POST',
     }),
-    markActivitySeen: (appId, activityVersion) => apiFetch(`/apps/${appId}/activity/seen`, {
+    markActivitySeen: (appId, activityVersion, appCreatedAt) => apiFetch(`/apps/${appId}/activity/seen`, {
       method: 'POST',
-      body: JSON.stringify({ activity_version: activityVersion }),
+      body: JSON.stringify({ activity_version: activityVersion, app_created_at: appCreatedAt }),
     }),
     update: (appId, payload) => listAffectingMutation('apps', `/apps/${appId}`, {
       method: 'PATCH',
@@ -1157,7 +1195,7 @@ export const api = {
     // Wipes the app's runtime storage back to empty while KEEPING it
     // installed — distinct from `remove` (which tombstones the whole app).
     deleteData: (appId) => apiFetch(`/apps/${appId}/data`, { method: 'DELETE' }),
-    // Stable base URL. AppCanvas appends `?v=<app.updated_at>` so the
+    // Stable base URL. AppCanvas appends `?v=<app.frame_version>` so the
     // service worker can serve cached offline-capable apps cache-first while
     // app edits naturally become cache misses. The backend still sends ETags
     // for browser-cache revalidation on non-SW/cold paths.

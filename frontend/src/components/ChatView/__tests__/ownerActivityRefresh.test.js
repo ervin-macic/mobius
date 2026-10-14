@@ -90,7 +90,7 @@ test('question answers share the same owner-activity refresh boundary', () => {
   const answerPath = slice(
     chatView,
     'const doSendSilent = useCallback',
-    'function handleSubmit(e)',
+    'function handleSubmit(e',
   )
   const response = answerPath.indexOf('const response = await streamSend')
   const refresh = answerPath.indexOf('onOwnerActivityRef.current?.()')

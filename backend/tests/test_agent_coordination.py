@@ -1468,7 +1468,8 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   monkeypatch.setattr(
     coordination, "paused_goal_run",
     lambda _db, chat_id: (
-      SimpleNamespace(id="builder-goal-run") if chat_id == builder.id else None
+      SimpleNamespace(id="builder-goal-run", goal_id=runs["builder"].goal_id)
+      if chat_id == builder.id else None
     ),
   )
   started = []
@@ -1498,6 +1499,9 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   )
   assert interrupted.status_code == 200, interrupted.text
   assert interrupted.json()["woken"] == [builder.id]
+  # The wake resumes under the paused Goal, not as Goal-less work.
+  assert started[-1]["goal_id"] == runs["builder"].goal_id
+  assert started[-1]["source_work_id"] == "builder-goal-run"
   assert len(started) == 1
   wake = started[0]
   assert wake["chat_id"] == builder.id
@@ -1778,3 +1782,39 @@ def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
   assert claim.notification_revision == claim.revision
   assert len(notices) == 1
   assert delivered == [(["claim-follower"], "interrupt")]
+
+
+def test_goal_parent_and_its_helper_share_one_coordination_scope(db):
+  """A Goal helper is keyed by its physical spawning root but owned by the
+  Goal. Coordination must use the same ownership, or the parent cannot see or
+  message its own live helpers."""
+  from app.agent_coordination import _scope_membership, send_scope_message
+
+  parent = create_chat(id="goal-scope-parent", title="Coordinator", messages=[])
+  helper = create_chat(id="goal-scope-helper", title="Helper", messages=[])
+  db.add_all([parent, helper])
+  db.flush()
+  db.add(models.ChatGoal(id="goal-scope-g", chat_id=parent.id, objective="Ship it",
+                         status="open"))
+  db.add(models.ChatRun(id="goal-scope-attempt", root_run_id="goal-scope-attempt",
+                        chat_id=parent.id, goal_id="goal-scope-g", status="running",
+                        provider="claude"))
+  db.add(models.Delegation(
+    id="goal-scope-delegation", parent_chat_id=parent.id,
+    parent_root_run_id="goal-scope-attempt", goal_id="goal-scope-g",
+    child_chat_id=helper.id, task_key="scout", provider="codex", scope="write",
+    cwd="/data", prompt_sha256="0" * 64,
+  ))
+  db.commit()
+
+  parent_scope = scope_for_chat(db, parent.id, "goal-scope-attempt")
+  helper_scope = scope_for_chat(db, helper.id)
+
+  assert parent_scope.id == helper_scope.id == "goal-scope-g"
+  members, _ = _scope_membership(db, parent_scope, limit=None)
+  assert helper.id in members
+  sent = send_scope_message(
+    db, parent_scope, sender_chat_id=parent.id, sender_run_id="goal-scope-attempt",
+    recipients=[helper.id], broadcast=False, kind="note", body="Check the logs first.",
+  )
+  assert [row["recipient_chat_id"] for row in sent] == [helper.id]

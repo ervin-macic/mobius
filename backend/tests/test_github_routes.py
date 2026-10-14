@@ -1098,7 +1098,7 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
   for a fast-forward landing. A retry after a real merge commit must still
   take the full proof path so a pending conflict receipt is honoured.
   """
-  from app import app_git, install, models
+  from app import app_git, install, models, pending_update
   from app.app_capabilities import contract_and_digest
   from app.database import SessionLocal
 
@@ -1214,12 +1214,22 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
     capability_contract=contract,
     capability_digest=capability_digest,
     candidate_digest="a" * 64,
-    source_review_digest="b" * 64,
+    # A fetched candidate's review digest is its package content digest.
+    source_review_digest=install.package_content_digest(
+      manifest=manifest, entry_bytes=tree["index.jsx"], icon_processed=None,
+      bundled_job=None, static_assets={}, source_files={}, seeds={},
+    ),
   )
   monkeypatch.setattr(
     github_routes, "_merged_upstream_sha", lambda *_args: landed,
   )
-  monkeypatch.setattr(app_git, "fetch_origin_commit", lambda *_args: landed)
+  async def fetched_commit(_repo, ref):
+    from app import fs_locks
+    # Publication handoff transfers before it takes any app lock.
+    assert not fs_locks.install_uninstall_lock().locked()
+    assert not fs_locks.source_dir_lock(str(_repo)).locked()
+    return ref
+  monkeypatch.setattr(install, "fetch_app_commit", fetched_commit)
   async def fetched(_url):
     return candidate
   monkeypatch.setattr(install, "fetch_install_candidate", fetched)
@@ -1269,7 +1279,7 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
 
   # Simulate the narrow crash window after a conflicting handoff committed
   # the app identity and pending receipt but before its ledger mirror landed.
-  install.stage_pending_conflict_update(
+  pending_update.stage_pending_conflict_update(
     source,
     app_id=target["id"],
     upstream_commit=landed,
@@ -1293,7 +1303,7 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
   assert recovered.json()["connection"]["conflict_paths"] == []
   assert installs == 1
 
-  install.stage_pending_conflict_update(
+  pending_update.stage_pending_conflict_update(
     source,
     app_id=target["id"],
     upstream_commit=landed,
@@ -1664,7 +1674,7 @@ def test_connect_published_app_rejects_package_mismatch_before_activation(
     candidate_digest="a" * 64,
     source_review_digest="b" * 64,
   )
-  package_digest = install.install_candidate_content_digest(candidate)
+  package_digest = candidate.source_review_digest
   expected = {
     "manifest_id": "mismatch",
     "package_digest": package_digest,
@@ -1809,7 +1819,13 @@ def test_connect_published_app_rejects_full_handoff_drift_after_install(
     return reviewed_head
 
   monkeypatch.setattr(github_routes, "_merged_upstream_sha", merged_upstream)
-  monkeypatch.setattr(app_git, "fetch_origin_commit", lambda *_args: reviewed_head)
+  async def fetched_commit(_repo, ref):
+    from app import fs_locks
+    # Publication handoff transfers before it takes any app lock.
+    assert not fs_locks.install_uninstall_lock().locked()
+    assert not fs_locks.source_dir_lock(str(_repo)).locked()
+    return ref
+  monkeypatch.setattr(install, "fetch_app_commit", fetched_commit)
   def verify_landed(repo, **kwargs):
     expected = original_spec
     if drift_field == "reviewed_head_sha" and json.loads(
@@ -1841,17 +1857,13 @@ def test_connect_published_app_rejects_full_handoff_drift_after_install(
       f"app-concurrent-publication/{reviewed_head}/"
     ),
     candidate_digest="4" * 64,
+    source_review_digest=original_spec.package_digest,
   )
 
   async def fetch_candidate(_url):
     return candidate
 
   monkeypatch.setattr(install, "fetch_install_candidate", fetch_candidate)
-  monkeypatch.setattr(
-    install,
-    "install_candidate_content_digest",
-    lambda _candidate: original_spec.package_digest,
-  )
   installs = []
 
   async def install_and_drift(db, **_kwargs):
@@ -15647,3 +15659,239 @@ def test_assignment_choices_reject_missing_github_capability(client, owner_token
     headers={"Authorization": f"Bearer {app_token}"},
   )
   assert response.status_code == 403
+
+
+def _stack_rows(tmp_name: str, status: str) -> tuple[Path, list[dict]]:
+  repo = Path(get_settings().data_dir) / "contrib" / tmp_name / "repo"
+  repo.mkdir(parents=True)
+  record = {"id": "layer-1", "status": status, "plan": {"repo_path": str(repo)}}
+  return repo, [{"record": record}]
+
+
+def _cancel_under_source_lock(repo, operation, worker):
+  from app import fs_locks
+  from tests.cancel_helpers import cancel_while_worker_blocked
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(repo)), operation, worker,
+  ))
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+
+
+def test_cancelled_stack_submit_holds_source_locks_through_its_preflight(
+  db, monkeypatch,
+):
+  """The preflight checks out branches and writes trees: it ends under the lock."""
+  from app.routes import github as routes
+  from tests.cancel_helpers import BlockedWorker
+
+  repo, rows = _stack_rows("stack-submit-cancel", "submitting")
+  monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(routes, "_cleanup_durable_complete_attempt", lambda *a, **k: None)
+  monkeypatch.setattr(routes, "_personal_resume_allowed", lambda *a, **k: None)
+  owner = SimpleNamespace(recovery_record=lambda record: record)
+  monkeypatch.setattr(
+    routes, "_personal_claim_owners", lambda **_kwargs: ({"layer-1": owner}, None),
+  )
+  monkeypatch.setattr(routes, "_claim_stack_records", lambda **_kwargs: rows)
+  monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
+  worker = BlockedWorker()
+  monkeypatch.setattr(routes, "_preflight_prepared_stack", worker)
+
+  _cancel_under_source_lock(repo, lambda: routes.submit_contribution_stack(
+    None, 1, routes.ContributionStackSubmitRequest(record_ids=["layer-1"]), db, None,
+  ), worker)
+
+
+def test_a_cancelled_stack_landing_never_starts_the_landing(db, monkeypatch):
+  """A cancel during the pre-landing proof lands before the public fast-forward."""
+  from app.routes import github as routes
+  from tests.cancel_helpers import BlockedWorker
+
+  repo, rows = _stack_rows("stack-land-cancel", "landing")
+  landed = []
+  monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(routes, "_claim_stack_landing", lambda **_kwargs: (rows, "land"))
+  monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
+  monkeypatch.setattr(routes, "_land_reviewed_stack", lambda rows: landed.append(rows))
+  worker = BlockedWorker()
+  monkeypatch.setattr(routes, "_assert_pending_equivalence_preflight", worker)
+
+  # The source lock stays held while the proof's thread runs, then the cancel
+  # lands without starting the landing.
+  _cancel_under_source_lock(repo, lambda: routes.land_contribution_stack(
+    None, 1, routes.ContributionStackLandRequest(record_ids=["layer-1"]), db, None,
+  ), worker)
+  assert not landed
+
+
+def test_a_cancelled_submit_publishes_nothing(db, monkeypatch):
+  """A cancel during the source proof never goes on to push or open the PR."""
+  from app.routes import github as routes
+  from tests.cancel_helpers import BlockedWorker
+
+  repo, rows = _stack_rows("submit-cancel", "submitting")
+  published = []
+  owner = SimpleNamespace(
+    recovery_record=lambda record: record, event=lambda *a: None,
+    replay_phase=lambda: None, receipt=lambda: None,
+  )
+  monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(routes, "_personal_resume_allowed", lambda **_kwargs: False)
+  monkeypatch.setattr(
+    routes, "_personal_claim_owners", lambda **_kwargs: ({"layer-1": owner}, None),
+  )
+  monkeypatch.setattr(
+    routes, "_claim_record",
+    lambda **_kwargs: (rows[0]["record"], repo / "record.json", repo / "diff"),
+  )
+  monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
+  monkeypatch.setattr(
+    routes, "_submit_prepared_pr", lambda *a, **k: published.append(a),
+  )
+  worker = BlockedWorker()
+  monkeypatch.setattr(routes, "_assert_personal_publication_source", worker)
+
+  _cancel_under_source_lock(
+    repo, lambda: routes.submit_contribution(None, 1, "layer-1", None, db, None), worker,
+  )
+  assert not published
+
+
+def test_a_cancel_just_after_the_pr_opens_is_recovered_from_its_receipt(
+  client, owner_token, db, monkeypatch,
+):
+  """A client gone right after the public write never republishes or sticks.
+
+  The signed receipt already says the PR is open, so the next Send settles that
+  exact PR from it instead of pushing or creating again.
+  """
+  import threading
+
+  from app import models
+  from app.deps import Principal
+
+  _write_token(login="octocat")
+  app_id, _ = _app_token(client, owner_token, github_access=True)
+  record_id = "cancel-after-open"
+  head = "a" * 40
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
+  (repo / ".git").mkdir(parents=True)
+  record = {
+    "id": record_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/app-demo", "branch": "fix/cancel-after-open",
+    "plan": {
+      "action": "pr", "repo": "mobius-os/app-demo", "repo_path": str(repo),
+      "branch": "fix/cancel-after-open", "base_sha": "b" * 40,
+      "head_sha": head, "diff_sha256": "c" * 64, "title": "Cancel safe",
+      "body_draft": "Exact body",
+    },
+  }
+  _write_contribution(app_id, record_id, record, "reviewed")
+  url = "https://github.com/mobius-os/app-demo/pull/77"
+  patch = {
+    "last_submit_stage": "pr_created", "last_submit_push_sha": head,
+    "head_repository": "octocat/app-demo", "publication_stage": "draft",
+  }
+  monkeypatch.setattr(
+    github_routes, "_assert_personal_publication_source", lambda *_a: "exact",
+  )
+  monkeypatch.setattr(github_routes, "_equivalence_source_repo", lambda _r: None)
+
+  async def no_witness(*_args, **_kwargs):
+    return None
+
+  monkeypatch.setattr(github_routes, "_record_pending_equivalence_locked", no_witness)
+  opened, finish = threading.Event(), threading.Event()
+  calls = []
+
+  def publish(_record, _diff, **kwargs):
+    calls.append(kwargs["prior_attempt_phase"])
+    if kwargs["prior_attempt_phase"] == "armed":
+      kwargs["attempt_event"]("complete", {
+        "action": "create_pr", "url": url, "number": 77, "head_sha": head,
+      }, patch)
+      opened.set()
+      assert finish.wait(5)
+    return url, 77, {**patch, "url": url, "number": 77}
+
+  monkeypatch.setattr(github_routes, "_submit_prepared_pr", publish)
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+
+  async def cancelled_send():
+    task = asyncio.create_task(
+      github_routes.submit_contribution(None, app_id, record_id, None, db, principal),
+    )
+    assert await asyncio.to_thread(opened.wait, 5)
+    task.cancel()
+    await asyncio.sleep(.02)
+    assert not task.done()  # The public write's thread finishes first.
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+  asyncio.run(cancelled_send())
+  receipt_path = github_routes.contribution_runtime.personal_attempt_path(
+    app_id, record_id,
+  )
+  record_path = (
+    Path(get_settings().data_dir) / "apps" / str(app_id)
+    / "contributions" / f"{record_id}.json"
+  )
+  assert json.loads(record_path.read_text())["status"] == "submitting"
+  assert receipt_path.exists()
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  # The retry resumed from the receipt: no fresh publication.
+  assert calls == ["armed", "complete"]
+  settled_record = response.json()["record"]
+  assert (settled_record["status"], settled_record["number"]) == ("draft", 77)
+  assert not receipt_path.exists()
+
+
+_CANONICAL_PUBLICATION = (
+  "https://raw.githubusercontent.com/mobius-os/app-notes/main/mobius.json"
+)
+
+
+@pytest.mark.parametrize("manifest_url, accepted", [
+  (_CANONICAL_PUBLICATION, True),
+  (_CANONICAL_PUBLICATION.replace("https://", "HTTPS://"), False),
+  (_CANONICAL_PUBLICATION.replace(".com/", ".com//"), False),
+  (_CANONICAL_PUBLICATION.replace(".com/", ".com:443/"), False),
+  (_CANONICAL_PUBLICATION.replace("raw.github", "RAW.GITHUB"), False),
+  (_CANONICAL_PUBLICATION + "?token=1", False),
+  (_CANONICAL_PUBLICATION + "#manifest-id=notes", False),
+  (_CANONICAL_PUBLICATION.replace("app-notes", "app%2Dnotes"), False),
+  (_CANONICAL_PUBLICATION.replace("/main/", "/dev/"), False),
+  (_CANONICAL_PUBLICATION.replace("mobius-os/", "someone/"), False),
+  (_CANONICAL_PUBLICATION.replace("app-notes", "notes"), False),
+  (_CANONICAL_PUBLICATION.replace("mobius.json", "other.json"), False),
+  ("https://raw.githubusercontent.com/mobius-os/app-notes/main", False),
+])
+def test_publication_handoff_requires_the_canonical_manifest_spelling(
+  manifest_url, accepted,
+):
+  """Only the exact canonical address identifies a published catalog app."""
+  from app.contribution_errors import ContributionSubmitError
+  from app.github_contributions import publication_handoff_identity
+
+  record = {
+    "id": "publish-notes", "type": "pr", "status": "merged",
+    "repo": "mobius-os/app-notes",
+    "plan": {"after_merge": {
+      "action": "connect_app", "app_id": 7, "manifest_url": manifest_url,
+    }},
+  }
+  if not accepted:
+    with pytest.raises(ContributionSubmitError):
+      publication_handoff_identity(record)
+    return
+  identity = publication_handoff_identity(record)
+  assert identity.repo_slug == "mobius-os/app-notes"
+  assert identity.manifest_id == "notes"
+  assert identity.target_app_id == 7

@@ -252,7 +252,9 @@ def test_underdeclared_update_preserves_still_imported_sibling(
     "}\n"
   )
   helper = "export const HELPER_LABEL = 'HELPER_FROM_V1'\n"
-  work, bare = _make_origin(tmp_path, {"index.jsx": index, "helper.js": helper})
+  work, bare = _make_origin(tmp_path, {
+    "mobius.json": json.dumps(manifest_v1), "index.jsx": index, "helper.js": helper,
+  })
   repo_ref = (bare.as_uri(), "main")
 
   r1 = _install(
@@ -269,8 +271,6 @@ def test_underdeclared_update_preserves_still_imported_sibling(
     "return <div>{HELPER_LABEL}</div>",
     "return <div data-version=\"2\">{HELPER_LABEL}</div>",
   )
-  _push_origin(work, bare, {"index.jsx": index_v2, "helper.js": helper})
-
   # v2 is under-declared: the upstream git tree still carries helper.js and the
   # entry still imports it, but the manifest no longer lists that sibling in
   # source_files and HTTP only returns index.jsx.
@@ -279,6 +279,10 @@ def test_underdeclared_update_preserves_still_imported_sibling(
     "Bug2 Underdeclared",
     "2.0.0",
   )
+  _push_origin(work, bare, {
+    "mobius.json": json.dumps(manifest_v2), "index.jsx": index_v2,
+    "helper.js": helper,
+  })
   r2 = _install(
     client, auth, base, manifest_v2, {"index.jsx": index_v2},
     repo_ref=repo_ref,
@@ -343,21 +347,22 @@ def test_genuinely_removed_upstream_source_file_is_pruned(
   )
   helper_v1 = "export const HELPER_LABEL = 'HELPER_V1'\n"
   dropped_v1 = "export const DROPPED = 'DROP_ME'\n"
-  work, bare = _make_origin(
-    tmp_path,
-    {
-      "index.jsx": index,
-      "helper.js": helper_v1,
-      "dropped.js": dropped_v1,
-    },
-  )
-  repo_ref = (bare.as_uri(), "main")
   manifest_v1 = _manifest(
     "bug2-genuine-drop",
     "Bug2 Genuine Drop",
     "1.0.0",
     source_files=["helper.js", "dropped.js"],
   )
+  work, bare = _make_origin(
+    tmp_path,
+    {
+      "mobius.json": json.dumps(manifest_v1),
+      "index.jsx": index,
+      "helper.js": helper_v1,
+      "dropped.js": dropped_v1,
+    },
+  )
+  repo_ref = (bare.as_uri(), "main")
 
   r1 = _install(
     client, auth, base, manifest_v1,
@@ -375,13 +380,16 @@ def test_genuinely_removed_upstream_source_file_is_pruned(
   assert (src / "dropped.js").exists()
 
   helper_v2 = "export const HELPER_LABEL = 'HELPER_V2'\n"
-  _push_origin(work, bare, {"index.jsx": index, "helper.js": helper_v2})
   manifest_v2 = _manifest(
     "bug2-genuine-drop",
     "Bug2 Genuine Drop",
     "2.0.0",
     source_files=["helper.js"],
   )
+  _push_origin(work, bare, {
+    "mobius.json": json.dumps(manifest_v2), "index.jsx": index,
+    "helper.js": helper_v2,
+  })
   r2 = _install(
     client, auth, base, manifest_v2,
     {"index.jsx": index, "helper.js": helper_v2},

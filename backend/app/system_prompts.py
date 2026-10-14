@@ -11,9 +11,11 @@ transport requires.
 
 An app opts into this privileged surface by declaring a root-level
 ``system_prompt`` markdown file in its manifest.  The installer stores only the
-validated basename. At chat start, composition reads the bytes from live app
-rows and stores the exact result as a content-addressed snapshot. Installation,
-update, and soft-uninstall therefore affect chats started afterwards; an
+validated basename. At chat start, composition reads each fragment from the
+app's accepted Git revision (``source_commit``), never the editable worktree,
+and stores the exact result as a content-addressed snapshot. Installation,
+update, explicit apply, and soft-uninstall therefore affect chats started
+afterwards; an unapplied or half-written edit affects none, and an
 already-started chat keeps the prompt it began with.
 
 Möbius is single-owner software: installing an app is the trust decision.  This
@@ -24,17 +26,17 @@ continue to make the declaration visible.
 
 from __future__ import annotations
 
-import logging
+import asyncio
 import hashlib
-import os
-import stat
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from app import models
+from app import app_git, models
 from app.config import get_settings
 
 log = logging.getLogger("moebius.chat")
@@ -43,10 +45,13 @@ _MAX_FRAGMENT_BYTES = 256 * 1024
 
 def _read_safe_fragment(
   source_dir: str | None,
+  source_commit: str | None,
   basename: str | None,
 ) -> str | None:
-  """Read one confined regular file through a pinned directory descriptor."""
+  """Read one confined fragment from the app's accepted revision, or None."""
   if not source_dir or not basename or not isinstance(basename, str):
+    return None
+  if not source_commit:
     return None
   if (
     not basename.endswith(".md")
@@ -57,59 +62,43 @@ def _read_safe_fragment(
   ):
     return None
   source = Path(source_dir)
-  dir_fd = None
-  file_fd = None
   try:
     apps_root = (Path(get_settings().data_dir) / "apps").resolve(strict=True)
     # Installed source trees are immediate, real directories below apps/.  A
-    # corrupt row or post-install symlink must not turn a prompt fragment into
-    # an arbitrary host-file read.
+    # corrupt row or post-install symlink must not point composition at some
+    # other repository.
     if source.is_symlink():
       return None
     resolved_source = source.resolve(strict=True)
     if resolved_source.parent != apps_root or not resolved_source.is_dir():
       return None
-    dir_fd = os.open(
-      resolved_source,
-      os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-    file_fd = os.open(
-      basename,
-      os.O_RDONLY | os.O_NOFOLLOW,
-      dir_fd=dir_fd,
-    )
-    info = os.fstat(file_fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_FRAGMENT_BYTES:
-      return None
-    chunks: list[bytes] = []
-    remaining = _MAX_FRAGMENT_BYTES + 1
-    while remaining > 0:
-      chunk = os.read(file_fd, min(65_536, remaining))
-      if not chunk:
-        break
-      chunks.append(chunk)
-      remaining -= len(chunk)
-    raw = b"".join(chunks)
-    if len(raw) > _MAX_FRAGMENT_BYTES:
-      return None
-    fragment = raw.decode("utf-8").strip()
-    return fragment or None
-  except (OSError, RuntimeError, UnicodeError):
+  except (OSError, RuntimeError):
     return None
-  finally:
-    if file_fd is not None:
-      os.close(file_fd)
-    if dir_fd is not None:
-      os.close(dir_fd)
+  raw = app_git.read_committed_file(
+    resolved_source, source_commit, basename, max_bytes=_MAX_FRAGMENT_BYTES,
+  )
+  if raw is None:
+    return None
+  try:
+    fragment = raw.decode("utf-8").strip()
+  except UnicodeError:
+    return None
+  return fragment or None
 
 
-def compose_system_prompt(base: str, db: Session) -> str:
-  """Append prompt fragments from live installed apps in stable id order.
+@dataclass(frozen=True)
+class FragmentSource:
+  """Plain row values a fragment is read from, safe to hand to a thread."""
 
-  Missing or unreadable fragments are skipped rather than taking chat down.
-  When no live app contributes a readable fragment, the return value is exactly
-  ``base`` so landing the mechanism is behavior-neutral.
-  """
+  app_id: int
+  slug: str
+  source_dir: str | None
+  source_commit: str | None
+  basename: str | None
+
+
+def fragment_sources(db: Session) -> tuple[FragmentSource, ...]:
+  """Live installed apps that declare a fragment, in stable id order."""
   rows = (
     db.query(models.App)
     .filter(
@@ -119,20 +108,52 @@ def compose_system_prompt(base: str, db: Session) -> str:
     .order_by(models.App.id.asc())
     .all()
   )
+  return tuple(
+    FragmentSource(
+      app.id, app.slug, app.source_dir, app.source_commit, app.system_prompt_file,
+    )
+    for app in rows
+  )
+
+
+def compose_from_sources(base: str, sources: tuple[FragmentSource, ...]) -> str:
+  """Append each readable fragment; reads Git but never the database."""
   fragments: list[str] = []
-  for app in rows:
-    fragment = _read_safe_fragment(app.source_dir, app.system_prompt_file)
+  for source in sources:
+    fragment = _read_safe_fragment(
+      source.source_dir, source.source_commit, source.basename,
+    )
     if fragment is None:
-      log.warning("invalid system-prompt fragment row for app id=%s", app.id)
+      log.warning("invalid system-prompt fragment row for app id=%s", source.app_id)
       continue
-    source_label = str(Path(app.source_dir).resolve())
+    source_label = str(Path(source.source_dir).resolve())
     fragments.append(
-      f"<!-- installed app: {app.slug}; "
+      f"<!-- installed app: {source.slug}; "
       f"source_dir: {source_label} -->\n{fragment}"
     )
   if not fragments:
     return base
   return base.rstrip() + "\n\n" + "\n\n".join(fragments) + "\n"
+
+
+def compose_system_prompt(base: str, db: Session) -> str:
+  """Append prompt fragments from live installed apps in stable id order.
+
+  Missing or unreadable fragments are skipped rather than taking chat down.
+  When no live app contributes a readable fragment, the return value is exactly
+  ``base`` so landing the mechanism is behavior-neutral.
+  """
+  return compose_from_sources(base, fragment_sources(db))
+
+
+async def compose_system_prompt_off_loop(base: str, db: Session) -> str:
+  """``compose_system_prompt`` with its per-app Git reads in a worker thread.
+
+  The database is read on the caller's loop, so the session never crosses
+  threads; a cancelled caller leaves only a read-only thread behind.
+  """
+  sources = fragment_sources(db)
+  return await asyncio.to_thread(compose_from_sources, base, sources)
 
 
 def read_prompt_snapshot(chat: models.Chat, db: Session) -> str | None:
@@ -161,17 +182,21 @@ def prompt_for_chat(
   db: Session,
   *,
   persist: bool,
+  composed: str | None = None,
 ) -> str:
   """Return a chat-stable prompt, capturing live app fragments once.
 
   Empty/unstarted chats have no snapshot yet. ``persist=False`` is a read-only
   preview for observability; the first real turn passes ``persist=True`` and
-  records the exact composed bytes before invoking a provider.
+  records the exact composed bytes before invoking a provider. A caller that
+  composed ``base`` already (off its event loop) passes the result as
+  ``composed``; an existing snapshot still wins over it.
   """
   existing = read_prompt_snapshot(chat, db)
   if existing is not None:
     return existing
-  composed = compose_system_prompt(base, db)
+  if composed is None:
+    composed = compose_system_prompt(base, db)
   if not persist:
     return composed
   digest = hashlib.sha256(composed.encode("utf-8")).hexdigest()

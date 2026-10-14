@@ -1,0 +1,300 @@
+/* /context panel: the Usage inspector's dialog shell around one bar and one
+   row per part. Series colours are the data-viz reference palette's first two
+   slots (validated as a pair for colour-vision deficiency in both themes);
+   text always stays in text tokens. */
+
+.ctx__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  box-sizing: border-box;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="light"] .ctx__overlay { background: rgba(15, 18, 25, 0.32); }
+
+.ctx {
+  --ctx-mobius: #3987e5;
+  --ctx-conversation: #d95926;
+  width: min(560px, 100%);
+  max-height: calc(100% - 36px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 18px 52px rgba(0, 0, 0, 0.32);
+}
+
+[data-theme="light"] .ctx {
+  --ctx-mobius: #2a78d6;
+  --ctx-conversation: #eb6834;
+  box-shadow:
+    0 4px 12px rgba(0, 0, 0, 0.08),
+    0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.ctx__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ctx__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.ctx__subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ctx__close {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  margin: -7px -7px 0 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.ctx__close:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.ctx__body {
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 18px 18px;
+  overscroll-behavior: contain;
+}
+
+.ctx__state {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ctx__state--error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  color: var(--text);
+}
+
+.ctx__state--error p { margin: 0; }
+
+.ctx__retry {
+  min-height: 44px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ctx__retry:disabled { opacity: 0.6; cursor: default; }
+
+.ctx-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.ctx-summary__percent {
+  font-size: 28px;
+  font-weight: 650;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-summary__detail {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* One bar: fills in series colour, free space as the track. The 2px gaps show
+   the panel surface between marks; the outer ends carry the 4px rounding. */
+.ctx-bar {
+  display: flex;
+  gap: 2px;
+  height: 12px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.ctx-bar__fill {
+  flex-grow: 0;
+  flex-shrink: 0;
+  min-width: 2px;
+}
+
+.ctx-bar__fill--mobius { background: var(--ctx-mobius); }
+.ctx-bar__fill--conversation { background: var(--ctx-conversation); }
+
+.ctx-bar__free {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--surface-2);
+}
+
+.ctx-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.ctx-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  column-gap: 10px;
+  row-gap: 2px;
+  align-items: baseline;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-light, var(--border));
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.ctx-row:first-child { border-top: 0; }
+
+.ctx-row__swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  align-self: center;
+}
+
+.ctx-row__swatch--mobius { background: var(--ctx-mobius); }
+.ctx-row__swatch--conversation { background: var(--ctx-conversation); }
+.ctx-row__swatch--free {
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.ctx-row__label {
+  grid-column: 2;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.ctx-row__value {
+  grid-column: 3;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.ctx-row__description {
+  grid-column: 2 / 4;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* A part belongs to "Möbius adds" above it: indented, regular weight. */
+.ctx-row--part {
+  border-top: 0;
+  padding: 4px 0 4px 0;
+}
+
+.ctx-row--part .ctx-row__label {
+  font-weight: 400;
+}
+
+.ctx__note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ctx__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.ctx__compact {
+  min-height: 40px;
+  padding: 0 16px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-fg, #fff);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Touch needs the 44px target on any width — tablets included, where the
+   narrow-width rule below never applies. */
+@media (pointer: coarse) {
+  .ctx__compact { min-height: 44px; }
+}
+
+.ctx__compact:focus-visible,
+.ctx__close:focus-visible,
+.ctx__retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .ctx__overlay {
+    align-items: end;
+    padding: 10px;
+  }
+
+  .ctx { max-height: calc(100% - 20px); }
+
+  .ctx__head { padding: 16px; }
+
+  .ctx__body { padding: 14px 16px 16px; }
+
+  .ctx__foot { flex-wrap: wrap; }
+
+  .ctx__compact { flex: 1; min-height: 44px; }
+}

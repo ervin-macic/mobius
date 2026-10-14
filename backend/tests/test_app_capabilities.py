@@ -599,7 +599,7 @@ async def test_bootstrap_initialization_waits_for_backend_readiness(
   db, bypass_url_validation,
 ):
   """Bootstrap and interactive installs share launch ownership but not timing."""
-  from app.install import install_from_manifest
+  from app.install import install_from_manifest, prepare_package
 
   base = "https://capability.test/bootstrap-memory/"
   manifest = _manifest(id="bootstrap-memory", name="Bootstrap Memory")
@@ -621,6 +621,9 @@ async def test_bootstrap_initialization_waits_for_backend_readiness(
       None,
       source="bootstrap",
       reviewed_capability_digest=digest,
+      prepared=await prepare_package(
+        base + "mobius.json", reviewed_capability_digest=digest,
+      ),
     )
   app = result.app
   mode = result.mode

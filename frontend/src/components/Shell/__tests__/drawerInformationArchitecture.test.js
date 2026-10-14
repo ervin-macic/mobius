@@ -8,25 +8,53 @@ import {
   projectPendingDrawerPins,
 } from '../../Drawer/drawerInformationArchitecture.js'
 
-test('projects join Recents only after they have been opened', () => {
-  const unopened = { id: 'p-unopened', name: 'Unopened', updated_at: '2026-08-26T08:00:00' }
+test('a never-opened project joins Recents at its creation, not its file edits', () => {
+  // An agent-created project the owner never opened must still be findable
+  // without pinning it; edits in its tree must not move it.
+  const unopened = {
+    id: 'p-unopened',
+    name: 'Agent-made project',
+    created_at: '2026-08-26T08:00:00',
+    updated_at: '2026-08-26T11:00:00',
+  }
   const opened = {
     id: 'p-opened',
     name: 'Opened',
+    created_at: '2026-08-20T08:00:00',
     updated_at: '2026-08-25T08:00:00',
     last_opened_at: '2026-08-26T09:00:00',
   }
+  const chat = { id: 'chat', has_messages: true, activity_at: '2026-08-26T10:00:00Z' }
 
-  const result = buildDrawerSections([], [], [unopened, opened])
+  const result = buildDrawerSections([chat], [], [unopened, opened])
 
   assert.deepEqual(result.recents.map(row => `${row.kind}:${row.item.id}`), [
+    'chat:chat',
     'project:p-opened',
+    'project:p-unopened',
+  ])
+})
+
+test('opening a project ranks it by that open rather than its creation', () => {
+  const project = {
+    id: 'p-1',
+    created_at: '2026-08-20T08:00:00',
+    last_opened_at: '2026-08-26T12:00:00+00:00',
+  }
+  const chat = { id: 'chat', has_messages: true, activity_at: '2026-08-26T10:00:00Z' }
+
+  const result = buildDrawerSections([chat], [], [project])
+
+  assert.deepEqual(result.recents.map(row => `${row.kind}:${row.item.id}`), [
+    'project:p-1',
+    'chat:chat',
   ])
 })
 
 test('built artifacts join Recents only after they have been opened', () => {
   const project = {
-    id: 'project-1', name: 'Album', updated_at: '2026-08-26T08:00:00',
+    id: 'project-1', name: 'Album',
+    created_at: '2026-08-20T08:00:00', updated_at: '2026-08-26T08:00:00',
     artifacts: [
       { id: 'unopened', name: 'Unopened', status: 'ok', has_output: true },
       {
@@ -40,6 +68,7 @@ test('built artifacts join Recents only after they have been opened', () => {
 
   assert.deepEqual(result.recents.map(row => `${row.kind}:${row.item.id}`), [
     'artifact:project-1:opened',
+    'project:project-1',
   ])
 })
 

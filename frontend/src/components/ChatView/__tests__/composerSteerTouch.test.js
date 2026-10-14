@@ -23,7 +23,7 @@ test('ordinary live-turn submission stays a queued Send, never implicit Steer', 
     /function PrimaryAction\([\s\S]*?\n}\n\n\n\/\*\*\n \* The input bar/,
   )?.[0] || ''
   const sendBlock = primaryAction.match(
-    /if \(hasInput && !listening\)[\s\S]*?<button[\s\S]*?<\/button>/,
+    /if \(holdsQueuedEdit \|\| \(hasInput && !listening\)\)[\s\S]*?<button[\s\S]*?<\/button>/,
   )?.[0] || ''
 
   assert.match(sendBlock, /className="chat__action chat__send"/)
@@ -39,7 +39,7 @@ test('ordinary live-turn submission stays a queued Send, never implicit Steer', 
 test('Send, Steer, and Stop reuse one continuously visible primary action', () => {
   assert.match(
     inputBar,
-    /if \(!questionBlocked && sending && !hasInput && showSteer\)[\s\S]*?key="primary"[\s\S]*?disabled=\{!steerReady\}/,
+    /if \(!holdsQueuedEdit && !questionBlocked && sending && !hasInput && showSteer\)[\s\S]*?key="primary"[\s\S]*?disabled=\{!steerReady\}/,
     'the semantic Steer identity must not wait for serverTs confirmation',
   )
   assert.match(
@@ -53,13 +53,13 @@ test('Send, Steer, and Stop reuse one continuously visible primary action', () =
     'an early Steer tap must await the queue write before reading steerable rows',
   )
   const steerBlock = inputBar.match(
-    /if \(!questionBlocked && sending && !hasInput && showSteer\)[\s\S]*?<button[\s\S]*?<\/button>/,
+    /if \(!holdsQueuedEdit && !questionBlocked && sending && !hasInput && showSteer\)[\s\S]*?<button[\s\S]*?<\/button>/,
   )?.[0] || ''
   const stopBlock = inputBar.match(
-    /if \(questionBlocked \|\| \(sending && !hasInput\)\)[\s\S]*?<button[\s\S]*?<\/button>/,
+    /if \(!holdsQueuedEdit && \(questionBlocked \|\| \(sending && !hasInput\)\)\)[\s\S]*?<button[\s\S]*?<\/button>/,
   )?.[0] || ''
   const sendBlock = inputBar.match(
-    /if \(hasInput && !listening\)[\s\S]*?<button[\s\S]*?<\/button>/,
+    /if \(holdsQueuedEdit \|\| \(hasInput && !listening\)\)[\s\S]*?<button[\s\S]*?<\/button>/,
   )?.[0] || ''
 
   assert.match(steerBlock, /key="primary"/)
@@ -70,7 +70,7 @@ test('Send, Steer, and Stop reuse one continuously visible primary action', () =
 test('per-row fast-forward appears with the optimistic row and dispatches on touchend', () => {
   assert.match(
     queuedMessages,
-    /\{steerActive && !rejected && \(/,
+    /\{steerActive && !rejected && !inComposer && \(/,
     'the row action should render before serverTs confirmation, alongside cancel',
   )
   assert.doesNotMatch(

@@ -166,12 +166,13 @@ test('open_item drops malformed item ids but OMITS a malformed source (degrade)'
   assert.equal(r.placement, PLACE_WITH_FOCUS, 'no source → default with-focus')
 })
 
-// Agents place chats and apps only; Settings is an owner-driven surface, never
-// an agent-requestable item. The itemKind whitelist (chat|app) is the structural
-// exclusion — a 'settings' open-item is dropped exactly like any unknown kind,
-// so no resolver path, source, or activation can smuggle a Settings tab into a
-// pane on the agent's behalf. (The backend open_item enum excludes it too.)
-test('an agent open_item can NEVER request the Settings tab', () => {
+// The placement resolver handles chats and apps only. An agent may OPEN Settings
+// (open_item kind 'settings'), but Shell routes that to its single Settings
+// navigation (openSettingsSection), never through this resolver: the itemKind
+// whitelist (chat|app) drops a 'settings' request exactly like any unknown kind,
+// so no source, placement, or activation can create a second Settings tab or
+// split a pane on the agent's behalf.
+test('an agent open_item never PLACES a Settings tab through the resolver', () => {
   assert.equal(openItemWorkspaceRequest({ itemKind: 'settings', itemId: 'settings' }), null)
   assert.equal(openItemWorkspaceRequest({
     itemKind: 'settings', itemId: 'settings', activation: 'foreground',

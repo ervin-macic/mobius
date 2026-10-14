@@ -81,7 +81,7 @@ from claude_agent_sdk.types import (
   UserMessage,
 )
 
-from app import activity, generated_files, tracing
+from app import activity, generated_files, settled, tracing
 from app.memory_observability import cgroup_oom_kill_count, process_was_oom_killed
 from app.claude_events import (
   NativeContinuationTracker,
@@ -90,9 +90,10 @@ from app.claude_events import (
   is_root_conversation_message,
 )
 from app.claude_sdk_contract import transport_process_pid
-from app.owner_card_receipts import owner_card_receipt_id
+from app.owner_card_receipts import turn_end_receipt_id
 from app.platform_tools import (
   APPROVAL_TOOL_NAME,
+  ASK_PARENT_TOOL_NAME,
   CONTROL_SERVER_NAME,
   QUESTION_TOOL_NAME,
   RESTART_TOOL_NAME,
@@ -256,8 +257,9 @@ _CLAUDE_BUILTIN_HELPER_TOOLS = (
 # command-line fallbacks, which print the same receipt. Naming them keeps the card-end
 # hook from cutting on an unrelated tool that merely echoes receipt-shaped JSON
 # — notably a Task result quoting a child agent's card.
-_CLAUDE_OWNER_CARD_TOOLS = (
+_CLAUDE_TURN_END_TOOLS = (
   f"mcp__{CONTROL_SERVER_NAME}__{APPROVAL_TOOL_NAME}",
+  f"mcp__{CONTROL_SERVER_NAME}__{ASK_PARENT_TOOL_NAME}",
   f"mcp__{CONTROL_SERVER_NAME}__{QUESTION_TOOL_NAME}",
   f"mcp__{CONTROL_SERVER_NAME}__{RESTART_TOOL_NAME}",
   f"mcp__{CONTROL_SERVER_NAME}__{SECRET_TOOL_NAME}",
@@ -857,22 +859,16 @@ class ActiveClaudeClient:
     ):
       return
     self._force_stop_started = True
-    reap_task = asyncio.create_task(asyncio.to_thread(
-      _terminate_claude_processes, self._process_group_id, self._run_marker,
-    ))
-    deferred_cancel: asyncio.CancelledError | None = None
-    while not reap_task.done():
+    process_group_id, run_marker = self._process_group_id, self._run_marker
+
+    def reap() -> None:
       try:
-        await asyncio.shield(reap_task)
-      except asyncio.CancelledError as exc:
-        deferred_cancel = deferred_cancel or exc
-    try:
-      reap_task.result()
-    except Exception:
-      log.warning("Claude process-group cleanup failed chat_id=%s", self.chat_id,
-                  exc_info=True)
-    if deferred_cancel is not None:
-      raise deferred_cancel
+        _terminate_claude_processes(process_group_id, run_marker)
+      except Exception:
+        log.warning("Claude process-group cleanup failed chat_id=%s", self.chat_id,
+                    exc_info=True)
+
+    await settled.run_settled(reap)
 
   def mark_finished(self) -> None:
     """Resolves the stop waiter once the runner is fully drained."""
@@ -1121,6 +1117,7 @@ async def run_claude_sdk_turn(
   run_policy=None,
   connector_plan=None,
   coordination_enabled: bool = True,
+  goal_brief_refresh=None,
 ) -> RunnerResult:
   """Runs one Claude SDK turn and translates SDK messages to Möbius events.
 
@@ -1218,6 +1215,8 @@ async def run_claude_sdk_turn(
   ) -> dict[str, Any]:
     del tool_use_id, context
     trigger = _precompact_log_trigger(hook_input)
+    if goal_brief_refresh is not None:
+      goal_brief_refresh.mark_compacted()
     log.info(
       "Claude context compacted for chat %s (trigger=%s)",
       chat_id, trigger,
@@ -1260,6 +1259,21 @@ async def run_claude_sdk_turn(
       },
     }
 
+  async def goal_brief_after_compaction_hook(
+    hook_input: dict[str, Any],
+    tool_use_id: str | None,
+    context: dict[str, Any],
+  ) -> dict[str, Any]:
+    del tool_use_id, context
+    if goal_brief_refresh is None or hook_input.get("agent_id"):
+      return {"continue_": True}
+    brief = await goal_brief_refresh.take()
+    if not brief:
+      return {"continue_": True}
+    return {"continue_": True, "hookSpecificOutput": {
+      "hookEventName": "PostToolUse", "additionalContext": brief,
+    }}
+
   # Fires after every root-agent tool result and ENDS THE TURN when that result
   # is this turn's saved owner card. `continue_: False` refuses the next model
   # request while the receipt is still inside the CLI, so the response is cut at
@@ -1271,33 +1285,33 @@ async def run_claude_sdk_turn(
   # is_error False, stop_reason "tool_use", terminal_reason "hook_stopped",
   # result "". The `stopReason` string is not rendered anywhere and the session
   # stays resumable, which is how the owner's answer continues the chat.
-  async def owner_card_end_hook(
+  async def turn_end_hook(
     hook_input: dict[str, Any],
     tool_use_id: str | None,
     context: dict[str, Any],
   ) -> dict[str, Any]:
     del tool_use_id, context
-    if hook_input.get("tool_name") not in _CLAUDE_OWNER_CARD_TOOLS:
+    if hook_input.get("tool_name") not in _CLAUDE_TURN_END_TOOLS:
       return {"continue_": True}
     # `agent_id` is present only inside a Task-spawned child. Refusing to
     # continue there would end the CHILD, not the owner's turn, so a child's
     # card stays with the sink's `begin_finish_after_owner_card` fallback.
     if hook_input.get("agent_id"):
       return {"continue_": True}
-    question_id = owner_card_receipt_id(hook_input.get("tool_response"))
-    if question_id is None:
+    receipt_id = turn_end_receipt_id(hook_input.get("tool_response"))
+    if receipt_id is None:
       return {"continue_": True}
     # Only the card this turn actually saved ends this turn: a tool that merely
     # printed an old receipt has no matching continuation block here.
-    has_card = getattr(bc, "has_continuation_card", None)
-    if not callable(has_card) or not has_card(question_id):
+    ends_turn = getattr(bc, "ends_turn", None)
+    if not callable(ends_turn) or not ends_turn(receipt_id):
       return {"continue_": True}
     if active_client is None or not active_client.claim_owner_card_end():
       # Stop or another card already owns the cut.
       return {"continue_": True}
     log.info(
-      "Claude turn ended at saved owner card chat_id=%s question_id=%s",
-      chat_id, question_id,
+      "Claude turn ended at confirmed result chat_id=%s receipt_id=%s",
+      chat_id, receipt_id,
     )
     return {
       "continue_": False,
@@ -1406,7 +1420,8 @@ async def run_claude_sdk_turn(
         "UserPromptSubmit": [HookMatcher(matcher=None, hooks=[queued_prompt_hook])],
         "PostToolUse": [
           HookMatcher(matcher="WebSearch", hooks=[websearch_sources_hook]),
-          HookMatcher(matcher=None, hooks=[owner_card_end_hook]),
+          HookMatcher(matcher=None, hooks=[goal_brief_after_compaction_hook]),
+          HookMatcher(matcher=None, hooks=[turn_end_hook]),
         ],
         "PreCompact": [
           HookMatcher(matcher=None, hooks=[precompact_hook]),
@@ -1751,32 +1766,34 @@ async def run_claude_sdk_turn(
         "error": str(exc),
       }
     finally:
+      # Each awaited step below runs to its end: a cancellation landing in one
+      # is held until the unregister, disconnect and reap have all run.
+      teardown = settled.Teardown(log, f"chat_id={chat_id}")
       active_client.close_admission()
-      queue_cancel_failed = False
-      try:
-        await active_client.cancel_native_queue()
-      except Exception:
-        queue_cancel_failed = True
-        log.exception("Claude native queue cancellation failed chat_id=%s", chat_id)
+      queue_cancel_failed = not await teardown.step(
+        active_client.cancel_native_queue(), "Claude native queue cancellation",
+      )
       # A failed receipt seal ends the turn with an explicit error. Preserve
       # proven consumption before final file events so the pending row cannot
       # be blindly replayed, and later output stays on its correct side. Never
       # manufacture delivery for unacknowledged stdin writes.
       from app.chat_queue import get_lock
-      try:
+
+      async def seal_consumed_input() -> None:
         async with get_lock(chat_id):
           if registry.current_generation(chat_id) == active_client._run_generation:
             await _seal_steer_split(bc, active_client, chat_id)
-      except Exception:
-        log.exception("Claude consumed-input seal failed chat_id=%s", chat_id)
-      try:
-        await generated_files.publish_inbox_files(
+
+      await teardown.step(seal_consumed_input(), "Claude consumed-input seal")
+      await teardown.step(
+        generated_files.publish_inbox_files(
           bc,
           data_dir=generated_data_dir,
           chat_id=chat_id,
-        )
-      except Exception:
-        log.debug("generated-file turn capture failed", exc_info=True)
+        ),
+        "generated-file capture",
+        level=logging.DEBUG,
+      )
       current_handle = registry.get_handle(chat_id, RunnerKind.CLAUDE_SDK)
       if current_handle is active_client:
         registry.unregister(chat_id, RunnerKind.CLAUDE_SDK)
@@ -1797,6 +1814,9 @@ async def run_claude_sdk_turn(
           finally:
             active_client.mark_finished()
             from app.file_cache import reclaim_provider_cache
-            await reclaim_provider_cache("claude")
+            try:
+              await reclaim_provider_cache("claude")
+            finally:
+              teardown.finish()
 
   return await _run_once()

@@ -12,6 +12,11 @@ export function isContinuationMessage(message) {
     || message?.kind === 'auto_continuation'
 }
 
+/** An added `/btw` answer: kept context for the agent, never an owner message. */
+export function isSideQuestionMessage(message) {
+  return message?.kind === 'side_question'
+}
+
 const ACTIVATION_RETRY_DELAYS_MS = [1000, 3000, 8000, 15000, 30000]
 
 /** Delay before quietly retrying a failed chat activation, or null to stop.
@@ -119,12 +124,16 @@ export function supersedeResumedPauseBlocks(messages, {
 }
 
 /** A visible transcript row authored by the owner, excluding product events
- * that retain role=user only because the provider receives `continue`. */
+ * that retain role=user only because the provider receives `continue`, and
+ * added side questions, which the agent receives as context, not a request.
+ * So neither is resent from ↑ history, copied as the owner's words, or read
+ * as the start of a turn. */
 export function isOwnerUserMessage(message) {
   return !!message
     && message.role === 'user'
     && !message.hidden
     && !isContinuationMessage(message)
+    && !isSideQuestionMessage(message)
 }
 
 /** The complete, contiguous batch of owner rows that reached the provider as
@@ -335,6 +344,24 @@ export function shouldRepairRuntimeStream({
     || !shouldAttachRunningStream({ running, pendingQuestionId })
   ) return false
   return connectionError !== 'retrying'
+}
+
+/**
+ * Whether the chat stream is demonstrably delivering: it already carries run,
+ * question, steer, and queue-promotion events, so the active-turn runtime read
+ * can drop to a slow safety cadence. "Demonstrably" means a body read
+ * (keepalives included) within one server keepalive (30 s) plus grace. A
+ * half-open socket can stay `isStreaming` with no error indefinitely, and then
+ * the fast runtime read is its only recovery.
+ */
+export const RUNTIME_SAFETY_POLL_MS = 15_000
+export const RUNTIME_STREAM_FRESH_MS = 35_000
+
+export function runtimeStreamDelivering({
+  isStreaming, connectionError, lastReadAt, now = Date.now(),
+}) {
+  return Boolean(isStreaming && !connectionError && lastReadAt > 0
+    && now - lastReadAt < RUNTIME_STREAM_FRESH_MS)
 }
 
 export function runtimeSnapshot(value = {}) {

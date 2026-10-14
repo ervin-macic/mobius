@@ -57,6 +57,22 @@ RUN useradd -m -s /bin/bash mobius
 # agent-browser looks by default). Chrome for Testing publishes no Linux
 # ARM64 build, so arm64 images install Debian's Chromium instead; the trusted
 # agent-browser config below points agent turns at it.
+# On amd64, Chrome for Testing's chrome-headless-shell for the same version
+# goes beside full Chrome and is the agents' default (config below): full
+# Chrome's ~280 MB binary plus 12-15 processes thrash a 1 GB container until
+# startup and screenshots time out, while the shell captures in seconds. Full
+# Chrome stays for extensions and other full-browser features. The directory
+# deliberately lacks agent-browser's `chrome-` prefix so its own installed-
+# Chrome discovery never selects the shell implicitly.
+# Trust decision: neither Chrome download is integrity-checked. Pinning
+# AGENT_BROWSER_VERSION does not pin Chrome: `agent-browser install` resolves
+# the current Stable from Chrome for Testing's last-known-good feed on every
+# build, and Chrome for Testing publishes no independent checksums. Both
+# browsers therefore trust TLS to storage.googleapis.com, the same as the full
+# Chrome download already did. The `--version | grep` below only confirms that
+# the right archive was unpacked; it is not an integrity check, because a
+# tampered binary could print any version. Pinning a version and sha256 for
+# both browsers, like tectonic below, is tracked in mobius-os/mobius#1849.
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
 ARG CODEX_VERSION=0.159.0
@@ -76,7 +92,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          apt-get install -y --no-install-recommends chromium \
          && mkdir -p /root/.agent-browser; \
        else \
-         agent-browser install; \
+         agent-browser install \
+         && set -- /root/.agent-browser/browsers/chrome-* \
+         && [ "$#" -eq 1 ] \
+         && chrome_version="${1##*/chrome-}" \
+         && curl -fsSL -o /tmp/chrome-headless-shell.zip \
+           "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chrome-headless-shell-linux64.zip" \
+         && unzip -q /tmp/chrome-headless-shell.zip -d /tmp/chrome-headless-shell \
+         && mv /tmp/chrome-headless-shell/chrome-headless-shell-linux64 \
+           /root/.agent-browser/browsers/headless-shell \
+         && rm -rf /tmp/chrome-headless-shell /tmp/chrome-headless-shell.zip \
+         && /root/.agent-browser/browsers/headless-shell/chrome-headless-shell --version \
+           | grep -F "$chrome_version"; \
        fi \
     && mv /root/.agent-browser /opt/agent-browser \
     && chown -R mobius:mobius /opt/agent-browser \
@@ -143,14 +170,15 @@ RUN ln -s /opt/agent-browser /root/.agent-browser \
 
 # Agent turns point AGENT_BROWSER_CONFIG here so untrusted workspace config
 # cannot register executable plugins. Runtime settings still travel through
-# explicit AGENT_BROWSER_* environment variables owned by chat.py. On arm64
-# this image-owned file also names the Debian Chromium installed above, since
-# no downloaded Chrome for Testing exists there.
+# explicit AGENT_BROWSER_* environment variables owned by chat.py. This
+# image-owned file also names the default browser installed above: the
+# headless shell on amd64, and Debian's Chromium on arm64, since no downloaded
+# Chrome for Testing exists there.
 RUN install -d -m 0755 /app \
     && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
          printf '{"executablePath": "/usr/bin/chromium"}\n'; \
        else \
-         printf '{}\n'; \
+         printf '{"executablePath": "/opt/agent-browser/browsers/headless-shell/chrome-headless-shell"}\n'; \
        fi > /app/agent-browser-config.json \
     && chmod 0644 /app/agent-browser-config.json
 

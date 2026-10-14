@@ -637,7 +637,7 @@ class _CardBus(_ChatBus):
 
   question_id = "card-9"
 
-  def has_continuation_card(self, question_id: str) -> bool:
+  def ends_turn(self, question_id: str) -> bool:
     return question_id == self.question_id
 
 
@@ -3627,3 +3627,35 @@ def test_claude_final_identity_cache_is_bounded_without_remembering_payloads():
       model="synthetic", message_id="msg", uuid=f"envelope-{n}"), bus, None)
   assert len(bus._claude_final_text_items) == 1024
   assert "not retained" not in str(bus._claude_final_text_items)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_turn_teardown_still_disconnects_and_unregisters(monkeypatch):
+  """Cancellations landing in a teardown await skip none of the steps after it."""
+  from app.runner_registry import RunnerKind, registry as runners
+
+  capture_started, finish_capture = asyncio.Event(), asyncio.Event()
+
+  async def final_files(*args, **kwargs):
+    capture_started.set()
+    await finish_capture.wait()
+
+  monkeypatch.setattr(claude_sdk_runner.generated_files, "publish_inbox_files", final_files)
+
+  class _Client(_FakeClient):
+    async def receive_response(self):
+      yield _success_result()
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  task = asyncio.create_task(_run_turn("teardown-cancel-chat"))
+  await asyncio.wait_for(capture_started.wait(), timeout=2)
+  task.cancel("stop one")
+  await asyncio.sleep(0)
+  task.cancel("stop two")
+  await asyncio.sleep(0)
+  assert not task.done() and not clients[0].disconnected
+  finish_capture.set()
+  with pytest.raises(asyncio.CancelledError, match="^stop one$"):
+    await asyncio.wait_for(task, timeout=2)
+  assert clients[0].disconnected
+  assert runners.get_handle("teardown-cancel-chat", RunnerKind.CLAUDE_SDK) is None
