@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import base64
 from contextlib import asynccontextmanager
+import io
 import json
 import shutil
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 
 from app import community_publish, models
 from app.routes import community
+
+
+def _png() -> bytes:
+  output = io.BytesIO()
+  Image.new("RGB", (8, 8), (40, 90, 180)).save(output, format="PNG")
+  return output.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -116,6 +124,8 @@ async def test_local_publication_preview_is_bound_to_the_accepted_listing(
     name="Pocket List",
     source_dir="/data/apps/pocket-list",
     updated_at="2026-08-27 12:00:00",
+    icon_png=None,
+    icon_override_png=None,
   )
 
   class Query:
@@ -146,9 +156,18 @@ async def test_local_publication_preview_is_bound_to_the_accepted_listing(
   files = [{"path": "mobius.json", "content_base64": "e30="}]
   monkeypatch.setattr(community.fs_locks, "source_dir_lock", source_lock)
   monkeypatch.setattr(
-    community, "build_public_snapshot", lambda _: ("a" * 40, files),
+    community, "read_public_snapshot", lambda _: ("a" * 40, files, []),
   )
-  monkeypatch.setattr(community, "public_store_listing", lambda value: listing)
+  review = {
+    "ready": True,
+    "checklist": [
+      {"id": item, "done": True, "code": "", "message": ""}
+      for item in ("details", "icon", "tagline", "description", "screenshots", "hero")
+    ],
+    "listing": listing,
+    "draft": {**listing, "hero": ""},
+  }
+  monkeypatch.setattr(community, "store_listing_review", lambda value, problems: review)
 
   preview = await community.preview_local_app_publication(42, DB(), None)
 
@@ -160,7 +179,8 @@ async def test_local_publication_preview_is_bound_to_the_accepted_listing(
     + "/"
   )
   assert preview["icon_url"] == accepted_base + "icon.png"
-  assert preview["asset_base"] == accepted_base + "static/"
+  assert preview["asset_root"] == accepted_base
+  assert preview["ready"] is True
   assert preview["listing"] is listing
 
 
@@ -185,19 +205,23 @@ async def test_publication_preview_asset_serves_commit_bound_bytes(monkeypatch):
 
   seen = {}
 
+  # JPEG bytes behind a .png name: the type follows the bytes, not the name.
+  jpeg = io.BytesIO()
+  Image.new("RGB", (8, 8), (1, 2, 3)).save(jpeg, format="JPEG")
+
   def exact_asset(value, commit, path):
     seen.update(app=value, commit=commit, path=path)
-    return b"accepted-screen"
+    return jpeg.getvalue()
 
   monkeypatch.setattr(community.fs_locks, "source_dir_lock", source_lock)
-  monkeypatch.setattr(community, "read_public_store_asset", exact_asset)
+  monkeypatch.setattr(community, "read_public_store_asset_bytes", exact_asset)
   response = await community.preview_local_app_publication_asset(
     42, "a" * 40, "static/store/screen.png", DB(),
   )
 
-  assert response.body == b"accepted-screen"
-  assert response.media_type == "image/png"
-  assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+  assert response.body == jpeg.getvalue()
+  assert response.media_type == "image/jpeg"
+  assert response.headers["cache-control"] == "private, max-age=31536000, immutable"
   assert seen == {
     "app": app,
     "commit": "a" * 40,
@@ -481,7 +505,7 @@ async def test_local_publish_rejects_an_incomplete_listing_before_github_writes(
       "path": "mobius.json",
       "content_base64": base64.b64encode(json.dumps(manifest).encode()).decode(),
     },
-    {"path": "icon.png", "content_base64": ""},
+    {"path": "icon.png", "content_base64": base64.b64encode(_png()).decode()},
   ]
   monkeypatch.setattr(community.github_auth, "get_token", lambda: "local-only-token")
   monkeypatch.setattr(community.community_broker, "request", fake_broker)

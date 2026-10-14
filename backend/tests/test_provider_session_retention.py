@@ -179,3 +179,47 @@ def test_claude_malformed_settings_are_never_replaced(tmp_path):
     ensure_claude_settings_defaults(tmp_path)
 
   assert path.read_text() == "not-json"
+
+
+def _cancel_acquire(monkeypatch, then):
+  """Cancel an async session-lock acquire while its thread blocks."""
+  import asyncio
+  from app import codex_session_lock
+  from tests.cancel_helpers import BlockedWorker
+
+  worker = BlockedWorker(then)
+  monkeypatch.setattr(codex_session_lock, "acquire_codex_session_activity", worker)
+
+  async def run():
+    task = asyncio.create_task(
+      codex_session_lock.acquire_codex_session_activity_async("/unused"),
+    )
+    assert await asyncio.to_thread(worker.entered.wait, 5)
+    task.cancel("turn stopped")
+    await asyncio.sleep(.02)
+    assert not task.done()
+    worker.release.set()
+    with pytest.raises(asyncio.CancelledError, match="^turn stopped$"):
+      await task
+
+  asyncio.run(run())
+
+
+def test_cancelled_session_lock_acquire_releases_the_lock_it_got(monkeypatch):
+  released = []
+
+  class Acquired:
+    def release(self):
+      released.append(True)
+
+  _cancel_acquire(monkeypatch, Acquired)
+  assert released == [True]
+
+
+def test_cancelled_session_lock_acquire_logs_its_failure(monkeypatch, caplog):
+  def fail():
+    raise OSError("no codex home")
+
+  _cancel_acquire(monkeypatch, fail)
+  assert "Codex session lock acquire failed after its caller was cancelled" in caplog.text
+  assert "no codex home" in caplog.text

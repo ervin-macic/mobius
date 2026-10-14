@@ -214,7 +214,7 @@ function copyWholeFragment(msg, visibleText) {
   const paragraph = { nodeType: 1, tagName: 'P', childNodes:
     msg.content.includes('![diagram]') ? [image, strong] : [strong] }
   const fragment = { nodeType: 11, childNodes: [paragraph] }
-  const block = { dataset: { assistantMarkdownBlock: '0' }, contains: () => true }
+  const block = { dataset: { markdownBlock: '0' }, contains: () => true }
   const range = {
     startContainer: block, endContainer: block, commonAncestorContainer: block,
     startOffset: 0, endOffset: 1, collapsed: false,
@@ -231,7 +231,8 @@ function copyWholeFragment(msg, visibleText) {
   const payload = new Map()
   const clipboardData = { setData: (type, value) => payload.set(type, value), getData: type => payload.get(type) || '' }
   let prevented = false
-  onCopy({ currentTarget: { ownerDocument, querySelectorAll: () => [block] }, clipboardData,
+  // The whole modeled selection lives inside this surface, like the real DOM.
+  onCopy({ currentTarget: { ownerDocument, querySelectorAll: () => [block], contains: node => node === block }, clipboardData,
     preventDefault: () => { prevented = true } })
   assert.equal(prevented, true)
   return { html, clipboardData }

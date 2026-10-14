@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { renderHook } from '../hooks/__tests__/react-hook-shim.mjs'
 import {
+  persistComposerDraft,
+  readComposerDraft,
   readComposerHandoff,
   stageComposerHandoff,
 } from '../composerDraft.js'
@@ -12,6 +14,7 @@ import {
   settleFailedSendConfirmation,
 } from '../sendAttemptRecovery.js'
 import useComposerDraftState from '../hooks/useComposerDraftState.js'
+import useComposerHistory from '../hooks/useComposerHistory.js'
 
 function storageStub() {
   const values = new Map()
@@ -257,4 +260,99 @@ test('a newer mounted draft supersedes late ambiguous-send confirmation', () => 
     if (previousStorage === undefined) delete globalThis.sessionStorage
     else globalThis.sessionStorage = previousStorage
   }
+})
+
+// The chat box as ChatView and ChatInputBar wire it: the draft's durable owner
+// and history browsing share one box.
+const BROWSED = [
+  { key: 's1', kind: 'sent', text: 'Fix the colour picker on mobile' },
+]
+
+function mountChatBox(chatId) {
+  const hook = renderHook(() => {
+    const draft = useComposerDraftState({ chatId, hidden: false, inputRef: { current: null } })
+    const history = useComposerHistory({
+      chatId,
+      value: draft.input,
+      sentHistory: BROWSED,
+      queuedMessages: [],
+      showValue: draft.handleComposerInputChange,
+      saveQueued: async () => 'saved',
+      draftAside: { set: draft.setDraftAside, take: draft.takeDraftBack },
+    })
+    return { draft, history }
+  })
+  return {
+    get draft() { return hook.result.current.draft },
+    get history() { return hook.result.current.history },
+    type(text) {
+      hook.result.current.history.noteEdit()
+      hook.result.current.draft.handleComposerInputChange(text)
+    },
+    unmount: () => hook.unmount(),
+  }
+}
+
+function withTabStorage(run) {
+  const previousStorage = globalThis.sessionStorage
+  globalThis.sessionStorage = storageStub()
+  try { run() } finally {
+    if (previousStorage === undefined) delete globalThis.sessionStorage
+    else globalThis.sessionStorage = previousStorage
+  }
+}
+
+test('switching chats while browsing history keeps the draft and its files, not the browsed message', () => {
+  withTabStorage(() => {
+    const file = { id: 'file-1', name: 'plan.txt', size: 12, mime_type: 'text/plain', status: 'done' }
+    persistComposerDraft('browse-switch', 'my unfinished thought', [file])
+    const box = mountChatBox('browse-switch')
+    assert.equal(box.draft.input, 'my unfinished thought')
+
+    assert.equal(box.history.move('older'), true)
+    assert.equal(box.draft.input, 'Fix the colour picker on mobile')
+    box.type('Fix the colour picker on mobile and tablet')
+    assert.equal(readComposerDraft('browse-switch').input, 'my unfinished thought',
+      'the browsed message never becomes the stored draft')
+
+    box.unmount()
+    const back = mountChatBox('browse-switch')
+    assert.equal(back.history.browsing, false)
+    assert.equal(back.draft.input, 'my unfinished thought')
+    assert.deepEqual(back.draft.pendingFiles.map(f => f.name), ['plan.txt'])
+    back.unmount()
+  })
+})
+
+test('a pane shown again while browsing keeps the browsed message and returns the draft as edited elsewhere', () => {
+  withTabStorage(() => {
+    persistComposerDraft('browse-visible', 'first idea')
+    const box = mountChatBox('browse-visible')
+    box.history.move('older')
+
+    persistComposerDraft('browse-visible', 'first idea, edited in another pane')
+    box.draft.restoreDurableDraft()
+    assert.equal(box.draft.input, 'Fix the colour picker on mobile', 'the box keeps what is browsed')
+    assert.equal(box.history.browsing, true)
+
+    box.history.move('newer')
+    assert.equal(box.history.browsing, false)
+    assert.equal(box.draft.input, 'first idea, edited in another pane')
+    box.unmount()
+  })
+})
+
+test('resending an earlier message keeps the draft stored, then brings it back', () => {
+  withTabStorage(() => {
+    persistComposerDraft('browse-resend', 'still writing this')
+    const box = mountChatBox('browse-resend')
+    box.history.move('older')
+    assert.equal(box.history.submit(), 'send')
+
+    box.draft.setComposerInput('')
+    assert.equal(box.history.browsing, false)
+    assert.equal(box.draft.input, 'still writing this')
+    assert.equal(readComposerDraft('browse-resend').input, 'still writing this')
+    box.unmount()
+  })
 })

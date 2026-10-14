@@ -9,8 +9,12 @@ if we ever break compatibility we write a new file activity.v2.jsonl and
 read both):
 
   {"ev":"app_open",       "ts", "app_id", "slug"}
-  {"ev":"app_install",    "ts", "app_id", "slug", "source":"bootstrap|store|url"}
+  {"ev":"app_install",    "ts", "app_id", "slug", "source":"bootstrap|store|url", "kept_local_paths"?:[str]}
   {"ev":"app_uninstall",  "ts", "app_id", "slug"}   # logical (tombstone) delete
+  {"ev":"app_update_outcome", "ts", "batch_id", "app_id",
+                           "outcome":"updated|conflict|failed", "duration_ms"}
+                           # one per batch entry that finishes in its run; entries
+                           # cancelled at shutdown or settled at boot log none
   {"ev":"storage_write",  "ts", "app_id", "path", "size_delta"}  # delete = negative delta
   {"ev":"cron_outcome",   "ts", "app_id", "job", "exit_code", "duration_ms"}
   {"ev":"skill_loaded",   "ts", "chat_id", "skill"}

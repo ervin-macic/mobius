@@ -1,6 +1,5 @@
 """Artifact persistence and public-site ownership for installed apps."""
 
-import asyncio
 import html
 import logging
 import mimetypes
@@ -15,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import fs_locks, storage_io
+from app import fs_locks, settled, storage_io
 from app.artifact_data import (
   ArtifactDataError,
   MAX_ARTIFACT_KEYS,
@@ -201,7 +200,7 @@ async def _revoke_publish_token(
     if not target.exists():
       continue
     try:
-      await asyncio.to_thread(shutil.rmtree, target)
+      await settled.run_settled(shutil.rmtree, target)
     except OSError as exc:
       log.warning("revoked token %s cleanup failed for %s: %s",
                   token, target, exc)
@@ -619,7 +618,7 @@ async def publish_app_site(
     promoted = False
     preserve_stage = False
     try:
-      await asyncio.to_thread(_snapshot)
+      await settled.run_settled(_snapshot)
       # Keep the exchange itself on this task so cancellation cannot leave the
       # thread committing a swap after ``promoted`` incorrectly stayed false.
       atomic_promote_directory(stage, destination)
@@ -638,7 +637,7 @@ async def publish_app_site(
           pass
       if promoted and record.state == "staged":
         try:
-          await asyncio.to_thread(shutil.rmtree, destination)
+          await settled.run_settled(shutil.rmtree, destination)
         except OSError:
           pass
       elif promoted and republishing:
@@ -665,7 +664,7 @@ async def publish_app_site(
     finally:
       if not preserve_stage and stage.exists() and not stage.is_symlink():
         try:
-          await asyncio.to_thread(shutil.rmtree, stage)
+          await settled.run_settled(shutil.rmtree, stage)
         except OSError:
           pass
   return {

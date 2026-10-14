@@ -58,6 +58,9 @@ def _git_env(repo: Path) -> dict[str, str]:
   ):
     env.pop(name, None)
   env["GIT_CEILING_DIRECTORIES"] = str(repo.resolve().parent)
+  # Status is read-only: never refresh the index, so an abandoned or timed-out
+  # read cannot leave index.lock behind for the next writer.
+  env["GIT_OPTIONAL_LOCKS"] = "0"
   return env
 
 

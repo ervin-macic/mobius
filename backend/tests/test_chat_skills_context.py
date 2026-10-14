@@ -248,13 +248,13 @@ def test_goal_routing_rechecks_phase_transitions_and_prefers_platform_tool():
   assert "ready independent sibling leaves concurrently" in planning_normalized
   assert "Parallelism itself is not the saving" in planning_normalized
   assert "Serialize dependencies, shared writes, plan revisions" in planning_normalized
-  assert "call `update_goal` with `complete" in planning_normalized
+  assert "call `update_goal(complete: true)`" in planning_normalized
   assert "No outcome closes while helpers are active" in planning_normalized
   assert "goal_plan.py" not in planning
   assert "not a keyword trigger" in planning_normalized
-  assert "first-class `promote_goal` tool" in planning_normalized
-  assert "resilience, not an equivalent convenience path" in planning_normalized
-  assert "an attempted tool call returns a failure" in planning_normalized
+  assert "first-class `promote_goal(objective:" in planning_normalized
+  assert "Use the script only when the tool is absent" in planning_normalized
+  assert "A refusal is an answer; do not retry it through the script" in planning_normalized
   assert "one targeted settlement continuation in the existing runner" in planning_normalized
   assert "Terminal settlement" not in planning_normalized
   assert "turns are not a budget" in planning_normalized
@@ -298,7 +298,7 @@ def test_goal_responsibility_requires_truthful_outcome_or_real_handoff():
   assert "### Responsibility, handoffs and outcomes" in planning
   assert "Its answer resumes the same work" in planning_normalized
   assert "A temporary approval gate or outage is not capitulation" in planning_normalized
-  assert "Stop and arbitrary process crashes never grant automatic continuation" in planning_normalized
+  assert "Stop, owner holds, and arbitrary crashes never grant automatic continuation" in planning_normalized
   # The retired rule demanded one owning interaction at every Goal turn end.
   assert "create exactly one owning interaction" not in planning_normalized
   assert "# Waiting visibly — durable monitors or explicit owner actions" in waiting
@@ -522,6 +522,45 @@ def test_owned_app_skill_summaries_expose_complete_initial_read_sets():
   assert "theming.md" in visual
 
 
+def test_visual_testing_explains_full_chrome_is_unavailable_on_small_servers():
+  repo = Path(__file__).resolve().parents[2]
+  visual = (
+    repo / "backend" / "scripts" / "seed-skills" / "visual-testing.md"
+  ).read_text(encoding="utf-8")
+
+  assert "**headless shell**" in visual
+  assert "cat /sys/fs/cgroup/memory.max" in visual
+  assert "**Below 2 GiB\n(2147483648), do not start it:**" in visual
+  assert 'AGENT_BROWSER_EXECUTABLE_PATH="${FULL_CHROME:?}"' in visual
+  assert "This recipe is for amd64 only" in visual
+
+
+def test_full_chrome_recipe_gives_each_session_its_own_profile_and_removes_it():
+  # Chrome locks its profile directory, and session reset selects browsers by
+  # profile. Several named sessions in one chat share its TMPDIR, so a fixed
+  # profile name there makes a second launch fail or attach, and lets one
+  # session's reset end another session's browser.
+  repo = Path(__file__).resolve().parents[2]
+  visual = (
+    repo / "backend" / "scripts" / "seed-skills" / "visual-testing.md"
+  ).read_text(encoding="utf-8")
+
+  # Missing values stop the command instead of collapsing every caller onto
+  # one shared profile, or deleting a path built from an empty value.
+  assert 'FULL_SESSION="${AGENT_BROWSER_SESSION:?}-full"' in visual
+  assert 'FULL_PROFILE="${TMPDIR:?}/agent-browser-$FULL_SESSION"' in visual
+  assert 'AGENT_BROWSER_SESSION="$FULL_SESSION"' in visual
+  assert 'AGENT_BROWSER_PROFILE="$FULL_PROFILE"' in visual
+  assert "full-chrome-profile" not in visual
+  # Cleanup runs as its own command, so it must repeat the definitions; run
+  # without them it stops on the guard. The profile is deleted only after the
+  # reset confirms no browser still owns it.
+  assert "including the cleanup, with these definitions" in visual
+  assert (
+    'agent_browser_session_reset.py" "${FULL_PROFILE:?}" && rm -rf "$FULL_PROFILE"'
+  ) in visual
+
+
 def test_visual_testing_selector_guidance_requires_observed_evidence():
   repo = Path(__file__).resolve().parents[2]
   visual = (
@@ -534,6 +573,34 @@ def test_visual_testing_selector_guidance_requires_observed_evidence():
   assert '[data-testid="..."]' not in visual
   assert "**Served before spoken.**" in visual
   assert "## Close the browser session when you are done" in visual
+
+
+def test_visual_testing_names_the_working_app_frame_pointer_path():
+  """Frame-relative boxes once made raw pointer input look blocked.
+
+  Raw mouse input does reach a response-sandboxed app frame at page
+  coordinates; `eval` stays in the shell document. The guidance must keep
+  naming the supported press-and-hold path rather than calling it untestable.
+  """
+  repo = Path(__file__).resolve().parents[2]
+  visual = (
+    repo / "backend" / "scripts" / "seed-skills" / "visual-testing.md"
+  ).read_text(encoding="utf-8")
+
+  assert "`eval` always runs in the shell document" in visual
+  assert "`get box` inside the frame reports frame-relative coordinates" in visual
+  assert "agent-browser hover @eN" in visual
+  assert "agent-browser mouse down\nagent-browser wait 800\nagent-browser mouse up" in visual
+
+
+def test_visual_testing_keeps_extra_browsers_chat_scoped():
+  repo = Path(__file__).resolve().parents[2]
+  visual = (
+    repo / "backend" / "scripts" / "seed-skills" / "visual-testing.md"
+  ).read_text(encoding="utf-8")
+
+  assert "Never run `agent-browser close --all`" in visual
+  assert "put its profile under `$TMPDIR`, never in\n`/data/agent-browser-profiles/`" in visual
 
 
 def test_seeded_guidance_uses_current_preview_recovery_and_resolver_contracts():
@@ -567,6 +634,9 @@ def test_core_routes_operational_recipes_to_their_owning_skills():
   # The open_item tool builds the event; its placement rules live in the skill.
   assert "The `open_item` tool" in notifications
   assert "Default `activation` to `background`" in notifications
+  # Opening Settings for the owner is navigation; the changes stay theirs.
+  assert "Opening only navigates" in notifications
+  assert "that only navigates" in core
 
 
 def test_notifications_skill_leaves_card_notifications_to_the_platform():

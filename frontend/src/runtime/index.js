@@ -18,6 +18,8 @@
 // of the wrong type for a path throws a clear error rather than corrupting:
 //   window.mobius.appId
 //   window.mobius.online                          -> probed reachability verdict (the shell's /api/health probe forwarded by AppCanvas; navigator.onLine is only the initial seed)
+//   window.mobius.visible                         -> true only while the shell shows this frame AND the document is not hidden
+//   window.mobius.onVisibilityChange(cb)          -> unsubscribe fn; cb(boolean) now and on every change (pause polling while false)
 //   window.mobius.storage.get(path)               -> JSON value | null  (offline-capable, SWR)
 //   window.mobius.storage.set(path, data)         -> {synced} | {queued}
 //   window.mobius.storage.getText(path)           -> string | null      (offline-capable, SWR)
@@ -49,8 +51,16 @@
 //     handle.setGuidance(text), and handle.destroy(). See the
 //     "Agent-chat embed" block below.
 //   window.mobius.nav.open(label, onBack)        -> { ready, outcome, close }
+//     Restoration never moves focus. Reusing a retired slot can proceed in a
+//     promoted, visible background pane; new history entries wait for focus,
+//     leaving ready/outcome pending without an ownership timeout.
 //     outcome distinguishes host ownership from request failures; see
 //     building-apps.md.
+//   window.mobius.nav.setLocation(value)         -> reports the app's current place
+//     (JSON, <= 4 KiB as UTF-8; null clears) for its next frame.
+//   window.mobius.nav.location                   -> the place this app's previous
+//     frame reported (code update, eviction, crash or shell reload) or the
+//     latest setLocation value; null when there is none.
 //   window.mobius.immersive.toggle() / set(hidden) -> hides/shows the Möbius top
 //     bar so an app with its own header takes the full pane (no two toolbars).
 //     .hidden getter, .subscribe(cb), and .holdToToggle(el) (long-press an
@@ -95,6 +105,7 @@ import { makeCapabilities } from './capabilities.js'
 import { makeImmersive } from './immersive.js'
 import { makeClipboard } from './clipboard.js'
 import { makeProjects } from './projects.js'
+import { makeVisibility } from './visibility.js'
 import { tokenMatchesRuntime } from './token.js'
 
 export * from './storage.js'
@@ -104,6 +115,7 @@ export * from './navigation.js'
 export * from './capabilities.js'
 export * from './immersive.js'
 export * from './projects.js'
+export * from './visibility.js'
 
 
 // ── P1-A: probed-online reactive backing ─────────────────────────────────────
@@ -156,6 +168,12 @@ if (typeof window !== 'undefined') {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// One per document: frame visibility belongs to the iframe, not to an init()
+// identity, so a re-init keeps the same verdict and subscribers.
+const _visibility = typeof window !== 'undefined'
+  ? makeVisibility({ win: window, doc: typeof document !== 'undefined' ? document : null })
+  : makeVisibility()
+
 // ── Host capability sessions ────────────────────────────────────────────────
 // Opaque app frames cannot use every origin-bound browser API directly. This
 // broker exposes one transport for every shell-owned operation instead of
@@ -175,11 +193,18 @@ let _runtimeContext = null
 // should keep its legacy fallback.
 export const runtimeFeatures = Object.freeze({
   authoritativeVersionedReads: true,
+  frameVisibility: true,
   idleDocument: true,
+  navLocation: true,
   projects: true,
 })
 
-export function init({ appId, appInstanceId = null, getToken, capabilityContract = null }) {
+export function init({
+  appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null,
+  waitForNavigationReady = false, frameVisible,
+}) {
+  // The frame host's latest verdict, which may predate this module's listener.
+  _visibility.setFrameVisible(frameVisible)
   const identityKey = `${String(appId)}:${appInstanceId || 'legacy'}`
   if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
     // Hosts may replace their token broker after a refresh. Keep one runtime and
@@ -225,6 +250,10 @@ export function init({ appId, appInstanceId = null, getToken, capabilityContract
       try { cb(_online) } catch (e) {}
       return () => { _onlineListeners.delete(cb) }
     },
+    // False while the shell keeps this frame mounted but out of sight, or while
+    // the browser tab itself is hidden. Pause polling and animation when false.
+    get visible() { return _visibility.visible },
+    onVisibilityChange: _visibility.onVisibilityChange,
     storage,
     DurableWriteError,
     durableWrite: storage.durableWrite,
@@ -241,7 +270,7 @@ export function init({ appId, appInstanceId = null, getToken, capabilityContract
     signal,
     capabilities,
     chat,
-    nav: makeNav(),
+    nav: makeNav({ location: navLocation, waitForNavigationReady }),
     split: makeSplit(),
     immersive: makeImmersive({ appId }),
     clipboard: makeClipboard(),

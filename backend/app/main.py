@@ -55,6 +55,7 @@ from app.frontend_assets import (
   live_frontend_dir,
   resolve_frontend_dir,
 )
+from app.managed_paths import SERVED_STATIC_DIR
 from app.memory_observability import record_memory_checkpoint
 from app.runtime_provenance import (
   protected_runtime_status,
@@ -314,6 +315,13 @@ async def lifespan(app):
   record_memory_checkpoint("startup_frontend_watcher_started")
   if database_boot.serviceable:
     await supervisors.start_database_services()
+    # Like cron mutation and restoration, the retry never runs in the test
+    # runtime, where it would reach other tests' HTTP doubles.
+    if (
+      startup_context.bootstrap_retry is not None
+      and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+    ):
+      supervisors.retry_bootstrap_apps(startup_context.bootstrap_retry)
     from app.saved_secure_inputs import recover_interrupted
     await recover_interrupted()
     from app.startup import _capture_platform_activation_snapshot
@@ -342,11 +350,13 @@ async def lifespan(app):
       setup_task.cancel()
       await asyncio.gather(setup_task, return_exceptions=True)
     record_memory_checkpoint("shutdown_begin")
-    try:
-      from app.public_app_transport import close_public_fetch_clients
-      await close_public_fetch_clients()
-    except Exception as exc:
-      _log.error("public fetch client shutdown failed: %s", exc, exc_info=True)
+    from app.public_app_transport import close_public_fetch_clients
+    from app.routes.proxy import close_proxy_clients
+    for close_clients in (close_public_fetch_clients, close_proxy_clients):
+      try:
+        await close_clients()
+      except Exception as exc:
+        _log.error("outbound fetch client shutdown failed: %s", exc, exc_info=True)
     # Preserve the final partial request-error windows across graceful restarts.
     # This is one bounded batch append, not one write per response.
     activity.flush_request_errors()
@@ -1735,7 +1745,7 @@ def _serve_app_static_asset(
   if not source_dir:
     raise HTTPException(status_code=404, detail="Not found.")
 
-  root = (Path(source_dir) / "static").resolve()
+  root = (Path(source_dir) / SERVED_STATIC_DIR).resolve()
   try:
     target = (root / (asset_path or "index.html")).resolve()
   except OSError:

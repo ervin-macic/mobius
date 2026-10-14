@@ -18,8 +18,8 @@ import pathlib
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
-from fastapi.concurrency import run_in_threadpool
 
+from app import settled
 from app.config import get_settings
 from app.image_previews import discard_image_preview
 from app.path_utils import validate_path_within_base
@@ -138,6 +138,7 @@ async def sweep_expired_uploads(db, chat, keep: set[str] = frozenset()) -> None:
       db.commit()
     return expired
 
-  expired = await run_in_threadpool(drop)
+  # Settled: the caller's chat lock must outlive the commit and the removal.
+  expired = await settled.run_settled(drop)
   if expired:
-    await run_in_threadpool(remove_upload_files, upload_dir(chat.id), expired)
+    await settled.run_settled(remove_upload_files, upload_dir(chat.id), expired)

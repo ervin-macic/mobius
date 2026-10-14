@@ -46,6 +46,8 @@ backups-external/
 *.bak-*
 apps/*/data/
 apps/*/.git/
+# Private staging for app Git transfers, swept at boot.
+/apps/.git-transfers/
 agent-browser-profiles/
 generated/
 logs/
@@ -85,6 +87,8 @@ platform.crashloop-prev.*
 .platform-restart-requested
 .platform-rolled-back
 .platform-update-progress.json
+# Server-owned App Store update batch receipts are runtime progress.
+/app-update-batches/
 .platform-reconcile-pre
 .platform-reconcile.lock
 """

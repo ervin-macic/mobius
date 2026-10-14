@@ -20,7 +20,8 @@ import SecureInputCard from './SecureInputCard.jsx'
 import Attachments from './Attachments.jsx'
 import CompactionCard from './CompactionCard.jsx'
 import ContinuationCard from './ContinuationCard.jsx'
-import { isContinuationMessage } from './chatRuntimeState.js'
+import SideQuestionNote from './SideQuestionNote.jsx'
+import { isContinuationMessage, isSideQuestionMessage } from './chatRuntimeState.js'
 import { questionKey } from './questionKey.js'
 import {
   legacyRestartActivityOwners,
@@ -33,7 +34,7 @@ import ErrorCard, { errorCardViewModel } from './ErrorCard.jsx'
 import { ownsRecoveryAction } from './recoveryCard.js'
 import ContextCompactionMarker from './ContextCompactionMarker.jsx'
 import { assistantBlockKey } from './streamPromotion.js'
-import { copyAssistantSelection } from './markdownClipboard.js'
+import { copyMarkdownSelection } from './markdownClipboard.js'
 import { markdownRangeSource } from './markdown/steerMarkdownRange.js'
 import { goalMessageObjectiveFromText } from './goalProgress.js'
 import GoalHistoryCard from './GoalHistoryCard.jsx'
@@ -68,31 +69,47 @@ function blockAnswerable(block, { msg, isLastMsg, liveQuestionId, onQuestionAnsw
   )
 }
 
-function AssistantCopySurface({ msg, markdownByIndex, children }) {
-  if (msg.role !== 'assistant') return children
+/** Prose rendered through the markdown formatter (replies and owner messages)
+ * copies back as Markdown, so a selection pasted into the composer keeps its
+ * formatting. Each rendered text block carries `data-markdown-block`. */
+function MarkdownCopySurface({ msg, markdownByIndex, children }) {
+  if (msg.role !== 'assistant' && msg.role !== 'user') return children
 
   function markdownForBlock(element) {
-    const index = element.dataset.assistantMarkdownBlock
+    const index = element.dataset.markdownBlock
     // A supplied map is authoritative, including a missing entry. Streaming
     // and cold-rendered blocks intentionally omit source until the whole block
     // is visible; falling back to msg.content here would copy the hidden tail.
     if (markdownByIndex) return markdownByIndex.get(index) ?? ''
+    if (msg.role === 'user') return stripAugmentation(msg.content ?? '')
     return msg.markdown_range ? markdownRangeSource(msg.markdown_range) : msg.content ?? ''
   }
 
   return (
     <div
-      className="chat__assistant-copy-surface"
-      onCopy={(event) => copyAssistantSelection(event, markdownForBlock)}
+      className="chat__markdown-copy-surface"
+      onCopy={(event) => copyMarkdownSelection(event, markdownForBlock)}
     >
       {children}
     </div>
   )
 }
 
-function UserMessageText({ text }) {
+/** Owner text renders through the same formatter as replies, with the
+ * owner-text rules (typed line breaks and tag-like text stay as typed; see
+ * BlockRenderer's `configuredMarked`). A `/goal` command keeps its Goal tag. */
+function UserMessageText({ text, onInternalNav, mediaDimensions }) {
   const goalObjective = goalMessageObjectiveFromText(text)
-  if (!goalObjective) return text
+  if (!goalObjective) {
+    return (
+      <StandardMarkdown
+        text={text}
+        writtenByOwner
+        onInternalNav={onInternalNav}
+        mediaDimensions={mediaDimensions}
+      />
+    )
+  }
 
   return (
     <span className="chat__goal-message">
@@ -105,11 +122,15 @@ function UserMessageText({ text }) {
 
 /** Owner messages delivered together render as ONE bubble (one row for
  * spacing/scroll) with a quiet squiggle where each original message began. */
-function UserMessageSegments({ segments }) {
+function UserMessageSegments({ segments, onInternalNav, mediaDimensions }) {
   return segments.map((segment, i) => (
     <Fragment key={i}>
       {i > 0 && <span className="chat__batch-squiggle" aria-hidden="true" />}
-      <UserMessageText text={segment} />
+      <UserMessageText
+        text={segment}
+        onInternalNav={onInternalNav}
+        mediaDimensions={mediaDimensions}
+      />
     </Fragment>
   ))
 }
@@ -197,6 +218,7 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
+  // Memoized once per message: open image previews derive from this list.
   const generatedFiles = useMemo(() => (
     msg.role === 'assistant' && !isStreaming
       ? (msg.blocks || []).flatMap(block =>
@@ -223,6 +245,10 @@ function MsgContentInner({
 
   if (isContinuationMessage(msg)) {
     return <ContinuationCard msg={msg} />
+  }
+
+  if (isSideQuestionMessage(msg)) {
+    return <SideQuestionNote msg={msg} />
   }
 
   if (msg.blocks?.length || positionedNotes?.length) {
@@ -298,9 +324,11 @@ function MsgContentInner({
     const questionOwnsTurn = finalEntries.some(({ item }) => (
       isQuestionAnswerable(item)
     ))
-    const assistantMarkdownByIndex = new Map(
-      msg.role !== 'assistant' ? [] : finalEntries.flatMap(({ item, idx }) => {
+    const markdownByIndex = new Map(
+      finalEntries.flatMap(({ item, idx }) => {
         if (item.type !== 'text' || !item.content) return []
+        if (msg.role === 'user') return [[String(idx), stripAugmentation(item.content)]]
+        if (msg.role !== 'assistant') return []
         const coldFraction = Number(item._coldRenderFraction)
         const fullyRendered = !(
           Number.isFinite(coldFraction) && coldFraction > 0 && coldFraction < 1
@@ -397,7 +425,7 @@ function MsgContentInner({
           <div
             key={assistantBlockKey(block, i)}
             className={`chat__text chat__text--${msg.role}`}
-            data-assistant-markdown-block={msg.role === 'assistant' ? i : undefined}
+            data-markdown-block={msg.role === 'assistant' || msg.role === 'user' ? i : undefined}
           >
             {msg.role === 'assistant'
               ? (isActiveAnswer || block.reply_text_owner
@@ -415,7 +443,13 @@ function MsgContentInner({
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
                     />)
-              : msg.role === 'user' ? <UserMessageText text={text} /> : text}
+              : msg.role === 'user'
+                ? <UserMessageText
+                    text={text}
+                    onInternalNav={onInternalNav}
+                    mediaDimensions={msg.media_dimensions}
+                  />
+                : text}
           </div>
         )
       }
@@ -601,13 +635,6 @@ function MsgContentInner({
     // arrive here after conversion to the same block shape, so the transcript
     // doesn't reshuffle on promote.
     const nodes = groupActivityRuns(foldAppActivityOperations(finalEntries))
-    const generatedFiles = msg.role === 'assistant' && !isStreaming
-      ? (msg.blocks || []).flatMap(block =>
-          block.type === 'generated_files' && Array.isArray(block.files)
-            ? block.files.map(file => ({ ...file, kind: 'generated' }))
-            : [],
-        )
-      : []
     // The inbox is captured after the turn ends, which can be after a saved
     // question. Place those files after the agent's last prose but before any
     // terminal question card, including in already-saved transcripts.
@@ -622,7 +649,7 @@ function MsgContentInner({
       : null
 
     return (
-      <AssistantCopySurface msg={msg} markdownByIndex={assistantMarkdownByIndex}>
+      <MarkdownCopySurface msg={msg} markdownByIndex={markdownByIndex}>
         <AnswerCause msg={msg} />
         {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
         {nodes.flatMap((node, nodeIdx) => {
@@ -667,7 +694,7 @@ function MsgContentInner({
         {beforeQuestionNode < 0 && fileAttachments}
         {!isStreaming && <GoalHistory msg={msg} />}
         {!isStreaming && <StoppedWaits msg={msg} />}
-      </AssistantCopySurface>
+      </MarkdownCopySurface>
     )
   }
 
@@ -675,14 +702,14 @@ function MsgContentInner({
     ? stripAugmentation(msg.content) : msg.content
 
   return (
-    <AssistantCopySurface msg={msg}>
+    <MarkdownCopySurface msg={msg}>
       <AnswerCause msg={msg} />
       {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
       {text ? (
         <div
           key={isActiveAnswer ? 0 : undefined}
           className={`chat__text chat__text--${msg.role}`}
-          data-assistant-markdown-block={msg.role === 'assistant' ? 0 : undefined}
+          data-markdown-block={msg.role === 'assistant' || msg.role === 'user' ? 0 : undefined}
         >
           {msg.role === 'assistant'
             ? (isActiveAnswer
@@ -701,14 +728,22 @@ function MsgContentInner({
                   />)
             : msg.role === 'user'
               ? (msg.segments?.length > 1
-                  ? <UserMessageSegments segments={msg.segments} />
-                  : <UserMessageText text={text} />)
+                  ? <UserMessageSegments
+                      segments={msg.segments}
+                      onInternalNav={onInternalNav}
+                      mediaDimensions={msg.media_dimensions}
+                    />
+                  : <UserMessageText
+                      text={text}
+                      onInternalNav={onInternalNav}
+                      mediaDimensions={msg.media_dimensions}
+                    />)
               : text}
         </div>
       ) : null}
       {!isStreaming && <GoalHistory msg={msg} />}
       {!isStreaming && <StoppedWaits msg={msg} />}
-    </AssistantCopySurface>
+    </MarkdownCopySurface>
   )
 }
 

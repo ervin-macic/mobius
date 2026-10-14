@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
@@ -83,9 +83,8 @@ def _plan_refusal(exc: GoalPlanError) -> HTTPException:
 
 def _publish(chat_id: str, plan: dict[str, Any]) -> None:
   broadcast = get_broadcast(chat_id)
-  if broadcast is None or not broadcast.running:
-    return
-  broadcast.publish({"type": "goal_plan_updated", "plan": plan})
+  if broadcast is not None and broadcast.running:
+    broadcast.publish({"type": "goal_plan_updated", "plan": plan})
 
 
 @router.get("/{chat_id}/goal-plan")
@@ -100,13 +99,21 @@ def get_goal_plan(
   rows = presented_goal_rows(db, chat_id)
   if goal_id is not None:
     from app import models
-    from app.goal_plans import _goal_rows_for_physical
     run = db.query(models.ChatRun).filter(
       models.ChatRun.chat_id == chat_id, models.ChatRun.goal_id == goal_id,
     ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
-    if run is None:
+    goal = db.get(models.ChatGoal, goal_id)
+    if goal is None or goal.chat_id != chat_id:
       raise HTTPException(status_code=404, detail="Goal not found in this chat.")
-    rows = _goal_rows_for_physical(db, run)
+    if run is None and goal.completion_run_id is not None:
+      run = db.get(models.ChatRun, goal.completion_run_id)
+    if run is None:
+      run = db.query(models.ChatRun).filter(
+        models.ChatRun.chat_id == chat_id,
+      ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
+    if run is None:
+      raise HTTPException(status_code=404, detail="Goal has no execution in this chat.")
+    rows = (run, goal)
   plan = serialize_plan(db, *rows) if rows is not None else None
   return {
     "plan": plan,
@@ -166,10 +173,8 @@ async def promote_current_run_to_goal(
     broadcast = get_broadcast(chat_id)
     if broadcast is not None and broadcast.running:
       broadcast.publish({
-        "type": "goal_activated",
-        "objective": result["objective"],
-        "root_run_id": result["root_run_id"],
-        "run_id": result["run_id"],
+        "type": "goal_activated", "objective": result["objective"],
+        "root_run_id": result["root_run_id"], "run_id": result["run_id"],
       })
   return result
 
@@ -212,10 +217,7 @@ async def clear_presented_goal(
   await settle_claims_with_owner(chat_id)
   broadcast = get_broadcast(chat_id)
   if broadcast is not None and broadcast.running:
-    broadcast.publish({
-      "type": "goal_cleared",
-      "goal_id": result["goal_id"],
-    })
+    broadcast.publish({"type": "goal_cleared", "goal_id": result["goal_id"]})
   return {"cleared": True, "goal": None}
 
 
@@ -242,8 +244,6 @@ class GoalUpdateRequest(BaseModel):
   @field_validator("complete", mode="before")
   @classmethod
   def completion_signal(cls, value):
-    # Preserve already-running clients with the old string tool schema.
-    # Advertise only true to new agents; never coerce 1 or "true" into it.
     if value is None or value is True:
       return value
     if isinstance(value, str) and value.strip() and len(value) <= 4000:
@@ -331,6 +331,74 @@ async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
   return _active_rows_or_409(db, chat_id, principal)
 
 
+@router.get("/{chat_id}/goal-brief")
+def read_goal_brief(
+  chat_id: str,
+  task: str | None = Query(default=None, min_length=1, max_length=64),
+  principal: Principal = Depends(get_agent_run_principal),
+  db: Session = Depends(get_db),
+):
+  """read_goal: expand one task of the calling agent's own Goal, on demand.
+
+  The same projection a turn receives, refocused on ``task``. Without a
+  task a helper re-reads its assignment brief; a coordinator is pointed to
+  update_goal with no arguments, its one overview. A helper reads only the
+  Goal its delegation chain anchors; the owner's next step and
+  other Goals never reach it. Read-only: it never attaches a run or lifts a
+  hold. The full saved plan stays at goal-plan.
+  """
+  if principal.chat_id != chat_id:
+    raise HTTPException(status_code=403, detail="Agent run belongs to another chat.")
+  get_active_chat_for_principal(db, chat_id, principal)
+  from app.goals import read_goal_view
+  try:
+    return read_goal_view(
+      db, chat_id, principal.run_id, delegation_id=principal.delegation_id,
+      task_id=task,
+    )
+  except PermissionError as exc:
+    raise HTTPException(status_code=403, detail=str(exc)) from exc
+  except ValueError as exc:
+    raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class CompactionBriefRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+  thread_id: str = Field(min_length=1, max_length=128)
+
+
+@router.post("/{chat_id}/goal-brief/compaction", dependencies=[Depends(reject_cross_site)])
+async def take_goal_brief_after_compaction(
+  chat_id: str,
+  body: CompactionBriefRequest,
+  principal: Principal = Depends(get_agent_run_principal),
+  db: Session = Depends(get_db),
+):
+  """Codex's post-compaction hook: this live turn's fresh brief, once.
+
+  Codex runs this hook only after it compacts, so the call itself marks the
+  need. Only the run that owns the streaming turn on that exact Codex thread
+  may take it, never a finished or stopping one. Empty context means no Goal
+  or a failed read; the next turn's brief and read_goal then cover it.
+  """
+  from app.chat_event_sink import get_active_sink
+  from app.runner_registry import RunnerKind, registry
+
+  if principal.chat_id != chat_id:
+    raise HTTPException(status_code=403, detail="Agent run belongs to another chat.")
+  get_active_chat_for_principal(db, chat_id, principal, load_fields=())
+  sink = get_active_sink(chat_id)
+  handle = registry.get_handle(chat_id, RunnerKind.CODEX_SDK)
+  if sink is None or sink.run_token != principal.run_id or handle is None:
+    raise HTTPException(status_code=409, detail="This run has no live Codex turn.")
+  db.close()  # The brief loads in its own short session; hold no connection.
+  try:
+    context = await handle.goal_brief_after_compaction(body.thread_id)
+  except LookupError as exc:
+    raise HTTPException(status_code=409, detail=str(exc)) from exc
+  return {"context": context}
+
+
 @router.post("/{chat_id}/goal/update", dependencies=[Depends(reject_cross_site)])
 async def update_goal(
   chat_id: str, body: GoalUpdateRequest,
@@ -389,3 +457,61 @@ async def update_goal(
     from app.agent_coordination import settle_claims_with_owner
     await settle_claims_with_owner(chat_id)
   return {"goal": _goal_summary(db, goal), "plan": plan}
+
+
+class HelperTaskUpdateRequest(BaseModel):
+  """A partial checklist edit, never an outcome or whole-plan replacement."""
+  model_config = ConfigDict(extra="forbid")
+  tasks: list[dict[str, Any]] = Field(min_length=1)
+
+
+@router.post("/{chat_id}/goal/tasks", dependencies=[Depends(reject_cross_site)])
+async def update_helper_goal_tasks(
+  chat_id: str, body: HelperTaskUpdateRequest,
+  principal: Principal = Depends(get_agent_run_principal),
+  db: Session = Depends(get_db),
+):
+  """Merge helper patches under the same lock and revision as coordinator edits.
+
+  No parent wake or approval handshake: the UI invalidation is enough. A
+  routine write returns only touched task states, not a fresh full brief.
+  """
+  from app import chat_queue, models
+  from app.goal_plans import goal_assignment, stage_helper_task_edits
+  from app.goals import update_goal_record
+
+  if principal.chat_id != chat_id or principal.delegation_id is None:
+    raise HTTPException(status_code=403, detail="Only the assigned helper may edit its branch.")
+  get_active_chat_for_principal(db, chat_id, principal)
+  assignment = goal_assignment(db, chat_id)
+  if assignment is None or assignment.delegation_id != principal.delegation_id:
+    raise HTTPException(status_code=403, detail="This helper has no Goal assignment.")
+  owner_chat_id, goal_id = assignment.goal.chat_id, assignment.goal.id
+  # Follow cancellation's ancestor-before-descendant lock order. A helper
+  # being stopped must settle before its write can recheck run authority.
+  async with (chat_queue.get_transition_lock(owner_chat_id),
+              chat_queue.get_transition_lock(chat_id)):
+    # The caller may have waited behind a coordinator edit or Stop. Resolve
+    # authority again and merge into fresh state, never the pre-lock snapshot.
+    db.rollback()
+    db.expire_all()
+    assignment = goal_assignment(db, chat_id)
+    row = db.get(models.Delegation, principal.delegation_id)
+    run = db.get(models.ChatRun, principal.run_id)
+    if (assignment is None or assignment.delegation_id != principal.delegation_id
+        or assignment.goal.id != goal_id or row is None
+        or row.cancelled_at is not None or row.interrupted_at is not None
+        or run is None or run.chat_id != chat_id or run.status != "running"):
+      raise HTTPException(status_code=409, detail="This helper no longer owns the assignment.")
+    try:
+      stage_helper_task_edits(assignment, body.tasks)
+      update_goal_record(db, run, assignment.goal, assignment.goal.revision, tasks=body.tasks)
+    except (GoalPlanError, GoalPlanConflict) as exc:
+      db.rollback()
+      if isinstance(exc, GoalPlanError):
+        raise _plan_refusal(exc) from exc
+      raise HTTPException(status_code=409, detail=str(exc)) from exc
+    touched = {edit["id"] for edit in body.tasks}
+    return {"goal_id": goal_id, "revision": assignment.goal.revision,
+            "tasks": [{"id": task["id"], "status": task["status"]}
+                      for task in assignment.goal.plan_json["tasks"] if task["id"] in touched]}

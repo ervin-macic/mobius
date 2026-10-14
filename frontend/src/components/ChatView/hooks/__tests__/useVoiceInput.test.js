@@ -90,3 +90,27 @@ test('a manual edit while listening survives late speech results and rebases dic
     delete globalThis.window
   }
 })
+
+test('dictation holds the recording audio session only while listening', () => {
+  installSpeechRecognition()
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const audioSession = { type: 'auto' }
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { audioSession } })
+  try {
+    const { result, unmount } = renderHook(() => useVoiceInput({
+      onTranscript: () => {},
+      inputRef: { current: { value: '' } },
+    }))
+    result.current.startVoice()
+    assert.equal(audioSession.type, 'play-and-record')
+    result.current.stopVoice()
+    assert.equal(audioSession.type, 'auto')
+
+    result.current.startVoice()
+    unmount()
+    assert.equal(audioSession.type, 'auto')
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', previousNavigator)
+    delete globalThis.window
+  }
+})

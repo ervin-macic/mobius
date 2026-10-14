@@ -111,6 +111,19 @@ test('an intent cannot smuggle in a different destination', () => {
   )
 })
 
+test('a Settings target keeps a well-shaped section and navigates the shell', () => {
+  assert.equal(safeTarget('/shell/?settings=ai-providers'), '/shell/?settings=ai-providers')
+  assert.equal(
+    safeTarget('https://mobius.test/shell/?settings=github&x=1'),
+    '/shell/?settings=github',
+  )
+  // The worker cannot know the section list; it only refuses a malformed id,
+  // and the shell narrows the rest to its known sections.
+  assert.equal(safeTarget('/shell/?settings=../x'), '/shell/?settings')
+  assert.equal(safeTarget('/shell/?settings'), '/shell/?settings')
+  assert.equal(safeTarget('/shell/?app=<x>&settings=github'), '/shell/')
+})
+
 test('out-of-scope targets still fall back to root', () => {
   assert.equal(safeTarget('https://evil.test/phish?app=pages'), '/')
   // A cross-origin target is refused even when it mimics a valid shell route.

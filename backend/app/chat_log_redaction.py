@@ -41,6 +41,8 @@ from __future__ import annotations
 import re
 
 from app.continuations import (
+  SIDE_QUESTION_LABEL,
+  SIDE_QUESTION_MESSAGE_KIND,
   continuation_actor_label,
   is_continuation_message,
 )
@@ -160,7 +162,11 @@ def redact_message(msg: dict) -> dict | None:
       "text": f"{continuation_actor_label(msg)}.",
     }
   role = msg.get("role")
-  if role == "assistant":
+  if msg.get("kind") == SIDE_QUESTION_MESSAGE_KIND:
+    # Kept /btw answers ride the user slot but are not the owner's words.
+    role = "system"
+    text = f"{SIDE_QUESTION_LABEL}: {msg.get('content', '') or ''}"
+  elif role == "assistant":
     text = _assistant_text(msg.get("blocks") or [], msg.get("content", ""))
   else:
     # User (or any non-assistant) message: strip the fs-path

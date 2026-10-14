@@ -1,6 +1,6 @@
 import LifecycleIcon from './LifecycleIcon.jsx'
 import { useRef, useState } from 'react'
-import { ChevronDown } from '@openai/apps-sdk-ui/components/Icon'
+import { ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { preserveTogglePosition } from './preserveTogglePosition.js'
 
 // Shared shell for "marker" messages — system/product moments that are neither
@@ -13,9 +13,10 @@ import { preserveTogglePosition } from './preserveTogglePosition.js'
 //
 // `children` is the optional collapsible body. With children the header is a
 // real toggle button; with none the card is a static labeled divider (no
-// chevron, non-interactive header).
-export default function MarkerCard({ icon, title, subtitle, children }) {
-  const [open, setOpen] = useState(false)
+// chevron, non-interactive header). `defaultOpen` shows the body first, for a
+// marker whose body is the point (an added side question's answer).
+export default function MarkerCard({ icon, title, subtitle, children, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen)
   const headerRef = useRef(null)
   const collapsible = !!children
   const cls = 'chat__marker' + (open ? ' chat__marker--open' : '')
@@ -28,13 +29,7 @@ export default function MarkerCard({ icon, title, subtitle, children }) {
         {subtitle && <span className="chat__marker-sub">{subtitle}</span>}
       </span>
       {collapsible && (
-        <span className="chat__marker-toggle" aria-hidden="true">
-          <ChevronDown
-            className={`chat__chevron${open ? '' : ' chat__chevron--collapsed'}`}
-            width={10}
-            height={10}
-          />
-        </span>
+        <ChevronRight className="chat__panel-chevron" width={14} height={14} aria-hidden="true" />
       )}
     </>
   )

@@ -256,3 +256,37 @@ def test_cleanup_uses_signed_relay_terminal_state_over_mutable_status(
   assert response.status_code == 200, response.text
   assert settled == [("merged", merge_sha)]
   assert not checkout.exists()
+
+
+def test_cancelled_cleanup_holds_the_source_lock_through_its_settlement(
+  client, auth, db, monkeypatch,
+):
+  """The settlement's thread ends under the lock; the cancel then lands."""
+  import asyncio
+
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  app = create_local_app(client, auth, name="Cleanup cancel")
+  checkout = Path(get_settings().data_dir) / "contrib" / "cleanup-cancel" / "repo"
+  (checkout / ".git").mkdir(parents=True)
+  record_id = "cleanup-cancel"
+  _write_terminal_record(app["id"], record_id, {
+    "id": record_id, "status": "closed", "plan": {"repo_path": str(checkout)},
+  })
+  monkeypatch.setattr(github_routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(github_routes, "_recheck_submit_app", lambda *_args: None)
+  monkeypatch.setattr(github_routes, "_equivalence_source_repo", lambda _record: None)
+  worker = BlockedWorker()
+  monkeypatch.setattr(github_routes, "_settle_equivalence", worker)
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(checkout)),
+    lambda: github_routes.cleanup_contribution_staging(
+      None, app["id"], record_id, db, None,
+    ),
+    worker,
+    while_blocked=checkout.exists,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  assert checkout.exists()  # No cleanup step starts after the cancel.

@@ -1,9 +1,12 @@
-"""In-container helper for scripts/test-transcript-rollback.sh.
+"""Release-side helper for the transcript rollback proofs.
 
-Runs inside a Möbius image against its own baked code, so each release reads
-and writes the shared database exactly as that release does. Commands print
-JSON. "previous" means an image without per-message rows; "candidate" means
-the release that keeps ``chats.messages`` as a mirror of those rows.
+scripts/test-transcript-rollback.sh and scripts/test-host-helper.sh run it
+inside a Möbius image; scripts/test-transcript-previous-code.py runs it with
+an exported release's backend. Either way it runs a release's own code, so
+each release reads and writes the shared database exactly as that release
+does. Commands print JSON. "candidate" means a release that stores
+per-message rows and keeps ``chats.messages`` as their mirror; "previous" is
+the release rolled back to, with or without rows of its own.
 
   python3 transcript_rollback_probe.py <command>
 
@@ -11,9 +14,9 @@ the release that keeps ``chats.messages`` as a mirror of those rows.
   dump          either: every chat's decoded transcript, keyed by chat id
   pending       candidate: chats whose rows are not yet authoritative
   write-new     candidate: writer-command edits, a new chat, a rename, a purge
-  write-old     previous: an append, a new chat, a rename, a purge
+  write-old     previous: an append, a new chat, a rename, a purge; reports the
+                chats left unconverted and the chat purged
   unconverted   any image, server stopped: ids without a conversion marker
-  stores-rows   any image, server stopped: whether this release keeps message rows
   mirror-exact  candidate: converted chats whose legacy bytes are not exactly
                 '[' + ', '.join(row bodies) + ']' (must be none)
 
@@ -180,8 +183,9 @@ def write_old():
     db.add(new_chat(f"from-previous-{ROUND}", "Previous chat", [{"role": "user", "content": "previous born"}]))
     db.get(models.Chat, f"bulk-{ROUND * 10 + 4:04d}").title = "Renamed by previous"
     db.commit()
-  purge(f"bulk-{ROUND * 10 + 5:04d}")
-  return {"written": "previous", "expect_unconverted": sorted(expected)}
+  purged = f"bulk-{ROUND * 10 + 5:04d}"
+  purge(purged)
+  return {"written": "previous", "expect_unconverted": sorted(expected), "purged": purged}
 
 
 def mirror_exact():
@@ -199,8 +203,7 @@ def mirror_exact():
 
 
 COMMANDS = {"mirror-exact": mirror_exact, "seed": seed, "dump": dump, "pending": pending, "write-new": write_new,
-            "write-old": write_old, "unconverted": unconverted,
-            "stores-rows": lambda: {"rows": candidate()}}
+            "write-old": write_old, "unconverted": unconverted}
 
 if __name__ == "__main__":
   print(json.dumps(COMMANDS[sys.argv[1]](), sort_keys=True))

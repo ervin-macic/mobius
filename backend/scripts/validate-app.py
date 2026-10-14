@@ -17,7 +17,9 @@ Runs the same checks the install path runs (``app.app_source_check``):
 Usage:
     python3 backend/scripts/validate-app.py <app-dir> [--manifest path]
 
-Exit code is 1 if any completeness error is found, else 0.
+Exit code is 1 if any completeness error is found, else 0. It is 3 when the
+build environment stalled before compilation could judge the source: a
+machine-load outcome, not a source error, so retry rather than edit.
 """
 
 import argparse
@@ -35,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.app_source_check import check_manifest_tree  # noqa: E402
 from app.app_compile_contract import (  # noqa: E402
-  ROLLDOWN_TIMEOUT_SECS,
+  ROLLDOWN_WALL_LIMIT_SECS,
+  RolldownStalled,
   rolldown_command,
   rolldown_report_contract_error,
 )
@@ -102,7 +105,7 @@ def _compile(
       with build_lease():
         result = subprocess.run(
           command, capture_output=True, text=True,
-          timeout=ROLLDOWN_TIMEOUT_SECS, check=False,
+          timeout=ROLLDOWN_WALL_LIMIT_SECS, check=False,
         )
     except FileNotFoundError:
       return (
@@ -110,7 +113,8 @@ def _compile(
         "an app"
       )
     except subprocess.TimeoutExpired:
-      return f"Rolldown timed out after {ROLLDOWN_TIMEOUT_SECS} seconds"
+      # run() has already killed and reaped the build.
+      raise RolldownStalled() from None
     if result.returncode != 0:
       detail = " ".join(result.stderr.strip().splitlines())
       return detail or f"Rolldown exited {result.returncode}"
@@ -167,6 +171,24 @@ def _referenced_file_findings(
       errors.append(
         f"manifest icon {icon!r} is missing; local apply rejects the revision"
       )
+    else:
+      try:
+        from app.icon_assets import InvalidIcon, normalize_icon
+      except ModuleNotFoundError as exc:
+        if exc.name is None or not exc.name.startswith("PIL"):
+          raise
+        errors.append(
+          "icon validation requires Pillow; install backend requirements "
+          "before validating an app with an icon"
+        )
+      else:
+        try:
+          normalize_icon(icon_path.read_bytes())
+        except InvalidIcon as exc:
+          errors.append(
+            f"manifest icon {icon!r}: {exc} Local apply and Store publication "
+            "reject it, and installs skip it."
+          )
   for source in static_assets.values():
     if _symlink_component(root, source) is None and not (root / source).is_file():
       errors.append(f"static asset source {source!r} is missing")
@@ -185,10 +207,6 @@ def _package_size_errors(root: Path, manifest_path: Path, manifest: dict) -> lis
 
   if manifest_path.stat().st_size > MANIFEST_MAX_BYTES:
     errors.append(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
-
-  package_total = package_bytes_on_disk(root, manifest)
-  if package_total > PACKAGE_MAX_BYTES:
-    errors.append(package_limit_message(package_total))
 
   for skill in manifest.get("skills") or []:
     if isinstance(skill, str) and size_on_disk(root, skill) > SKILL_MAX_BYTES:
@@ -259,6 +277,14 @@ def main() -> int:
     print(f"[ERROR] mobius.json: {exc}", file=sys.stderr)
     return 1
 
+  package_total = package_bytes_on_disk(root, manifest)
+  if package_total > PACKAGE_MAX_BYTES:
+    print(
+      f"[ERROR] mobius.json: {package_limit_message(package_total)}",
+      file=sys.stderr,
+    )
+    return 1
+
   tree = _load_tree(root)
   static_assets = static_asset_entries(manifest.get("static_assets") or {})
   for destination in static_assets:
@@ -282,7 +308,19 @@ def main() -> int:
     if not isinstance(entry, str) or not entry:
       compile_error = "manifest `entry` must be a non-empty string"
     else:
-      compile_error = _compile(root, manifest, static_assets)
+      try:
+        compile_error = _compile(root, manifest, static_assets)
+      except RolldownStalled as exc:
+        # Not a source error: say so distinctly, and with its own exit code,
+        # so nobody edits correct code because the machine was busy.
+        print(f"[ENVIRONMENT] {entry}: compile did not finish: {exc}", file=sys.stderr)
+        name = manifest.get("name") or manifest.get("id") or root.name
+        print(
+          f"\n{name}: INCONCLUSIVE — the build environment stalled; "
+          "the source was not judged",
+          file=sys.stderr,
+        )
+        return 3
   if compile_error:
     print(f"[ERROR] {entry or 'mobius.json'}: compile failed: {compile_error}", file=sys.stderr)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -28,7 +27,7 @@ from app import chat_writer
 from app import (
   auth, chat_queue, drawer_pins, fs_locks, github_auth, models,
   project_builders, schemas,
-  project_drawer, project_git, providers, questions, workspace_files,
+  project_drawer, project_git, providers, questions, settled, workspace_files,
 )
 from app.broadcast import get_system_broadcast
 from app.recovery_notifications import (
@@ -2376,7 +2375,9 @@ async def initialize_project_git(
   project = _project_for(db, project_id, principal, "maintainer")
   try:
     async with fs_locks.source_dir_lock(str(_project_root(project))):
-      return await asyncio.to_thread(project_git.initialize_project, _project_root(project))
+      return await settled.run_settled(
+        project_git.initialize_project, _project_root(project),
+      )
   except project_git.GitProjectError as exc:
     raise HTTPException(409, str(exc)) from exc
 
@@ -2393,7 +2394,7 @@ async def commit_project_git(
   project = _project_for(db, project_id, principal, "maintainer")
   try:
     async with fs_locks.source_dir_lock(str(_project_root(project))):
-      return await asyncio.to_thread(
+      return await settled.run_settled(
         project_git.commit_project, _project_root(project), body.message, body.expected_head,
       )
   except project_git.GitProjectError as exc:
@@ -2488,7 +2489,7 @@ async def pull_project_git_remote(
   root = _project_root(project)
   try:
     async with fs_locks.source_dir_lock(str(root)):
-      result = await asyncio.to_thread(project_git.pull_project, root, body.expected_head)
+      result = await settled.run_settled(project_git.pull_project, root, body.expected_head)
   except project_git.GitProjectError as exc:
     raise HTTPException(409, str(exc)) from exc
   project.updated_at = now_naive_utc()

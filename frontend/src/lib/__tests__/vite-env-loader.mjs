@@ -33,6 +33,7 @@ const REACT_SHIMMED_MODULES = [
   '/components/ChatView/useFileUpload.js',
   '/components/ChatView/usePaginationLifecycle.js',
   '/components/ChatView/hooks/useComposerDraftState.js',
+  '/components/ChatView/hooks/useComposerHistory.js',
   '/components/ChatView/useScrollMode.js',
   '/hooks/useNavigation.js',
 ]

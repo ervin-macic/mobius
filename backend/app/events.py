@@ -105,7 +105,8 @@ SYSTEM_EVENT_TYPES: frozenset[str] = frozenset({
   # Explicit agent-initiated "open this in the partner's workspace" request
   # (split-pane design §6.3). The agent POSTs it with a typed item + optional
   # source + placement/activation; Shell confirms the item exists, then routes
-  # it through the same pane-aware resolver as app_preview_ready. Like that
+  # it through the same pane-aware resolver as app_preview_ready. itemKind
+  # settings instead navigates to Settings (optionally one section). Like that
   # preview action it is system-bus-only (an action must never replay).
   "open_item",
   "app_updated",
@@ -882,6 +883,10 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
       # can suppress transport without guessing from tool names or output.
       if isinstance(event.get("owner_card_question_id"), str):
         blk["owner_card_question_id"] = event["owner_card_question_id"]
+      # A screenshot step names its saved chat-media picture (stamped by the
+      # sink from the full result; see screenshot_steps).
+      if isinstance(event.get("saved_image"), str):
+        blk["saved_image"] = event["saved_image"]
       return True
     return False
 

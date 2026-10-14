@@ -40,6 +40,11 @@ PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS = 5 * 60
 OOM_WATCHDOG_FAST_INTERVAL_SECS = 2.0
 OOM_WATCHDOG_SLOW_INTERVAL_SECS = 20.0
 OOM_WATCHDOG_FAST_WINDOW_SECS = 180.0
+# A heavy WebGL page can grow by gigabytes within a minute.
+BROWSER_REAPER_INTERVAL_SECS = 30.0
+# Chat browsers may hold this share of the container memory limit; the server
+# and agent processes need the rest.
+BROWSER_MEMORY_SHARE = 0.4
 REQUIRED_DATABASE_SUPERVISORS = frozenset({
   "wedged-marker-sweep",
   "reset-park-sweep",
@@ -86,6 +91,8 @@ class RuntimeSupervisors:
     self._frontend_handler = None
     self._database_services_started = False
     self._database_services_error: str | None = None
+    from app.app_update_batches import AppUpdateBatches
+    self.app_updates = AppUpdateBatches(settings.data_dir)
 
   def _spawn(self, name: str, coroutine) -> None:
     self._tasks[name] = asyncio.create_task(
@@ -127,12 +134,40 @@ class RuntimeSupervisors:
 
     self._spawn("boot-file-cache-reclaim", reclaim())
 
+  def retry_bootstrap_apps(self, outcome) -> None:
+    """Keep retrying default apps that failed only transiently at boot."""
+    from app.bootstrap import retry_bootstrap_apps
+    self._spawn("bootstrap-apps-retry", retry_bootstrap_apps(outcome))
+
   async def start_process_services(self) -> None:
     """Start services that are safe without a serviceable database."""
     await self._start_frontend_watcher()
     from app.connect_outbound import supervise_outbound_connects
     self._spawn("connect-outbound", supervise_outbound_connects())
     self._spawn("oom-watchdog", self._oom_watchdog_loop())
+    self._spawn("browser-reaper", self._browser_reaper_loop())
+
+  async def _browser_reaper_loop(self) -> None:
+    """Close agent browsers left by turns that died with an earlier process.
+
+    Its first pass starts at boot alongside other supervisors. A browser
+    outliving a killed server may hold memory across restarts; this sweep
+    runs concurrently with chat resumption, not as a startup barrier.
+    """
+    from app import chat, memory_observability
+
+    while True:
+      try:
+        # No container limit means no OOM cliff to guard.
+        limit = memory_observability.cgroup_memory_snapshot().get("limit_bytes")
+        await chat.reap_unowned_browsers(
+          memory_budget_bytes=int(limit * BROWSER_MEMORY_SHARE) if limit else None,
+        )
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        self.log.error("agent-browser reaper failed: %s", exc, exc_info=True)
+      await asyncio.sleep(BROWSER_REAPER_INTERVAL_SECS)
 
   async def _oom_watchdog_loop(self) -> None:
     """Record a durable diagnostic whenever the cgroup loses a process to OOM.
@@ -211,6 +246,8 @@ class RuntimeSupervisors:
           "required runtime supervisors were not started: "
           + ", ".join(sorted(missing))
         )
+      # Settles any batch a stopped server left running, then admits new ones.
+      await self.app_updates.start()
       self._database_services_started = True
       self._database_services_error = None
     except Exception as exc:
@@ -593,6 +630,8 @@ class RuntimeSupervisors:
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""
+    # First, so each running update settles while the owners it uses still run.
+    await self.app_updates.stop()
     tasks = list(self._tasks.values())
     for task in tasks:
       task.cancel()

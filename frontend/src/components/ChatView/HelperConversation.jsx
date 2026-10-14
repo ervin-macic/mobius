@@ -6,6 +6,7 @@ import { apiFetch } from '../../api/client.js'
 import useDialogFocus from '../../hooks/useDialogFocus.js'
 import { StandardMarkdown } from './markdown/BlockRenderer.jsx'
 import ToolBlock from './ToolBlock.jsx'
+import { HELPER_AWAITING_PARENT_LABEL } from './workingHelper.js'
 import './HelperConversation.css'
 
 // A running helper keeps writing its conversation; re-read it on this cadence
@@ -13,7 +14,7 @@ import './HelperConversation.css'
 const LIVE_REFRESH_MS = 3000
 
 const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex', mobius: 'Möbius' }
-const STATUS_LABELS = { running: 'Working', done: 'Finished', failed: 'Failed' }
+const STATUS_LABELS = { running: 'Working', done: 'Finished', failed: 'Failed', waiting: HELPER_AWAITING_PARENT_LABEL }
 
 async function readConversation(chatId, taskId, signal) {
   const response = await apiFetch(

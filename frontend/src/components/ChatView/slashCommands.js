@@ -38,28 +38,87 @@ export const SLASH_COMMANDS = [
     summary: 'Compact this chat',
     detail: 'Refresh live context; add guidance after the command. The transcript stays.',
   },
+  {
+    // `aliases` are other names typed for the same command. The menu shows
+    // one row, and the parity test counts each alias as a dispatched command.
+    name: 'new',
+    aliases: ['clear'],
+    args: '<first message>',
+    summary: 'Start a new chat',
+    detail: 'Same project and model. Any text after it becomes the first message.',
+  },
+  {
+    name: 'context',
+    summary: 'See what fills the context',
+    detail: 'Estimated size of each part, from Möbius instructions to the conversation.',
+  },
+  {
+    name: 'btw',
+    args: '<side question>',
+    summary: 'Ask a side question',
+    detail: 'A temporary copy of this chat answers. The agent isn’t interrupted.',
+    // Answers come from a fork of the provider's own session. Claude-only:
+    // only a Claude fork can run with every tool turned off, and a copy that
+    // kept file reads could leak owner data to the provider (PR #1836 review).
+    providers: ['claude'],
+  },
 ]
 
 /**
- * Commands Möbius handles itself instead of handing to the model.
+ * Commands that are chat actions: the composer runs them instead of sending.
  *
- * `/goal` is sent as a message; the backend turns it into the Goal and hands
- * the agent a plain request. `/compact` is not a prompt at all — it is a chat
- * action: the platform rewrites the chat's live context and resets the provider
- * session. It is dispatched to the backend's compaction endpoint, never sent as
- * prose. Both lists are still pinned to the backend by
+ * `/goal` is not here: it is sent as a message, and the backend turns it into
+ * the Goal and hands the agent a plain request. These never become prose:
+ * `/compact` rewrites the chat's live context and resets the provider
+ * session; `/new` (typed `/clear` too) opens a new chat in the same project;
+ * `/context` opens the context breakdown; `/btw` asks a temporary copy of the
+ * chat. The registry above is still pinned to the backend by
  * test_slash_command_registry_parity, so a menu entry can never silently
  * degrade into a message.
  */
-export const MOBIUS_CHAT_COMMANDS = ['/compact']
+const CHAT_ACTIONS = {
+  '/compact': 'compact',
+  '/new': 'new',
+  '/clear': 'new',
+  '/context': 'context',
+  '/btw': 'btw',
+}
 
-/** The Möbius chat command and its optional guidance, or null. */
+export const MOBIUS_CHAT_COMMANDS = Object.keys(CHAT_ACTIONS)
+
+/**
+ * The chat action typed in the composer, or null for anything to send.
+ *
+ * `name` is what was typed (`/clear` stays `/clear`), `action` is what runs
+ * (`new` for both), and `argument` is the trimmed text after the command:
+ * compaction guidance, a new chat's first message, or the side question.
+ */
 export function mobiusChatCommand(text) {
   const value = (text ?? '').trim()
   if (!value) return null
-  const match = value.match(/^\/compact(?:\s+([\s\S]*))?$/)
-  if (!match) return null
-  return { name: '/compact', instructions: (match[1] || '').trim() }
+  const match = value.match(/^(\/[a-z]+)(?:\s+([\s\S]*))?$/)
+  const action = match ? CHAT_ACTIONS[match[1]] : null
+  if (!action) return null
+  return { name: match[1], action, argument: (match[2] || '').trim() }
+}
+
+/**
+ * Why `command` cannot run as typed, or null when it can. `/context` opens
+ * the context breakdown and takes no text: running it anyway would silently
+ * discard the trailing words, so the composer keeps them and shows this.
+ * A command typed in full skips the menu, so the menu's provider rule is
+ * enforced here too: `/btw` on a Codex chat is refused before any request.
+ */
+export function chatCommandRejection(command, provider) {
+  if (!command) return null
+  const entry = SLASH_COMMANDS.find((candidate) => candidate.name === command.action)
+  if (entry && !slashCommandIsAvailable(entry, provider)) {
+    return `‘${command.name}’ isn’t available here. ${slashCommandUnavailableReason(entry, provider)} Your message stays in the box.`
+  }
+  if (command.action === 'context' && command.argument) {
+    return '‘/context’ takes no text after it. Your message stays in the box.'
+  }
+  return null
 }
 
 /** Restore a failed compact command unless the owner has already typed anew. */
@@ -114,20 +173,34 @@ export function fuzzyScore(query, name) {
   return score
 }
 
+/** The command's best-scoring name or alias for `query`, or null. */
+function bestNameMatch(query, command) {
+  let best = null
+  for (const typed of [command.name, ...(command.aliases || [])]) {
+    const score = fuzzyScore(query, typed)
+    if (score !== null && (best === null || score > best.score)) best = { score, typed }
+  }
+  return best
+}
+
 /**
  * Commands offered for the current composer text, best match first.
  *
  * Returns [] when the composer isn't in slash mode, which is also the signal
- * to keep the menu closed — callers don't need a second predicate.
+ * to keep the menu closed — callers don't need a second predicate. A command
+ * matched through an alias comes back as a copy carrying `invokedAs`, so the
+ * menu shows and accepting inserts the name being typed ("/cl" → "/clear").
  */
 export function matchSlashCommands(input) {
   const query = slashQueryFor(input)
   if (query === null) return []
   return SLASH_COMMANDS
-    .map((command) => ({ command, score: fuzzyScore(query, command.name) }))
-    .filter((entry) => entry.score !== null)
-    .sort((a, b) => b.score - a.score || a.command.name.localeCompare(b.command.name))
-    .map((entry) => entry.command)
+    .map((command) => ({ command, match: bestNameMatch(query, command) }))
+    .filter((entry) => entry.match !== null)
+    .sort((a, b) => b.match.score - a.match.score || a.command.name.localeCompare(b.command.name))
+    .map(({ command, match }) => (
+      match.typed === command.name ? command : { ...command, invokedAs: match.typed }
+    ))
 }
 
 /** Whether selecting this command would dispatch on the current provider. */
@@ -176,5 +249,5 @@ export function resolveSlashMenuKey(event, { open, count } = {}) {
 
 /** Composer text after accepting a command: the name plus the space its arguments start after. */
 export function applySlashCommand(command) {
-  return `/${command.name} `
+  return `/${command.invokedAs || command.name} `
 }

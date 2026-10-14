@@ -5,9 +5,13 @@ that an app's `main` no longer satisfies would otherwise ship silently. The
 install test fetches the packages from GitHub, so the hermetic suite skips it;
 CI runs it as its own step with MOBIUS_LIVE_BOOTSTRAP=1.
 
-Installing resolves each app's repository id through api.github.com. Shared CI
-runners exhaust GitHub's unauthenticated rate limit, so CI passes its workflow
-token as GITHUB_TOKEN and the test sends it on api.github.com requests only.
+Installing a package that declares `package_id` needs its GitHub repository
+id. The platform's own catalog repositories are listed in
+`_TRUSTED_CATALOG_REPOSITORY_IDS`, so first boot needs no API call; the table
+check below asks api.github.com so that list cannot drift from the default
+apps. Shared CI runners exhaust GitHub's unauthenticated rate limit, so CI
+passes its workflow token as GITHUB_TOKEN and the tests send it on
+api.github.com requests only.
 """
 
 import asyncio
@@ -19,6 +23,15 @@ import pytest
 
 from app import models
 from app.bootstrap import _CORE_BOOTSTRAP_APPS, ensure_bootstrap_apps_installed
+from app.install import (
+  _TRUSTED_CATALOG_REPOSITORY_IDS,
+  _github_root_manifest_identity,
+)
+
+_LIVE = pytest.mark.skipif(
+  os.environ.get("MOBIUS_LIVE_BOOTSTRAP") != "1",
+  reason="fetches the first-boot apps from GitHub",
+)
 
 
 
@@ -76,10 +89,7 @@ def test_github_api_token_reaches_only_api_github_com(monkeypatch):
   }
 
 
-@pytest.mark.skipif(
-  os.environ.get("MOBIUS_LIVE_BOOTSTRAP") != "1",
-  reason="fetches the first-boot apps from GitHub",
-)
+@_LIVE
 def test_empty_instance_installs_every_bootstrap_app(
   db, monkeypatch, caplog,
 ):
@@ -97,3 +107,31 @@ def test_empty_instance_installs_every_bootstrap_app(
     for row in db.query(models.App).filter(models.App.deleted_at.is_(None))
   }
   assert {app.manifest_id for app in _CORE_BOOTSTRAP_APPS} <= installed
+
+
+@_LIVE
+def test_every_default_package_identity_is_in_the_trusted_table():
+  """A default app that declares `package_id` must not need the API on boot."""
+  headers = {}
+  token = os.environ.get("GITHUB_TOKEN")
+  if token:
+    headers["Authorization"] = f"Bearer {token}"
+  expected = {}
+  with httpx.Client(timeout=30, follow_redirects=True) as cli:
+    for app in _CORE_BOOTSTRAP_APPS:
+      manifest = cli.get(app.manifest_url)
+      manifest.raise_for_status()
+      if not manifest.json().get("package_id"):
+        continue
+      owner, repo = _github_root_manifest_identity(app.manifest_url)
+      metadata = cli.get(
+        f"https://api.github.com/repos/{owner}/{repo}", headers=headers,
+      )
+      metadata.raise_for_status()
+      assert metadata.json()["full_name"].lower() == f"{owner}/{repo}"
+      expected[(owner, repo)] = metadata.json()["id"]
+
+  assert expected
+  assert {
+    key: _TRUSTED_CATALOG_REPOSITORY_IDS.get(key) for key in expected
+  } == expected

@@ -1,11 +1,41 @@
 """Mini-app compile contract shared by the compiler and local validator."""
 
+import hashlib
 import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
 
-ROLLDOWN_TIMEOUT_SECS = 30
+# A Rolldown build that outlives this wall limit is stopped, so a runaway or
+# hung build cannot hold the shared build lease indefinitely. Machine load
+# alone can stretch a correct build a long way: an overloaded 2-vCPU, 1 GB
+# instance has turned a sub-second build into more than 30 s. A stop is
+# therefore reported as an environment stall, never as a source error. The
+# limit covers only Rolldown itself; the lease wait and Git snapshot before
+# it are outside, so it bounds rather than guarantees fitting the apply
+# tool's 120 s request deadline.
+ROLLDOWN_WALL_LIMIT_SECS = 60
+
+
+class RolldownStalled(RuntimeError):
+  """Rolldown did not finish within its wall-time limit and was stopped.
+
+  An environment outcome (an overloaded or memory-starved machine, or a hung
+  build), never a verdict on the app source.
+  """
+
+  def __init__(self) -> None:
+    super().__init__(
+      f"The build environment stalled: Rolldown did not finish within "
+      f"{ROLLDOWN_WALL_LIMIT_SECS} s and was stopped. The machine is likely "
+      "overloaded or short of memory; the app source was not judged. Retry "
+      "when the machine is less busy before changing code."
+    )
+
+  def detail(self) -> dict[str, str]:
+    """The one refusal shape every HTTP caller answers with (status 503)."""
+    return {"code": "build_stalled", "message": str(self)}
+
 
 # The largest compiled module the shell will load: it refuses anything bigger
 # (`APP_MODULE_MAX_BYTES` in frontend/src/lib/appModuleBroker.js; keep them
@@ -48,12 +78,45 @@ COMPILED_RUNTIME_ABI = 1
 # compiled-runtime change that remains host-compatible. Keep ABI for actual
 # host/runtime incompatibilities: a revision-only rollout is safe while the
 # live checkout and backend process briefly run different generations.
-COMPILED_RUNTIME_ARTIFACT_REVISION = 8
+COMPILED_RUNTIME_ARTIFACT_REVISION = 10
 COMPILED_RUNTIME_GLOBAL = "__mobiusCompiledRuntime"
 COMPILED_RUNTIME_BANNER = (
   f"/* mobius-compiled-runtime-abi:{COMPILED_RUNTIME_ABI};"
   f"artifact-revision:{COMPILED_RUNTIME_ARTIFACT_REVISION} */"
 )
+
+
+def app_frame_version(app) -> str:
+  """Derive the frame reload key from an App row or its AppOut projection.
+
+  A frame runs one content-addressed bundle (its file name carries the
+  SHA-256, and the compile banner carries the runtime revision), initialized
+  with the accepted runtime declarations and published asset tree, and bound
+  to one storage generation.
+  Ordinary row writes such as a pin, rename, icon, or permission change touch
+  none of these, so the shell keeps the running frame and the app keeps its
+  place. The published tree revision includes /app-assets: static-app updates
+  must reload even when their wrapper bundle stays unchanged. The raw nonce is
+  not exposed by this key (app-scoped JWTs separately carry it as app_nonce).
+  """
+  runtime = (
+    app.capability_contract.get("runtime")
+    if isinstance(app.capability_contract, Mapping) else None
+  )
+  identity = json.dumps(
+    [
+      Path(app.compiled_path or "").name, runtime or {}, app.token_nonce or "",
+      app.runtime_revision or "",
+    ],
+    sort_keys=True,
+    separators=(",", ":"),
+  )
+  return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def app_storage_generation(token_nonce: str | None) -> str:
+  """Non-secret installation identity for binding saved client-side state."""
+  return hashlib.sha256((token_nonce or "").encode("utf-8")).hexdigest()[:20]
 
 
 def runtime_inject_path() -> Path:

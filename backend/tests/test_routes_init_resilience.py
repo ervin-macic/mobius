@@ -252,6 +252,7 @@ def test_lifespan_waits_for_initial_restart_resume_sweep(monkeypatch):
     # assertion budget and must not turn the ordering contract into a network
     # timing test.
     del db
+    return bootstrap_mod.BootstrapOutcome()
 
   monkeypatch.setattr(
     bootstrap_mod,
@@ -289,7 +290,7 @@ def test_restart_receipt_failure_does_not_abort_lifespan(monkeypatch):
   from app.main import app as main_app
 
   async def skip_external_bootstrap(_db):
-    return None
+    return bootstrap_mod.BootstrapOutcome()
 
   monkeypatch.setattr(
     bootstrap_mod,

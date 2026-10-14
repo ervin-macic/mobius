@@ -62,8 +62,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app import chat_archive, models, schemas, transcript_rows
 from app.goals import admit_goal
-from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
+from app.continuations import SIDE_QUESTION_MESSAGE_KIND
 from app.json_safety import json_safe
 from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
@@ -101,6 +101,19 @@ def create_chat(**fields) -> models.Chat:
 # `reconcile_interrupted_chats` always calls BEFORE `start_writer()`, so the
 # handler exists by the time the writer thread can log.
 log = logging.getLogger("moebius.chat.writer")
+
+
+
+def _publish_goal_runtime_changed(db, chat_id: str) -> None:
+  """Invalidate committed lifecycle state at its direct and immutable owners."""
+  from app.goal_plans import publish_goal_changed, publish_plan_for_delegation
+  helper = db.query(models.Delegation).filter(
+    models.Delegation.child_chat_id == chat_id,
+  ).first()
+  if helper is not None:
+    publish_plan_for_delegation(db, helper)
+  else:
+    publish_goal_changed(chat_id)
 
 
 def _name_chat_from_first_message(chat: models.Chat, content: object) -> None:
@@ -431,8 +444,9 @@ class AcknowledgeProviderSuccess(_Command):
   Provider admission is intentionally earlier: it prevents ambiguous replay
   of an execution attempt. It is not proof that the provider accepted the
   prompt. This later acknowledgement both heals an older provider-limit signal
-  and records what the provider received — the peer-note cursor and the Wait
-  results the turn carried — in the same writer-owned transaction.
+  and records what the provider received — the peer-note cursor, the Wait
+  results and the added side questions the turn carried — in the same
+  writer-owned transaction.
   """
 
   chat_id: str = ""
@@ -440,6 +454,8 @@ class AcknowledgeProviderSuccess(_Command):
   peer_message_through_created_at: datetime | None = None
   peer_message_through_id: str | None = None
   wait_results: tuple[str, ...] = ()
+  # cids of the added /btw side questions this turn's prompt carried.
+  side_question_cids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -984,6 +1000,27 @@ class AppendSteeredUserMessage(_Command):
 
 
 @dataclass
+class AppendSideQuestion(_Command):
+  """Add an owner-kept ``/btw`` answer to the transcript without a turn.
+
+  The row is context for the agent, not a request: it never enters the
+  pending queue, so it cannot start a turn or join a queued batch, and it may
+  land while a turn runs (above that turn's reply). It is refused while an
+  owner question card is open, because that card must stay the transcript's
+  tail to remain answerable. ``cid`` makes a retried add return the stored
+  row. The agent receives the row once, on its next successful turn
+  (``transcript_rows.owed_side_questions`` and AcknowledgeProviderSuccess).
+  Returns ``{"status": "stored", "stored": row}`` or a ``conflict``.
+  """
+
+  chat_id: str = ""
+  cid: str = ""
+  question: str = ""
+  answer: str = ""
+  provider: str = ""
+
+
+@dataclass
 class PromotePending(_Command):
   """Move pending follow-ups into the transcript and mark the run.
 
@@ -1088,6 +1125,45 @@ class PersistCompaction(_Command):
   # Required when a verified note replaces a transcript prefix. The route
   # holds the checkpoint transition lock through this actor's commit.
   source_note_hash: str | None = None
+  # Explicit manual batches finish through this same atomic owner.
+  recovery_id: str | None = None
+  batch_id: str | None = None
+  generation: int | None = None
+
+
+@dataclass
+class BeginManualCompaction(_Command):
+  """Admit one explicit batch against an unchanged source snapshot."""
+
+  chat_id: str = ""
+  recovery_id: str = ""
+  batch_id: str = ""
+  source: dict = field(default_factory=dict)
+  generation: int = 0
+  continuing: bool = False
+
+
+@dataclass
+class AdvanceManualCompaction(_Command):
+  """Commit completed synthesis progress before allowing the next call."""
+
+  chat_id: str = ""
+  recovery_id: str = ""
+  batch_id: str = ""
+  generation: int = 0
+  expected_chunk: int = 0
+  next_chunk: int = 0
+  briefing: str = ""
+
+
+@dataclass
+class EndManualCompaction(_Command):
+  """Release this batch only; never schedule another one."""
+
+  chat_id: str = ""
+  recovery_id: str = ""
+  batch_id: str = ""
+  error: str | None = None
 
 
 @dataclass
@@ -2157,10 +2233,18 @@ class ChatWriterActor:
       return self._append_pending(db, cmd)
     if isinstance(cmd, AppendSteeredUserMessage):
       return self._append_steered_user_message(db, cmd)
+    if isinstance(cmd, AppendSideQuestion):
+      return self._append_side_question(db, cmd)
     if isinstance(cmd, BeginNoteRecovery):
       return self._begin_note_recovery(db, cmd)
     if isinstance(cmd, PersistCompaction):
       return self._persist_compaction(db, cmd)
+    if isinstance(cmd, (BeginManualCompaction, AdvanceManualCompaction, EndManualCompaction)):
+      from app.manual_compaction import persist_manual_progress
+      result = persist_manual_progress(db, cmd)
+      if not _commit_or_rollback(db):
+        raise _PersistFailed("Manual compaction progress did not persist")
+      return result
     if isinstance(cmd, AuthorizeCheckpoint):
       return self._authorize_checkpoint(db, cmd)
     if isinstance(cmd, SwitchProviderWithCompaction):
@@ -2501,6 +2585,7 @@ class ChatWriterActor:
     )
     if not _commit_or_rollback(db):
       raise _PersistFailed("AnswerQuestion did not persist")
+    _publish_goal_runtime_changed(db, cmd.chat_id)
     return True
 
   def _resolve_platform_restart_card(
@@ -2706,6 +2791,7 @@ class ChatWriterActor:
       ACTIVITY_DELIVERY_FINALIZE_ATOMIC,
       WAKE_ELIGIBLE_RUN_STATUSES,
       activity_continuation_delivery_source_work_id,
+      delegation_source_work_filter,
     )
     source_work_id = activity_continuation_delivery_source_work_id(
       db, cmd.chat_id, cmd.run_token,
@@ -2723,7 +2809,7 @@ class ChatWriterActor:
       ]
       if source_work_id is not None:
         ownership_filters.append(
-          models.Delegation.parent_root_run_id == source_work_id,
+          delegation_source_work_filter(source_work_id),
         )
       # The context holds these exact results. Each must be a settled run of
       # its helper that has not already been delivered. A helper reopened
@@ -2814,8 +2900,68 @@ class ChatWriterActor:
     )
     from app.chat_waits import stage_wait_results_delivered
     stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results)
+    self._stage_side_questions_delivered(db, cmd.chat_id, cmd.side_question_cids)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
+
+  def _stage_side_questions_delivered(
+    self, db, chat_id: str, cids: tuple[str, ...],
+  ) -> None:
+    """Record, in the ack's transaction, that the agent got these answers."""
+    if not cids:
+      return
+    chat = _active_chat(db, chat_id)
+    if chat is None:
+      return
+    for cid in cids:
+      seq = transcript_rows.client_message_seq(db, chat, cid)
+      if seq is None:
+        continue
+      body = transcript_rows.at(db, chat, seq)
+      if (
+        isinstance(body, dict)
+        and body.get("kind") == SIDE_QUESTION_MESSAGE_KIND
+        and body.get("delivered_to_agent") is not True
+      ):
+        transcript_rows.update_at(
+          db, chat, seq, {**body, "delivered_to_agent": True},
+        )
+
+  def _append_side_question(self, db, cmd: AppendSideQuestion) -> dict:
+    """Append one kept side question; see AppendSideQuestion."""
+    from datetime import UTC, datetime
+
+    if not cmd.cid or not cmd.question.strip() or not cmd.answer.strip():
+      raise _PersistFailed("AppendSideQuestion needs a cid, question and answer")
+    chat = _active_chat(db, cmd.chat_id)
+    if chat is None:
+      raise _PersistFailed("AppendSideQuestion: chat not found or deleted")
+    existing = transcript_rows.client_message_seq(db, chat, cmd.cid)
+    if existing is not None:
+      db.rollback()
+      return {"status": "stored", "stored": transcript_rows.at(db, chat, existing)}
+    if chat.pending_question_id is not None:
+      db.rollback()
+      return {"status": "conflict", "reason": "question_open"}
+    from app.side_questions import side_question_row_content
+    row = {
+      "role": "user",
+      "kind": SIDE_QUESTION_MESSAGE_KIND,
+      "content": side_question_row_content(cmd.question, cmd.answer),
+      "side_question": {
+        "question": cmd.question,
+        "answer": cmd.answer,
+        "provider": cmd.provider,
+      },
+      "delivered_to_agent": False,
+      "cid": cmd.cid,
+      "ts": _next_row_ts(db, chat, list(chat.pending_messages or [])),
+    }
+    transcript_rows.append(db, chat, row)
+    chat.updated_at = datetime.now(UTC)
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("AppendSideQuestion did not persist")
+    return {"status": "stored", "stored": row}
 
   def _stage_activity_delivery_consumption(
     self, db, *, chat_id: str, run_token: str,
@@ -2847,7 +2993,7 @@ class ChatWriterActor:
     envelope = run.activity_delivery_json
     if not isinstance(envelope, dict):
       return
-    from app.delegations import ACTIVITY_DELIVERY_FINALIZE_ATOMIC
+    from app.delegations import ACTIVITY_DELIVERY_FINALIZE_ATOMIC, delegation_source_work_filter
     if (
       envelope.get("delivery_contract")
       != ACTIVITY_DELIVERY_FINALIZE_ATOMIC
@@ -2870,7 +3016,7 @@ class ChatWriterActor:
       if not isinstance(source_work_id, str) or not source_work_id:
         raise _PersistFailed("Finalize: malformed activity delivery scope")
       ownership_filters.append(
-        models.Delegation.parent_root_run_id == source_work_id,
+        delegation_source_work_filter(source_work_id),
       )
     matching = db.query(models.Delegation.id).filter(
       *ownership_filters,
@@ -3580,6 +3726,8 @@ class ChatWriterActor:
     ))
     if not _commit_or_rollback(db):
       raise _PersistFailed("StartTurn did not persist")
+    if goal_id is not None:
+      _publish_goal_runtime_changed(db, cmd.chat_id)
     # This run_token now owns the in-process handoff fence.
     self._run_token_owner[cmd.chat_id] = cmd.run_token
     return {
@@ -3666,7 +3814,6 @@ class ChatWriterActor:
     def settle_activation_card() -> None:
       if activation_wait is None:
         return
-      from sqlalchemy.orm.attributes import flag_modified
       messages = transcript_rows.reverse_iter(db, chat)
       found = False
       for seq, original in messages:
@@ -3976,6 +4123,8 @@ class ChatWriterActor:
     ))
     if not _commit_or_rollback(db):
       raise _PersistFailed("StartContinuation did not persist")
+    if goal_id is not None:
+      _publish_goal_runtime_changed(db, cmd.chat_id)
     self._run_token_owner[cmd.chat_id] = cmd.run_token
     return {
       "history": history,
@@ -3998,6 +4147,8 @@ class ChatWriterActor:
       _parent_wake_continuation_root,
       current_result_undelivered,
       derived_status,
+      delegation_goal_id,
+      delegation_source_work_filter,
       parent_wake_blocker,
     )
     from app.models import ChatRun
@@ -4010,7 +4161,7 @@ class ChatWriterActor:
     trigger = db.query(models.Delegation).filter(
       models.Delegation.id == cmd.activity_id,
       models.Delegation.parent_chat_id == cmd.chat_id,
-      models.Delegation.parent_root_run_id == cmd.source_work_id,
+      delegation_source_work_filter(cmd.source_work_id),
       models.Delegation.notify_parent_on_complete.is_(True),
       current_result_undelivered(),
       models.Delegation.cancelled_at.is_(None),
@@ -4094,8 +4245,12 @@ class ChatWriterActor:
     if blocker is not None:
       db.rollback()
       return StartContinuationBlocked(blocker)
-    goal_id = source.goal_id if source is not None else None
-    goal_objective = source.goal_objective if goal_id else None
+    goal_id = delegation_goal_id(db, trigger)
+    # A nested helper works in its coordinator's Goal, but this physical run
+    # belongs to the helper chat: bind only an open Goal this chat owns. The
+    # shared Goal stays in the activity source and the assignment chain.
+    from app.run_state import open_goal_identity_for_chat
+    goal_objective, goal_id = open_goal_identity_for_chat(db, cmd.chat_id, goal_id)
 
     existing = transcript_rows.read_all(db, chat)
     try:
@@ -4169,9 +4324,21 @@ class ChatWriterActor:
     if latest is None or latest[0] != run.id:
       db.rollback()
       return GoalPromotionRejected("run_not_current")
-    if run.goal_objective not in (None, cmd.objective):
+    current_goal = db.get(models.ChatGoal, run.goal_id) if run.goal_id else None
+    terminal = {"completed", "cannot_complete", "cancelled"}
+    if run.goal_id and (current_goal is None or current_goal.chat_id != cmd.chat_id):
+      db.rollback()
+      return GoalPromotionRejected("goal_not_open")
+    replacing = current_goal is not None and current_goal.status in terminal
+    if current_goal is not None and not replacing and (
+      current_goal.objective != cmd.objective
+      or cmd.resume_goal_id not in (None, current_goal.id)
+    ):
       db.rollback()
       return GoalPromotionRejected("different_goal_active")
+    if current_goal is not None and current_goal.status not in terminal | {"open"}:
+      db.rollback()
+      return GoalPromotionRejected("attempt_was_stopped")
 
     if cmd.resume_goal_id is not None:
       target = db.get(models.ChatGoal, cmd.resume_goal_id)
@@ -4210,10 +4377,15 @@ class ChatWriterActor:
         and outstanding.id != run.goal_id):
       db.rollback()
       return GoalPromotionRejected("unfinished_goal_exists")
-    goal_id = cmd.resume_goal_id or run.goal_id or run.id
-    if run.goal_id is not None and run.goal_id != goal_id:
+    goal_id = cmd.resume_goal_id or (
+      current_goal.id if current_goal is not None and not replacing else uuid.uuid4().hex
+    )
+    if replacing and db.query(models.ChatGoal.id).filter(
+      models.ChatGoal.chat_id == cmd.chat_id,
+      models.ChatGoal.status == "open", models.ChatGoal.id != goal_id,
+    ).first() is not None:
       db.rollback()
-      return GoalPromotionRejected("different_goal_active")
+      return GoalPromotionRejected("unfinished_goal_exists")
     goal_was_missing = db.get(models.ChatGoal, goal_id) is None
     goal = db.get(models.ChatGoal, goal_id)
     reopening = goal is not None and goal.status == "stopped"
@@ -4222,17 +4394,38 @@ class ChatWriterActor:
       if cmd.resume_goal_id is not None else None
     ))
     identity_changed = (
-      run.goal_objective is None
-      or run.goal_id is None
+      run.goal_objective != cmd.objective
+      or run.goal_id != goal_id
     )
     run.goal_objective = cmd.objective
     run.goal_id = goal_id
+    if goal_was_missing:
+      # A helper spawned before promotion has no Goal snapshot yet. Adopt only
+      # this physical attempt's helpers, never an earlier turn sharing its root.
+      frontier = [cmd.chat_id]
+      first = True
+      while frontier:
+        rows = db.query(models.Delegation).filter(
+          models.Delegation.parent_chat_id.in_(frontier),
+          models.Delegation.goal_id.is_(None),
+          models.Delegation.app_id.is_(None),
+          models.Delegation.source_work_id.is_(None),
+          *((models.Delegation.parent_root_run_id == root_id,
+             models.Delegation.created_at >= run.started_at) if first else ()),
+        ).all()
+        for row in rows:
+          row.goal_id = goal_id
+        frontier = [row.child_chat_id for row in rows]
+        first = False
     if (identity_changed or goal_was_missing or reopening) and not _commit_or_rollback(db):
       raise _PersistFailed("PromoteRunToGoal did not persist")
     if not identity_changed and not goal_was_missing and not reopening:
       db.rollback()
+    else:
+      _publish_goal_runtime_changed(db, cmd.chat_id)
     return {
       "objective": cmd.objective,
+      "goal_id": goal_id,
       "root_run_id": root_id,
       "run_id": run.id,
       "state": "promoted" if identity_changed else "active",
@@ -4288,6 +4481,7 @@ class ChatWriterActor:
         run.restart_nonce = None
     if not _commit_or_rollback(db):
       raise _PersistFailed("ClearPresentedGoal did not persist")
+    _publish_goal_runtime_changed(db, cmd.chat_id)
     return {"status": "cleared", "goal_id": goal_id}
 
   def _settle_secure_input(self, db, cmd: SettleSecureInput) -> dict:
@@ -4791,6 +4985,12 @@ class ChatWriterActor:
     chat = _active_chat(db, cmd.chat_id)
     if chat is None:
       raise _PersistFailed("PersistCompaction: chat not found or deleted")
+    draft = None
+    if cmd.recovery_id is not None:
+      from app.manual_compaction import checked_draft
+      draft = checked_draft(db, chat, cmd.recovery_id, cmd.batch_id, cmd.generation)
+      if draft is None or draft.state["next_chunk"] != draft.state["total_chunks"]:
+        return {"status": "conflict", "reason": "recovery_changed"}
     messages = transcript_rows.read_all(db, chat)
     from app.run_state import has_nonterminal_run
     if chat.pending_messages or has_nonterminal_run(db, cmd.chat_id):
@@ -4816,10 +5016,15 @@ class ChatWriterActor:
       "from_provider": cmd.expected_provider,
       "ts": next_message_ts(messages + list(chat.pending_messages or [])),
     }
+    if draft is not None:
+      new_msg["source_evidence"] = {"chat_id": chat.id, **draft.state["evidence"]}
+      new_msg["recovery_id"] = cmd.recovery_id
     messages.append(new_msg)
     transcript_rows.append(db, chat, new_msg)
     chat.session_id = None
     chat.updated_at = datetime.now(UTC)
+    if draft is not None:
+      draft.state = {**draft.state, "status": "complete", "briefing": None, "error": None}
     if not _commit_or_rollback(db):
       raise _PersistFailed("PersistCompaction did not persist")
     return {"status": "committed", "stored": new_msg}
@@ -5028,7 +5233,7 @@ class ChatWriterActor:
     from app.continuations import continues_logical_root
     from app.run_state import (
       goal_identity_for_run_start,
-      product_result_continuation_root,
+      queued_continuation_root,
     )
     goal_objective, goal_id = goal_identity_for_run_start(
       db, cmd.chat_id, agent_pending,
@@ -5047,7 +5252,7 @@ class ChatWriterActor:
       .order_by(ChatRun.started_at.desc(), ChatRun.id.desc())
       .first()
     )
-    causal_root = product_result_continuation_root(
+    causal_root = queued_continuation_root(
       db, cmd.chat_id, agent_pending,
     )
     root_run_id = (
@@ -5132,10 +5337,8 @@ class ChatWriterActor:
     ).first() is not None:
       return None
     from app.delegations import _self_resuming_helper_rows
-    from app.goal_plans import goal_attempt_root_ids
-    helper_roots = goal_attempt_root_ids(db, chat.id, goal.id)
     if any(
-      row.parent_root_run_id in helper_roots
+      row.goal_id == goal.id
       for row, _status in _self_resuming_helper_rows(db, {chat.id})
     ):
       return None
@@ -5229,6 +5432,8 @@ class ChatWriterActor:
     if not _commit_or_rollback(db):
       raise _PersistFailed(failure_message)
     self._run_token_owner[chat.id] = run.id
+    if run.goal_id is not None:
+      _publish_goal_runtime_changed(db, chat.id)
 
   def _cancel_pending(self, db, cmd: CancelPending) -> dict:
     """Remove the queued message whose `cid` matches; return the remainder.
@@ -5327,10 +5532,13 @@ class ChatWriterActor:
     pending = list(chat.pending_messages or [])
     from app.continuations import (
       DELEGATION_RESULT_MESSAGE_KIND,
+      helper_answer_question_id,
       is_retired_goal_handoff,
     )
 
     def preserved_carrier(message: object) -> bool:
+      if isinstance(message, dict) and helper_answer_question_id(message):
+        return True
       return bool(
         isinstance(message, dict)
         and message.get("hidden")
@@ -5452,6 +5660,7 @@ class ChatWriterActor:
     count = _cancel_activation_owners(db, chat)
     if not _commit_or_rollback(db):
       raise _PersistFailed("PrepareChatStop did not persist")
+    _publish_goal_runtime_changed(db, cmd.chat_id)
     return count
 
   @staticmethod
@@ -5608,6 +5817,8 @@ class ChatWriterActor:
         changed = True
     if changed and not _commit_or_rollback(db):
       raise _PersistFailed("FinishRun did not persist")
+    if changed:
+      _publish_goal_runtime_changed(db, cmd.chat_id)
     if not cmd.run_token or owner == cmd.run_token:
       self._run_token_owner.pop(cmd.chat_id, None)
     return None

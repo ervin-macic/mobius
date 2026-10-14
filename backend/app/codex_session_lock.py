@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from app import settled
+
 
 # Codex SDK waits can occupy every default asyncio worker. Lock acquisition is
 # part of starting/closing that SDK, so it needs a tiny independent executor or
@@ -63,22 +65,20 @@ async def acquire_codex_session_activity_async(
   data_dir: str | Path,
 ) -> CodexSessionLock:
   """Acquire without blocking the event loop or leaking on cancellation."""
-  task = asyncio.ensure_future(asyncio.get_running_loop().run_in_executor(
-    _LOCK_EXECUTOR,
-    acquire_codex_session_activity,
-    data_dir,
-  ))
-  deferred_cancel: asyncio.CancelledError | None = None
-  while not task.done():
-    try:
-      await asyncio.shield(task)
-    except asyncio.CancelledError as exc:
-      deferred_cancel = deferred_cancel or exc
-  ownership = task.result()
-  if deferred_cancel is not None:
-    ownership.release()
-    raise deferred_cancel
-  return ownership
+  return await settled.settle(
+    asyncio.get_running_loop().run_in_executor(
+      _LOCK_EXECUTOR, acquire_codex_session_activity, data_dir,
+    ),
+    abandoned=_release_abandoned,
+  )
+
+
+def _release_abandoned(acquired: asyncio.Future[CodexSessionLock]) -> None:
+  """A cancelled caller never takes the lock it was acquiring: release it."""
+  if acquired.exception() is None:
+    acquired.result().release()
+  else:
+    settled.log_abandoned_failure(acquired, "Codex session lock acquire")
 
 
 def codex_home_in_use(data_dir: str | Path, *, proc_root: Path = Path("/proc")) -> bool:

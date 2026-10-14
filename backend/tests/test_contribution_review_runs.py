@@ -78,6 +78,38 @@ def test_exact_clear_head_merges_once_and_replay_is_read_only(setup, monkeypatch
   assert calls == [TARGET]
 
 
+@pytest.mark.parametrize("queued", [False, True])
+def test_a_cancelled_report_holds_the_transition_lock_through_the_merge(
+  setup, monkeypatch, queued,
+):
+  """The merge or enqueue thread ends under the lock before the cancel lands."""
+  from app import chat_queue
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  db, row, principal = setup
+  monkeypatch.setattr(
+    domain, "pull_checks", lambda *args: {**CHECKS, "isMergeQueueEnabled": queued},
+  )
+  worker = BlockedWorker(
+    (lambda: {"id": "queue-1"}) if queued else (lambda: {"merged": True, "sha": "landed"}),
+  )
+  monkeypatch.setattr(domain, "enqueue" if queued else "perform_merge", worker)
+  data = {**ITEM, "state": "all_clear", "summary": "Full diff reviewed",
+          "scope": sorted(routes.SCOPE), "tests": "Focused tests passed"}
+
+  transition = chat_queue.get_transition_lock(f"review-outcome:{row.id}")
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    SimpleNamespace(locked=transition._lock.locked),
+    lambda: routes.report_outcome(1, row.id, routes.ReviewOutcome(**data), db, principal),
+    worker,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.refresh(row)
+  # The armed attempt stays durable, so the next report reconciles, never replays.
+  assert row.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
+
+
 def test_foreign_chat_cannot_report_or_consume_grant(setup):
   setup[2].chat_id = "someone-else"
   with pytest.raises(HTTPException) as error:

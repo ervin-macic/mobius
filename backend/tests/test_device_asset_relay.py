@@ -198,3 +198,28 @@ def test_device_asset_relay_rejects_an_upstream_beyond_reviewed_size(client, aut
   assert response.status_code == 413
   assert upstream.closed is True
   assert http_client.closed is True
+
+
+def test_device_asset_range_resolves_its_host_off_the_event_loop(monkeypatch):
+  """getaddrinfo blocks, so the relay must not resolve on the server's loop."""
+  import asyncio
+
+  import pytest
+  from fastapi import HTTPException
+
+  from app.routes import app_runtime
+
+  on_loop = []
+
+  def validate(target):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    raise HTTPException(400, "stop after resolving")
+
+  monkeypatch.setattr(app_runtime, "validate_url_safe", validate)
+  with pytest.raises(HTTPException):
+    asyncio.run(app_runtime._open_device_asset_range("https://x.test/a.bin", 0, 4))
+  assert on_loop == [False]

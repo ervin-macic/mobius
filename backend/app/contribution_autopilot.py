@@ -27,7 +27,6 @@ this row for the app UI and cron — never read back for enforcement.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -37,7 +36,7 @@ from sqlalchemy import and_, update
 from sqlalchemy.orm import Session
 
 from app import chat_writer
-from app import fs_locks, models, providers
+from app import fs_locks, models, providers, settled
 from app.chat_start import start_programmatic_chat_turn
 from app.config import get_settings
 from app.contribution_records import (
@@ -747,7 +746,7 @@ async def mirror_to_ledger(app_id: int, record_id: str) -> None:
 
   try:
     async with fs_locks.app_storage_lock(app_id):
-      await asyncio.to_thread(_write)
+      await settled.run_settled(_write)
   except Exception:
     log.debug("mirror_to_ledger failed app=%s rec=%s", app_id, record_id,
               exc_info=True)
@@ -773,7 +772,7 @@ async def set_ledger_attention(
     return record
 
   async with fs_locks.app_storage_lock(app_id):
-    return await asyncio.to_thread(_write)
+    return await settled.run_settled(_write)
 
 
 # ─────────────────────────── chat spawn ─────────────────────────────

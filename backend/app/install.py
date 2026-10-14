@@ -24,7 +24,6 @@ See feature ticket 062 for the design rationale.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -33,16 +32,19 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping
-from urllib.parse import unquote, urljoin, urlparse
+from typing import Callable, Mapping, Sequence
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from fastapi import HTTPException
 from sqlalchemy import case
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app import (
@@ -50,16 +52,18 @@ from app import (
   app_git,
   app_python_env,
   applied_app_runtime,
-  data_git,
   drawer_pins,
   fs_locks,
   icon_assets,
   managed_paths,
   models,
+  settled,
 )
 from app import app_cron
+from app.build_admission import BuildLeaseUnavailable
 from app.app_capabilities import contract_and_digest
-from app.app_source_check import check_app_source
+from app.app_compile_contract import RolldownStalled
+from app.app_source_check import SourceCheckResult, check_app_source
 from app.compiler import (
   CompileError,
   compile_jsx,
@@ -68,17 +72,27 @@ from app.compiler import (
   unlink_app_bundle,
 )
 from app.config import get_settings
+from app.manifest_identity import (
+  MANIFEST_ID_MARKER as _MANIFEST_ID_MARKER,
+  canonical_manifest_base as _canonical_base,
+  canonical_manifest_identity_key as _canonical_identity_key,
+  parse_root_manifest,
+  requested_manifest_source,
+  require_bound_manifest as _require_bound_manifest,
+  require_permanent_package,
+  stored_manifest_fetch_url,
+)
 from app.manifest_contract import (
+  EXECUTABLE_MANIFEST_FIELDS,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
-  SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
+  package_input_paths,
   package_bytes,
   package_limit_message,
   python_lock,
-  skill_member_paths,
   static_asset_entries,
   validate_manifest_contract,
   validate_schedule_job,
@@ -88,8 +102,25 @@ from app.manifest_contract import (
 # the install tests patch `app.install._validate_url_safe`. The canonical
 # validator now lives in net_utils (shared with routes/proxy.py) — see
 # net_utils.py for why the two SSRF validators were unified.
-from app.net_utils import validate_url_safe as _validate_url_safe
+from app.net_utils import (
+  MAX_REDIRECTS as _MAX_REDIRECTS,
+  pinned_client,
+  validate_url_safe as _validate_url_safe,
+)
 from app.storage_io import atomic_write
+# Moved out of this module and imported by name: tests patch `_stage`,
+# `fetch_app_commit`, `_sync_app_skills` and `clear_pending_conflict_update`
+# here to reach the install path, and routes call `fetch_app_commit` and
+# apply calls `_sync_app_skills` through this module for the same reason.
+from app.app_skills import _sync_app_skills
+from app.git_transfers import (
+  _stage, discard_staged, fetch_app_commit, git_transfer_root,
+)
+from app.pending_update import (
+  clear_pending_conflict_update,
+  committed_pending_resolution,
+  stage_pending_conflict_update,
+)
 from app.terminal_output import strip_terminal_noise
 from app.app_identity import (
   allocate_unique_slug,
@@ -186,47 +217,11 @@ def _compile_error_detail(app_name: str, exc: CompileError) -> str:
 _STATIC_ASSETS_MANIFEST = managed_paths.STATIC_ASSETS_MANIFEST
 _STATIC_ASSETS_BACKUP_ASSET_PREFIX = "assets"
 _STATIC_ASSETS_BACKUP_METADATA_PREFIX = "metadata"
-_PENDING_UPDATE_DIR = "mobius-pending-update"
 
-# Shared skill files an app declares via manifest `skills`: a root-level
-# `<id>.md` or a `<id>/` folder (SKILL.md + sibling markdown) whose
-# `source_files` the post-commit sync phase copies into /data/shared/skills/.
-# Records key by that relative path. Small caps — skills are prose, not data.
-_SKILL_MAX_BYTES = _CONTRACT_SKILL_MAX_BYTES
 
 # A system-prompt fragment is more privileged than a skill because it is read
 # every turn. It uses the same root-level markdown and byte-size contract.
 _SYSTEM_PROMPT_MAX_BYTES = _CONTRACT_SYSTEM_PROMPT_MAX_BYTES
-
-# Installer-owned ownership/provenance sidecar inside the skills dir. A
-# dotfile that is not `*.md`, so the skill loaders (the app-skills catalog
-# app, the SDK skill-load observers) never list or read it.
-_APP_SKILLS_SIDECAR = ".app-skills.json"
-
-
-def _app_skill_id(rel: str) -> str:
-  """The shared-skill id a recorded app skill path belongs to."""
-  folder, sep, _ = rel.partition("/")
-  return folder if sep else Path(rel).stem
-
-
-def _is_app_skill_rel(rel: str) -> bool:
-  """A record path the installer may touch: `<id>.md` or `<id>/<file>.md`."""
-  parts = rel.split("/")
-  if len(parts) == 1:
-    return rel.endswith(".md") and Path(rel).name == rel and rel[0] != "."
-  return (
-    len(parts) == 2
-    and all(part and not part.startswith(".") for part in parts)
-    and parts[1].endswith(".md")
-  )
-
-
-def _prune_empty_skill_folder(root: Path, rel: str) -> None:
-  """Drop a folder skill's directory once its last member has moved away."""
-  if "/" in rel:
-    with contextlib.suppress(OSError):
-      (root / rel.partition("/")[0]).rmdir()
 
 
 # Tracked files in a merged tree that are NOT hand-written app source: the
@@ -238,15 +233,10 @@ _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
 
 _HTTP_TIMEOUT = 15.0
 
-# Hard cap on redirect hops. Real GitHub raw URLs don't redirect at
-# all; legitimate community hosts shouldn't need more than a couple.
-# The cap is the safety net against redirect loops + redirect-based
-# SSRF where each hop slips through validation by aiming at a
-# different host.
-_MAX_REDIRECTS = 5
-
 # Tests override this module attribute to prevent production cron mutation.
 CRON_SCAFFOLD = app_cron.BAKED_CRON_SCAFFOLD
+# Moved to `app_cron`; this name stays for callers and tests that patch it here.
+_unregister_cron = app_cron.unregister_cron
 
 
 def _validate_manifest(m: dict) -> None:
@@ -288,35 +278,18 @@ def _derive_raw_base(manifest_url: str) -> str:
 
 
 def _derive_repo_ref(manifest_url: str) -> tuple[str, str] | None:
-  """Return the GitHub repo/ref for a raw GitHub manifest URL, if derivable.
+  """The clone URL and ref of a root Git package, or None to fetch it over HTTP.
 
-  Deliberately narrow: only a ROOT manifest at a SINGLE-SEGMENT ref
-  (`raw.githubusercontent.com/<org>/<repo>/<ref>/<manifest-file>`, exactly four
-  path segments) is clone-eligible. That is the canonical `mobius-os/app-*`
-  shape, and it is the only shape where the repo root's `index.jsx` is the entry
-  the manifest points at. Two other shapes must NOT be clone-derived — they are
-  imported over HTTP into a local Git repository instead of mis-cloning:
-    - a manifest in a repo SUBDIR (`…/<ref>/<subdir>/mobius.json`) — cloning the
-      repo root would then get the wrong `index.jsx`.
-    - a branch name CONTAINING A SLASH (`…/<repo>/feature/x/mobius.json`) — a
-      greedy `parts[:3]` would mis-read the ref as `feature`.
-  Both push the segment count past four, so the strict `== 4` check rejects
-  them. The caller (`install_from_manifest`) treats a `None` return as
-  not-clone-eligible and keeps the already-fetched HTTP entry.
+  Only a root ``mobius.json`` (``parse_root_manifest`` with a file name) is
+  cloned, because a Git package is read from its repository root. A manifest
+  in a repository subdirectory, at a ref containing a slash, or under another
+  file name is imported over HTTP into a local Git repository instead. A
+  stored identity key is resolved to its fetch address first.
   """
-  parsed = urlparse(manifest_url)
-  parts = [unquote(part) for part in parsed.path.split("/") if part]
-  if (
-    parsed.scheme != "https"
-    or parsed.netloc != "raw.githubusercontent.com"
-    or len(parts) != 4
-  ):
+  root = parse_root_manifest(requested_manifest_source(manifest_url)[0])
+  if root is None or root.filename is None:
     return None
-  org, repo, ref, _manifest_file = parts
-  for part in (org, repo, ref):
-    if part in ("", ".", "..") or part.startswith("-") or "\\" in part:
-      return None
-  return f"https://github.com/{org}/{repo}.git", ref
+  return root.origin_url, root.ref
 
 
 def _normalize_raw_base(raw_base: str) -> str:
@@ -332,106 +305,27 @@ def _normalize_raw_base(raw_base: str) -> str:
   return base if base.endswith("/") else base + "/"
 
 
-def _canonical_base(url_or_base: str) -> str:
-  """The canonical base of a manifest URL: fragment, query string, a trailing
-  `/mobius.json`, and a trailing slash all stripped.
-
-  Strip BOTH fragment and query string. Without ?-strip, two paste-a-URL flows
-  for the same app (with vs without `?utm_source=…`) would canonicalise to
-  different keys and split the app into two App rows on the second install.
-  The identity key is `<base>#manifest-id=<id>`, so this base is ALSO the prefix
-  to match installed rows on regardless of the manifest id — callers that need
-  to ask "is this URL's app installed?" LIKE `<base>#manifest-id=%`."""
-  base = url_or_base.split("#", 1)[0].split("?", 1)[0]
-  if base.endswith("/mobius.json"):
-    base = base[: -len("/mobius.json")]
-  return base.rstrip("/")
-
-
-def _trusted_catalog_repo_base(url_or_base: str) -> str | None:
-  """A ref-INDEPENDENT identity base for a trusted mobius-os catalog ROOT
-  manifest, or None when `url_or_base` isn't that shape.
-
-  `raw.githubusercontent.com/mobius-os/<repo>/<ref>/mobius.json` collapses to the
-  identity `raw.githubusercontent.com/mobius-os/<repo>` — the mutable `<ref>`
-  segment dropped. A `mobius-os/app-*` repo is ONE app whatever revision we
-  fetch, so a pinned-commit bump (bootstrap moving app-skills from `main` to a
-  reviewed commit, and every later re-pin) must name the SAME app as the row it
-  supersedes — never fork a duplicate, never miss an owner's tombstone and
-  silently undo their uninstall.
-
-  Deliberately narrow, mirroring `_derive_repo_ref`: only the canonical
-  single-segment-ref ROOT shape (canonical base == `<org>/<repo>/<ref>`, three
-  path parts) qualifies. A repo SUBDIR manifest keeps its ref-bearing base, so
-  two apps hosted in one repo can never collapse onto one identity.
-  """
-  if not isinstance(url_or_base, str) or not url_or_base:
-    return None
-  base = _canonical_base(url_or_base)
-  parsed = urlparse(base)
-  if parsed.hostname != "raw.githubusercontent.com":
-    return None
-  parts = [unquote(part) for part in parsed.path.split("/") if part]
-  if len(parts) != 3 or ".." in parts:
-    return None
-  org, repo, ref = parts
-  if org != "mobius-os":
-    return None
-  for part in (org, repo, ref):
-    if part in ("", ".", "..") or part.startswith("-") or "\\" in part:
-      return None
-  return f"{parsed.scheme}://{parsed.hostname}/{org}/{repo}"
-
-
 def _trusted_catalog_origin_url(url_or_base: str) -> str | None:
-  """Return the one canonical Git origin proven by a trusted catalog URL."""
-  parsed = urlparse(url_or_base)
-  if (
-    parsed.scheme != "https"
-    or parsed.netloc != "raw.githubusercontent.com"
-    or parsed.username is not None
-    or parsed.password is not None
-  ):
+  """The Git origin of a root package in the trusted ``mobius-os`` catalog.
+
+  A ``mobius-os/<repo>`` repository is one app at every ref, so a pinned
+  commit and a branch name the same origin.
+  """
+  root = parse_root_manifest(url_or_base)
+  if root is None or root.repository[0] != "mobius-os":
     return None
-  repo_base = _trusted_catalog_repo_base(url_or_base)
-  if repo_base is None:
-    return None
-  parts = [part for part in urlparse(repo_base).path.split("/") if part]
-  if len(parts) != 2:
-    return None
-  return f"https://github.com/{parts[0]}/{parts[1]}.git"
+  return root.origin_url
 
 
 def _github_root_manifest_identity(url_or_base: str) -> tuple[str, str] | None:
-  """Return owner/repository for one root raw-GitHub manifest URL."""
-  if not isinstance(url_or_base, str) or not url_or_base:
-    return None
-  parsed = urlparse(_canonical_base(url_or_base))
-  if (
-    parsed.scheme != "https"
-    or parsed.hostname != "raw.githubusercontent.com"
-    or parsed.username is not None
-    or parsed.password is not None
-  ):
-    return None
-  parts = [unquote(part) for part in parsed.path.split("/") if part]
-  if len(parts) != 3 or ".." in parts:
-    return None
-  owner, repo, ref = parts
-  if any(
-    part in ("", ".", "..") or part.startswith("-") or "\\" in part
-    for part in (owner, repo, ref)
-  ):
-    return None
-  return owner.lower(), repo.lower()
+  """Return the lowercased owner/repository of one root raw-GitHub package."""
+  root = parse_root_manifest(url_or_base)
+  return root.repository if root is not None else None
 
 
 def _github_origin_url(url_or_base: str) -> str | None:
-  identity = _github_root_manifest_identity(url_or_base)
-  if identity is None:
-    return None
-  owner, repo = identity
-  return f"https://github.com/{owner}/{repo}.git"
+  root = parse_root_manifest(url_or_base)
+  return root.origin_url if root is not None else None
 
 
 def _reviewed_predecessor_source(
@@ -479,11 +373,7 @@ def _trusted_catalog_origin_matches(
   expected_origin = _trusted_catalog_origin_url(source_url)
   if expected_origin is None:
     return False
-  actual_origin = app_git.origin_url(source_dir)
-  return bool(
-    actual_origin
-    and actual_origin.rstrip("/") == expected_origin.rstrip("/")
-  )
+  return app_git.same_origin(app_git.origin_url(source_dir), expected_origin)
 
 
 def trusted_catalog_checkout(
@@ -525,7 +415,7 @@ def _find_ref_independent_catalog_row(
   repository = _github_root_manifest_identity(canonical_manifest_url)
   if repository is None:
     return None
-  suffix = f"#manifest-id={manifest_id}"
+  suffix = f"{_MANIFEST_ID_MARKER}{manifest_id}"
   candidates = (
     db.query(models.App)
     .filter(models.App.manifest_url.like(f"%{suffix}"))
@@ -592,6 +482,11 @@ def _find_install_identity_row(
   existing = (
     db.query(models.App)
     .filter(models.App.manifest_url == canonical)
+    # Rows can share an address; choose deterministically, as below.
+    .order_by(
+      case((models.App.deleted_at.is_(None), 0), else_=1),
+      models.App.id.asc(),
+    )
     .first()
   )
   if existing is None:
@@ -716,7 +611,7 @@ def _catalog_identity_matches(
   candidate_identity = _canonical_identity_key(candidate_url, manifest_id)
   if candidate_identity == existing_identity:
     return True
-  suffix = f"#manifest-id={manifest_id}"
+  suffix = f"{_MANIFEST_ID_MARKER}{manifest_id}"
   existing_repo = _github_root_manifest_identity(existing_identity)
   candidate_repo = _github_root_manifest_identity(candidate_identity)
   return bool(
@@ -756,18 +651,6 @@ def pending_conflict_update_matches_app(
   )
 
 
-def _canonical_identity_key(url_or_base: str, manifest_id: str) -> str:
-  """Single canonical shape for the `manifest_url` column.
-
-  The two install paths (inline-manifest install with `raw_base`, and
-  URL install with `manifest_url=.../mobius.json`) used to write
-  visibly different strings into `App.manifest_url` for the same
-  underlying app. Re-installing via the other path then missed the
-  update branch and created a duplicate row. The fragment is purely a
-  marker — it's never dereferenced over the wire."""
-  return f"{_canonical_base(url_or_base)}#manifest-id={manifest_id}"
-
-
 async def _http_get(
   client: httpx.AsyncClient, url: str, max_bytes: int, _hops: int = 0,
 ) -> bytes:
@@ -791,7 +674,8 @@ async def _http_get(
     raise HTTPException(
       502, f"Too many redirects (>{_MAX_REDIRECTS}) starting from {url}",
     )
-  pinned_url, host_header, sni_host = _validate_url_safe(url)
+  # getaddrinfo blocks; resolve off the event loop.
+  pinned_url, host_header, sni_host = await asyncio.to_thread(_validate_url_safe, url)
   try:
     async with client.stream(
       "GET", pinned_url,
@@ -814,8 +698,8 @@ async def _http_get(
         next_url = None
         if r.status_code == 404:
           raise HTTPException(404, f"Not found: {url}")
-        if r.status_code == 429:
-          raise HTTPException(429, _rate_limit_detail(url, r.headers))
+        if _is_rate_limited(url, r.status_code, r.headers):
+          raise _rate_limit_error(url, r.headers)
         if r.status_code >= 400:
           raise HTTPException(
             502, f"Upstream {r.status_code} fetching {url}",
@@ -867,7 +751,10 @@ class _PackageDownload:
     data = self._files.get(rel)
     if data is None:
       try:
-        data = await _http_get(self._client, self._raw_base + rel, remaining)
+        # Declared names are literal paths; encode them (e.g. `%`, spaces).
+        data = await _http_get(
+          self._client, self._raw_base + quote(rel), remaining,
+        )
       except HTTPException as exc:
         if exc.status_code != 413:
           raise
@@ -889,13 +776,29 @@ async def _resolve_source_identity(
   an exact URL-derived identity and can still move through the explicit
   old-source handoff contract.
   """
-  repository = _github_root_manifest_identity(source_url)
-  if repository is None:
+  root = parse_root_manifest(source_url)
+  if root is None:
     base = _canonical_base(source_url)
     digest = hashlib.sha256(base.encode("utf-8")).hexdigest()
     return f"url:{digest}", source_url
 
-  owner, repo = repository
+  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(root.repository)
+  if repository_id is not None:
+    canonical_owner, canonical_repo = root.repository
+  else:
+    repository_id, canonical_owner, canonical_repo = (
+      await _fetch_github_repository(client, root.owner, root.repo)
+    )
+  canonical = dataclasses.replace(
+    root, owner=canonical_owner, repo=canonical_repo,
+  )
+  return f"github:{repository_id}", canonical.url
+
+
+async def _fetch_github_repository(
+  client: httpx.AsyncClient, owner: str, repo: str,
+) -> tuple[int, str, str]:
+  """Return GitHub's numeric id and canonical owner/name for one repository."""
   api_url = f"https://api.github.com/repos/{owner}/{repo}"
   try:
     raw = await _http_get(client, api_url, 256 * 1024)
@@ -914,17 +817,7 @@ async def _resolve_source_identity(
   canonical_owner, canonical_repo = full_name.split("/", 1)
   if not canonical_owner or not canonical_repo:
     raise HTTPException(502, "GitHub returned incomplete repository metadata.")
-
-  parsed = urlparse(source_url)
-  parts = [part for part in parsed.path.split("/") if part]
-  if len(parts) < 3:
-    raise HTTPException(400, "GitHub package source is not a root manifest.")
-  parts[0] = canonical_owner
-  parts[1] = canonical_repo
-  trailing_slash = parsed.path.endswith("/")
-  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
-  canonical_url = parsed._replace(path=canonical_path).geturl()
-  return f"github:{repository_id}", canonical_url
+  return repository_id, canonical_owner, canonical_repo
 
 
 def _header(headers, name: str) -> str | None:
@@ -942,26 +835,71 @@ def _wait_label(seconds: int) -> str:
   return f"about {minutes} minute{'s' if minutes != 1 else ''}"
 
 
-def _rate_limit_detail(url: str, headers) -> str:
-  host = urlparse(url).hostname or "upstream"
-  service = "GitHub" if "github" in host.lower() else host
-  detail = f"{service} rate-limited this app update."
+_GITHUB_RATE_LIMIT_HOSTS = frozenset((
+  "github.com", "api.github.com", "raw.githubusercontent.com",
+))
+
+# GitHub's permanent ids for the platform's own catalog repositories whose
+# packages declare `package_id`. The `mobius-os` organization is already the
+# trust root for these sources, so their identity needs no anonymous API call,
+# which shared egress addresses often have exhausted on first boot. Any other
+# repository is still resolved through the API. `tests/test_bootstrap_live.py`
+# checks every live default app against this table.
+_TRUSTED_CATALOG_REPOSITORY_IDS = {
+  ("mobius-os", "app-store"): 1253755424,
+  ("mobius-os", "app-social"): 1354986466,
+}
+
+
+def _is_rate_limited(url: str, status_code: int, headers) -> bool:
+  """True for 429, and for the 403 GitHub uses for its rate limits.
+
+  GitHub answers an exhausted primary limit with 403 and
+  ``x-ratelimit-remaining: 0``, and a secondary limit with 403 and
+  ``retry-after``; both are a wait, not a permission problem.
+  """
+  return status_code == 429 or (
+    status_code == 403
+    and urlparse(url).hostname in _GITHUB_RATE_LIMIT_HOSTS
+    and (
+      _header(headers, "x-ratelimit-remaining") == "0"
+      or _header(headers, "retry-after") is not None
+    )
+  )
+
+
+def _rate_limit_wait_seconds(headers) -> int | None:
+  """Seconds the upstream asked us to wait, from retry-after or its reset."""
   retry_after = _header(headers, "retry-after")
   if retry_after:
     try:
       seconds = int(float(retry_after))
       if seconds > 0:
-        return f"{detail} Try again in {_wait_label(seconds)}."
+        return seconds
     except ValueError:
       pass
   reset = _header(headers, "x-ratelimit-reset")
   if reset:
     try:
-      reset_at = datetime.fromtimestamp(int(reset), UTC)
-      return f"{detail} Try again after {reset_at.isoformat(timespec='minutes')}."
-    except (ValueError, OSError):
+      return max(1, int(reset) - int(time.time()))
+    except ValueError:
       pass
-  return f"{detail} Please wait a minute and try again."
+  return None
+
+
+def _rate_limit_error(url: str, headers) -> HTTPException:
+  """The 429 for a rate-limited fetch, carrying the wait as Retry-After."""
+  host = urlparse(url).hostname or "upstream"
+  service = "GitHub" if host in _GITHUB_RATE_LIMIT_HOSTS else host
+  detail = f"{service} rate-limited this app request."
+  wait = _rate_limit_wait_seconds(headers)
+  if wait is None:
+    return HTTPException(429, f"{detail} Please wait a minute and try again.")
+  return HTTPException(
+    429,
+    f"{detail} Try again in {_wait_label(wait)}.",
+    headers={"Retry-After": str(wait)},
+  )
 
 
 def _seed_value_is_inline(value) -> bool:
@@ -1194,192 +1132,97 @@ def _write_static_assets(
     )
 
 
-def stage_pending_conflict_update(
-  source_dir: str | Path,
-  *,
-  app_id: int,
-  upstream_commit: str,
-  manifest: dict,
-  raw_base: str,
-  capability_digest: str,
-  candidate_digest: str,
-  merge_base_override: str | None = None,
-) -> None:
-  """Persist everything explicit resolution needs to finish an update.
+def _update_package_paths(
+  source_dir: str | Path, incoming_manifest: dict,
+) -> set[str] | None:
+  """Protect declarations on either side and everything the app serves.
 
-  A conflict deliberately returns before install materialization. The resolver
-  may run minutes later (or after a restart), so its exact identity must
-  outlive the request. The digest binds every fetched source/static/icon/seed
-  byte; replay refetches and refuses to promote if any byte moved. The receipt
-  lives under ``.git`` and is replaced atomically, so a restart sees either the
-  previous complete candidate or the new complete candidate, never a gap. A
-  newer conflicting release supersedes any resolution parked for an older one;
-  the same release conflicting again keeps the resolver's checkout.
+  A trailing slash protects a whole directory: the asset route serves every
+  file below SERVED_STATIC_DIR, declared or not. None protects every path
+  when the local package contract cannot be read.
   """
-  repo = Path(source_dir)
-  git_dir = repo / ".git"
-  target = git_dir / _PENDING_UPDATE_DIR
-  if target.is_symlink():
-    raise ValueError("pending update path must not be a symlink")
-  target.mkdir(parents=True, exist_ok=True)
   try:
-    previous = json.loads((target / "receipt.json").read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-    previous = None
-  if not isinstance(previous, dict) or (
-    previous.get("upstream_commit") != upstream_commit
-  ):
-    _drop_pending_update_worktree(repo)
-  atomic_write(target / "receipt.json", json.dumps({
-    "schema": 4,
-    "app_id": app_id,
-    "upstream_commit": upstream_commit,
-    "manifest": manifest,
-    "raw_base": raw_base,
-    "capability_digest": capability_digest,
-    "candidate_digest": candidate_digest,
-    "merge_base_override": merge_base_override,
-  }, ensure_ascii=False, sort_keys=True) + "\n")
-
-
-def pending_update_worktree(source_dir: str | Path) -> Path:
-  """The private checkout where a resolver reconciles one pending update.
-
-  It lives inside the app's own git directory, so the served source directory
-  never holds a half-merged tree: ordinary edits and applies keep working
-  while a resolver works, and finalization merges those late edits with the
-  resolution through the same three-way merge every update uses.
-  """
-  return Path(source_dir) / ".git" / _PENDING_UPDATE_DIR / "worktree"
-
-
-_CONFLICT_MARKER = r"^(<{7,} |>{7,} )"
-
-
-def committed_conflict_marker_paths(
-  repo: str | Path, ref: str, upstream_commit: str,
-) -> list[str] | None:
-  """Paths the resolution changed from upstream that commit a conflict
-  boundary. Unchanged upstream content is never a conflict, even if it
-  legitimately contains such a line. None when Git cannot tell."""
-  repo = Path(repo)
-  changed = app_git._run(
-    repo, "diff", "--name-only", "-z", upstream_commit, ref, check=False,
-  )
-  if changed.returncode != 0:
-    return None
-  paths = [path for path in changed.stdout.split("\0") if path]
-  if not paths:
-    return []
-  found = app_git._run(
-    repo, "grep", "-z", "-lE", _CONFLICT_MARKER, ref, "--",
-    *(f":(literal){path}" for path in paths),
-    check=False,
-  )
-  if found.returncode > 1:
-    return None
-  return [p.removeprefix(f"{ref}:") for p in found.stdout.split("\0") if p]
-
-
-def committed_pending_resolution(
-  source_dir: str | Path, upstream_commit: str,
-) -> str | None:
-  """The resolver's committed answer for ``upstream_commit``, if it has one.
-
-  The answer is the private checkout's commit, and only when it contains the
-  pending upstream, nothing is left uncommitted or mid-merge, and it commits no
-  conflict markers. Git has already refused to commit any unresolved path.
-  """
-  worktree = pending_update_worktree(source_dir)
-  if (
-    not (worktree / ".git").exists()
-    or app_git.merge_in_progress(worktree)
-    or app_git.worktree_dirty(worktree)
-    or app_git.ref_is_ancestor(worktree, upstream_commit, "HEAD") is not True
-    or committed_conflict_marker_paths(worktree, "HEAD", upstream_commit) != []
+    raw = app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b""
+    if len(raw) > _MANIFEST_MAX_BYTES:
+      return None
+    local_manifest = json.loads(raw)
+    validate_manifest_contract(local_manifest)
+  except (
+    OSError, subprocess.SubprocessError, UnicodeDecodeError,
+    json.JSONDecodeError, ManifestContractError, RecursionError,
   ):
     return None
-  return app_git._run(worktree, "rev-parse", "HEAD").stdout.strip()
+  paths = {"mobius.json", f"{managed_paths.SERVED_STATIC_DIR}/"}
+  for side in (incoming_manifest, local_manifest):
+    paths.update(package_input_paths(side))
+  return paths
 
 
-def pending_update_resolved(source_dir: str | Path, upstream_commit: str) -> bool:
-  """Whether nothing but installation is left for this pending update.
+async def _kept_local_bundle_unchanged(
+  tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
+  upstream: Mapping[str, bytes], kept_local: Sequence[str],
+) -> bool:
+  """Retain ancillary conflicts only when they cannot change the served bundle.
 
-  Either the private checkout holds a committed answer, or ``main`` already
-  contains the upstream: a resolver from an earlier release committed there,
-  or an install moved ``main`` and was interrupted before completing. In both
-  cases rerunning the installer promotes it; the receipt stays until then.
+  Compile both alternatives in the same root so generated paths cannot create
+  spurious differences. Non-JavaScript runtimes are not covered by this proof.
+  Source completeness also protects URL references that are not bundle inputs.
   """
-  return (
-    app_git.ref_is_ancestor(source_dir, upstream_commit, app_git.LOCAL_BRANCH)
-    is True
-    or committed_pending_resolution(source_dir, upstream_commit) is not None
+  if EXECUTABLE_MANIFEST_FIELDS.intersection(manifest):
+    return False
+  source_check = await asyncio.to_thread(
+    _source_completeness, tree, manifest, static_assets,
   )
-
-
-def _drop_pending_update_worktree(source_dir: str | Path) -> None:
-  worktree = pending_update_worktree(source_dir)
-  if os.path.lexists(worktree):
-    app_git.remove_overlay_worktree(source_dir, worktree)
-
-
-def pending_update_receipt_file(source_dir: str | Path) -> Path:
-  """The durable "not installed yet" marker of a pending update."""
-  return Path(source_dir) / ".git" / _PENDING_UPDATE_DIR / "receipt.json"
-
-
-def pending_conflict_update_receipt_present(source_dir: str | Path) -> bool:
-  """Whether any pending-receipt filesystem entry needs validation."""
-  root = Path(source_dir) / ".git" / _PENDING_UPDATE_DIR
-  receipt_path = root / "receipt.json"
-  return os.path.lexists(root) or os.path.lexists(receipt_path)
-
-
-def read_pending_conflict_update_receipt(
-  source_dir: str | Path, *, app_id: int, upstream_commit: str | None,
-) -> dict | None:
-  """Read validated pending metadata without loading potentially large assets.
-
-  Receipts written by earlier releases (schemas 1-3) carried a resolution
-  policy and a reviewed tree; both are ignored because the resolver's own
-  commit is now the complete answer.
-  """
-  root = Path(source_dir) / ".git" / _PENDING_UPDATE_DIR
-  receipt_path = root / "receipt.json"
-  if root.is_symlink() or receipt_path.is_symlink():
-    return None
+  if source_check.errors:
+    return False
+  # Creation and removal touch disk; keep both off the event loop.
+  temp = await asyncio.to_thread(tempfile.mkdtemp, prefix="mobius-ancillary-check-")
   try:
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-    return None
-  if not isinstance(receipt, dict):
-    return None
-  schema = receipt.get("schema")
-  merge_base_override = (
-    receipt.get("merge_base_override") if schema in (3, 4) else None
-  )
-  if (
-    schema not in (1, 2, 3, 4)
-    or receipt.get("app_id") != app_id
-    or not upstream_commit
-    or receipt.get("upstream_commit") != upstream_commit
-    or not isinstance(receipt.get("manifest"), dict)
-    or not isinstance(receipt.get("raw_base"), str)
-    or not isinstance(receipt.get("capability_digest"), str)
-    or not re.fullmatch(r"[0-9a-f]{64}", receipt.get("candidate_digest", ""))
-    or (
-      merge_base_override is not None
-      and (
-        not isinstance(merge_base_override, str)
-        or not re.fullmatch(
-          r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_base_override,
-        )
-      )
-    )
-  ):
-    return None
-  receipt["merge_base_override"] = merge_base_override
-  return receipt
+    root = Path(temp).resolve() / "source"
+    output = Path(temp) / "bundle.js"
+
+    def write_kept_tree() -> str:
+      inputs = dict(tree)
+      inputs.update({
+        f"static/{dest}": static_assets[dest]
+        for dest in static_asset_entries(manifest.get("static_assets"))
+      })
+      for rel, data in inputs.items():
+        path = root / rel
+        _assert_within(root, path, f"package input {rel}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+      return entry.read_text(encoding="utf-8")
+
+    def write_upstream_alternative() -> tuple[bytes, str]:
+      kept_bundle = output.read_bytes()
+      output.unlink()
+      for rel in kept_local:
+        path = root / rel
+        _assert_within(root, path, f"package input {rel}")
+        if rel in upstream:
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_bytes(upstream[rel])
+        else:
+          path.unlink(missing_ok=True)
+      return kept_bundle, entry.read_text(encoding="utf-8")
+
+    try:
+      entry = root / manifest["entry"]
+      source = await asyncio.to_thread(write_kept_tree)
+      await compile_jsx(source, source_path=entry, out_path=output)
+      kept_bundle, source = await asyncio.to_thread(write_upstream_alternative)
+      await compile_jsx(source, source_path=entry, out_path=output)
+      return kept_bundle == await asyncio.to_thread(output.read_bytes)
+    except BuildLeaseUnavailable as exc:
+      raise HTTPException(503, "JavaScript builder is busy; retry the update.") from exc
+    except RolldownStalled as exc:
+      # A stall says nothing about whether the trees differ.
+      raise HTTPException(503, exc.detail()) from exc
+    except (RuntimeError, OSError, UnicodeError, KeyError, HTTPException):
+      return False
+  finally:
+    await asyncio.to_thread(shutil.rmtree, temp, ignore_errors=True)
 
 
 PackageContentBytes = bytes | app_git.GitTreeBlob
@@ -1511,79 +1354,14 @@ def package_content_digest_from_tree(
   when the manifest contract grows.
   """
   try:
-    manifest_bytes = tree["mobius.json"]
-    if manifest_bytes is None:
-      raise KeyError("mobius.json")
-    manifest = json.loads(_package_input_bytes(manifest_bytes))
-    validate_manifest_contract(manifest)
-  except (
-    KeyError, UnicodeDecodeError, json.JSONDecodeError, ManifestContractError,
-  ) as exc:
-    raise PackageContentError("invalid or missing mobius.json") from exc
-
-  def required_bytes(relative: str, field: str) -> PackageContentBytes:
-    try:
-      value = tree[relative]
-      if value is None:
-        raise KeyError(relative)
-      return value
-    except KeyError as exc:
-      raise PackageContentError(
-        f"missing declared {field} file ({relative})",
-      ) from exc
-
-  entry_bytes = required_bytes(manifest["entry"], "entry")
-  source_files = {
-    relative: required_bytes(relative, "source_files")
-    for relative in manifest.get("source_files") or []
-  }
-  schedule = manifest.get("schedule")
-  job_name = schedule.get("job") if isinstance(schedule, dict) else None
-  bundled_job = (
-    _package_input_bytes(required_bytes(job_name, "schedule job"))
-    if job_name else None
-  )
-  if bundled_job is not None:
-    try:
-      validate_schedule_job(manifest, bundled_job)
-    except ManifestContractError as exc:
-      raise PackageContentError(str(exc)) from exc
-
-  icon_processed = None
-  icon_name = manifest.get("icon")
-  if icon_name:
-    try:
-      icon_processed = icon_assets.normalize_icon(
-        _package_input_bytes(required_bytes(icon_name, "icon")),
-      )
-    except icon_assets.InvalidIcon as exc:
-      raise PackageContentError("invalid declared icon") from exc
-
-  static_assets = {
-    destination: required_bytes(relative, "static asset")
-    for destination, relative in static_asset_entries(
-      manifest.get("static_assets") or {},
-    ).items()
-  }
-  seeds: dict[str, PackageContentBytes] = {}
-  for destination, value in (manifest.get("storage_seeds") or {}).items():
-    seeds[destination] = (
-      json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-      ).encode("utf-8")
-      if _seed_value_is_inline(value)
-      else required_bytes(value, "storage seed")
+    inputs = _read_git_package_inputs(
+      tree, _read_git_package_manifest(tree, strict=True),
     )
-
-  return manifest["id"], package_content_digest(
-    manifest=manifest,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
+  except HTTPException as exc:
+    raise PackageContentError(str(exc.detail)) from exc
+  except ValueError as exc:
+    raise PackageContentError(str(exc)) from exc
+  return inputs.manifest["id"], inputs.content_digest()
 
 
 def package_content_digest_from_git(
@@ -1642,119 +1420,39 @@ def read_recorded_update_source(
     }
 
 
-def _git_runtime_source_tree(
-  source_dir: str | Path,
-  commit: str,
-  manifest: dict,
-) -> dict[str, bytes]:
-  """Project one repository commit onto the manifest's executable sources."""
-  repo = Path(source_dir)
-
-  def required(path: str) -> bytes:
-    value = app_git.read_blob(repo, commit, path)
-    if value is None:
-      raise RuntimeError(f"Git package is missing declared source {path}")
-    return value
-
-  tree = {"index.jsx": required(manifest["entry"])}
-  tree.update({
-    rel: required(rel) for rel in manifest.get("source_files") or []
-  })
-  schedule = manifest.get("schedule")
-  if isinstance(schedule, dict) and schedule.get("job"):
-    tree[schedule["job"]] = required(schedule["job"])
-  return tree
-
-
-def _verify_git_install_candidate(
-  source_dir: str | Path,
-  commit: str,
-  candidate: InstallCandidate,
+def _require_git_candidate(
+  source_dir: str | Path, commit: str, candidate: InstallCandidate,
 ) -> None:
-  """Prove that one Git commit is the complete package reviewed over HTTP."""
-  repo = Path(source_dir)
+  """Prove that a present Git commit holds the package fetched over HTTP.
 
-  def mismatch(reason: str) -> None:
-    raise HTTPException(
-      409,
-      detail={
-        "code": "git_source_mismatch",
-        "message": (
-          "The fetched Git commit does not match the package bytes that were "
-          "reviewed. Refresh the update and try again."
-        ),
-        "reason": reason,
-      },
-    )
-
-  manifest_bytes = app_git.read_blob(repo, commit, "mobius.json")
-  if manifest_bytes is not None:
-    try:
-      git_manifest = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-      mismatch("invalid mobius.json")
-    if git_manifest != candidate.manifest:
-      mismatch("manifest changed")
-
-  expected_runtime = {
-    "index.jsx": candidate.entry_bytes,
-    **candidate.source_files,
-  }
-  if candidate.bundled_job is not None:
-    expected_runtime[candidate.manifest["schedule"]["job"]] = (
-      candidate.bundled_job
-    )
+  A prepared install reads its package from the very commit it adopts; only a
+  caller that fetched over HTTP, such as a publication handoff, needs this.
+  """
+  reason = None
   try:
-    actual_runtime = _git_runtime_source_tree(
-      repo, commit, candidate.manifest,
-    )
-  except (OSError, RuntimeError, ValueError) as exc:
-    mismatch(str(exc))
-  if actual_runtime != expected_runtime:
-    mismatch("runtime source changed")
-
-  def required(path: str, field: str) -> bytes:
-    data = app_git.read_blob(repo, commit, path)
-    if data is None:
-      mismatch(f"missing declared {field} {path}")
-    return data
-
-  for destination, relative in static_asset_entries(
-    candidate.manifest.get("static_assets") or {},
-  ).items():
-    if required(relative, "static asset") != candidate.static_assets.get(
-      destination
-    ):
-      mismatch(f"static asset changed: {relative}")
-
-  for destination, declared in (
-    candidate.manifest.get("storage_seeds") or {}
-  ).items():
-    if _seed_value_is_inline(declared):
-      continue
-    if required(declared, "storage seed") != candidate.seeds.get(destination):
-      mismatch(f"storage seed changed: {declared}")
-
-  if candidate.icon_processed is not None and candidate.manifest.get("icon"):
-    icon_raw = required(candidate.manifest["icon"], "icon")
-    try:
-      icon_processed = icon_assets.normalize_icon(icon_raw)
-    except icon_assets.InvalidIcon:
-      mismatch("invalid icon")
-    if icon_processed != candidate.icon_processed:
-      mismatch("icon changed")
-
-
-def clear_pending_conflict_update(source_dir: str | Path) -> None:
-  # The receipt is the durable "not installed yet" marker, so it goes first. A
-  # crash afterwards leaves only a stray checkout, which the next conflict or
-  # resolver replaces.
-  pending_update_receipt_file(source_dir).unlink(missing_ok=True)
-  _drop_pending_update_worktree(source_dir)
-  shutil.rmtree(
-    Path(source_dir) / ".git" / _PENDING_UPDATE_DIR,
-    ignore_errors=True,
-  )
+    actual = read_git_install_candidate(
+      source_dir, commit, candidate.raw_base + "mobius.json",
+    ).candidate
+    if actual.manifest != candidate.manifest:
+      reason = "manifest changed"
+    elif actual.source_review_digest != candidate.source_review_digest:
+      reason = "package files changed"
+  except HTTPException as exc:  # An invalid Git manifest.
+    reason = f"invalid mobius.json: {exc.detail}"
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    reason = str(exc)
+  if reason is None:
+    return
+  log.warning("install: Git commit %s does not match its package: %s", commit, reason)
+  raise HTTPException(409, detail={
+    "code": "git_source_mismatch",
+    "message": (
+      "The fetched Git commit does not match the package bytes that were "
+      "reviewed. Refresh the update and try again."
+    ),
+    "reason": reason,
+    "retryable": True,
+  })
 
 
 def _reconcile_cron_after_install_rollback() -> None:
@@ -1782,72 +1480,6 @@ def _reconcile_cron_after_install_rollback() -> None:
     # Rollback is already a best-effort failure path. Log without masking the
     # original install exception that caused it.
     log.warning("install rollback cron reconciliation failed: %s", exc)
-
-
-def _crontab_without_app(current: str, source_dir: Path) -> str | None:
-  """Return `current` crontab text with every line whose COMMAND runs a
-  script under `source_dir` removed — or None if nothing matched, so the
-  caller can skip rewriting entirely.
-
-  Matches on the command's executable path (see `app_cron.crontab_command_path`),
-  NOT a whole-line substring: that keeps the news/news-2 prefix safe AND
-  avoids dropping an unrelated app whose ARGUMENTS merely reference this
-  app's dir (e.g. `... /data/apps/agg/run.sh --feed /data/apps/news/x`).
-  Comments, blanks, and `PATH=`/env lines run no command and are preserved;
-  `@daily`/`@reboot` shorthand and inline `VAR=val <cmd>` are handled too.
-  """
-  needle = f"{str(source_dir).rstrip('/')}/"
-  kept, dropped = [], False
-  for ln in current.splitlines():
-    if app_cron.crontab_command_path(ln).startswith(needle):
-      dropped = True
-    else:
-      kept.append(ln)
-  if not dropped:
-    return None
-  return ("\n".join(kept) + "\n") if kept else ""
-
-
-def _unregister_cron(source_dir: Path) -> None:
-  """Remove crontab entries that invoke scripts under `source_dir`.
-
-  Called on app delete so a removed app does not leave a crontab entry
-  firing a now-missing script. The spool isn't on the /data volume, so
-  an orphan self-clears on the next container restart anyway — this just
-  stops it firing (and erroring) in the meantime, and prevents stale
-  lines like the `news-2/job.sh` orphan from accumulating across
-  reinstalls. Best-effort: every failure is swallowed, exactly like the
-  source-tree rmtree this accompanies. Runs `crontab -u mobius` (the
-  server runs as mobius, which may edit its own crontab).
-  """
-  if app_cron.cron_mutation_blocked_in_test_runtime():
-    return
-  try:
-    listing = subprocess.run(
-      ["crontab", "-u", "mobius", "-l"],
-      capture_output=True, text=True, timeout=10,
-    )
-  except (OSError, subprocess.SubprocessError):
-    return
-  if listing.returncode != 0:
-    # No crontab yet, or no crontab binary (as in the test image) —
-    # nothing to clean.
-    return
-  new_crontab = _crontab_without_app(listing.stdout, source_dir)
-  if new_crontab is None:
-    return  # no entry referenced this app — leave the crontab untouched
-  try:
-    proc = subprocess.run(
-      ["crontab", "-u", "mobius", "-"],
-      input=new_crontab, text=True, timeout=10, check=False,
-    )
-  except (OSError, subprocess.SubprocessError):
-    return
-  if proc.returncode != 0:
-    log.warning(
-      "cron: failed to rewrite mobius crontab on app delete (rc=%s)",
-      proc.returncode,
-    )
 
 
 def _drop_app_cron(source_dir: Path) -> None:
@@ -1887,395 +1519,22 @@ def _storage_path(app_id: int, sub: str) -> Path:
   return data_dir / "apps" / str(app_id) / sub
 
 
-async def _sync_app_skills(
-  db: Session,
-  app: "models.App",
-  manifest: dict,
-  warnings: list[str],
-) -> None:
-  """Materializes manifest-declared skill files into /data/shared/skills.
-
-  Post-commit best-effort phase (same contract as cron): the app row is
-  already durable, so every failure appends a warning instead of raising.
-  Bytes come from the app's FINAL on-disk source tree, which is uniform
-  across the synthetic, clone, and post-merge update paths (validation
-  guarantees skills ⊆ root source_files, so the tree carries them).
-
-  The never-lose-work contract: a present skill file whose bytes differ
-  from what this installer last recorded (agent edits) is git-snapshotted
-  into the /data repo BEFORE being
-  overwritten, and left untouched when the snapshot cannot be guaranteed.
-  Ownership rides the installer-owned sidecar so one app can never
-  silently take over another live app's skill file.
-  """
-  skills = skill_member_paths(manifest)
-  data_dir = Path(get_settings().data_dir)
-  skills_dir = data_dir / "shared" / "skills"
-  source_dir = Path(app.source_dir)
-  version = str(manifest.get("version", "unknown"))
-  async with fs_locks.shared_skills_lock():
-    from app import skills as skills_mod
-
-    # Resolve any crash-interrupted /api/skills install FIRST, so a pending
-    # directory skill is either a fully-owned collision below or gone — the
-    # same reconciliation the direct install/uninstall paths run under this
-    # lock. Then read the installed-skills sidecar so this writer honors the
-    # SAME basename-collision policy as a direct install: a flat `foo.md` must
-    # never coexist with an installed directory skill `foo/` under one id.
-    skills_mod.reconcile_installed(skills_dir)
-    installed_records = skills_mod._read_sidecar(
-      skills_dir / skills_mod.INSTALLED_SKILLS_SIDECAR
-    )
-    # Platform seeds have a recorded owner too. An app may continue managing a
-    # basename it already owns, but may not silently adopt a platform skill
-    # merely because both use the historical flat-file shape.
-    seed_sidecar = skills_dir / skills_mod.SEED_SKILLS_SIDECAR
-    if seed_sidecar.is_symlink():
-      warnings.append("skills: platform ownership unreadable — sync skipped")
-      return
-    if seed_sidecar.exists():
-      try:
-        seed_records = json.loads(seed_sidecar.read_text(encoding="utf-8"))
-      except (OSError, ValueError):
-        seed_records = None
-      if (
-        not isinstance(seed_records, dict)
-        or any(not isinstance(name, str) or not isinstance(rec, dict)
-               for name, rec in seed_records.items())
-      ):
-        warnings.append("skills: platform ownership unreadable — sync skipped")
-        return
-    else:
-      seed_records = {}
-    seed_owned = {
-      name for name, rec in seed_records.items()
-      if isinstance(rec, dict) and rec.get("status") != "retired"
-    } | {
-      f"{name}.md" for name in skills_mod._seed_names()
-    }
-    sidecar_path = skills_dir / _APP_SKILLS_SIDECAR
-    records: dict = {}
-    if sidecar_path.exists():
-      try:
-        loaded = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-          records = loaded
-      except (OSError, ValueError):
-        # A corrupt sidecar downgrades every present file to the
-        # modified-or-unrecorded case — snapshot-then-overwrite — which is
-        # the safe direction: work is preserved, ownership is re-earned.
-        warnings.append("skills: ownership sidecar unreadable — rebuilding")
-    desired = set(skills)
-    # An update that drops a previously-owned skill must deactivate it just as
-    # surely as an uninstall. Preserve the exact bytes in a retired archive,
-    # then release the basename for another app.
-    for rel, rec in list(records.items()):
-      if not isinstance(rec, dict) or rec.get("app_id") != app.id:
-        continue
-      if rel in desired:
-        continue
-      target = skills_dir / rel
-      retired = (
-        skills_dir / ".inactive" / str(app.id) / "retired" / rel
-      )
-      inactive = skills_dir / ".inactive" / str(app.id) / rel
-      source = target if target.is_file() else inactive
-      if source.is_file():
-        retired.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, retired)
-      _prune_empty_skill_folder(skills_dir, rel)
-      records.pop(rel, None)
-      warnings.append(f"skill {rel}: retired by update")
-    # Ownership and shape collisions are decided per skill id, so a folder
-    # skill lands or is skipped as a whole rather than file by file.
-    ours = {
-      key for key, rec in records.items()
-      if isinstance(rec, dict) and rec.get("app_id") == app.id
-    }
-    refused_ids: dict[str, str] = {}
-    for skill_id in dict.fromkeys(_app_skill_id(rel) for rel in skills):
-      is_folder = f"{skill_id}.md" not in skills
-      flat, folder = skills_dir / f"{skill_id}.md", skills_dir / skill_id
-      owners = {
-        rec.get("app_id") for key, rec in records.items()
-        if isinstance(rec, dict) and _app_skill_id(key) == skill_id
-      } - {app.id, None}
-      live_owner = None
-      for owner_id in owners:
-        live_owner = db.query(models.App).filter(models.App.id == owner_id).first()
-        if live_owner is not None:
-          break
-      if f"{skill_id}.md" in seed_owned and f"{skill_id}.md" not in ours:
-        refused_ids[skill_id] = "owned by the platform"
-      elif live_owner is not None:
-        # A hard-purged recorded owner no longer reserves the id.
-        refused_ids[skill_id] = f"owned by app {live_owner.slug}"
-      elif isinstance(installed_records.get(skill_id), dict) or (
-        not is_folder and folder.is_dir()
-      ):
-        # Cross-SHAPE collision: an install-provenance skill may hold the same
-        # logical id in the other on-disk shape. Refuse a second skill under
-        # one id; the owner resolves it by removing one deliberately.
-        refused_ids[skill_id] = (
-          f"an installed skill already holds id {skill_id!r} "
-          "(directory shape)"
-        )
-      elif is_folder and (
-        flat.exists()
-        # A folder is someone else's when it holds none of this app's recorded
-        # members and a file this app does not declare. A folder of only our
-        # declared files (e.g. after a sidecar rebuild) re-earns ownership
-        # through the snapshot-then-overwrite path, like a flat skill.
-        or (folder.is_dir()
-            and not any(key.startswith(f"{skill_id}/") for key in ours)
-            and any(f"{skill_id}/{child.name}" not in skills
-                    for child in folder.iterdir()))
-      ):
-        refused_ids[skill_id] = (
-          f"id {skill_id!r} is already held by another file or folder"
-        )
-    for rel in skills:
-      if _app_skill_id(rel) in refused_ids:
-        warnings.append(f"skill {rel}: {refused_ids[_app_skill_id(rel)]} — skipped")
-        continue
-      try:
-        content = (source_dir / rel).read_bytes()
-      except OSError:
-        # Validation checked the manifest's declaration, not the repo's
-        # contents — a clone whose tree lacks the file lands here.
-        warnings.append(f"skill {rel}: missing from installed source tree")
-        continue
-      if len(content) > _SKILL_MAX_BYTES:
-        warnings.append(
-          f"skill {rel}: exceeds {_SKILL_MAX_BYTES} bytes — skipped"
-        )
-        continue
-      rec = records.get(rel)
-      owner_id = rec.get("app_id") if isinstance(rec, dict) else None
-      if (
-        isinstance(rec, dict)
-        and owner_id == app.id
-        and rec.get("active", True) is False
-      ):
-        inactive = skills_dir / ".inactive" / str(app.id) / rel
-        if inactive.is_file():
-          retired = (
-            skills_dir / ".inactive" / str(app.id) / "retired" / rel
-          )
-          retired.parent.mkdir(parents=True, exist_ok=True)
-          os.replace(inactive, retired)
-      target = skills_dir / rel
-      recorded_sha = rec.get("sha256") if isinstance(rec, dict) else None
-      if target.exists():
-        current_sha = hashlib.sha256(target.read_bytes()).hexdigest()
-        if current_sha != recorded_sha:
-          # Modified since last recorded, or never recorded (an agent
-          # edit): snapshot the current
-          # bytes before replacing them — never trade edits for an update.
-          if (data_dir / ".git").is_dir():
-            try:
-              ok, detail = await asyncio.to_thread(
-                data_git.snapshot_path,
-                data_dir,
-                f"shared/skills/{rel}",
-                f"pre-install snapshot of {rel} (app {app.slug} v{version})",
-              )
-            except Exception as exc:
-              ok, detail = False, repr(exc)
-            if not ok:
-              warnings.append(
-                f"skill {rel}: left unchanged (snapshot failed: {detail}); "
-                "will retry next update"
-              )
-              continue
-            warnings.append(f"skill {rel}: snapshotted then updated")
-          else:
-            warnings.append(
-              f"skill {rel}: updated, no /data repo for snapshot"
-            )
-      target.parent.mkdir(parents=True, exist_ok=True)
-      atomic_write(target, content)
-      # 0o664 mirrors init_skills' boot convention — group-writable so the
-      # agent can edit the skill no matter which uid materialized it.
-      os.chmod(target, 0o664)
-      records[rel] = {
-        "app_id": app.id,
-        "slug": app.slug,
-        "manifest_url": app.manifest_url,
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "installed_at": datetime.now(UTC).isoformat(),
-        "active": True,
-      }
-      # Persist provenance immediately after each file lands: a crash
-      # between files must never leave an installed skill without its
-      # ownership record (the next install would treat it as agent-modified
-      # and snapshot-then-overwrite — safe, but noisy). Installs are rare
-      # and the JSON is tiny, so a per-file write costs nothing.
-      atomic_write(
-        sidecar_path,
-        json.dumps(records, indent=2, sort_keys=True) + "\n",
-      )
-    # Persist the final reconciliation too: a non-empty desired set can still
-    # skip every file, and removals above must not be retried forever. Keep the
-    # per-file writes for crash safety between successful materializations.
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write(
-      sidecar_path,
-      json.dumps(records, indent=2, sort_keys=True) + "\n",
-    )
-    # The skill set changed (or may have) — refresh the generated tier-1 index
-    # INSIDE the lock. Regenerating after release let a concurrent direct
-    # install/uninstall's newer index be overwritten by this writer's stale
-    # snapshot. Best-effort like everything else in this post-commit phase.
-    _regenerate_skills_index(skills_dir)
-
-
-def _read_app_skill_records(skills_dir: Path) -> tuple[Path, dict]:
-  sidecar = skills_dir / _APP_SKILLS_SIDECAR
-  try:
-    value = json.loads(sidecar.read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-    value = {}
-  return sidecar, value if isinstance(value, dict) else {}
-
-
-async def deactivate_app_skills(app_id: int) -> list[str]:
-  """Remove one app's skills from discovery while preserving exact bytes."""
-  warnings: list[str] = []
-  skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
-  async with fs_locks.shared_skills_lock():
-    sidecar, records = _read_app_skill_records(skills_dir)
-    changed = False
-    for rel, rec in records.items():
-      if not isinstance(rec, dict) or rec.get("app_id") != app_id:
-        continue
-      if not _is_app_skill_rel(rel):
-        warnings.append(f"skill record {rel!r}: invalid path")
-        continue
-      target = skills_dir / rel
-      inactive = skills_dir / ".inactive" / str(app_id) / rel
-      try:
-        if target.is_file():
-          inactive.parent.mkdir(parents=True, exist_ok=True)
-          os.replace(target, inactive)
-          _prune_empty_skill_folder(skills_dir, rel)
-        if inactive.is_file():
-          # Keep ``sha256`` as the last app-supplied baseline. The inactive
-          # digest records the exact preserved bytes separately; otherwise an
-          # owner-edited skill would become its own new baseline and a later
-          # app update could overwrite it without taking the normal snapshot.
-          rec["inactive_sha256"] = hashlib.sha256(
-            inactive.read_bytes()
-          ).hexdigest()
-          rec["active"] = False
-          rec["inactive_path"] = str(inactive.relative_to(skills_dir))
-          rec["deactivated_at"] = datetime.now(UTC).isoformat()
-          changed = True
-      except OSError as exc:
-        warnings.append(f"skill {rel}: could not deactivate ({exc})")
-    if changed:
-      atomic_write(
-        sidecar,
-        json.dumps(records, indent=2, sort_keys=True) + "\n",
-      )
-    # Inside the lock: a stale post-release regen could clobber a concurrent
-    # mutation's newer index.
-    _regenerate_skills_index(skills_dir)
-  return warnings
-
-
-async def restore_app_skills(app_id: int) -> list[str]:
-  """Restore exact tombstoned skill bytes and their discovery records."""
-  warnings: list[str] = []
-  skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
-  async with fs_locks.shared_skills_lock():
-    sidecar, records = _read_app_skill_records(skills_dir)
-    changed = False
-    for rel, rec in records.items():
-      if (
-        not isinstance(rec, dict)
-        or rec.get("app_id") != app_id
-        or rec.get("active", True) is not False
-      ):
-        continue
-      if not _is_app_skill_rel(rel):
-        warnings.append(f"skill record {rel!r}: invalid path")
-        continue
-      inactive = skills_dir / ".inactive" / str(app_id) / rel
-      target = skills_dir / rel
-      if not inactive.is_file():
-        warnings.append(f"skill {rel}: preserved bytes are missing")
-        continue
-      try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-          if target.read_bytes() != inactive.read_bytes():
-            conflict = (
-              skills_dir / ".inactive" / str(app_id) / "conflicts" / rel
-            )
-            conflict.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(target, conflict)
-            warnings.append(
-              f"skill {rel}: preserved a file created while app was inactive"
-            )
-          else:
-            target.unlink()
-        os.replace(inactive, target)
-        rec["active"] = True
-        rec.pop("inactive_path", None)
-        rec.pop("inactive_sha256", None)
-        rec["restored_at"] = datetime.now(UTC).isoformat()
-        changed = True
-      except OSError as exc:
-        warnings.append(f"skill {rel}: could not restore ({exc})")
-    if changed:
-      atomic_write(
-        sidecar,
-        json.dumps(records, indent=2, sort_keys=True) + "\n",
-      )
-    # Inside the lock: a stale post-release regen could clobber a concurrent
-    # mutation's newer index.
-    _regenerate_skills_index(skills_dir)
-  return warnings
-
-
-async def purge_app_skills(app_id: int) -> None:
-  """Release records and inactive archives after the recovery TTL expires."""
-  skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
-  async with fs_locks.shared_skills_lock():
-    sidecar, records = _read_app_skill_records(skills_dir)
-    for rel, rec in list(records.items()):
-      if isinstance(rec, dict) and rec.get("app_id") == app_id:
-        target = skills_dir / rel
-        if rec.get("active", True) and target.is_file():
-          try:
-            digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            if digest == rec.get("sha256"):
-              target.unlink()
-              _prune_empty_skill_folder(skills_dir, rel)
-          except OSError:
-            pass
-        records.pop(rel, None)
-    shutil.rmtree(
-      skills_dir / ".inactive" / str(app_id), ignore_errors=True,
-    )
-    atomic_write(
-      sidecar,
-      json.dumps(records, indent=2, sort_keys=True) + "\n",
-    )
-    # Inside the lock: a stale post-release regen could clobber a concurrent
-    # mutation's newer index.
-    _regenerate_skills_index(skills_dir)
-
-
-def _regenerate_skills_index(skills_dir: Path) -> None:
-  """Best-effort refresh of the generated skills-index.md after a change."""
-  try:
-    from app import skills as skills_mod
-
-    skills_mod.write_index(skills_dir)
-  except Exception:  # noqa: BLE001 - the index is a convenience surface
-    log.warning("skills index regeneration failed", exc_info=True)
+def _source_completeness(
+  tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
+) -> SourceCheckResult:
+  """Check imports using caller-selected static bytes (opaque on publication)."""
+  files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
+  files.update({
+    f"static/{dest}": data.decode("utf-8", "replace")
+    for dest, data in static_assets.items()
+  })
+  return check_app_source(
+    files,
+    entry=manifest["entry"],
+    source_files=manifest.get("source_files") or [],
+    job=(manifest.get("schedule") or {}).get("job"),
+    static_assets=(f"static/{dest}" for dest in static_assets),
+  )
 
 
 def _check_source_completeness(
@@ -2283,9 +1542,7 @@ def _check_source_completeness(
   app_name: str,
   manifest: dict,
   source_tree: dict[str, bytes],
-  entry_key: str,
-  static_dests: list[str],
-  job_name: str | None,
+  static_assets: Mapping[str, bytes],
 ) -> None:
   """Assert the source tree the manifest declares is self-contained.
 
@@ -2304,22 +1561,13 @@ def _check_source_completeness(
   ``source_tree`` IS the whole declared tree (entry + every fetched
   ``source_files`` entry + the job script), so it is the sole source of bytes.
   Static-asset dests are recorded below their installer-owned ``static/``
-  directory so source checks see the exact path compilation sees. For example,
+  directory so source checks see the exact path compilation sees. Their bytes
+  remain opaque on publication, as generated assets may contain import-like
+  strings. For example,
   logical destination ``logo.js`` is importable as ``./static/logo.js``.
   """
-  files: dict[str, str] = {
-    rel: data.decode("utf-8", "replace") for rel, data in source_tree.items()
-  }
-  static_source_paths = [f"static/{dest}" for dest in static_dests]
-  for path in static_source_paths:
-    files.setdefault(path, "")
-
-  result = check_app_source(
-    files,
-    entry=entry_key,
-    source_files=manifest.get("source_files") or [],
-    job=job_name,
-    static_assets=static_source_paths,
+  result = _source_completeness(
+    source_tree, manifest, {dest: b"" for dest in static_assets},
   )
   for warning in result.warnings:
     log.warning(
@@ -2334,24 +1582,47 @@ def _check_source_completeness(
     )
 
 
+def validate_manifest_address(
+  manifest: dict, manifest_url: str | None, *,
+  db: Session | None = None, package_id: str | None = None,
+) -> None:
+  """Bind a stored address to its manifest or installed permanent package."""
+  if manifest_url is None:
+    return
+  _, bound_id = requested_manifest_source(manifest_url)
+  if db is not None and bound_id is not None:
+    existing = _find_install_identity_row(
+      db, source_url=manifest_url, manifest_id=bound_id,
+    )
+    package_id = existing.package_id if existing is not None else None
+  try:
+    _require_bound_manifest(manifest, bound_id, package_id)
+  except ValueError as exc:
+    raise HTTPException(409, str(exc)) from exc
+
+
 async def _fetch_and_validate_manifest(
   cli: httpx.AsyncClient,
   *,
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
+  db: Session | None = None,
 ) -> tuple[dict, str]:
   """Load one manifest and return it with its normalized asset base.
 
   Preview and install intentionally share this exact boundary.  The preview is
   therefore not a second, weaker interpretation that can drift from what the
-  installer eventually applies.
+  installer eventually applies. Stored identity addresses are normalized and
+  bound here, before any package assets are fetched.
   """
   if (manifest_url is None) == (manifest is None):
     raise HTTPException(
       400, "Provide exactly one of `manifest_url` or `manifest`.",
     )
+  requested_url = manifest_url
   if manifest_url is not None:
+    manifest_url = requested_manifest_source(manifest_url)[0]
     raw = await _http_get(cli, manifest_url, _MANIFEST_MAX_BYTES)
     try:
       loaded = json.loads(raw)
@@ -2368,6 +1639,7 @@ async def _fetch_and_validate_manifest(
     raise HTTPException(400, "Manifest root must be a JSON object.")
 
   _validate_manifest(manifest)
+  validate_manifest_address(manifest, requested_url, db=db)
   return manifest, _normalize_raw_base(raw_base)
 
 
@@ -2376,17 +1648,16 @@ async def preview_manifest_capabilities(
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
+  db: Session | None = None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     loaded, normalized_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
       manifest=manifest,
       raw_base=raw_base,
+      db=db,
     )
   contract, digest = contract_and_digest(loaded)
   return loaded, normalized_base, contract, digest
@@ -2417,6 +1688,71 @@ class InstallCandidate:
   source_identity: str | None = None
   predecessor_source_identity: str | None = None
   canonical_source_url: str = ""
+
+
+def _new_candidate(
+  *,
+  manifest: dict,
+  raw_base: str,
+  entry_bytes: bytes,
+  icon_processed: bytes | None,
+  icon_warning: str | None,
+  bundled_job: bytes | None,
+  static_assets: dict[str, bytes],
+  source_files: dict[str, bytes],
+  seeds: dict[str, bytes],
+  source_review_digest: str | None = None,
+  source_identity: str | None = None,
+  predecessor_source_identity: str | None = None,
+  canonical_source_url: str | None = None,
+) -> InstallCandidate:
+  """Bind one package's bytes and source identities into its digests."""
+  package = dict(
+    manifest=manifest,
+    entry_bytes=entry_bytes,
+    icon_processed=icon_processed,
+    bundled_job=bundled_job,
+    static_assets=static_assets,
+    source_files=source_files,
+    seeds=seeds,
+  )
+  identity = dict(
+    source_identity=source_identity,
+    predecessor_source_identity=predecessor_source_identity,
+    canonical_source_url=canonical_source_url or raw_base,
+  )
+  capability_contract, capability_digest = contract_and_digest(manifest)
+  return InstallCandidate(
+    **package,
+    **identity,
+    raw_base=raw_base,
+    icon_warning=icon_warning,
+    capability_contract=capability_contract,
+    capability_digest=capability_digest,
+    candidate_digest=_install_candidate_digest(
+      raw_base=raw_base, **package, **identity,
+    ),
+    source_review_digest=(
+      source_review_digest or package_content_digest(**package)
+    ),
+  )
+
+
+async def _resolve_package_identity(
+  client: httpx.AsyncClient, manifest: dict, source_url: str,
+) -> tuple[str | None, str | None, str | None]:
+  """Source, predecessor and canonical URL of a permanent-identity package."""
+  if not manifest.get("package_id"):
+    return None, None, None
+  source_identity, canonical_source_url = await _resolve_source_identity(
+    client, source_url,
+  )
+  predecessor_source_identity = None
+  if manifest.get("previous_manifest_url"):
+    predecessor_source_identity, _ = await _resolve_source_identity(
+      client, manifest["previous_manifest_url"],
+    )
+  return source_identity, predecessor_source_identity, canonical_source_url
 
 
 class PackageTooLarge(ValueError):
@@ -2501,16 +1837,10 @@ class _GitPackageInputs:
 def _read_git_package_manifest(
   tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
 ) -> dict:
-  """Validate a Git manifest, checking its metadata before materialization."""
+  """Parse and validate a Git manifest independently of admission limits."""
   raw_manifest = tree.get("mobius.json")
   if raw_manifest is None:
     raise ValueError("candidate Git tree is missing manifest mobius.json")
-  size = _package_input_size(raw_manifest)
-  if size > _MANIFEST_MAX_BYTES:
-    raise PackageTooLarge(
-      f"This app's mobius.json is {size} bytes, more than the "
-      f"{_MANIFEST_MAX_BYTES} byte manifest limit.",
-    )
   try:
     manifest = json.loads(_package_input_bytes(raw_manifest))
   except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -2522,8 +1852,26 @@ def _read_git_package_manifest(
   return manifest
 
 
-def _read_git_package_inputs(
+def _read_git_candidate_inputs(
   tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
+) -> _GitPackageInputs:
+  """Apply admission limits before parsing or materializing candidate inputs."""
+  raw_manifest = tree.get("mobius.json")
+  size = _package_input_size(raw_manifest)
+  if size > _MANIFEST_MAX_BYTES:
+    raise PackageTooLarge(
+      f"This app's mobius.json is {size} bytes, more than the "
+      f"{_MANIFEST_MAX_BYTES} byte manifest limit.",
+    )
+  manifest = _read_git_package_manifest(tree, strict=strict)
+  size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
+  if size > _PACKAGE_MAX_BYTES:
+    raise PackageTooLarge(package_limit_message(size))
+  return _read_git_package_inputs(tree, manifest)
+
+
+def _read_git_package_inputs(
+  tree: Mapping[str, PackageContentBytes | None], manifest: dict,
 ) -> _GitPackageInputs:
   # Discovery intentionally differs from strict installation validation.
   # Both readers share missing-input, schedule and non-fatal icon semantics.
@@ -2535,11 +1883,6 @@ def _read_git_package_inputs(
       return value
     except KeyError as exc:
       raise ValueError(f"candidate Git tree is missing {field} {relative}") from exc
-
-  manifest = _read_git_package_manifest(tree, strict=strict)
-  size = package_bytes(manifest, lambda rel: _package_input_size(tree.get(rel)))
-  if size > _PACKAGE_MAX_BYTES:
-    raise PackageTooLarge(package_limit_message(size))
 
   entry_bytes = required(manifest["entry"], "entry")
   source_files = {
@@ -2560,10 +1903,15 @@ def _read_git_package_inputs(
 
   icon_processed = None
   icon_warning = None
-  if manifest.get("icon"):
+  icon = manifest.get("icon")
+  if icon and icon not in tree:
+    # As over HTTP, an optional icon the package lacks is only a warning. A
+    # listed but unreadable object still fails closed like any other input.
+    icon_warning = f"icon: candidate Git tree is missing icon {icon}"
+  elif icon:
     try:
       icon_processed = icon_assets.normalize_icon(
-        _package_input_bytes(required(manifest["icon"], "icon")),
+        _package_input_bytes(required(icon, "icon")),
       )
     except icon_assets.InvalidIcon as exc:
       icon_warning = f"icon: {exc}"
@@ -2596,21 +1944,42 @@ def _read_git_package_inputs(
   )
 
 
+def _same_repository_predecessor(
+  manifest: dict, source_url: str, source_identity: str | None,
+) -> str | None:
+  """A ``previous_manifest_url`` in the source's own repository shares its identity."""
+  previous_source = manifest.get("previous_manifest_url")
+  if (
+    source_identity is not None
+    and previous_source
+    and _github_root_manifest_identity(previous_source)
+    == _github_root_manifest_identity(source_url)
+  ):
+    return source_identity
+  return None
+
+
 def read_git_install_candidate(
   source_dir: str | Path,
   commit: str,
   source_url: str,
   *,
   source_identity: str | None = None,
+  predecessor_source_identity: str | None = None,
+  canonical_source_url: str | None = None,
   strict: bool = True,
 ) -> GitInstallCandidate:
-  """Read every declared install input from one already-fetched commit."""
+  """Read every declared install input from one already-fetched commit.
+
+  Without a resolved ``predecessor_source_identity``, a predecessor in the
+  same repository shares ``source_identity``.
+  """
   repo = Path(source_dir)
   resolved = _reviewed_git_package_commit(repo, commit)
   # Spool the commit rather than reading every file into memory: the package
   # bound is checked first, then only declared inputs are materialized.
   with app_git.open_ref_tree(repo, resolved) as tree:
-    inputs = _read_git_package_inputs(tree, strict=strict)
+    inputs = _read_git_candidate_inputs(tree, strict=strict)
     entry_bytes = _package_input_bytes(inputs.entry_bytes)
     static_assets = {
       key: _package_input_bytes(value) for key, value in inputs.static_assets.items()
@@ -2623,56 +1992,32 @@ def read_git_install_candidate(
     }
     content_digest = inputs.content_digest()
   manifest = inputs.manifest
-  icon_processed = inputs.icon_processed
-  icon_warning = inputs.icon_warning
-  bundled_job = inputs.bundled_job
-
   raw_base = _normalize_raw_base(
     source_url.rsplit("/mobius.json", 1)[0]
     if "/mobius.json" in source_url else source_url
   )
-  predecessor_source_identity = None
-  previous_source = manifest.get("previous_manifest_url")
-  if (
-    source_identity is not None
-    and previous_source
-    and _github_root_manifest_identity(previous_source)
-    == _github_root_manifest_identity(source_url)
-  ):
-    predecessor_source_identity = source_identity
-  capability_contract, capability_digest = contract_and_digest(manifest)
-  candidate_digest = _install_candidate_digest(
-    manifest=manifest,
-    raw_base=raw_base,
-    source_identity=source_identity,
-    predecessor_source_identity=predecessor_source_identity,
-    canonical_source_url=source_url if source_identity else raw_base,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
+  if predecessor_source_identity is None:
+    predecessor_source_identity = _same_repository_predecessor(
+      manifest, source_url, source_identity,
+    )
   return GitInstallCandidate(
     commit=resolved,
-    candidate=InstallCandidate(
+    candidate=_new_candidate(
       manifest=manifest,
       raw_base=raw_base,
       entry_bytes=entry_bytes,
-      icon_processed=icon_processed,
-      icon_warning=icon_warning,
-      bundled_job=bundled_job,
+      icon_processed=inputs.icon_processed,
+      icon_warning=inputs.icon_warning,
+      bundled_job=inputs.bundled_job,
       static_assets=static_assets,
       source_files=source_files,
       seeds=seeds,
-      capability_contract=capability_contract,
-      capability_digest=capability_digest,
-      candidate_digest=candidate_digest,
       source_review_digest=content_digest,
       source_identity=source_identity,
       predecessor_source_identity=predecessor_source_identity,
-      canonical_source_url=source_url if source_identity else raw_base,
+      canonical_source_url=canonical_source_url or (
+        source_url if source_identity else None
+      ),
     ),
   )
 
@@ -2699,7 +2044,7 @@ def read_git_package_summary(
   repo = Path(source_dir)
   resolved = _reviewed_git_package_commit(repo, commit)
   with app_git.open_ref_tree(repo, resolved) as tree:
-    inputs = _read_git_package_inputs(tree, strict=strict)
+    inputs = _read_git_candidate_inputs(tree, strict=strict)
     return GitPackageSummary(
       commit=resolved,
       manifest=inputs.manifest,
@@ -2708,55 +2053,86 @@ def read_git_package_summary(
     )
 
 
-def _fetch_git_package_commit(source_dir: str | Path, source_url: str) -> str:
-  repo_ref = _derive_repo_ref(source_url)
-  if repo_ref is None:
-    raise ValueError("update source is not a root Git repository package")
-  expected_origin, ref = repo_ref
-  actual_origin = app_git.origin_url(source_dir)
-  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
-  if actual_origin is None or normalize(actual_origin) != normalize(expected_origin):
-    raise ValueError("installed Git origin does not match update source")
-  return app_git.fetch_origin_ref(source_dir, ref)
+_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
 
 
-def fetch_git_install_candidate(
-  source_dir: str | Path,
-  source_url: str,
-  *,
-  source_identity: str | None = None,
-  strict: bool = True,
-) -> GitInstallCandidate:
-  """Fetch one Git ref, then read the complete package from its exact commit."""
-  commit = _fetch_git_package_commit(source_dir, source_url)
-  return read_git_install_candidate(
-    source_dir,
-    commit,
-    source_url,
-    source_identity=source_identity,
-    strict=strict,
-  )
+def transient_failure(exc: BaseException) -> tuple[bool, int | None]:
+  """Whether the same request may later get past ``exc`` unchanged, and any wait.
+
+  The one rule for install, update and bootstrap retries: a Git transfer that
+  timed out or lost its connection (``app_git`` classifies its failures),
+  incomplete Git history, a resolver that could not answer, and an upstream
+  rate limit or gateway failure. A failure the installer has already
+  classified carries ``retryable`` in its detail. Anything else, such as a
+  missing repository, a full disk or an invalid package, will fail again.
+  """
+  if isinstance(exc, app_git.GitTransferFailed):
+    return exc.transient, None
+  if isinstance(exc, app_git.HistoryIncomplete):
+    return True, None
+  # Only a resolver that could not answer may answer later; a name that does
+  # not exist stays missing.
+  if isinstance(exc, HTTPException) and isinstance(exc.__cause__, socket.gaierror):
+    exc = exc.__cause__
+  if isinstance(exc, socket.gaierror):
+    return exc.errno == socket.EAI_AGAIN, None
+  if not isinstance(exc, HTTPException):
+    return False, None
+  detail = exc.detail
+  if exc.status_code not in _TRANSIENT_STATUS_CODES and not (
+    isinstance(detail, dict) and detail.get("retryable") is True
+  ):
+    return False, None
+  try:
+    wait = int((exc.headers or {}).get("Retry-After") or 0)
+  except ValueError:
+    wait = 0
+  return True, wait or None
 
 
-def fetch_git_package_summary(
-  source_dir: str | Path, source_url: str, *, strict: bool = False,
-) -> GitPackageSummary:
-  """Fetch a discovery candidate under the same origin guard as installation."""
-  commit = _fetch_git_package_commit(source_dir, source_url)
-  return read_git_package_summary(source_dir, commit, strict=strict)
+def git_source_error(
+  outcome: str, exc: BaseException, *,
+  code: str = "git_update_unavailable", failure: str = "",
+  retry_hint: str = "",
+) -> HTTPException:
+  """The owner-facing 409 for a Git source that could not be used.
+
+  A transfer exceeding its wall-clock ceiling is reported as a timeout,
+  distinct from a missing or unverifiable source. ``retryable`` marks a
+  failure the same request may later get past unchanged (``transient_failure``);
+  bootstrap retries it, and only then is ``retry_hint`` added to the message.
+  """
+  retryable = transient_failure(exc)[0]
+  if retryable and retry_hint:
+    failure = f"{failure} {retry_hint}"
+  if isinstance(exc, app_git.GitTransferTimeout):
+    code = "git_transfer_timeout"
+    failure = f"The app's Git transfer timed out: {exc}."
+    outcome = f"{outcome} Retrying on a steadier connection may help."
+  elif isinstance(exc, app_git.HistoryIncomplete):
+    log.warning("install: %s", exc)  # Names the refs; the owner text does not.
+    failure = (
+      "The app's Git history is incomplete, so the update can't be merged "
+      "safely; retry when its source is reachable."
+    )
+  return HTTPException(409, detail={
+    "code": code, "message": f"{failure} {outcome}".strip(),
+    "retryable": retryable,
+  })
 
 
-def install_candidate_content_digest(candidate: InstallCandidate) -> str:
-  """Return the origin-independent package digest for one fetched candidate."""
-  return package_content_digest(
-    manifest=candidate.manifest,
-    entry_bytes=candidate.entry_bytes,
-    icon_processed=candidate.icon_processed,
-    bundled_job=candidate.bundled_job,
-    static_assets=candidate.static_assets,
-    source_files=candidate.source_files,
-    seeds=candidate.seeds,
-  )
+def _url_update_commit(
+  repo: Path, ref: str, staged_clone: app_git.Staged | None,
+) -> str:
+  """The URL update's commit, imported from its staged clone or already here."""
+  if staged_clone is not None:
+    return app_git.import_staged(repo, staged_clone)
+  present = app_git.present_commit(repo, ref)
+  if present is None:
+    raise HTTPException(
+      409, "The app's Git update must be fetched before it is installed.",
+    )
+  return present
 
 
 @dataclass(frozen=True)
@@ -2830,55 +2206,26 @@ async def _fetch_install_candidate(
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
-  reviewed_capability_digest: str | None,
-  reviewed_source_digest: str | None,
-  expected_app_id: int | None,
-  expected_upstream_commit: str | None,
-  expected_candidate_digest: str | None,
+  reviewed_capability_digest: str | None = None,
+  db: Session | None = None,
 ) -> InstallCandidate:
-  """Fetch every install input once and enforce all review/replay guards."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  """Fetch every install input of a package over HTTP, once."""
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     manifest, raw_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
       manifest=manifest,
       raw_base=raw_base,
+      db=db,
     )
-    source_url = manifest_url if manifest_url is not None else raw_base
-    source_identity = None
-    predecessor_source_identity = None
-    canonical_source_url = raw_base
-    if manifest.get("package_id"):
-      source_identity, canonical_source_url = await _resolve_source_identity(
-        cli, source_url,
+    _require_reviewed_capabilities(manifest, reviewed_capability_digest)
+    source_identity, predecessor_source_identity, canonical_source_url = (
+      await _resolve_package_identity(
+        cli,
+        manifest,
+        requested_manifest_source(manifest_url)[0] if manifest_url else raw_base,
       )
-      previous_source = manifest.get("previous_manifest_url")
-      if previous_source:
-        predecessor_source_identity, _ = await _resolve_source_identity(
-          cli, previous_source,
-        )
-    capability_contract, capability_digest = contract_and_digest(manifest)
-    if (
-      reviewed_capability_digest is not None
-      and reviewed_capability_digest != capability_digest
-    ):
-      raise HTTPException(
-        409,
-        {
-          "code": "capability_changed",
-          "message": (
-            "The app's capabilities changed after they were reviewed. "
-            "Review the current manifest and try again."
-          ),
-          "manifest": manifest,
-          "capability_contract": capability_contract,
-          "capability_digest": capability_digest,
-        },
-      )
-
+    )
     package = _PackageDownload(cli, raw_base)
     entry_bytes = await package.read(manifest["entry"])
 
@@ -2929,67 +2276,7 @@ async def _fetch_install_candidate(
       else:
         seeds[sub] = await package.read(value)
 
-  candidate_digest = _install_candidate_digest(
-    manifest=manifest,
-    raw_base=raw_base,
-    source_identity=source_identity,
-    predecessor_source_identity=predecessor_source_identity,
-    canonical_source_url=canonical_source_url,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
-  source_review_digest = package_content_digest(
-    manifest=manifest,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
-  if (
-    reviewed_source_digest is not None
-    and source_review_digest != reviewed_source_digest
-  ):
-    raise HTTPException(
-      409,
-      {
-        "code": "update_changed",
-        "message": (
-          "The app source changed after it was reviewed. "
-          "Refresh the update preview and try again."
-        ),
-      },
-    )
-  replay_fields = (
-    expected_app_id,
-    expected_upstream_commit,
-    expected_candidate_digest,
-  )
-  if any(value is not None for value in replay_fields) and not all(
-    value is not None for value in replay_fields
-  ):
-    raise RuntimeError("resolved update replay identity is incomplete")
-  if (
-    expected_candidate_digest is not None
-    and candidate_digest != expected_candidate_digest
-  ):
-    raise HTTPException(
-      409,
-      {
-        "code": "pending_update_changed",
-        "message": (
-          "The pending update changed upstream. "
-          "Review the latest update and start again."
-        ),
-      },
-    )
-
-  return InstallCandidate(
+  return _new_candidate(
     manifest=manifest,
     raw_base=raw_base,
     entry_bytes=entry_bytes,
@@ -2999,28 +2286,229 @@ async def _fetch_install_candidate(
     static_assets=static_assets,
     source_files=source_files,
     seeds=seeds,
-    capability_contract=capability_contract,
-    capability_digest=capability_digest,
-    candidate_digest=candidate_digest,
-    source_review_digest=source_review_digest,
     source_identity=source_identity,
     predecessor_source_identity=predecessor_source_identity,
     canonical_source_url=canonical_source_url,
   )
 
 
-async def fetch_install_candidate(manifest_url: str) -> InstallCandidate:
+async def fetch_install_candidate(
+  manifest_url: str, *, db: Session | None = None,
+) -> InstallCandidate:
   """Fetch the exact package the installer would use, without installing it."""
   return await _fetch_install_candidate(
-    manifest_url=manifest_url,
-    manifest=None,
-    raw_base=None,
-    reviewed_capability_digest=None,
-    reviewed_source_digest=None,
-    expected_app_id=None,
-    expected_upstream_commit=None,
-    expected_candidate_digest=None,
+    manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
   )
+
+
+@dataclass(frozen=True)
+class PreparedPackage:
+  """A fresh install's package, fetched before the lifecycle lock.
+
+  A root Git package is read from its staged clone, so the installer adopts
+  exactly the commit it reviewed and downloads the package only once. The
+  caller owns ``staged_clone`` and discards it once the install is over.
+  """
+
+  candidate: InstallCandidate
+  staged_clone: app_git.Staged | None = None
+
+
+async def prepare_package(
+  manifest_url: str | None,
+  manifest: dict | None = None,
+  raw_base: str | None = None,
+  *,
+  reviewed_capability_digest: str | None = None,
+  db: Session | None = None,
+) -> PreparedPackage:
+  """The network half of a fresh install; run it holding no lock.
+
+  A root Git package is cloned and read from its clone. An owner request
+  passes ``db``: the manifest is validated first, with the stored address
+  checks the preview uses, so a missing or invalid package, or one whose
+  capabilities changed since review, is refused before any history is
+  transferred, and the connection is released before the transfer.
+  """
+  if (manifest_url is None) == (manifest is None):
+    raise HTTPException(
+      400, "Provide exactly one of `manifest_url` or `manifest`.",
+    )
+  repo_ref = _derive_repo_ref(manifest_url) if manifest_url else None
+  if repo_ref is None:
+    candidate = await _fetch_install_candidate(
+      manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
+      reviewed_capability_digest=reviewed_capability_digest, db=db,
+    )
+    if db is not None:
+      db.rollback()  # No connection is held while the caller waits for a lock.
+    return PreparedPackage(candidate)
+  if db is not None:
+    previewed, *_ = await preview_manifest_capabilities(
+      manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
+    )
+    db.rollback()
+    _require_reviewed_capabilities(previewed, reviewed_capability_digest)
+  try:
+    staged = await _stage(app_git.stage_clone, *repo_ref, git_transfer_root())
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    raise git_source_error(
+      "Nothing was installed.",
+      exc,
+      code="git_install_unavailable",
+      failure="The app's Git repository could not be cloned or verified.",
+      retry_hint="Retry when its source is available.",
+    ) from exc
+  try:
+    return PreparedPackage(
+      await _staged_clone_candidate(manifest_url, staged, db=db), staged,
+    )
+  except BaseException:
+    await asyncio.to_thread(discard_staged, staged)
+    raise
+
+
+def _read_staged_manifest(staged: app_git.Staged) -> dict | None:
+  """The staged commit's bounded, valid root manifest, or None.
+
+  None when it is absent, oversized or invalid, or when Git could not read
+  it; the full package read then reports which.
+  """
+  raw = app_git.read_committed_file(
+    staged.path, staged.sha, "mobius.json", max_bytes=_MANIFEST_MAX_BYTES,
+  )
+  if raw is None:
+    return None
+  try:
+    return _read_git_package_manifest({"mobius.json": raw}, strict=True)
+  except (ValueError, HTTPException):
+    return None
+
+
+async def _staged_package_identity(
+  manifest: dict, manifest_url: str, source_url: str, db: Session | None,
+) -> dict[str, str | None]:
+  """Check a staged manifest's address, then resolve a permanent identity.
+
+  The address is checked before any identity request, so a package at the
+  wrong address never reaches the network.
+  """
+  validate_manifest_address(manifest, manifest_url, db=db)
+  if db is not None:
+    db.rollback()
+  if not manifest.get("package_id"):
+    return {}
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+    source_identity, predecessor, canonical = await _resolve_package_identity(
+      cli, manifest, source_url,
+    )
+  return dict(
+    source_identity=source_identity,
+    predecessor_source_identity=predecessor,
+    canonical_source_url=canonical,
+  )
+
+
+async def _read_staged_candidate(
+  staged: app_git.Staged, source_url: str, identity: dict[str, str | None],
+) -> InstallCandidate:
+  try:
+    return (await asyncio.to_thread(functools.partial(
+      read_git_install_candidate, staged.path, staged.sha, source_url,
+      **identity,
+    ))).candidate
+  except PackageTooLarge as exc:
+    raise HTTPException(
+      413, detail={"code": "package_too_large", "message": str(exc)},
+    ) from exc
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    raise HTTPException(422, f"The app's Git package is unusable: {exc}") from exc
+
+
+async def _staged_clone_candidate(
+  manifest_url: str, staged: app_git.Staged, *, db: Session | None,
+) -> InstallCandidate:
+  """Read a root Git package from its staged clone, binding its identity.
+
+  Identity comes from the bounded manifest alone, so the package is read
+  (and its digests derived) once, already bound to it.
+  """
+  source_url = requested_manifest_source(manifest_url)[0]
+  manifest = await asyncio.to_thread(_read_staged_manifest, staged)
+  if manifest is None:
+    # The full read reports an absent, oversized or invalid manifest. If it
+    # accepts the package, only the bounded read failed (a transient Git read
+    # error): bind identity from the manifest the full read accepted instead.
+    candidate = await _read_staged_candidate(staged, source_url, {})
+    identity = await _staged_package_identity(
+      candidate.manifest, manifest_url, source_url, db,
+    )
+    if not identity:
+      return candidate
+  else:
+    identity = await _staged_package_identity(
+      manifest, manifest_url, source_url, db,
+    )
+  return await _read_staged_candidate(staged, source_url, identity)
+
+
+def _require_reviewed_capabilities(
+  manifest: dict, reviewed_capability_digest: str | None,
+) -> None:
+  if reviewed_capability_digest is None:
+    return
+  capability_contract, capability_digest = contract_and_digest(manifest)
+  if capability_digest != reviewed_capability_digest:
+    raise HTTPException(409, detail={
+      "code": "capability_changed",
+      "message": (
+        "The app's capabilities changed after they were reviewed. "
+        "Review the current manifest and try again."
+      ),
+      "manifest": manifest,
+      "capability_contract": capability_contract,
+      "capability_digest": capability_digest,
+    })
+
+
+def _require_reviewed_candidate(
+  candidate: InstallCandidate,
+  *,
+  manifest: dict | None,
+  reviewed_capability_digest: str | None,
+  reviewed_source_digest: str | None,
+  expected_candidate_digest: str | None,
+  is_update: bool,
+) -> None:
+  """Refuse a candidate that is not the package the owner reviewed."""
+  if manifest is not None and manifest != candidate.manifest:
+    raise HTTPException(409, "Pending update manifest changed.")
+  _require_reviewed_capabilities(candidate.manifest, reviewed_capability_digest)
+  if (
+    reviewed_source_digest is not None
+    and reviewed_source_digest != candidate.source_review_digest
+  ):
+    raise HTTPException(409, detail={
+      "code": "update_changed",
+      "message": (
+        "The app source changed after it was reviewed. "
+        + (
+          "Refresh the update preview and try again." if is_update
+          else "Review the app again and try again."
+        )
+      ),
+    })
+  if (
+    expected_candidate_digest is not None
+    and expected_candidate_digest != candidate.candidate_digest
+  ):
+    raise HTTPException(409, detail={
+      "code": "pending_update_changed",
+      "message": (
+        "The pending update changed upstream. "
+        "Review the latest update and start again."
+      ),
+    })
 
 
 async def _authorize_source_handoff(
@@ -3039,14 +2527,13 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  old_manifest_url = _canonical_base(existing.manifest_url) + "/mobius.json"
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+    # The old row's own address is fetched without the stored id binding:
+    # trust here comes from `package_id` + `moved_to`, and a `package_id` app
+    # may have changed its manifest id without `previous_id`.
     old_manifest, _ = await _fetch_and_validate_manifest(
       cli,
-      manifest_url=old_manifest_url,
+      manifest_url=stored_manifest_fetch_url(existing.manifest_url),
       manifest=None,
       raw_base=None,
     )
@@ -3062,6 +2549,114 @@ async def _authorize_source_handoff(
     moved_identity, _ = await _resolve_source_identity(cli, moved_url)
   if moved_identity != candidate.source_identity:
     raise HTTPException(409, "Trusted app handoff names a different source.")
+
+
+@dataclass(frozen=True)
+class PackageRow:
+  """The installed row, if any, that one candidate package is."""
+
+  row: models.App | None
+  renamed: bool = False  # Found through the candidate's `previous_id`.
+  origin_migration: tuple[str, str] | None = None
+
+
+def resolve_package_row(
+  db: Session,
+  manifest: dict,
+  source_url: str,
+  *,
+  source_identity: str | None = None,
+  predecessor_identity: str | None = None,
+  canonical_source_url: str | None = None,
+) -> PackageRow:
+  """Resolve which installed row a candidate package is, by one rule.
+
+  Install, update-check and the update preview all call this, so discovery
+  offers an update exactly when install would apply it to that row:
+
+  1. Its permanent ``package_id`` and its address (the stored identity, any
+     ref of the same root GitHub package, or a proven legacy origin); when
+     both find a row they must agree.
+  2. Its ``previous_manifest_url`` under the same ``id``, for a permanent
+     package whose resolved provider identity (``source_identity``) equals the
+     predecessor's, proving both addresses name one repository.
+  3. A ``previous_id`` rename: under the current address, then (permanent
+     package) that proven predecessor address, or (otherwise) a predecessor
+     owned by the same GitHub account. A deleted predecessor is not revived.
+
+  A row holding a permanent ``package_id`` is only ever that package.
+  Raises HTTPException 409 for a conflicting or changed permanent identity and
+  400 for a rename across GitHub accounts without a permanent identity.
+  """
+  manifest_id = manifest["id"]
+  package_id = manifest.get("package_id")
+  previous_id = manifest.get("previous_id")
+  previous_source = manifest.get("previous_manifest_url")
+  key_source = canonical_source_url or source_url
+  existing = _find_install_identity_row(
+    db, source_url=source_url, manifest_id=manifest_id, package_id=package_id,
+  )
+  renamed = False
+  origin_migration = None
+  if existing is None:
+    # Only a resolved provider identity proves one repository; two unknown
+    # identities (a legacy row's update, an unresolved fetch) prove nothing.
+    same_repository = bool(
+      package_id and previous_source and source_identity is not None
+      and predecessor_identity == source_identity
+    )
+    # (address, manifest id, whether the row is a `previous_id` rename)
+    lookups: list[tuple[str, str, bool]] = []
+    if same_repository:
+      lookups.append((previous_source, manifest_id, False))
+    if previous_id and package_id:
+      lookups.append((key_source, previous_id, True))
+      if same_repository:
+        lookups.append((previous_source, previous_id, True))
+    elif previous_id:
+      predecessor_source, origin_migration = _reviewed_predecessor_source(
+        manifest, key_source,
+      )
+      lookups.append((predecessor_source, previous_id, True))
+    for lookup_source, lookup_id, rename in lookups:
+      existing = _find_install_identity_row(
+        db, source_url=lookup_source, manifest_id=lookup_id,
+      )
+      if existing is not None:
+        renamed = rename
+        break
+    if renamed and existing.deleted_at is not None:
+      existing, renamed = None, False
+    if not renamed:
+      origin_migration = None
+  if existing is not None:
+    try:
+      require_permanent_package(manifest, existing.package_id)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
+  return PackageRow(existing, renamed, origin_migration)
+
+
+def resolve_update_row(
+  db: Session, manifest: dict, manifest_url: str, source_identity: str | None,
+) -> PackageRow:
+  """The row a Store update of this Git candidate would apply to.
+
+  A Store update reads its package from the installed app's repository and
+  binds it to that row's own source identity (``install_from_manifest``), so
+  update discovery passes install the same inputs and needs no request.
+  """
+  fetch_url = requested_manifest_source(manifest_url)[0]
+  return resolve_package_row(
+    db,
+    manifest,
+    manifest_url,
+    source_identity=source_identity,
+    predecessor_identity=_same_repository_predecessor(
+      manifest, fetch_url, source_identity,
+    ),
+    canonical_source_url=fetch_url if source_identity else None,
+  )
 
 
 def _select_install_target(
@@ -3080,83 +2675,26 @@ def _select_install_target(
   requested_source = (
     manifest_url if manifest_url is not None else candidate.raw_base
   )
-  source_for_key = candidate.canonical_source_url or (
-    requested_source
-  )
+  source_for_key = candidate.canonical_source_url or requested_source
   canonical_manifest_url = _canonical_identity_key(
     source_for_key, manifest_id,
   )
-  existing = _find_install_identity_row(
+  resolved = resolve_package_row(
     db,
-    source_url=requested_source,
-    manifest_id=manifest_id,
-    package_id=package_id,
+    manifest,
+    requested_source,
+    source_identity=candidate.source_identity,
+    predecessor_identity=candidate.predecessor_source_identity,
+    canonical_source_url=candidate.canonical_source_url,
   )
-  previous_source = manifest.get("previous_manifest_url")
-  if (
-    existing is None
-    and package_id
-    and previous_source
-    and candidate.predecessor_source_identity == candidate.source_identity
-  ):
-    existing = _find_install_identity_row(
-      db, source_url=previous_source, manifest_id=manifest_id,
-    )
-
-  if existing is not None and existing.package_id is not None:
-    if package_id is None:
-      raise HTTPException(
-        409, "This installed app requires its permanent package identity.",
-      )
-    if existing.package_id != package_id:
-      raise HTTPException(409, "Permanent package identity changed.")
-
-  adopting_previous_id = False
-  origin_migration = None
-  if existing is None:
-    # A rename is explicit and source-bound. Ordinarily previous_id is looked
-    # up under the same package base; previous_manifest_url may name an old
-    # repository owned by the same GitHub account.
-    prev_id = manifest.get("previous_id")
-    if prev_id:
-      if package_id:
-        # First recover identity-free installs already checked out from the
-        # current trusted repository (Main's pre-manifest Social state).
-        existing = _find_install_identity_row(
-          db, source_url=source_for_key, manifest_id=prev_id,
-        )
-        # A persisted predecessor URL is safe across owner/repo renames only
-        # when the provider proves both paths are the same repository.
-        if (
-          existing is None
-          and previous_source
-          and candidate.predecessor_source_identity
-          == candidate.source_identity
-        ):
-          existing = _find_install_identity_row(
-            db, source_url=previous_source, manifest_id=prev_id,
-          )
-      else:
-        predecessor_source, origin_migration = _reviewed_predecessor_source(
-          manifest, source_for_key,
-        )
-        existing = _find_install_identity_row(
-          db, source_url=predecessor_source, manifest_id=prev_id,
-        )
-      if existing is not None and existing.deleted_at is not None:
-        existing = None
-      if existing:
-        adopting_previous_id = True
-      else:
-        origin_migration = None
-
-  if (
+  existing = resolved.row
+  origin_migration = resolved.origin_migration
+  adopting_previous_id = resolved.renamed or bool(
     existing is not None
     and package_id
     and existing.package_id == package_id
     and existing.slug != manifest_id
-  ):
-    adopting_previous_id = True
+  )
 
   required_app_id = (
     expected_app_id
@@ -3179,7 +2717,7 @@ def _select_install_target(
 
   old_origin = _github_origin_url(existing.manifest_url) if existing else None
   new_origin = _github_origin_url(source_for_key)
-  if old_origin and new_origin and old_origin.lower() != new_origin.lower():
+  if old_origin and new_origin and not app_git.same_origin(old_origin, new_origin):
     origin_migration = (old_origin, new_origin)
 
   service = manifest.get("service")
@@ -3313,7 +2851,7 @@ async def _converge_manifest_schedule_zones_unlocked(
         zone = _manifest_default_timezone(choice.cron, owner_zone)
         if zone == choice.timezone:
           continue
-        await app_cron.run_schedule_mutation(
+        await settled.run_settled(
           _move_manifest_schedule_zone, app,
           dataclasses.replace(choice, timezone=zone), scaffold,
         )
@@ -3348,7 +2886,7 @@ async def _sync_manifest_cron_unlocked(
   contract (``app_cron.owner_schedule_to_keep``); otherwise the manifest
   default is registered, in ``owner_zone`` when it is a fixed wall time.
   """
-  await app_cron.run_schedule_mutation(
+  await settled.run_settled(
     _sync_manifest_cron, app, manifest, drop_prior_cron,
     bundled_job, warnings, owner_zone,
   )
@@ -3532,7 +3070,7 @@ async def _prepare_app_row(
                 _reconcile_cron_after_install_rollback
               )
               try:
-                await app_cron.run_schedule_mutation(
+                await settled.run_settled(
                   _unregister_cron, Path(old_source_dir),
                 )
               except asyncio.CancelledError:
@@ -3540,7 +3078,7 @@ async def _prepare_app_row(
                 # row and filesystem journal while both lifecycle/source locks
                 # still exclude competitors, then propagate the cancellation.
                 db.rollback()
-                await app_cron.run_schedule_mutation(
+                await settled.run_settled(
                   journal.rollback_materialization,
                 )
                 raise
@@ -3569,16 +3107,14 @@ async def _prepare_app_row(
     if target.origin_migration and app_git.has_origin(app.source_dir):
       old_origin, new_origin = target.origin_migration
       current_origin = app_git.origin_url(app.source_dir)
-      normalized_origin = (
-        current_origin.rstrip("/").lower() if current_origin else None
-      )
-      if normalized_origin and normalized_origin not in {
-        old_origin.rstrip("/").lower(), new_origin.rstrip("/").lower(),
-      }:
+      if current_origin and not (
+        app_git.same_origin(current_origin, old_origin)
+        or app_git.same_origin(current_origin, new_origin)
+      ):
         raise HTTPException(
           409, "Installed app origin no longer matches its trusted source.",
         )
-      if normalized_origin and normalized_origin != new_origin.rstrip("/").lower():
+      if current_origin and not app_git.same_origin(current_origin, new_origin):
         app_git.set_origin_url(app.source_dir, new_origin)
         journal.rollback_actions.append(
           lambda p=app.source_dir, u=current_origin:
@@ -3727,6 +3263,10 @@ class _UncheckedPythonTree(Exception):
     self.runtime = runtime
     self.app_id = app_id
 
+  def discard(self) -> None:
+    """Remove the handed-out runtime copy once checked, or once abandoned."""
+    shutil.rmtree(self.runtime.root, ignore_errors=True)
+
 
 async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPythonTree:
   """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
@@ -3746,7 +3286,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
       500, "Install failed due to an unexpected server error.",
     ) from exc
   finally:
-    shutil.rmtree(pending.runtime.root, ignore_errors=True)
+    pending.discard()
   return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
@@ -3920,9 +3460,7 @@ async def _activate_install_source(
         # declare; checking that merged tree makes every later synthetic
         # fallback misdiagnose those preserved edits as a broken release.
         source_tree=plan.published_source_tree,
-        entry_key=plan.entry_key,
-        static_dests=list(plan.static_assets),
-        job_name=plan.job_name,
+        static_assets=plan.static_assets,
       )
 
   _write_static_assets(
@@ -4008,6 +3546,67 @@ async def _activate_install_source(
   return equivalence_target
 
 
+async def install_requested_app(
+  db: Session,
+  *,
+  manifest_url: str | None,
+  manifest: dict | None = None,
+  raw_base: str | None = None,
+  reviewed_capability_digest: str | None = None,
+  reviewed_source_digest: str | None = None,
+  update_app_id: int | None = None,
+  reviewed_upstream_commit: str | None = None,
+) -> InstallResult:
+  """One owner-reviewed Store install or update, the same for every caller.
+
+  The install route and each entry of a server-owned update batch take this
+  one path. Network transfers (``fetch_app_commit`` for a reviewed update,
+  ``prepare_package`` for an install) finish before the lifecycle lock, so
+  one slow package never holds up other apps' installs, updates or
+  uninstalls. The local install then runs under that lock
+  (``fs_locks.install_uninstall_lock`` has the full rationale), and its
+  passes settle before a cancellation.
+  """
+  prepared = None
+  try:
+    if update_app_id is not None and reviewed_upstream_commit is not None:
+      reviewed = db.get(models.App, update_app_id)
+      reviewed_source = reviewed.source_dir if reviewed is not None else None
+      # Release the connection for the transfer, as update-check does.
+      db.rollback()
+      if reviewed_source is not None and app_git.is_repo(reviewed_source):
+        try:
+          await fetch_app_commit(reviewed_source, reviewed_upstream_commit)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+          raise git_source_error(
+            "Refresh the update and try again.",
+            exc,
+            code="update_changed",
+            failure="The reviewed Git update is no longer available.",
+          ) from exc
+    elif update_app_id is None:
+      prepared = await prepare_package(
+        manifest_url, manifest, raw_base,
+        reviewed_capability_digest=reviewed_capability_digest, db=db,
+      )
+    async with fs_locks.install_uninstall_lock():
+      return await install_from_manifest(
+        db,
+        manifest_url=manifest_url,
+        manifest=manifest,
+        raw_base=raw_base,
+        source="store",
+        reviewed_capability_digest=reviewed_capability_digest,
+        reviewed_source_digest=reviewed_source_digest,
+        reviewed_app_id=update_app_id,
+        reviewed_upstream_commit=reviewed_upstream_commit,
+        prepared=prepared,
+      )
+  finally:
+    if prepared is not None:
+      await settled.run_settled(discard_staged, prepared.staged_clone)
+
+
 async def install_from_manifest(
   db: Session,
   manifest_url: str | None,
@@ -4022,6 +3621,7 @@ async def install_from_manifest(
   expected_upstream_commit: str | None = None,
   expected_candidate_digest: str | None = None,
   publication_handoff_app_id: int | None = None,
+  prepared: PreparedPackage | None = None,
 ) -> InstallResult:
   """Return a structured durable install/update/conflict outcome.
 
@@ -4046,6 +3646,11 @@ async def install_from_manifest(
 
   The per-app git model is unconditional. Every installed app has a canonical
   source directory and repository; updates never overwrite source blindly.
+  Callers hold the lifecycle lock, so a fresh install or a publication handoff
+  arrives ``prepared`` (by ``prepare_package``, or the handoff's verified
+  candidate) and a reviewed update or conflict replay as a commit already made
+  present by ``fetch_app_commit``. Only a legacy conflict replay whose commit
+  has no manifest still fetches its package here.
 
   Failure modes:
     - Pre-commit failures (manifest fetch, validation, JSX compile,
@@ -4079,6 +3684,13 @@ async def install_from_manifest(
     value is not None for value in reviewed_update_fields
   ):
     raise ValueError("reviewed update identity is incomplete")
+  replay_fields = (
+    expected_app_id, expected_upstream_commit, expected_candidate_digest,
+  )
+  if any(value is not None for value in replay_fields) and not all(
+    value is not None for value in replay_fields
+  ):
+    raise RuntimeError("resolved update replay identity is incomplete")
   if publication_handoff_app_id is not None:
     if source != "publication_handoff":
       raise ValueError("publication handoff requires its dedicated source")
@@ -4095,8 +3707,9 @@ async def install_from_manifest(
     reviewed_app = db.get(models.App, reviewed_id)
     if reviewed_app is None or not app_git.is_repo(reviewed_app.source_dir):
       raise HTTPException(409, "Reviewed app source is no longer available.")
-    reviewed_source_url = manifest_url or (
-      _normalize_raw_base(raw_base or "") + "mobius.json"
+    reviewed_source_url = (
+      requested_manifest_source(manifest_url)[0] if manifest_url
+      else (_normalize_raw_base(raw_base or "") + "mobius.json")
     )
     try:
       has_manifest = await asyncio.to_thread(
@@ -4119,25 +3732,18 @@ async def install_from_manifest(
     # migration population disappears.
     if not has_manifest and expected_upstream_commit:
       candidate = await _fetch_install_candidate(
-        manifest_url=manifest_url,
-        manifest=manifest,
-        raw_base=raw_base,
-        reviewed_capability_digest=reviewed_capability_digest,
-        reviewed_source_digest=reviewed_source_digest,
-        expected_app_id=expected_app_id,
-        expected_upstream_commit=expected_upstream_commit,
-        expected_candidate_digest=expected_candidate_digest,
+        manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
+        reviewed_capability_digest=reviewed_capability_digest, db=db,
       )
-      git_candidate = None
     else:
       try:
-        git_candidate = await asyncio.to_thread(
+        candidate = (await asyncio.to_thread(
           read_git_install_candidate,
           reviewed_app.source_dir,
           reviewed_commit,
           reviewed_source_url,
           source_identity=reviewed_app.source_identity,
-        )
+        )).candidate
       except PackageTooLarge as exc:
         raise HTTPException(
           413, detail={"code": "package_too_large", "message": str(exc)},
@@ -4153,59 +3759,20 @@ async def install_from_manifest(
             ),
           },
         ) from exc
-      candidate = git_candidate.candidate
-    if git_candidate is not None and manifest is not None and manifest != candidate.manifest:
-      raise HTTPException(409, "Pending update manifest changed.")
-    if (
-      git_candidate is not None
-      and reviewed_capability_digest is not None
-      and reviewed_capability_digest != candidate.capability_digest
-    ):
-      raise HTTPException(
-        409,
-        detail={
-          "code": "capability_changed",
-          "message": "The app's capabilities changed after review.",
-          "manifest": candidate.manifest,
-          "capability_contract": candidate.capability_contract,
-          "capability_digest": candidate.capability_digest,
-        },
-      )
-    if (
-      git_candidate is not None
-      and reviewed_source_digest is not None
-      and reviewed_source_digest != candidate.source_review_digest
-    ):
-      raise HTTPException(
-        409,
-        detail={
-          "code": "update_changed",
-          "message": "The app source changed after review.",
-        },
-      )
-    if (
-      git_candidate is not None
-      and expected_candidate_digest is not None
-      and expected_candidate_digest != candidate.candidate_digest
-    ):
-      raise HTTPException(
-        409,
-        detail={
-          "code": "pending_update_changed",
-          "message": "The pending update changed upstream.",
-        },
-      )
+      validate_manifest_address(candidate.manifest, manifest_url, db=db)
+  elif prepared is None:
+    raise ValueError("an install without a reviewed commit needs its prepared package")
   else:
-    candidate = await _fetch_install_candidate(
-      manifest_url=manifest_url,
-      manifest=manifest,
-      raw_base=raw_base,
-      reviewed_capability_digest=reviewed_capability_digest,
-      reviewed_source_digest=reviewed_source_digest,
-      expected_app_id=expected_app_id,
-      expected_upstream_commit=expected_upstream_commit,
-      expected_candidate_digest=expected_candidate_digest,
-    )
+    candidate = prepared.candidate
+    validate_manifest_address(candidate.manifest, manifest_url, db=db)
+  _require_reviewed_candidate(
+    candidate,
+    manifest=manifest,
+    reviewed_capability_digest=reviewed_capability_digest,
+    reviewed_source_digest=reviewed_source_digest,
+    expected_candidate_digest=expected_candidate_digest,
+    is_update=reviewed_id is not None,
+  )
 
   # Phase 2: immutable identity/update decision. No writes occur here.
   target = _select_install_target(
@@ -4232,13 +3799,35 @@ async def install_from_manifest(
     reviewed_upstream_commit=reviewed_upstream_commit,
     expected_upstream_commit=expected_upstream_commit,
     publication_handoff_app_id=publication_handoff_app_id,
+    staged_clone=prepared.staged_clone if prepared is not None else None,
   )
+  # Each pass holds the source lock across many Git threads and rolls back on
+  # failure, and the env check runs threads from the handed-out runtime, all
+  # under the caller's lifecycle lock. So each step settles before a cancelled
+  # caller unwinds, and the cancellation then stops the install between steps.
   try:
-    return await install_candidate(python_check=None)
+    return await settled.settle(
+      install_candidate(python_check=None), abandoned=_abandon_install_step,
+    )
   except _UncheckedPythonTree as unchecked:
     pending = unchecked
-  python_check = await _check_reconciled_python(pending)
-  return await install_candidate(python_check=python_check)
+  python_check = await settled.settle(
+    _check_reconciled_python(pending), abandoned=_abandon_install_step,
+  )
+  return await settled.settle(
+    install_candidate(python_check=python_check), abandoned=_abandon_install_step,
+  )
+
+
+def _abandon_install_step(step: asyncio.Future) -> None:
+  """Release what a step left once its caller was cancelled."""
+  outcome = step.exception()
+  if isinstance(outcome, _UncheckedPythonTree):
+    outcome.discard()
+  elif outcome is not None:
+    settled.log_abandoned_failure(step, "Install step")
+  elif isinstance(step.result(), CheckedPythonTree):
+    app_python_env.discard_env(step.result().env)
 
 
 async def _install_candidate(
@@ -4251,6 +3840,7 @@ async def _install_candidate(
   reviewed_upstream_commit: str | None,
   expected_upstream_commit: str | None,
   publication_handoff_app_id: int | None,
+  staged_clone: app_git.Staged | None,
   python_check: CheckedPythonTree | None,
 ) -> InstallResult:
   """Reconcile and activate one selected candidate in one transaction.
@@ -4509,8 +4099,21 @@ async def _install_candidate(
           cloned_update = await asyncio.to_thread(
             app_git.has_origin, git_source_dir,
           )
-        elif reviewed_upstream_commit is not None:
+        elif reviewed_upstream_commit is not None or (
+          repo_ref is not None
+          and await asyncio.to_thread(app_git.has_origin, git_source_dir)
+        ):
           try:
+            if reviewed_upstream_commit is not None:
+              upstream_sha = reviewed_upstream_commit
+            else:
+              upstream_sha = await settled.run_settled(
+                _url_update_commit, git_source_dir, repo_ref[1], staged_clone,
+              )
+              if staged_clone is None:
+                await asyncio.to_thread(
+                  _require_git_candidate, git_source_dir, upstream_sha, candidate,
+                )
             previous_tree = await asyncio.to_thread(
               app_git.read_ref_tree,
               git_source_dir,
@@ -4525,11 +4128,11 @@ async def _install_candidate(
               await asyncio.to_thread(
                 app_git.replace_upstream_ref,
                 git_source_dir,
-                reviewed_upstream_commit,
+                upstream_sha,
                 expected_sha=prev_upstream_commit,
               )
               promoted = app_git.FetchUpstreamResult(
-                sha=reviewed_upstream_commit,
+                sha=upstream_sha,
                 allow_unrelated_histories=True,
               )
               git_merge_base_override = prev_upstream_commit
@@ -4537,19 +4140,14 @@ async def _install_candidate(
               promoted = await asyncio.to_thread(
                 app_git.promote_upstream,
                 git_source_dir,
-                reviewed_upstream_commit,
+                upstream_sha,
                 trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-            raise HTTPException(
-              409,
-              detail={
-                "code": "git_update_unavailable",
-                "message": (
-                  "The reviewed Git update could not be applied. "
-                  "The installed version was left unchanged."
-                ),
-              },
+            raise git_source_error(
+              "The installed version was left unchanged.",
+              exc,
+              failure="The app's Git update could not be applied.",
             ) from exc
           app.upstream_commit = promoted.sha
           allow_unrelated_histories = (
@@ -4557,77 +4155,6 @@ async def _install_candidate(
             or promoted.allow_unrelated_histories
           )
           cloned_update = True
-        elif repo_ref is not None and await asyncio.to_thread(
-          app_git.has_origin, git_source_dir,
-        ):
-          _, ref = repo_ref
-          previous_tree = await asyncio.to_thread(
-            app_git.read_ref_tree,
-            git_source_dir,
-            app_git.UPSTREAM_BRANCH,
-          )
-          synthetic_baseline = bool(
-            prev_upstream_commit
-          ) and replaces_migration_bridge(
-            previous_tree, trusted_origin=target.trusted_origin,
-          )
-          if synthetic_baseline:
-            try:
-              fetched_sha = await asyncio.to_thread(
-                app_git.fetch_origin_ref, git_source_dir, ref,
-              )
-              await asyncio.to_thread(
-                _verify_git_install_candidate,
-                git_source_dir, fetched_sha, candidate,
-              )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise HTTPException(
-                409,
-                detail={
-                  "code": "git_update_unavailable",
-                  "message": (
-                    "The app's Git update could not be fetched or verified. "
-                    "The installed version was left unchanged."
-                  ),
-                },
-              ) from exc
-            await asyncio.to_thread(
-              app_git.replace_upstream_ref,
-              git_source_dir,
-              fetched_sha,
-              expected_sha=prev_upstream_commit,
-            )
-            app.upstream_commit = fetched_sha
-            git_merge_base_override = prev_upstream_commit
-            cloned_update = True
-          else:
-            try:
-              fetched_upstream = await asyncio.to_thread(
-                app_git.fetch_upstream,
-                git_source_dir,
-                ref,
-                trusted_origin_adoption=target.trusted_origin,
-                verify=lambda commit: _verify_git_install_candidate(
-                  git_source_dir, commit, candidate,
-                ),
-              )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise HTTPException(
-                409,
-                detail={
-                  "code": "git_update_unavailable",
-                  "message": (
-                    "The app's Git update could not be fetched or verified. "
-                    "The installed version was left unchanged."
-                  ),
-                },
-              ) from exc
-            app.upstream_commit = fetched_upstream.sha
-            allow_unrelated_histories = (
-              allow_unrelated_histories
-              or fetched_upstream.allow_unrelated_histories
-            )
-            cloned_update = True
         if expected_upstream_commit is not None:
           new_upstream_paths = await asyncio.to_thread(
             _read_upstream_source_paths, git_source_dir,
@@ -4717,19 +4244,6 @@ async def _install_candidate(
               app_git.LOCAL_BRANCH,
               resolved_commit,
             )
-            if merge.status == "conflict":
-              raise HTTPException(
-                409,
-                detail={
-                  "code": "resolution_behind_local_edits",
-                  "message": (
-                    "The app was edited while this update was being resolved, "
-                    "and those edits overlap the resolution. Finish it in the "
-                    "update's resolver chat."
-                  ),
-                  "conflict_paths": merge.conflict_paths,
-                },
-              )
           elif git_merge_base_override is not None:
             merge = await asyncio.to_thread(
               app_git.merge_refs,
@@ -4759,12 +4273,17 @@ async def _install_candidate(
             # same owner-gated resolver instead of overwriting local work.
             # JSON manifests can reconcile serialization drift and disjoint
             # edits structurally. Other files retain the APP_VERSION-only
-            # rule. Any remaining overlap leaves the whole update untouched
-            # for the owner to resolve.
+            # rule. Remaining overlaps need the owner unless a path outside
+            # a complete package can safely keep the owner's version.
+            package_paths = await asyncio.to_thread(
+              _update_package_paths, git_source_dir, manifest,
+            )
             benign = await asyncio.to_thread(
               app_git.resolve_benign_conflict,
               git_source_dir, merge.conflict_paths,
-              merge_base=git_merge_base_override,
+              merge_base=None if resolved_commit else git_merge_base_override,
+              package_paths=package_paths,
+              incoming=resolved_commit or app_git.UPSTREAM_BRANCH,
             )
             resolved_source = None
             if benign is not None:
@@ -4772,28 +4291,65 @@ async def _install_candidate(
                 rel: data for rel, data in benign.tree.items()
                 if rel not in _MERGED_NON_SOURCE
               }
+              if benign.kept_local:
+                upstream_tree = await asyncio.to_thread(
+                  app_git.read_ref_tree, git_source_dir,
+                  resolved_commit or app_git.UPSTREAM_BRANCH,
+                )
+                if not await _kept_local_bundle_unchanged(
+                  resolved_source, manifest, static_assets_fetched,
+                  upstream_tree, benign.kept_local,
+                ):
+                  resolved_source = None
             if resolved_source is not None and entry_key in resolved_source:
               source_tree = resolved_source
               divergence = "clean_merge"
               merge_applied = True
               warnings.append(
-                "auto-resolved a benign update conflict "
-                "(no semantic overlap between local edits and upstream)"
+                "auto-resolved an update conflict"
               )
+              if benign.kept_local:
+                warnings.append(
+                  "kept local edits to files outside the app package "
+                  "(upstream edits dropped): "
+                  + ", ".join(benign.kept_local)
+                )
               reconciliation = app_git.ReconciliationReceipt(
                 proven_present=reconciliation.proven_present,
                 local_only_paths=reconciliation.local_only_paths,
                 new_upstream_paths=reconciliation.new_upstream_paths,
                 compatible_paths=reconciliation.compatible_paths,
                 provenance_refs_used=reconciliation.provenance_refs_used,
+                kept_local_paths=benign.kept_local,
               )
-              # Exec bits come from the same merged tree the resolution was
-              # built on, mirroring the clean-merge branch above.
+              # Resolved package files use merge modes; ancillary files keep
+              # the owner's local mode as well as their bytes.
               git_exec_paths = await asyncio.to_thread(
                 app_git.read_tree_exec_paths,
                 git_source_dir, benign.tree_oid,
               )
+              if benign.kept_local:
+                local_exec_paths = await asyncio.to_thread(
+                  app_git.read_tree_exec_paths, git_source_dir, app_git.LOCAL_BRANCH,
+                )
+                git_exec_paths = (
+                  git_exec_paths.difference(benign.kept_local)
+                  | local_exec_paths.intersection(benign.kept_local)
+                )
             else:
+              if resolved_commit is not None:
+                raise HTTPException(
+                  409,
+                  detail={
+                    "code": "resolution_behind_local_edits",
+                    "message": (
+                      "The app was edited while this update was being resolved, "
+                      "and those edits overlap the resolution. Finish it in the "
+                      "update's resolver chat."
+                    ),
+                    "conflict_paths": merge.conflict_paths,
+                  },
+                )
               # Never rebase local. The app stays served with its current
               # bundle + source; the new upstream is recorded for a later
               # agent-resolution pass. Switch to conflict mode below.
@@ -4838,15 +4394,15 @@ async def _install_candidate(
         # URLs without a derivable origin remain supported: their fetched
         # source is imported into a local Git repository below.
         if repo_ref is not None:
-          repo_url, ref = repo_ref
+          if staged_clone is None:
+            raise HTTPException(
+              409, "The app's Git repository must be fetched before install.",
+            )
           try:
-            app.upstream_commit = await asyncio.to_thread(
-              app_git.clone_upstream, git_source_dir, repo_url, ref,
-            )
-            await asyncio.to_thread(
-              _verify_git_install_candidate,
-              git_source_dir, app.upstream_commit, candidate,
-            )
+            journal.rollback_actions.append(await settled.run_settled(
+              app_git.adopt_clone, staged_clone, git_source_dir,
+            ))
+            app.upstream_commit = staged_clone.sha
             entry_bytes = (git_source_dir / "index.jsx").read_bytes()
             upstream_jsx_sha = hashlib.sha256(entry_bytes).hexdigest()
             source_tree = {"index.jsx": entry_bytes}
@@ -4854,15 +4410,13 @@ async def _install_candidate(
           except (
             OSError, subprocess.SubprocessError, RuntimeError, ValueError,
           ) as exc:
-            raise HTTPException(
-              409,
-              detail={
-                "code": "git_install_unavailable",
-                "message": (
-                  "The app's Git repository could not be cloned or verified. "
-                  "Nothing was installed; retry when its source is available."
-                ),
-              },
+            raise git_source_error(
+              "Nothing was installed.",
+              exc,
+              code="git_install_unavailable",
+              failure="The app's Git repository could not be cloned or "
+              "verified.",
+              retry_hint="Retry when its source is available.",
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the
@@ -4911,6 +4465,10 @@ async def _install_candidate(
         dropped_source_paths |= await asyncio.to_thread(
           _read_upstream_source_paths, git_source_dir, app_git.LOCAL_BRANCH,
         ) - set(source_tree)
+
+      # The served merge result owns deletions, not the new upstream alone:
+      # an upstream deletion may conflict with an owner edit we retained.
+      dropped_source_paths -= set(source_tree)
 
       # The disk-write phase runs INSIDE the same held lock for the Git path so
       # no source commit interleaves between the merge decision and the write; a
@@ -5040,7 +4598,7 @@ async def _install_candidate(
     if equivalence_target_to_retire:
       try:
         async with fs_locks.source_dir_lock(str(app.source_dir)):
-          await asyncio.to_thread(
+          await settled.run_settled(
             app_git.retire_landed_equivalent_changes,
             app.source_dir, equivalence_target_to_retire,
           )
@@ -5060,6 +4618,8 @@ async def _install_candidate(
       app_id=app.id,
       slug=app.slug,
       source=source,
+      **({"kept_local_paths": list(reconciliation.kept_local_paths)}
+         if reconciliation.kept_local_paths else {}),
     )
 
     # Success: drop any .bak snapshots we made — the new bundle is
@@ -5073,6 +4633,16 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
+  except RolldownStalled as exc:
+    db.rollback()
+    journal.rollback_materialization()
+    raise HTTPException(503, exc.detail()) from exc
+  except app_git.HistoryIncomplete as exc:
+    db.rollback()
+    journal.rollback_materialization()
+    raise git_source_error(
+      "The installed version was left unchanged.", exc,
+    ) from exc
   except (HTTPException, _UncheckedPythonTree):
     db.rollback()
     journal.rollback_materialization()
@@ -5107,8 +4677,10 @@ async def _install_candidate(
   # Only now is the update fully converged. Until the receipt goes, a retry
   # reruns this whole install, post-commit effects included.
   try:
-    clear_pending_conflict_update(app.source_dir)
-  except (OSError, subprocess.SubprocessError):
+    async with fs_locks.source_dir_lock(app.source_dir):
+      await clear_pending_conflict_update(db, app)
+  except (OSError, subprocess.SubprocessError, SQLAlchemyError):
+    db.rollback()
     log.warning("install: could not clear the finished pending update", exc_info=True)
 
   return InstallResult(

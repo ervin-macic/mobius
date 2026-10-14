@@ -1,4 +1,5 @@
 import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+import { settingsSectionOrNull } from './settingsSections.js'
 
 const ACTIVE_CHAT_KEY = 'moebius_active_chat'
 const ACTIVE_VIEW_KEY = 'moebius_active_view'
@@ -45,6 +46,10 @@ export function parseShellDeepLink(location = globalThis.location) {
       if (chat) return { view: 'chat', chatId: chat, intent, focusQuestion }
       if (project) return { view: 'project', projectId: project }
       if (projects === '1') return { view: 'projects' }
+      if (params.has('settings')) {
+        const section = settingsSectionOrNull(params.get('settings'))
+        return { view: 'settings', ...(section ? { section } : {}) }
+      }
     } catch { /* malformed query is an ordinary empty destination */ }
     return null
   }

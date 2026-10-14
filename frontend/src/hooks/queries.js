@@ -29,6 +29,7 @@ const projectTemplatesKey = ['projects', 'templates']
 const chatsKey = ['chats']
 const chatUsageRootKey = ['chat-usage']
 const chatUsageKey = chatId => [...chatUsageRootKey, chatId]
+const chatContextSizesKey = chatId => ['chat-context-sizes', chatId]
 const chatCurrentUsageRootKey = ['chat-current-usage']
 const chatCurrentUsageKey = (chatId, provider, providerSessionId) => [
   ...chatCurrentUsageRootKey,
@@ -230,6 +231,30 @@ function useChatUsageQuery(chatId, { enabled = true } = {}) {
     staleTime: 60_000,
     retry: 0,
   })
+}
+
+async function fetchChatContextSizes(chatId, { signal } = {}) {
+  const res = await api.chats.contextSizes(chatId, { signal })
+  return jsonOrThrow(res, 'chat context sizes fetch failed:')
+}
+
+// Measured each time /context opens. A compaction can finish anywhere — this
+// composer, a resumed or automatic run, another device — and only the first
+// can invalidate this cache, so opening the panel always re-reads; the last
+// answer shows meanwhile. A compaction while a panel is open invalidates it
+// (ChatView's onCompacted).
+function chatContextSizesQueryOptions(chatId, { enabled = true } = {}) {
+  return {
+    queryKey: chatContextSizesKey(chatId),
+    queryFn: context => fetchChatContextSizes(chatId, context),
+    enabled: enabled && Boolean(chatId),
+    refetchOnMount: 'always',
+    retry: 0,
+  }
+}
+
+function useChatContextSizesQuery(chatId, options) {
+  return useQuery(chatContextSizesQueryOptions(chatId, options))
 }
 
 function useChatCurrentUsageQuery(
@@ -630,6 +655,7 @@ export const chatQueries = {
     messages: (chatId) => ['chat-messages', chatId],
     usage: chatUsageKey,
     currentUsage: chatCurrentUsageKey,
+    contextSizes: chatContextSizesKey,
   },
   list: {
     key: chatsKey,
@@ -651,6 +677,12 @@ export const chatQueries = {
     invalidate: (queryClient, chatId) => queryClient.invalidateQueries({
       queryKey: chatId ? chatUsageKey(chatId) : chatUsageRootKey,
     }),
+  },
+  contextSizes: {
+    key: chatContextSizesKey,
+    fetch: fetchChatContextSizes,
+    options: chatContextSizesQueryOptions,
+    useQuery: useChatContextSizesQuery,
   },
   currentUsage: {
     key: chatCurrentUsageKey,

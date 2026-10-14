@@ -1,6 +1,7 @@
 """Explicit mini-app source application."""
 from app.chat_writer import create_chat
 
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import call, patch
 
 import pytest
 
-from app import app_apply, app_git, icon_assets, models
+from app import app_apply, app_git, applied_app_runtime, icon_assets, models
 from app.config import get_settings
 from app.database import SessionLocal
 
@@ -787,6 +788,23 @@ def test_local_manifest_icon_is_materialized_with_its_accepted_revision(
   assert client.get(f"/api/apps/{app_id}/icon").status_code == 404
 
 
+def test_local_apply_scales_down_a_large_icon_like_install(client, auth, db):
+  """Apply used to refuse anything over 4096 px that install merely skipped."""
+  from PIL import Image
+  source = _source()
+  output = io.BytesIO()
+  Image.new("RGB", (5000, 4800), (40, 90, 180)).save(output, format="PNG")
+  _declare_icon(source, output.getvalue())
+
+  applied = _apply(client, auth, source)
+
+  assert applied.status_code == 200, applied.text
+  row = db.query(models.App).populate_existing().filter_by(
+    id=applied.json()["app"]["id"],
+  ).one()
+  assert Image.open(io.BytesIO(row.icon_png)).size == (1024, 1024)
+
+
 def test_invalid_local_manifest_icon_keeps_previous_revision(
   client, auth, db,
 ):
@@ -827,6 +845,39 @@ def test_compile_failure_keeps_previous_live_revision(client, auth, db):
 
   assert failed.status_code == 422
   assert failed.json()["detail"]["code"] == "compile_failed"
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.compiled_path == previous_bundle
+  assert "first" in row.jsx_source
+  assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
+
+
+def test_stalled_build_is_reported_as_environment_not_source(
+  client, auth, db, monkeypatch,
+):
+  """A build stopped by its wall limit must not read as a compile failure."""
+  from app import compiler
+
+  source = _source()
+  created = _apply(client, auth, source)
+  app_id = created.json()["app"]["id"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  previous_bundle = row.compiled_path
+  previous_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  (source / "index.jsx").write_text(
+    "export default function App(){ return 'second' }\n"
+  )
+  monkeypatch.setattr(compiler, "ROLLDOWN_WALL_LIMIT_SECS", 1)
+  monkeypatch.setattr(
+    compiler, "rolldown_command",
+    lambda *_args, **_kwargs: ["sleep", "300"],
+  )
+
+  failed = _apply(client, auth, source)
+
+  assert failed.status_code == 503
+  detail = failed.json()["detail"]
+  assert detail["code"] == "build_stalled"
+  assert "source was not judged" in detail["message"]
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert row.compiled_path == previous_bundle
   assert "first" in row.jsx_source
@@ -1143,6 +1194,55 @@ def test_reapply_unchanged_source_has_no_commit_or_timestamp_change(
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == head
 
 
+@pytest.mark.parametrize("module, step, served_while_blocked", [
+  (app_git, "materialize_tree", b"screen-v1"),
+  (applied_app_runtime, "prepare_runtime", b"screen-v2"),
+])
+def test_cancelled_apply_finishes_under_its_locks(
+  client, auth, db, monkeypatch, module, step, served_while_blocked,
+):
+  """A cancelled Apply keeps its locks until its writes end, and is not cut short.
+
+  Unsettled, the cancel released the source lock while the thread still wrote,
+  and skipped Apply's rollback, leaving new static assets on an old revision.
+  """
+  from app import fs_locks, schemas
+  from app.routes import apps as routes
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  source = _source()
+  asset = source / "listing-assets" / "screen.png"
+  asset.parent.mkdir()
+  asset.write_bytes(b"screen-v1")
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["static_assets"] = {"listing/screen.png": "listing-assets/screen.png"}
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  assert _apply(client, auth, source).status_code == 200
+  served = source / "static" / "listing" / "screen.png"
+  asset.write_bytes(b"screen-v2")
+  (source / "index.jsx").write_text(
+    "export default function App() { return <div>second</div> }\n"
+  )
+  worker = BlockedWorker(wraps=getattr(module, step))
+  monkeypatch.setattr(module, step, worker)
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(source)),
+    lambda: routes.apply_app_source(
+      schemas.AppApply(source_dir=str(source)), db, None,
+    ),
+    worker,
+    while_blocked=lambda: served.read_bytes() == served_while_blocked,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.expire_all()
+  row = db.query(models.App).filter_by(slug="demo").one()
+  assert "second" in row.jsx_source
+  assert row.source_commit == app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  assert served.read_bytes() == b"screen-v2"
+
+
 def test_local_source_revision_clears_previously_verified_distribution_manifest(
   client, auth, db,
 ):
@@ -1183,6 +1283,21 @@ def test_local_manifest_identity_is_immutable(client, auth, db):
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert row.slug == "demo"
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
+
+
+def test_local_manifest_identity_uses_stored_address_parser():
+  from types import SimpleNamespace
+
+  source = Path("/apps/local-name")
+  app = SimpleNamespace(manifest_url="https://example.test/app#manifest-id=stored-id")
+  app_apply._validate_local_identity(
+    source, {"id": "stored-id", "name": "Stored"}, app,
+  )
+  app.manifest_url += "&other=fragment"
+  with pytest.raises(app_apply.AppApplyError, match="source-directory name"):
+    app_apply._validate_local_identity(
+      source, {"id": "stored-id", "name": "Stored"}, app,
+    )
 
 
 def test_local_apply_updates_runtime_capabilities_with_source(
@@ -1343,7 +1458,7 @@ def test_store_ordinary_apply_warns_when_local_package_declarations_diverge(
   diverged = _apply(client, auth, source)
   assert diverged.status_code == 200, diverged.text
   assert diverged.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert not (row.capability_contract.get("agent") or {}).get("tools")
@@ -1369,7 +1484,7 @@ def test_store_ordinary_apply_warns_on_any_dropped_manifest_edit(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
 
 

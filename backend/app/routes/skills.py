@@ -64,6 +64,8 @@ from app.deps import (
 )
 from app import fs_locks
 from app.manifest_contract import SKILL_MAX_BYTES
+from app.net_utils import pinned_client
+from app.settled import run_settled
 from app.storage_io import atomic_write
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
@@ -842,7 +844,7 @@ async def install_skill(
 
   # follow_redirects=False — install._http_get walks the chain itself so every
   # hop is SSRF-revalidated and IP-pinned.
-  async with httpx.AsyncClient(follow_redirects=False, timeout=install._HTTP_TIMEOUT) as client:
+  async with pinned_client(timeout=install._HTTP_TIMEOUT) as client:
     name, files, source, commit, executables = await _fetch_files(client, body)
 
   if "SKILL.md" not in files or not files["SKILL.md"].strip():
@@ -1020,10 +1022,7 @@ async def update_skill(
     )
   else:
     source_body = SkillInstall(url=body.source.url, name=name)
-  async with httpx.AsyncClient(
-    follow_redirects=False,
-    timeout=install._HTTP_TIMEOUT,
-  ) as client:
+  async with pinned_client(timeout=install._HTTP_TIMEOUT) as client:
     fetched_name, files, source, commit, executables = await _fetch_files(
       client, source_body,
     )
@@ -1142,7 +1141,7 @@ async def update_skill(
 
     if (data_dir / ".git").is_dir():
       try:
-        ok, detail = await asyncio.to_thread(
+        ok, detail = await run_settled(
           data_git.snapshot_path,
           data_dir,
           f"shared/skills/{name}",
@@ -1421,7 +1420,7 @@ async def uninstall_skill(
 
     if target_kind == "dir" and (data_dir / ".git").is_dir():
       try:
-        ok, detail = await asyncio.to_thread(
+        ok, detail = await run_settled(
           data_git.snapshot_path,
           data_dir,
           f"shared/skills/{name}",

@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import time
@@ -48,6 +49,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from app.codex_sdk_contract import app_server_exit_code
 from app.memory_observability import ProcessExitEvidence, cgroup_oom_kill_count
+from app import settled
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +84,20 @@ PUBLIC_TURN_ENV = frozenset({
 })
 # The control tool server loads a helper turn's identity from this file.
 CALLER_ENV_FILE_ENV = "MOBIUS_CALLER_ENV_FILE"
+
+
+# Codex runs hooks with the host's environment and names only the thread, so
+# a host's hooks find a helper turn's env file through a link named by its
+# thread id in this host-private directory (see TurnEnvFile.link_thread).
+THREAD_ENV_LINKS_ENV = "MOBIUS_THREAD_ENV_LINKS"
+_THREAD_ID = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{0,127}")
+
+
+def thread_env_link(directory: str, thread_id: str) -> Path | None:
+  """Where a host hook finds ``thread_id``'s turn env file, if well formed."""
+  if not directory or not _THREAD_ID.fullmatch(thread_id or ""):
+    return None
+  return Path(directory) / f"{thread_id}.env"
 
 
 def hosts_enabled() -> bool:
@@ -140,6 +156,7 @@ class TurnEnvFile:
   def __init__(self, directory: Path, marker: str, values: dict[str, str]):
     directory.mkdir(parents=True, exist_ok=True)
     self.path = directory / f".helper-turn-{marker or 'run'}.env"
+    self._links: list[Path] = []
     lines = [
       f"export {name}={shlex.quote(value)}"
       for name, value in sorted(values.items())
@@ -150,7 +167,28 @@ class TurnEnvFile:
       handle.write("\n".join(lines) + "\n")
     os.chmod(self.path, 0o600)
 
+  def link_thread(self, directory: Path, thread_id: str) -> None:
+    """Let this host's hooks resolve ``thread_id`` to this turn's identity.
+
+    The link holds only this file's path; ``remove`` drops it with the file.
+    """
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    link = thread_env_link(str(directory), thread_id)
+    if link is None:
+      raise ValueError("unexpected Codex thread id")
+    staged = link.with_name(f".{link.name}.{os.getpid()}")
+    with contextlib.suppress(FileNotFoundError):
+      staged.unlink()
+    staged.symlink_to(self.path)
+    os.replace(staged, link)
+    self._links.append(link)
+
   def remove(self) -> None:
+    for link in self._links:
+      # A later turn of the same thread may already own the link.
+      with contextlib.suppress(OSError):
+        if os.readlink(link) == str(self.path):
+          link.unlink()
     with contextlib.suppress(FileNotFoundError):
       self.path.unlink()
 
@@ -235,8 +273,9 @@ class HostManager:
       host = self._hosts.get(key)
       if host is None or not host.alive or host.expired:
         if host is not None:
+          # Settled: the lock must outlive the old host's process group.
           with contextlib.suppress(Exception):
-            await host.close()
+            await settled.settle(host.close(), what="Helper host close")
         await self._close_idle_siblings(key)
         host = factory()
         await host.start()
@@ -266,7 +305,7 @@ class HostManager:
         if other._idle_task is not None:
           other._idle_task.cancel()
         with contextlib.suppress(Exception):
-          await other.close()
+          await settled.settle(other.close(), what="Helper host close")
 
   async def discard(self, host: Host) -> None:
     """Replace a broken host on next use."""
@@ -407,10 +446,14 @@ class CodexHelperHost(Host):
     )
     client, cancel = await _enter_codex_context_owned(self._context)
     self.client = client
-    if cancel is not None:
-      await self.close()
-      raise cancel
+    # Captured before the cancel check, so close also ends the process group.
     self.process_group_id = _codex_process_group_id(client)
+    if cancel is not None:
+      # Settled: a second cancel must not release the lease lock while the
+      # process group is still being killed.
+      with contextlib.suppress(Exception):
+        await settled.settle(self.close(), what="Helper host close")
+      raise cancel
     lower_process_group_priority(
       self.process_group_id, logger=log, label="Codex helper host",
     )

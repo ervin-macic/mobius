@@ -266,17 +266,48 @@ def test_node_runtime_satisfies_the_pinned_agent_browser_engine():
   for package in ("jq", "ripgrep", "sqlite3", "unzip"):
     assert re.search(rf"\b{package}\b", apt_layer)
   # The image-owned agent-browser config registers nothing a workspace could
-  # extend: empty on amd64, and only the image's own Chromium on arm64.
+  # extend: it names only a browser the image itself installed.
   config_layer = dockerfile[
     dockerfile.index("RUN install -d -m 0755 /app"):
     dockerfile.index("chmod 0644 /app/agent-browser-config.json")
   ]
   assert "printf '{\"executablePath\": \"/usr/bin/chromium\"}\\n';" in config_layer
-  assert "printf '{}\\n';" in config_layer
   assert "fi > /app/agent-browser-config.json" in config_layer
   assert "node:24-trixie-slim sh -c" in preship
   assert "node:22" not in dockerfile
   assert "node:22" not in preship
+
+
+def test_amd64_agents_default_to_the_headless_shell_matching_full_chrome():
+  """A 1 GB container cannot start full Chrome; the lean shell must be default.
+
+  Full Chrome stays installed for full-browser features, so the shell is
+  downloaded for exactly the version `agent-browser install` fetched and is
+  kept out of agent-browser's own `chrome-*` discovery.
+  """
+  dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+  shell = "/browsers/headless-shell/chrome-headless-shell"
+  install_layer = dockerfile[
+    dockerfile.index("# System deps and global npm packages"):
+    dockerfile.index("# tectonic is a server-side subprocess")
+  ]
+  assert "agent-browser install" in install_layer
+  assert '[ "$#" -eq 1 ]' in install_layer
+  assert (
+    "chrome-for-testing-public/${chrome_version}/linux64/"
+    "chrome-headless-shell-linux64.zip"
+  ) in install_layer
+  assert f'/root/.agent-browser{shell} --version' in install_layer
+  assert 'grep -F "$chrome_version"' in install_layer
+
+  config_layer = dockerfile[
+    dockerfile.index("RUN install -d -m 0755 /app"):
+    dockerfile.index("chmod 0644 /app/agent-browser-config.json")
+  ]
+  assert (
+    f"printf '{{\"executablePath\": \"/opt/agent-browser{shell}\"}}\\n';"
+  ) in config_layer
+  assert "printf '{}\\n';" not in config_layer
 
 
 def test_tectonic_release_is_verified_for_supported_image_architectures():
@@ -744,7 +775,8 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   ).exists()
   test_triggers = test_workflow.split("\npermissions:\n", 1)[0]
   image_triggers = image_workflow.split("\npermissions:\n", 1)[0]
-  # The backend check spans its checks, test shards, and combining gate.
+  # The backend check spans its checks, test shards, the all-unconverted
+  # boundary suites, and the combining gate.
   backend = test_workflow.split("\n  backend-checks:\n", 1)[1].split(
     "\n  frontend-unit:\n", 1,
   )[0]
@@ -756,7 +788,9 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   backend_env = (
     ROOT / ".github" / "actions" / "backend-env" / "action.yml"
   ).read_text(encoding="utf-8")
-  assert backend.count("uses: ./.github/actions/backend-env") == 2
+  assert backend.count("uses: ./.github/actions/backend-env") == 3
+  assert "MOBIUS_TEST_ALL_UNCONVERTED: '1'" in backend
+  assert "needs: [backend-checks, backend-tests, backend-all-unconverted]" in backend
   assert "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)" in backend_env
   for job in (backend, e2e):
     assert "github.event_name == 'pull_request'" not in job

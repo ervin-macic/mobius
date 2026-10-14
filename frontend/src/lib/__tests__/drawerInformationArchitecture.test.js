@@ -77,6 +77,7 @@ test('opened project artifacts join Recents once, plainly, and rebuilds do not m
     id: 12,
     name: 'Portfolio',
     color: '#3b82f6',
+    created_at: '2026-08-25T09:00:00Z',
     artifacts: [
       {
         id: 'site', name: 'Website', status: 'ok', has_output: true,
@@ -92,6 +93,7 @@ test('opened project artifacts join Recents once, plainly, and rebuilds do not m
   assert.deepEqual(before.recents.map(entry => [entry.kind, entry.item.id]), [
     ['chat', 'chat'],
     ['artifact', '12:site'],
+    ['project', 12],
   ])
   assert.equal(before.recents[1].item.artifact_id, 'site')
   assert.equal('project' in before.recents[1].item, false, 'an artifact row carries no project belonging')
@@ -103,6 +105,7 @@ test('opened project artifacts join Recents once, plainly, and rebuilds do not m
   assert.deepEqual(after.recents.map(entry => [entry.kind, entry.item.id]), [
     ['chat', 'chat'],
     ['artifact', '12:site'],
+    ['project', 12],
   ])
 })
 

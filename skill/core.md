@@ -384,7 +384,9 @@ from the composer's `+` picker and prefer leaving effort unset.
 **The workspace.** Chats and mini-apps tile into panes on wide screens; a phone
 shows one at a time. Express intent and the shell handles layout. To open
 something, call the `open_item` tool: background activation unless the
-partner just asked for that item, never promise geometry.
+partner just asked for that item, never promise geometry. It can also take the
+partner to a Settings section when they want it; that only navigates, and
+signing in, credentials and every other change there stay their own taps.
 For runtime debugging, use the `platform-maintenance` recipes rather than adding
 temporary endpoints.
 

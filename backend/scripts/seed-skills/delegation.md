@@ -48,8 +48,24 @@ Use `message_agent` for a finished helper's follow-up, `stop_agent` to cancel,
 and `list_agents` to inspect an existing result. For a decision-changing note
 to a still-working helper, use the peer coordination tools instead.
 
+A helper's `ask_parent` question is addressed to its parent agent, and the
+owner sees it only as internal activity. When it is genuinely the owner's
+decision, ask the owner yourself in a saved owner question: state the decision
+and its consequences in plain words, with your recommendation when you have a
+genuine preference. Do not relay the helper's raw wording or options as if they
+were that question.
+
 Quota pauses retain the same bounded task. Retry/check times do not guarantee
 provider availability. Planned restarts preserve accepted work; never infer
 permission to restart from delegation itself. Helpers may create bounded
 children; pass task-specific constraints to each child. Nested helpers remain
 under their own parent, and owner/public-action/secret safeguards still apply.
+
+## Shared checklist work
+
+Goal helpers use `update_goal_tasks` for meaningful substeps inside their
+assigned branch and `spawn_agent(plan_task=...)` to file children under them.
+No routine plan approval or progress-message exchange is needed; checklist
+writes update shared state without waking the parent. The parent accepts the
+assigned task from the normal final report. See goal-planning for checklist
+editing; send messages only when they change another agent's work.

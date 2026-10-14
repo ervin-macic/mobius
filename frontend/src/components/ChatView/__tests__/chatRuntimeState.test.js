@@ -14,6 +14,8 @@ import {
   ownerMessageBatch,
   startsFollowingTurn,
   jumpToLatestShown,
+  RUNTIME_STREAM_FRESH_MS,
+  runtimeStreamDelivering,
   runtimeSnapshotTransition,
   shouldRepairRuntimeStream,
   serverSnapshotBehindLocal,
@@ -886,4 +888,17 @@ test('shouldRetryStopAfterConfirm retries only the start-window running race', (
     confirmRunning: true,
     confirmFailed: true,
   }), false)
+})
+
+test('only a stream with a read inside one keepalive counts as delivering', () => {
+  const now = 1_000_000
+  const stream = { isStreaming: true, connectionError: null, now }
+  assert.equal(runtimeStreamDelivering({ ...stream, lastReadAt: now - 5_000 }), true)
+  assert.equal(runtimeStreamDelivering({ ...stream, lastReadAt: 0 }), false,
+    'no read yet on this controller proves nothing')
+  assert.equal(runtimeStreamDelivering({ ...stream, lastReadAt: now - RUNTIME_STREAM_FRESH_MS }), false,
+    'silent past one keepalive plus grace: the socket may be half-open')
+  assert.equal(runtimeStreamDelivering({ ...stream, connectionError: 'retrying', lastReadAt: now - 5_000 }), false)
+  assert.equal(runtimeStreamDelivering({ ...stream, isStreaming: false, lastReadAt: now - 5_000 }), false)
+  assert.ok(RUNTIME_STREAM_FRESH_MS > 30_000, 'longer than the server keepalive interval')
 })
